@@ -20,6 +20,25 @@ impl Default for SnapshotBuilderConfig {
     }
 }
 
+/// Builds a V8 startup snapshot from host-supplied JavaScript.
+///
+/// # This isolate is not sandboxed
+///
+/// [`create_runtime`] below deliberately builds a bare `JsRuntimeForSnapshot`
+/// with **no** `python_extension` (see `src/runtime/ops.rs`), so the bridge
+/// bootstrap that deletes `Deno`, `__bootstrap` and `__infra` never runs
+/// here. Every script passed to [`SnapshotBuilder::new`]'s `bootstrap_script`
+/// or to [`SnapshotBuilder::execute_script`] therefore has the raw
+/// `Deno.core.ops` table in scope -- including `op_print`, which writes
+/// straight to the host process's stdout -- with no timeout, no heap cap and
+/// no serialization limits. Snapshot input is host code at the same trust
+/// level as the embedder; it must never come from an untrusted source.
+///
+/// This is not a gap in the guest sandbox: a `Runtime` created from the
+/// resulting snapshot *does* run the bridge, which deletes those globals out
+/// of the restored heap before any guest code sees them
+/// (`tests/test_guest_globals.py` pins that under `RuntimeConfig(snapshot=)`
+/// as well as on a fresh runtime).
 pub struct SnapshotBuilder {
     runtime: Option<JsRuntimeForSnapshot>,
 }

@@ -94,12 +94,38 @@ pub const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 /// around depth ~1100-1200, consistent with far smaller optimized frames)
 /// but is not immune, only harder to reach.
 ///
-/// 640 KiB trips this check at depth 22 in *both* profiles -- comfortably
-/// before the ~40-deep debug crash, and very conservative relative to
-/// release's much deeper real boundary. One constant is deliberately shared
-/// across both profiles rather than tuned per-profile: it is simpler, and
-/// the cost of tripping early in an optimized build is a clear, catchable
-/// `RuntimeError` well short of any real danger, not a correctness problem.
+/// Where 640 KiB actually trips differs sharply by profile, because the
+/// per-frame cost does -- re-measured on macOS arm64 by bisecting the first
+/// rejected depth of the same `{n: {n: ...}}` chain:
+///
+/// | profile | trips at depth | that profile's real crash boundary |
+/// |---------|----------------|------------------------------------|
+/// | `unoptimized + debuginfo` | **22** | ~40 |
+/// | `release` | **743** | ~1100-1200 |
+///
+/// One constant is deliberately shared across both profiles rather than
+/// tuned per-profile: it is simpler, and the cost of tripping early is a
+/// clear, catchable `RuntimeError` well short of any real danger, not a
+/// correctness problem.
+///
+/// # This check is unconditional
+///
+/// It runs on *every* [`LimitTracker::enter`], not only when
+/// `max_serialization_depth` has been raised. In a `release` build that is
+/// invisible (743 is far past the default depth limit of 100, so the
+/// configured limit is always what a caller actually hits), but in an
+/// `unoptimized + debuginfo` build it means **nesting deeper than 21 is
+/// rejected regardless of `max_serialization_depth`** -- the default limit
+/// of 100 is not reachable there. That is the intended trade (a debug build
+/// genuinely cannot survive depth 40), but it is a real difference in
+/// behaviour between the two profiles, not just a safety margin.
+///
+/// The budget is also measured from the *thread* anchor, not from the
+/// serializer's entry frame, so whatever frames are already on the runtime
+/// thread's stack count against it: converting a value from inside a host
+/// op callback (itself invoked from an `eval`) has slightly less headroom
+/// than converting the same value from a top-level `eval`.
+///
 /// See `tests/test_serialization_headroom.py`.
 const STACK_HEADROOM_BYTES: usize = 640 * 1024;
 

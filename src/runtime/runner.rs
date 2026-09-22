@@ -169,6 +169,13 @@ struct WatchdogState {
     /// this: removing an entry can only push the next wakeup *later*, and the
     /// watchdog re-evaluates the remaining set every time it wakes anyway.
     wake: Condvar,
+    /// Set once, by `Watchdog::drop`, to stop the thread.
+    ///
+    /// It has its own mutex, but it is *read* by the watchdog thread while
+    /// that thread holds `armed`, so any writer must hold `armed` too across
+    /// the write -- otherwise the `wake` notification can land in the window
+    /// between that read and the `Condvar::wait` that parks the thread, and
+    /// be lost. See `Watchdog::drop`.
     shutdown: Mutex<bool>,
     next_id: AtomicU64,
 }
@@ -331,6 +338,31 @@ impl Watchdog {
 impl Drop for Watchdog {
     fn drop(&mut self) {
         {
+            // Take `armed` -- the mutex `wake` is paired with -- *before*
+            // setting `shutdown`, and hold it across the flag write.
+            //
+            // `shutdown` lives behind its own mutex, but the watchdog thread
+            // reads it while holding `armed`, and then releases `armed`
+            // atomically as it enters `Condvar::wait`. Setting the flag
+            // without `armed` therefore had a real lost-wakeup window: the
+            // watchdog could read `shutdown == false`, and only *after* that
+            // read (but before it was actually parked) this `notify_one`
+            // could fire against no waiter. A condvar notification is not
+            // queued, so it was simply dropped; with nothing armed, the
+            // watchdog then parked on the unbounded `wait` arm forever and
+            // the `join` below never returned -- i.e. closing a runtime
+            // could hang. Acquiring `armed` here serialises against that
+            // whole read-then-park critical section, so the notify either
+            // reaches a parked thread or is unnecessary because the flag is
+            // already visible on the watchdog's next read.
+            //
+            // Lock order (`armed` then `shutdown`) matches the watchdog
+            // thread's own order, so this cannot deadlock.
+            let _armed = self
+                .state
+                .armed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut shutdown = self
                 .state
                 .shutdown

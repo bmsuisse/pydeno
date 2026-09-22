@@ -1070,6 +1070,24 @@ class SnapshotBuilder:
 
     Use [`execute_script()`][pydeno.SnapshotBuilder.execute_script] to run multiple scripts before calling
     [`build()`][pydeno.SnapshotBuilder.build] to produce the serialized bytes.
+
+    !!! danger "Snapshot scripts are not sandboxed"
+
+        A snapshot is built in a plain `deno_core` isolate that pydeno's
+        guest bridge has *not* been installed into. Code passed to
+        `bootstrap=` or [`execute_script()`][pydeno.SnapshotBuilder.execute_script]
+        therefore runs with `Deno.core.ops` fully reachable -- the raw,
+        unmetered, untimed op table, which includes direct writes to the
+        host process's stdout/stderr. There is also no timeout and no
+        serialization limit applied while the snapshot is being built.
+
+        Snapshot input is **host code, at the same trust level as the Python
+        that calls this**. Never feed it JavaScript from an untrusted source.
+
+        The snapshot *contents* are safe to hand to
+        [`Runtime`][pydeno.Runtime]: the bridge deletes `Deno`, `__bootstrap`
+        and `__infra` when a runtime starts from a snapshot, exactly as it
+        does for a fresh one (pinned by `tests/test_guest_globals.py`).
     """
 
     def __init__(
