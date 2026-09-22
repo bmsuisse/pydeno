@@ -34,7 +34,7 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// still comfortably inside this 16 MiB OS reservation, so a generous OS
 /// stack does not, by itself, make deep recursion safe; see
 /// [`record_stack_anchor`] and [`LimitTracker::enter`] for the headroom check
-/// that actually enforces the real (V8) budget rather than this one.
+/// that actually enforces the real budget rather than this one.
 ///
 /// 16 MiB leaves room for V8's own stack limit, the `deno_core`/tokio frames
 /// above the converter, and future growth in the converters themselves. It is
@@ -70,64 +70,81 @@ pub const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 /// runtime thread's recorded stack anchor before it refuses to recurse
 /// further.
 ///
-/// This is not the OS thread's stack size ([`RUNTIME_THREAD_STACK_SIZE`]) --
-/// it is a much tighter budget approximating V8's own stack limit (~984 KB),
-/// which is what actually breaks first when `max_serialization_depth` is
-/// raised well past its default and a script builds a deeply nested value.
-/// Without this check, `LimitTracker` only counted *logical* nesting levels;
-/// raising the configured depth limit high enough (`max_serialization_depth
-/// = 10**6`, an explicit, supported configuration) let a deeply nested
-/// object exhaust the isolate's real stack budget before the depth counter
-/// ever objected, corrupting the process instead of raising a catchable
-/// Python exception.
+/// This approximates **V8's own native stack limit (~984 KB)**, which is the
+/// real boundary for anything that enters the isolate and is independent of
+/// the 16 MiB the runtime thread actually reserves
+/// ([`RUNTIME_THREAD_STACK_SIZE`]). Crossing it is not a catchable error: V8
+/// aborts the process with `Check failed: IsOnCentralStack()` from inside
+/// `Isolate::StackOverflow`. Without this check, `LimitTracker` only counted
+/// *logical* nesting levels, so `max_serialization_depth = 10**6` -- an
+/// explicit, supported configuration -- corrupted the process instead of
+/// raising a Python exception (reproducible on `main` @ a51a0a4).
 ///
-/// Tuned empirically on macOS arm64 against this checkout, with the anchor
-/// recorded at runtime-thread startup (before `JsRuntime::new`, so "used"
-/// includes the tokio/dispatcher frames already on the stack by the time a
-/// call reaches the serializer, not just the serializer's own recursion).
-/// Building a plain object chain (`{n: {n: {n: ...}}}`) with
-/// `max_serialization_depth=10**6` and *no* headroom check: an
-/// `unoptimized + debuginfo` build hits a real, uncatchable V8 fatal error
-/// (`Check failed: IsOnCentralStack()`, aborting the process) at depth ~40 --
-/// this is the pre-existing bug this check closes, reproducible on `main` @
-/// a51a0a4 before this fix. A `release` build survives much deeper (crashes
-/// around depth ~1100-1200, consistent with far smaller optimized frames)
-/// but is not immune, only harder to reach.
-///
-/// Where 640 KiB actually trips differs sharply by profile, because the
-/// per-frame cost does -- re-measured on macOS arm64 by bisecting the first
-/// rejected depth of the same `{n: {n: ...}}` chain:
-///
-/// | profile | trips at depth | that profile's real crash boundary |
-/// |---------|----------------|------------------------------------|
-/// | `unoptimized + debuginfo` | **22** | ~40 |
-/// | `release` | **743** | ~1100-1200 |
-///
-/// One constant is deliberately shared across both profiles rather than
-/// tuned per-profile: it is simpler, and the cost of tripping early is a
-/// clear, catchable `RuntimeError` well short of any real danger, not a
-/// correctness problem.
-///
-/// # This check is unconditional
+/// # This check is unconditional, and in a debug build it binds first
 ///
 /// It runs on *every* [`LimitTracker::enter`], not only when
-/// `max_serialization_depth` has been raised. In a `release` build that is
-/// invisible (743 is far past the default depth limit of 100, so the
-/// configured limit is always what a caller actually hits), but in an
-/// `unoptimized + debuginfo` build it means **nesting deeper than 21 is
-/// rejected regardless of `max_serialization_depth`** -- the default limit
-/// of 100 is not reachable there. That is the intended trade (a debug build
-/// genuinely cannot survive depth 40), but it is a real difference in
-/// behaviour between the two profiles, not just a safety margin.
+/// `max_serialization_depth` has been raised, because the stack does not
+/// care why the recursion is deep. Re-measured on macOS arm64 against this
+/// checkout by bisecting the first rejected depth of a `{n: {n: ...}}`
+/// chain:
 ///
-/// The budget is also measured from the *thread* anchor, not from the
+/// | profile | frame cost | trips at depth | V8's abort boundary |
+/// |---------|-----------|----------------|---------------------|
+/// | `unoptimized + debuginfo` | ~29.5 KB | **22** | ~40 |
+/// | `release` | ~0.9 KB | **743** | ~1100-1200 |
+///
+/// So in an `unoptimized + debuginfo` build **nesting deeper than 21 is
+/// rejected regardless of `max_serialization_depth`, and the documented
+/// default of 100 is unreachable**. Published wheels are release builds, so
+/// users are unaffected; developers and the debug CI job are not, and the
+/// rejection lands on perfectly legal input.
+///
+/// That is a build-profile ceiling, not a tuning mistake, and 0.4.1
+/// deliberately leaves it in place: an `unoptimized + debuginfo` frame is
+/// ~33x the optimized one, so a budget large enough for depth 100 there is
+/// far past V8's real limit. Raising this constant to 6 MiB was tried and
+/// reproduced the abort above at depth ~50, with the C stack trace running
+/// straight through `value_to_js_value_internal` -- the check is the only
+/// thing standing between a debug build and that abort, so it stays a hard
+/// backstop. `v8::CreateParams::set_stack_limit` does not move the boundary
+/// either: `StackGuard::InitThread` overwrites it from `v8_flags.stack_size`
+/// when the isolate is entered on a thread, and that flag is process-global,
+/// so raising it would also apply to `SnapshotBuilder` isolates, which are
+/// created on whatever Python thread calls them -- possibly a 512 KB one.
+///
+/// What 0.4.1 does change is the *message*: it now names the build profile
+/// as the cause rather than reading as a fault in the caller's data or
+/// configuration. Closing the gap properly means shrinking the debug frame
+/// (`value_to_js_value_internal` is one large function whose every branch
+/// gets its own stack slots unoptimized), which is a refactor, not a patch.
+///
+/// The budget is measured from the *thread* anchor, not from the
 /// serializer's entry frame, so whatever frames are already on the runtime
-/// thread's stack count against it: converting a value from inside a host
-/// op callback (itself invoked from an `eval`) has slightly less headroom
-/// than converting the same value from a top-level `eval`.
+/// thread's stack count against it: converting a value from inside a host op
+/// callback (itself invoked from an `eval`) has slightly less headroom than
+/// converting the same value from a top-level `eval`. Conservative in the
+/// safe direction, but it means the effective ceiling is context-dependent.
 ///
 /// See `tests/test_serialization_headroom.py`.
 const STACK_HEADROOM_BYTES: usize = 640 * 1024;
+
+/// How this build describes itself in the headroom rejection, so a reader
+/// hitting the check at depth 22 can tell at a glance that they are on a
+/// debug build rather than at a limit released wheels impose. See
+/// [`STACK_HEADROOM_BYTES`] for the measurements.
+#[cfg(debug_assertions)]
+const PROFILE_LABEL: &str = "unoptimized (debug_assertions on)";
+#[cfg(not(debug_assertions))]
+const PROFILE_LABEL: &str = "optimized";
+
+/// The approximate nesting depth at which [`STACK_HEADROOM_BYTES`] trips in
+/// this build profile, measured on macOS arm64.
+#[cfg(debug_assertions)]
+const PROFILE_CEILING: &str = "around depth 22 -- below the default \
+                               `max_serialization_depth` of 100";
+#[cfg(not(debug_assertions))]
+const PROFILE_CEILING: &str = "around depth 743 -- far past the default \
+                               `max_serialization_depth` of 100";
 
 thread_local! {
     /// The runtime thread's stack anchor: the address of a local variable
@@ -526,9 +543,15 @@ impl LimitTracker {
                 return Err(RuntimeError::internal(format!(
                     "stack headroom exhausted at depth {}: {used} bytes used since \
                      the runtime thread's stack anchor (limit {STACK_HEADROOM_BYTES} \
-                     bytes) -- this is a real V8/native stack limit, not \
-                     `max_serialization_depth`; the value being converted is too \
-                     deeply nested to serialize safely regardless of that setting",
+                     bytes). This is V8's own native stack limit, not \
+                     `max_serialization_depth` -- raising that setting cannot lift \
+                     it. How deep you can go depends on the build profile, because \
+                     a serializer frame is ~33x larger unoptimized: this pydeno was \
+                     built {PROFILE_LABEL}, where the ceiling is {PROFILE_CEILING}. \
+                     Released wheels are optimized builds; if you are seeing this \
+                     well below `max_serialization_depth` on ordinary data, you are \
+                     running a debug build of pydeno, not hitting a limit its users \
+                     see",
                     self.current_depth
                 )));
             }

@@ -137,6 +137,13 @@ class RuntimeConfig:
                 ``threading.Thread`` gets 512 KB on macOS, which pydeno cannot
                 change. The default has ~9x of headroom on such a thread; see
                 ``RUNTIME_THREAD_STACK_SIZE`` in ``src/runtime/js_value.rs``.
+                The effective ceiling is also lower than whatever you set here
+                when pydeno itself was built unoptimized: a debug build's
+                serializer frames are ~33x larger, so a native stack-headroom
+                backstop rejects nesting past roughly depth 22 there, well
+                before this setting applies. Released wheels are optimized
+                builds, where that backstop sits around depth 743 and this
+                setting is always what you actually hit.
             max_serialization_bytes: Maximum serialized byte size when transferring values
             force_kill_grace: How long a blocked caller waits for the runtime to
                 acknowledge a termination before abandoning the runtime thread and

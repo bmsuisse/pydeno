@@ -171,3 +171,85 @@ def test_distinct_acyclic_siblings_do_not_spuriously_collide() -> None:
             "c": {"d": {}, "e": {}},
             "f": [{}, {}, {}],
         }
+
+
+_DEFAULT_CONFIG_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    from pydeno import Runtime, RuntimeConfig
+
+    depth = {depth}
+    js = (
+        "(() => {{ let a = {{}}; let cur = a; "
+        "for (let i = 0; i < " + str(depth) + "; i++) {{ cur.n = {{}}; cur = cur.n; }} "
+        "return a; }})()"
+    )
+    with Runtime(RuntimeConfig()) as rt:
+        try:
+            value = rt.eval(js)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, this is the point
+            print("REJECTED:" + str(exc))
+            sys.exit(0)
+        got = 0
+        while isinstance(value, dict) and "n" in value:
+            value = value["n"]
+            got += 1
+        print("CONVERTED:" + str(got))
+        sys.exit(0)
+    """
+)
+
+
+@pytest.mark.parametrize("depth", [22, 40, 60, 99])
+def test_default_config_nesting_under_the_depth_limit(depth: int) -> None:
+    """The coverage gap that hid O1 from the 0.4.0 review.
+
+    Every depth here is legal at the *default* ``max_serialization_depth`` of
+    100, and nothing in the suite exercised the 22..99 band, so neither
+    profile's behaviour there was pinned. Two things must hold whatever the
+    build profile is:
+
+    * the process survives -- the headroom backstop turns what would be a V8
+      ``Check failed: IsOnCentralStack()`` abort into a catchable error;
+    * whatever comes back is honest. An optimized build converts the value
+      exactly (its backstop sits around depth 743). An unoptimized build
+      cannot: its serializer frames are ~33x larger, so ~984 KB of V8 stack
+      runs out around depth 22, and the rejection must say *that* -- naming
+      the build profile -- rather than reading as a fault in the caller's
+      data or in a setting that cannot lift it.
+
+    Released wheels are optimized builds, so only the first branch is what
+    users of pydeno see. See ``STACK_HEADROOM_BYTES`` in
+    ``src/runtime/js_value.rs`` for the measurements.
+    """
+    completed = subprocess.run(
+        [sys.executable, "-c", _DEFAULT_CONFIG_SCRIPT.format(depth=depth)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, (
+        f"process died converting a depth-{depth} value at the default config "
+        f"(returncode={completed.returncode}); stderr tail:\n"
+        f"{completed.stderr[-2000:]}"
+    )
+
+    if completed.stdout.startswith("CONVERTED:"):
+        assert completed.stdout.strip() == f"CONVERTED:{depth}", (
+            f"depth-{depth} chain did not round-trip intact: {completed.stdout!r}"
+        )
+        return
+
+    assert completed.stdout.startswith("REJECTED:"), completed.stdout
+    message = completed.stdout
+    assert "stack headroom exhausted" in message, message
+    # The rejection must point at the build, not at the caller: naming the
+    # configured depth limit here would send a reader to a knob that cannot
+    # help them.
+    assert "unoptimized" in message, (
+        f"a depth-{depth} value is legal at the default limit of 100, so a "
+        f"rejection has to explain that this build's frames are the ceiling: "
+        f"{message!r}"
+    )
+    assert "RuntimeConfig(max_serialization_depth=...)" not in message, message
