@@ -782,7 +782,7 @@ class Runtime:
         """
         ...
 
-    def termination_handle(self) -> TerminationHandle:
+    def termination_handle(self) -> "TerminationHandle":
         """
         Return a :class:`TerminationHandle` that can safely terminate this
         runtime's currently running (or next) JS execution from ANY thread,
