@@ -118,7 +118,19 @@ class RuntimeConfig:
             max_heap_size: Maximum heap size in bytes
             initial_heap_size: Initial heap size in bytes
             bootstrap: JavaScript source code to execute on startup
-            timeout: Execution timeout in seconds (float or int)
+            timeout: Execution timeout in seconds (float or int). A fired
+                deadline terminates whatever the isolate is running at that
+                moment, which is not necessarily the job that timed out: the
+                isolate is single-threaded and ``terminate_execution`` is
+                isolate-wide, so if you run concurrent work on one runtime --
+                a synchronous call dispatched while an async job is parked on
+                a promise, say -- the other job can be stopped instead, and
+                reports a bare ``execution terminated`` error rather than a
+                timeout. Use a runtime per concurrent job if you need a
+                termination error to be about the call that raised it. Note
+                also that an *async* job timing out on a still-pending promise
+                leaves the isolate terminated, so that runtime should be
+                discarded rather than reused.
             enable_console: Whether ``console`` output reaches the *process's*
                 stdout/stderr (defaults to False, which stubs ``console`` to
                 no-ops). Independent of ``on_console``.

@@ -155,6 +155,46 @@ struct TerminationState {
 /// an unrelated async job is still parked waiting on its own, independently
 /// timed, promise -- both need their own deadline enforced, so the watchdog
 /// tracks a small set rather than a single slot.
+///
+/// # Deadlines are not attributed to the job that set them
+///
+/// The set is tracked per job, but the *enforcement* is not: firing calls
+/// `terminate_execution()`, which is isolate-wide, and the isolate runs one
+/// thing at a time. So a deadline stops whatever the isolate is running at
+/// that moment, which need not be the job whose deadline expired.
+///
+/// Concretely, and reproducible on this checkout: an async job parked on a
+/// never-resolving promise under a 0.5 s timeout, with a sync `Eval`
+/// dispatched inline 0.2 s later and no timeout of its own, ends with the
+/// async job correctly reporting `Evaluation timed out after 500ms (promise
+/// still pending)` and the *sync* call -- which had no deadline at all --
+/// failing with a bare `Error: execution terminated`. Its own token never
+/// fired, so `apply_watchdog_result` has nothing to convert the termination
+/// into and passes it through.
+///
+/// This is a property of one-isolate-one-thread, not a bug in the set:
+/// `v8::Isolate::terminate_execution` has no per-job scope, there is nothing
+/// finer to aim at, and a runtime can be wedged inside blocking JS belonging
+/// to any job. Attributing a deadline would mean either declining to fire
+/// while an unrelated job is inline (which defeats the deadline whenever the
+/// wedged job *is* the inline one) or tracking which job owns the isolate at
+/// every instant, which is the one-isolate-one-thread model with extra steps.
+/// 0.4.1 leaves the behaviour alone and states it here and on
+/// `RuntimeConfig.timeout`; `tests/test_timeout_cross_talk.py` pins it, so
+/// this is a known contract rather than a surprise.
+///
+/// Practical consequence for callers: with concurrent work on one runtime, a
+/// bare termination error is not necessarily about the call that raised it.
+/// If that matters, use a runtime per concurrent job.
+///
+/// Found while pinning the above, pre-existing and *not* fixed here because
+/// it is outside what 0.4.1 was scoped to: `PendingJob::expired` calls
+/// `terminate_execution()` and nothing ever calls
+/// `cancel_terminate_execution()` for it -- only the synchronous path does,
+/// in `resolve_sync_watchdog`. An async job that times out on a pending
+/// promise therefore leaves the isolate latched in termination, and every
+/// later call on that runtime fails. Pinned by
+/// `test_runtime_is_unusable_after_an_async_deadline_fires`.
 struct ArmedDeadline {
     id: u64,
     deadline: Instant,
@@ -245,10 +285,15 @@ impl Watchdog {
                     // repeat `terminate_execution` call) and cheap, so there
                     // is no need to pick "the" expired entry.
                     if any_fired {
+                        // Pick the deadline that expired *first*, not whatever
+                        // `Vec` order happens to be: `disarm` uses
+                        // `swap_remove`, so position carries no meaning, and
+                        // taking the last fired entry made the reason attached
+                        // to a multi-expiry pass effectively arbitrary.
                         let reason = armed
                             .iter()
-                            .rev()
-                            .find(|entry| entry.fired)
+                            .filter(|entry| entry.fired)
+                            .min_by_key(|entry| entry.deadline)
                             .map(|entry| entry.reason.clone());
                         drop(armed);
                         if let Some(reason) = reason {
