@@ -2756,6 +2756,23 @@ impl RuntimeCoreState {
                 .execute_script("<eval>", code.to_string())
                 .map_err(|err| this.translate_js_error(*err))?;
 
+            // `execute_script` only runs the top-level script; anything the
+            // script queued with `queueMicrotask` (including a microtask
+            // that re-queues itself, forever) is still pending and does not
+            // run here. Left undrained, that queue was later drained by
+            // *some other, unrelated, untimed* call on this thread -- the
+            // next `eval`, `close`, or the dispatcher's own event-loop poll
+            // between commands -- which is what actually hung, arbitrarily
+            // far from the call that caused it and with no watchdog covering
+            // it. Draining it here, still inside this call's own
+            // start_sync_watchdog window, means a runaway microtask is
+            // bounded by *this* call's timeout and reported against it: a
+            // watchdog-driven `terminate_execution` interrupts the drain
+            // exactly as it would interrupt a runaway script, and
+            // `apply_watchdog_result` maps that to `TimeoutError` the same
+            // way. See tests/test_microtask_timeout.py.
+            this.js_runtime.v8_isolate().perform_microtask_checkpoint();
+
             let fn_registry = this.fn_registry.clone();
             let next_fn_id = this.next_fn_id.clone();
             let limits = this.serialization_limits;
@@ -2822,6 +2839,16 @@ impl RuntimeCoreState {
             if let Err(err) = eval_result {
                 return Err(this.translate_core_error(err));
             }
+
+            // `run_event_loop` above already drains microtasks tied to the
+            // module's own evaluation, but a microtask queued from module
+            // top-level code that isn't on the path the event loop waited
+            // for (e.g. a bare `queueMicrotask(...)` call, not part of what
+            // `mod_evaluate`'s receiver awaits) can still be left pending.
+            // Drain it here too, for the same reason and with the same
+            // watchdog coverage as `eval_sync` -- see the comment there and
+            // tests/test_microtask_timeout.py.
+            this.js_runtime.v8_isolate().perform_microtask_checkpoint();
 
             // Get the module namespace - must call get_module_namespace before handle_scope
             let module_namespace =
