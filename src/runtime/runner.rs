@@ -3311,7 +3311,28 @@ impl RuntimeCoreState {
                 .map_err(|_| RuntimeError::internal("Failed to cast to array"))?;
             let len = array.length() as usize;
 
-            let mut items = Vec::with_capacity(len);
+            // Charge for the array *before* touching its elements, exactly as
+            // the `Set` branch below does. Without this the array branch was
+            // the one container that cost nothing: every element of a sparse
+            // array is a hole, holes convert to `Undefined`, and `Undefined`
+            // charges `add_bytes(0)`. So `a[10_000_000] = 1` -- a 40-character
+            // guest script -- produced a ten-million-element Python list while
+            // `max_serialization_bytes` (10 MB by default) saw zero bytes
+            // consumed, and `a[4294967294] = 1` reached `Vec::with_capacity`
+            // with a guest-chosen four-billion-element reservation and took
+            // the host process out with SIGKILL before any limit was ever
+            // consulted.
+            //
+            // `array.length()` is guest-controlled, so it is metered first and
+            // only then used as a capacity hint, and the hint is clamped: a
+            // length that passes the byte check is small enough to reserve,
+            // but a tracker configured with a very large `max_bytes` must
+            // still not turn one `length` read into one enormous allocation.
+            tracker.add_bytes(16)?;
+            tracker.add_bytes(len.saturating_mul(size_of::<usize>()))?;
+
+            const ARRAY_CAPACITY_HINT_CAP: usize = 4096;
+            let mut items = Vec::with_capacity(len.min(ARRAY_CAPACITY_HINT_CAP));
             for i in 0..len {
                 let idx = i as u32;
                 let item = array.get_index(scope, idx).ok_or_else(|| {
