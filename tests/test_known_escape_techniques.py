@@ -101,10 +101,18 @@ class TestHeapjack:
             source = rt.eval("secretOp.toString()")
             assert "op_id" not in source
 
-            # `Deno`/`Deno.core.ops` is deleted by the bridge bootstrap before
-            # any guest code runs, so there is no ops table to forge a call
-            # against -- the only surface is the closures the host installed.
+            # `Deno`, `Deno.core.ops`, and deno_core's other bootstrap
+            # scaffolding globals (`__bootstrap`, `__infra`) are deleted by the
+            # bridge bootstrap before any guest code runs. That closes the ops
+            # table as an *ambient* global lookup, but the ops table itself
+            # still exists inside the isolate (closures the host installed
+            # capture it via a private JS scope, not via a deleted global) --
+            # see tests/test_guest_globals.py for the full pinned allowlist
+            # and the regression test for the `__bootstrap.core.ops.op_print`
+            # host-stdout escape this closed.
             assert rt.eval("typeof Deno") == "undefined"
+            assert rt.eval("typeof globalThis.__bootstrap") == "undefined"
+            assert rt.eval("typeof globalThis.__infra") == "undefined"
             assert rt.eval("publicOp(21)") == 42
 
     def test_isolate_state_does_not_leak_between_runtimes(self) -> None:

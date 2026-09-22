@@ -443,8 +443,19 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         r#"(function (globalThis) {
   const { ops } = Deno.core;
 
-  // Delete Deno global after caching ops
+  // Delete every guest-reachable deno_core scaffolding global after caching
+  // `ops`. `Deno` and `__bootstrap` both expose `core.ops`, which is a raw,
+  // unmetered, untimed call surface into the host process (e.g.
+  // `op_print` writes straight to the host's stdout/stderr, bypassing peno's
+  // own I/O entirely). `__infra` is deno_core's other bootstrap scaffolding
+  // global; it isn't always present, but is deleted defensively since a
+  // deno_core bump could start installing it unconditionally. See
+  // tests/test_guest_globals.py, which pins the exact guest-visible global
+  // surface so a future deno_core bump adding a new global fails loudly here
+  // instead of silently reopening this escape.
   delete globalThis.Deno;
+  delete globalThis.__bootstrap;
+  delete globalThis.__infra;
 
   // Install `key` as a plain own data property.
   //
