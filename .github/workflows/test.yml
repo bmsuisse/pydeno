@@ -110,6 +110,73 @@ jobs:
           echo "::error::pytest exited non-zero in the ${{ matrix.profile }} profile"
           exit 1
 
+  # Closes the gap the `pytest` job's comment above states plainly:
+  # `workflow.yaml` publishes `manylinux_2_28` wheels that no CI job ever
+  # imported, let alone tested. This job builds that exact wheel (same
+  # `manylinux: 2_28` as `workflow.yaml`) and actually installs + imports +
+  # tests it on Linux, instead of resting every Linux claim on "the
+  # container produced a wheel".
+  pytest-linux-wheel:
+    name: pytest (linux wheel)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-wheel
+
+      - name: Build a manylinux_2_28 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --find-interpreter
+          manylinux: 2_28
+
+      - name: Install the built wheel (not the editable dev build)
+        run: |
+          uv venv .wheel-venv
+          uv pip install --python .wheel-venv/bin/python dist/*.whl
+          # Matches the `testing` dependency group in pyproject.toml -- the
+          # test *runner's* deps, deliberately installed on top of the built
+          # wheel rather than an editable `maturin develop` install.
+          uv pip install --python .wheel-venv/bin/python \
+            "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
+
+      # Same collection-first-then-run-then-check shape as the macOS jobs, so
+      # a collection error or a mass-skip fails this job exactly as loudly.
+      - name: Collect tests
+        run: |
+          .wheel-venv/bin/python -m pytest tests/ --co -q \
+            -p no:randomly --strict-markers --strict-config \
+            | tee collect-linux-wheel.log
+
+      - name: Run pytest against the installed wheel
+        continue-on-error: true
+        id: pytest
+        run: |
+          .wheel-venv/bin/python -m pytest tests/ -v \
+            -p no:randomly --strict-markers --strict-config \
+            --junitxml=junit-linux-wheel.xml
+
+      - name: Check the test report for skipped or unrun tests
+        run: |
+          uv run python scripts/check_test_report.py \
+            --label "pytest linux-wheel" \
+            --junit junit-linux-wheel.xml \
+            --collect-log collect-linux-wheel.log \
+            --min-tests "$MIN_PYTHON_TESTS" \
+            --max-skipped "$MAX_SKIPPED"
+
+      - name: Fail if pytest itself failed
+        if: steps.pytest.outcome != 'success'
+        run: |
+          echo "::error::pytest exited non-zero against the installed linux wheel"
+          exit 1
+
   cargo-test:
     name: cargo test
     runs-on: macos-latest

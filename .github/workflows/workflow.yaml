@@ -71,9 +71,38 @@ jobs:
           name: wheels-sdist
           path: dist
 
+  # `test.yml`'s `pytest-linux-wheel` job runs this same check on every
+  # push/PR, but a `needs:` dependency only works within one workflow file,
+  # so a release can't lean on that job directly. This job re-runs the same
+  # gate -- install the manylinux_2_28 wheel this release is about to
+  # publish and actually `import`+test it -- against the artifact the
+  # `linux` job above just built, so `publish` cannot ship a wheel that was
+  # never installed anywhere.
+  test-linux-wheel:
+    name: Test the linux wheel before publishing
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@v6
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - name: Install the wheel and run the suite against it
+        run: |
+          uv venv .wheel-venv
+          uv pip install --python .wheel-venv/bin/python dist/*.whl
+          uv pip install --python .wheel-venv/bin/python \
+            "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
+          .wheel-venv/bin/python -m pytest tests/ -q \
+            -p no:randomly --strict-markers --strict-config
+
   publish:
     name: Publish to PyPI (Trusted Publishing)
-    needs: [linux, macos, windows, sdist]
+    needs: [linux, macos, windows, sdist, test-linux-wheel]
     runs-on: ubuntu-latest
     environment:
       name: pypi
