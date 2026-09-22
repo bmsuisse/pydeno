@@ -25,27 +25,32 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// up to [`MAX_JS_DEPTH`], and an unoptimized build does not merge or shrink
 /// those frames.
 ///
-/// Measured on `main` @ 40eb47d, macOS arm64, `dev` profile
-/// (`unoptimized + debuginfo`), by printing the address of a stack local at
-/// every level of `value_to_js_value_internal` while evaluating
-/// `"[" * 50 + "]" * 50`: the stride between consecutive frames was a
-/// perfectly uniform **28_336 bytes**. A full [`MAX_JS_DEPTH`] descent
-/// therefore needs ~2.83 MB of stack for the serializer alone -- past the
-/// 2 MiB default, which is exactly why `rt.eval("[" * 80 + "]" * 80)` used to
-/// die with SIGBUS on a debug build while passing on a release build, where
-/// `-O` shrinks the same frames below the limit.
+/// This 16 MiB figure is the OS thread's *own* reservation, and it is not the
+/// bound that actually matters once `max_serialization_depth` is raised past
+/// its default: **V8 imposes its own, much smaller stack limit -- roughly
+/// 984 KB -- on anything that enters the isolate**, independent of how much
+/// native stack the hosting OS thread was given. A caller can only raise
+/// `max_serialization_depth` far enough to run past that V8-side budget while
+/// still comfortably inside this 16 MiB OS reservation, so a generous OS
+/// stack does not, by itself, make deep recursion safe; see
+/// [`record_stack_anchor`] and [`LimitTracker::enter`] for the headroom check
+/// that actually enforces the real (V8) budget rather than this one.
 ///
-/// 16 MiB is ~5.6x the measured debug requirement, leaving room for V8's own
-/// stack limit (~1 MiB), the `deno_core`/tokio frames above the converter, and
-/// future growth in the converters themselves. It is only a *reservation*:
-/// pages are committed lazily, so an idle runtime thread does not pay for it.
+/// 16 MiB leaves room for V8's own stack limit, the `deno_core`/tokio frames
+/// above the converter, and future growth in the converters themselves. It is
+/// only a *reservation*: pages are committed lazily, so an idle runtime
+/// thread does not pay for it.
 ///
 /// # What this does *not* cover
 ///
 /// `python_to_js_value` recurses on the thread that **called** -- it needs
 /// that thread's GIL and its Python objects -- so this reservation is
 /// irrelevant to it. A `threading.Thread` gets 512 KB on macOS and `peno`
-/// cannot set the stack of a thread it did not spawn.
+/// cannot set the stack of a thread it did not spawn. The headroom check in
+/// [`LimitTracker::enter`] is a no-op on such a thread (no anchor was ever
+/// recorded there), so this class of caller is bounded only by
+/// `max_serialization_depth` and the OS thread's own stack size, same as
+/// before.
 ///
 /// Measured (debug, macOS arm64, 512 KB caller thread): a nested-dict
 /// argument converts safely to depth **900** and dies with SIGBUS at
@@ -60,6 +65,82 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// Python->JS conversion onto the runtime thread, which changes where the GIL
 /// is held across the boundary and is a bigger change than a constant.
 pub const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Headroom, in bytes, that [`LimitTracker::enter`] reserves below the
+/// runtime thread's recorded stack anchor before it refuses to recurse
+/// further.
+///
+/// This is not the OS thread's stack size ([`RUNTIME_THREAD_STACK_SIZE`]) --
+/// it is a much tighter budget approximating V8's own stack limit (~984 KB),
+/// which is what actually breaks first when `max_serialization_depth` is
+/// raised well past its default and a script builds a deeply nested value.
+/// Without this check, `LimitTracker` only counted *logical* nesting levels;
+/// raising the configured depth limit high enough (`max_serialization_depth
+/// = 10**6`, an explicit, supported configuration) let a deeply nested
+/// object exhaust the isolate's real stack budget before the depth counter
+/// ever objected, corrupting the process instead of raising a catchable
+/// Python exception.
+///
+/// Tuned empirically on macOS arm64 against this checkout, with the anchor
+/// recorded at runtime-thread startup (before `JsRuntime::new`, so "used"
+/// includes the tokio/dispatcher frames already on the stack by the time a
+/// call reaches the serializer, not just the serializer's own recursion).
+/// Building a plain object chain (`{n: {n: {n: ...}}}`) with
+/// `max_serialization_depth=10**6` and *no* headroom check: an
+/// `unoptimized + debuginfo` build hits a real, uncatchable V8 fatal error
+/// (`Check failed: IsOnCentralStack()`, aborting the process) at depth ~40 --
+/// this is the pre-existing bug this check closes, reproducible on `main` @
+/// a51a0a4 before this fix. A `release` build survives much deeper (crashes
+/// around depth ~1100-1200, consistent with far smaller optimized frames)
+/// but is not immune, only harder to reach.
+///
+/// 640 KiB trips this check at depth 22 in *both* profiles -- comfortably
+/// before the ~40-deep debug crash, and very conservative relative to
+/// release's much deeper real boundary. One constant is deliberately shared
+/// across both profiles rather than tuned per-profile: it is simpler, and
+/// the cost of tripping early in an optimized build is a clear, catchable
+/// `RuntimeError` well short of any real danger, not a correctness problem.
+/// See `tests/test_serialization_headroom.py`.
+const STACK_HEADROOM_BYTES: usize = 640 * 1024;
+
+thread_local! {
+    /// The runtime thread's stack anchor: the address of a local variable
+    /// captured near the top of that thread's closure, before `JsRuntime::new`
+    /// runs. `None` on every other thread (e.g. the Python caller thread that
+    /// runs `python_to_js_value` directly), which is what makes the headroom
+    /// check in [`LimitTracker::enter`] a no-op there.
+    static STACK_ANCHOR: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record the current thread's stack anchor for the headroom check in
+/// [`LimitTracker::enter`].
+///
+/// Must be called once, near the top of the runtime thread's closure and
+/// before `JsRuntime::new`, while the stack is still shallow. Calling it a
+/// second time on the same thread, or from any other thread, is harmless but
+/// pointless -- only the runtime thread's recursive serializer calls benefit
+/// from the check this enables.
+pub fn record_stack_anchor() {
+    let local_probe: u8 = 0;
+    let addr = &local_probe as *const u8 as usize;
+    STACK_ANCHOR.with(|cell| cell.set(Some(addr)));
+}
+
+/// Bytes of stack consumed between this thread's recorded anchor and `here`.
+///
+/// Returns `None` when no anchor was recorded on this thread (the check is
+/// then skipped by the caller). Stack grows down on every platform peno
+/// supports, so a healthy `anchor - here` distance grows as recursion goes
+/// deeper.
+fn stack_used_since_anchor() -> Option<usize> {
+    STACK_ANCHOR.with(|cell| {
+        cell.get().map(|anchor| {
+            let here_probe: u8 = 0;
+            let here = &here_probe as *const u8 as usize;
+            anchor.saturating_sub(here)
+        })
+    })
+}
 
 /// Configurable serialization limits applied during Python<->JS transfers.
 #[derive(Clone, Copy, Debug)]
@@ -399,11 +480,32 @@ impl LimitTracker {
 
     /// Enter a new depth level.
     ///
-    /// Returns an error if the depth limit is exceeded.
+    /// Returns an error if the depth limit is exceeded, or if this thread has
+    /// a recorded stack anchor ([`record_stack_anchor`]) and recursing this
+    /// deep has consumed more than [`STACK_HEADROOM_BYTES`] of real stack
+    /// since that anchor. The depth counter alone cannot catch this: a caller
+    /// is free to configure `max_serialization_depth` far higher than V8's
+    /// own stack budget can actually sustain, and without this check that
+    /// configuration corrupts the process instead of raising a Python
+    /// exception. On a thread with no anchor recorded (e.g. a Python caller
+    /// thread running `python_to_js_value` directly) this check is a no-op,
+    /// exactly as before.
     pub fn enter(&mut self) -> RuntimeResult<()> {
         self.current_depth = self.current_depth.saturating_add(1);
         if self.current_depth > self.max_depth {
             return Err(RuntimeError::internal(depth_limit_message(self.max_depth)));
+        }
+        if let Some(used) = stack_used_since_anchor() {
+            if used > STACK_HEADROOM_BYTES {
+                return Err(RuntimeError::internal(format!(
+                    "stack headroom exhausted at depth {}: {used} bytes used since \
+                     the runtime thread's stack anchor (limit {STACK_HEADROOM_BYTES} \
+                     bytes) -- this is a real V8/native stack limit, not \
+                     `max_serialization_depth`; the value being converted is too \
+                     deeply nested to serialize safely regardless of that setting",
+                    self.current_depth
+                )));
+            }
         }
         Ok(())
     }

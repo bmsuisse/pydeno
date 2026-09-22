@@ -12,7 +12,7 @@ use crate::runtime::inspector::{
     InspectorRegistrationParams, InspectorServer,
 };
 use crate::runtime::js_value::{
-    JSValue, LimitTracker, SerializationLimits, RUNTIME_THREAD_STACK_SIZE,
+    record_stack_anchor, JSValue, LimitTracker, SerializationLimits, RUNTIME_THREAD_STACK_SIZE,
 };
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{python_extension, OpToken, PythonOpMode, PythonOpRegistry};
@@ -29,7 +29,7 @@ use pyo3::prelude::Py;
 use pyo3::PyAny;
 use pyo3_async_runtimes::TaskLocals;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ptr;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -1966,6 +1966,15 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
         .stack_size(RUNTIME_THREAD_STACK_SIZE)
         .spawn(move || {
             let _thread_guard = RuntimeThreadGuard::new();
+            // Recorded here, before `JsRuntime::new` and while this thread's
+            // stack is still shallow, so `LimitTracker::enter` can later tell
+            // how much of this thread's *real* stack a deep recursive
+            // conversion has actually consumed -- the OS thread's 16 MiB
+            // reservation (`RUNTIME_THREAD_STACK_SIZE`) is not itself a safe
+            // bound once `max_serialization_depth` is raised past its
+            // default; V8's own stack limit is far smaller. See
+            // `record_stack_anchor` and `STACK_HEADROOM_BYTES`.
+            record_stack_anchor();
             let tokio_rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -3054,7 +3063,7 @@ impl RuntimeCoreState {
         limits: SerializationLimits,
         stream_registry: Rc<JsStreamRegistry>,
     ) -> RuntimeResult<JSValue> {
-        let mut seen = HashSet::new();
+        let mut seen: Vec<v8::Local<'s, v8::Object>> = Vec::new();
         let mut tracker = LimitTracker::new(limits.max_depth, limits.max_bytes);
         Self::value_to_js_value_internal(
             fn_registry,
@@ -3173,13 +3182,28 @@ impl RuntimeCoreState {
     }
 
     /// Internal recursive converter with cycle detection and optional receiver capture.
+    ///
+    /// `seen` is the path of container objects (`Array`/`Set`/plain object)
+    /// currently being descended into, in traversal order -- not a global set
+    /// of every object visited. A cycle is "this object is its own ancestor
+    /// on the current path", checked with `strict_equals` in O(depth) rather
+    /// than a `v8::Object::get_identity_hash()`-keyed `HashSet<i32>`.
+    ///
+    /// The identity-hash version rejected valid, acyclic input on a hash
+    /// collision: `get_identity_hash` returns a 32-bit hash that two distinct
+    /// live objects can share, and the old code treated any repeated hash as
+    /// "this object again", regardless of which object it actually was --
+    /// `{a: {}, b: {}}` was one misfortune of V8's hash function away from a
+    /// spurious "Cannot serialize circular reference". A path membership
+    /// check has no such failure mode: it only reports a cycle when an
+    /// object *actually* reappears as its own ancestor.
     #[allow(clippy::too_many_arguments)]
     fn value_to_js_value_internal<'s>(
         fn_registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
         next_fn_id: &Rc<RefCell<u32>>,
         scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
-        seen: &mut HashSet<i32>,
+        seen: &mut Vec<v8::Local<'s, v8::Object>>,
         tracker: &mut LimitTracker,
         receiver: Option<v8::Global<v8::Value>>,
         stream_registry: Rc<JsStreamRegistry>,
@@ -3296,16 +3320,17 @@ impl RuntimeCoreState {
             }
             Ok(JSValue::Bytes(buffer))
         } else if value.is_array() {
-            // Check for circular reference using identity hash
+            // Check for a circular reference: is this object already on the
+            // current traversal path?
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast array to object"))?;
-            let hash = obj.get_identity_hash().get();
 
-            if !seen.insert(hash) {
+            if seen.iter().any(|ancestor| ancestor.strict_equals(obj.into())) {
                 return Err(RuntimeError::internal(
                     "Cannot serialize circular reference",
                 ));
             }
+            seen.push(obj);
 
             let array = v8::Local::<v8::Array>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to array"))?;
@@ -3350,18 +3375,18 @@ impl RuntimeCoreState {
                 )?);
             }
 
-            seen.remove(&hash);
+            seen.pop();
             Ok(JSValue::Array(items))
         } else if value.is_set() {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast set to object"))?;
-            let hash = obj.get_identity_hash().get();
 
-            if !seen.insert(hash) {
+            if seen.iter().any(|ancestor| ancestor.strict_equals(obj.into())) {
                 return Err(RuntimeError::internal(
                     "Cannot serialize circular reference",
                 ));
             }
+            seen.push(obj);
 
             let set = v8::Local::<v8::Set>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to Set"))?;
@@ -3388,7 +3413,7 @@ impl RuntimeCoreState {
                 )?);
             }
 
-            seen.remove(&hash);
+            seen.pop();
             Ok(JSValue::Set(values))
         } else if value.is_date() {
             let date = v8::Local::<v8::Date>::try_from(value)
@@ -3404,16 +3429,17 @@ impl RuntimeCoreState {
             tracker.add_bytes(size_of::<u32>())?;
             Ok(JSValue::JsStream { id: stream_id })
         } else if value.is_object() {
-            // Check for circular reference using identity hash
+            // Check for a circular reference: is this object already on the
+            // current traversal path?
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
-            let hash = obj.get_identity_hash().get();
 
-            if !seen.insert(hash) {
+            if seen.iter().any(|ancestor| ancestor.strict_equals(obj.into())) {
                 return Err(RuntimeError::internal(
                     "Cannot serialize circular reference",
                 ));
             }
+            seen.push(obj);
 
             // Get property names
             let prop_names = obj
@@ -3458,7 +3484,7 @@ impl RuntimeCoreState {
                 );
             }
 
-            seen.remove(&hash);
+            seen.pop();
             Ok(JSValue::Object(map))
         } else {
             // Fallback: convert to string
