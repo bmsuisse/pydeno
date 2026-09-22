@@ -422,21 +422,35 @@ async def main():
                 yield {"count": i}
                 await asyncio.sleep(0.1)
 
-        stream_id = await rt.create_js_stream_from_python(data_generator())
-        rt.eval(f"globalThis.myStream = __pydeno_get_stream__({stream_id})")
+        # `stream_from_async_iterable` returns a handle; hand it to JS the
+        # same way as any other value, by passing it to a JS function. It
+        # arrives there as a `ReadableStream`.
+        py_stream = rt.stream_from_async_iterable(data_generator())
+        setter = rt.eval("(stream) => { globalThis.myStream = stream; }")
+        setter(py_stream)
 
         # Consume in JavaScript
         result = await rt.eval_async("""
-            const reader = myStream.getReader();
-            const chunks = [];
-            while (true) {
-                const {done, value} = await reader.read();
-                if (done) break;
-                chunks.push(value);
-            }
-            chunks
+            (async () => {
+                const reader = myStream.getReader();
+                const chunks = [];
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                }
+                return chunks;
+            })()
         """)
         print(result)  # List of chunks
+
+        # The other direction: a JS `ReadableStream` returned to Python
+        # arrives as a `JsStream`, an async iterator.
+        js_stream = await rt.eval_async(
+            "(async () => new ReadableStream({start(c) { c.enqueue(1); c.close(); }}))()"
+        )
+        async for chunk in js_stream:
+            print(chunk)
 
 asyncio.run(main())
 ```
