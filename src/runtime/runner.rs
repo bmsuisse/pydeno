@@ -3325,7 +3325,10 @@ impl RuntimeCoreState {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast array to object"))?;
 
-            if seen.iter().any(|ancestor| ancestor.strict_equals(obj.into())) {
+            if seen
+                .iter()
+                .any(|ancestor| ancestor.strict_equals(obj.into()))
+            {
                 return Err(RuntimeError::internal(
                     "Cannot serialize circular reference",
                 ));
@@ -3381,7 +3384,10 @@ impl RuntimeCoreState {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast set to object"))?;
 
-            if seen.iter().any(|ancestor| ancestor.strict_equals(obj.into())) {
+            if seen
+                .iter()
+                .any(|ancestor| ancestor.strict_equals(obj.into()))
+            {
                 return Err(RuntimeError::internal(
                     "Cannot serialize circular reference",
                 ));
@@ -3434,7 +3440,10 @@ impl RuntimeCoreState {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
 
-            if seen.iter().any(|ancestor| ancestor.strict_equals(obj.into())) {
+            if seen
+                .iter()
+                .any(|ancestor| ancestor.strict_equals(obj.into()))
+            {
                 return Err(RuntimeError::internal(
                     "Cannot serialize circular reference",
                 ));
