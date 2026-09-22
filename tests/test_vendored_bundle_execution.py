@@ -1,4 +1,4 @@
-"""Regression guard: a real, large, third-party JS bundle still runs in peno.
+"""Regression guard: a real, large, third-party JS bundle still runs in pydeno.
 
 What this protects
 ------------------
@@ -62,7 +62,7 @@ import zipfile
 from io import BytesIO
 
 import pytest
-from peno import Runtime
+from pydeno import Runtime
 
 # --- the pinned asset ------------------------------------------------------
 
@@ -118,11 +118,11 @@ def _bundle() -> str:
 DECK_SCRIPT_TEMPLATE = """
 const pres = new PptxGenJS();
 pres.layout = "LAYOUT_WIDE";
-pres.title = "peno vendored bundle regression deck";
+pres.title = "pydeno vendored bundle regression deck";
 
 const s1 = pres.addSlide();
 s1.background = { color: "1F2A44" };
-s1.addText("Vendored pptxgenjs in peno", {
+s1.addText("Vendored pptxgenjs in pydeno", {
   x: 0.6, y: 2.0, w: 12.1, h: 1.0,
   fontSize: 34, bold: true, color: "FFFFFF", align: "center",
 });
@@ -335,7 +335,7 @@ def test_vendored_bundle_is_the_pinned_bytes() -> None:
 
 
 def test_bare_isolate_has_none_of_the_browser_globals() -> None:
-    """Documents *why* the polyfills exist. If a future peno starts shipping
+    """Documents *why* the polyfills exist. If a future pydeno starts shipping
     these itself, this fails and the polyfill file can be trimmed."""
     with Runtime() as rt:
         for name in ("window", "global", "self", "setTimeout", "atob", "btoa"):

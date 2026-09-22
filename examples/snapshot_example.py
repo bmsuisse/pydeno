@@ -13,7 +13,7 @@ Use cases:
 """
 
 import time
-from peno import Runtime, RuntimeConfig, SnapshotBuilder
+from pydeno import Runtime, RuntimeConfig, SnapshotBuilder
 
 
 def measure_startup(label, config=None, iterations=10):

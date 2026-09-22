@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from peno import Runtime, RuntimeConfig, undefined
+from pydeno import Runtime, RuntimeConfig, undefined
 
 
 def _capturing_runtime(records: list[tuple[str, list[Any]]], **kwargs: Any) -> Runtime:
@@ -79,7 +79,7 @@ def test_arguments_arrive_structured_not_stringified() -> None:
 def test_console_null_and_undefined_both_arrive_as_js_undefined() -> None:
     """Documents (rather than changes) the existing host-callback convention.
 
-    Every op-argument path in peno collapses JS `null` and `undefined`
+    Every op-argument path in pydeno collapses JS `null` and `undefined`
     onto the same `JsUndefined` sentinel -- this is not specific to console
     capture, it is what `bind_function`/`bind_object` handlers have always
     received. Pinned here so console capture's argument semantics are stated

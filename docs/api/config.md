@@ -1,3 +1,3 @@
 # `RuntimeConfig`
 
-::: peno.RuntimeConfig
+::: pydeno.RuntimeConfig

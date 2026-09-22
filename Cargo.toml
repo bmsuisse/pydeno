@@ -1,11 +1,14 @@
 [package]
-name = "peno"
+name = "pydeno"
 version = "0.4.0"
 edition = "2021"
+repository = "https://github.com/bmsuisse/pydeno"
+license = "MIT"
+description = "Modern embedded JavaScript runtime for Python powered by V8 and Rust."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "_peno"            # Python import name
+name = "_pydeno"            # Python import name
 crate-type = ["cdylib", "rlib"] # rlib so benches/ can link the crate directly
 
 [dependencies]
@@ -47,7 +50,7 @@ name = "runtime_benches"
 harness = false
 required-features = ["bench"]
 
-# Overflow checks stay ON for peno's own code -- they are worth having -- but
+# Overflow checks stay ON for pydeno's own code -- they are worth having -- but
 # are turned off for third-party crates in unoptimized builds.
 #
 # `deno_core` 0.409.0 `source_map.rs:105` computes `line_number - 1` on a
@@ -56,7 +59,7 @@ required-features = ["bench"]
 # panics with "attempt to subtract with overflow" inside
 # `JsError::from_v8_exception`, killing the runtime thread and turning a
 # catchable `JavaScriptError` into `RuntimeError: Failed to receive eval
-# result`. peno cannot fix that arithmetic, and the release build users
+# result`. pydeno cannot fix that arithmetic, and the release build users
 # actually get wraps instead of panicking, so a debug-only panic in a
 # dependency is not a bug this project can act on -- it just makes the debug
 # test suite unrunnable. Found by the new debug pytest job; pre-existing on
@@ -64,7 +67,7 @@ required-features = ["bench"]
 # fuzz test that generates that input.
 #
 # Scoped to `package."*"`, which in Cargo means dependencies and *not* the
-# local crate, so an overflow in peno's own arithmetic still panics loudly.
+# local crate, so an overflow in pydeno's own arithmetic still panics loudly.
 # Remove both sections once `deno_core` is bumped past the fix.
 [profile.dev.package."*"]
 overflow-checks = false

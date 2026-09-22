@@ -1,7 +1,7 @@
-"""Minimal example demonstrating peno module loading from Python."""
+"""Minimal example demonstrating pydeno module loading from Python."""
 
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 
 async def main() -> None:

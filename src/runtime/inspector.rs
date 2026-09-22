@@ -1,5 +1,5 @@
 //! Inspector server that mirrors Deno's DevTools bridge while exposing
-//! peno-friendly metadata. The server runs on a dedicated thread that drives
+//! pydeno-friendly metadata. The server runs on a dedicated thread that drives
 //! a single-threaded Tokio runtime so that runtime threads can remain isolated.
 
 use anyhow::{Context, Result};
@@ -129,7 +129,7 @@ impl InspectorServer {
             InspectorInfoConfig {
                 target_url: params
                     .target_url
-                    .unwrap_or_else(|| "peno://runtime".to_string()),
+                    .unwrap_or_else(|| "pydeno://runtime".to_string()),
                 display_name: params.display_name,
                 wait_for_session: params.wait_for_connection,
                 description: self.name.to_string(),
@@ -375,7 +375,7 @@ async fn listen_for_new_inspectors(
         );
         log::info!("Open chrome://inspect to connect.");
         if info.wait_for_session {
-            log::info!("peno is waiting for the debugger to attach");
+            log::info!("pydeno is waiting for the debugger to attach");
         }
         if inspector_map.borrow_mut().insert(info.uuid, info).is_some() {
             log::error!("Inspector UUID collision detected");
@@ -479,7 +479,7 @@ impl InspectorInfo {
             .unwrap_or_default();
         self.display_name
             .clone()
-            .unwrap_or_else(|| format!("peno{thread} [pid: {}]", process::id()))
+            .unwrap_or_else(|| format!("pydeno{thread} [pid: {}]", process::id()))
     }
 
     fn metadata_for_host(&self, host_override: Option<String>) -> InspectorMetadata {

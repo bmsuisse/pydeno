@@ -10,7 +10,7 @@ The inspector enables debugging via the [Chrome DevTools Protocol](https://chrom
 Enable the inspector when creating the runtime:
 
 ```python
-from peno import Runtime, RuntimeConfig, InspectorConfig
+from pydeno import Runtime, RuntimeConfig, InspectorConfig
 
 # Configure inspector (waits for DevTools to connect)
 config = RuntimeConfig(inspector=InspectorConfig(wait_for_connection=True))
@@ -45,7 +45,7 @@ When DevTools is connected, execution stops at `debugger;` and you can:
 
 ## Configuration Options
 
-[`InspectorConfig`][peno.InspectorConfig] provides several options:
+[`InspectorConfig`][pydeno.InspectorConfig] provides several options:
 
 - `host`: Bind address (default: `"127.0.0.1"`)
 - `port`: DevTools port (default: `9229`)
@@ -54,7 +54,7 @@ When DevTools is connected, execution stops at `debugger;` and you can:
 - `target_url`: Optional URL reported to DevTools
 - `display_name`: Optional display title in `chrome://inspect`
 
-Use [`runtime.inspector_endpoints()`][peno.Runtime.inspector_endpoints] to get the `devtools_frontend_url` and `websocket_url` for connecting.
+Use [`runtime.inspector_endpoints()`][pydeno.Runtime.inspector_endpoints] to get the `devtools_frontend_url` and `websocket_url` for connecting.
 
 ## Next Steps
 

@@ -7,7 +7,7 @@ This allows for true parallelism between JavaScript execution and Python threads
 
 import threading
 import time
-from peno import Runtime
+from pydeno import Runtime
 
 
 def cpu_bound_python():
@@ -19,7 +19,7 @@ def cpu_bound_python():
     return counter
 
 
-def run_peno_eval():
+def run_pydeno_eval():
     """Run a CPU-intensive JavaScript computation in JS Runtime."""
     with Runtime() as rt:
         # This JS code will run for a noticeable amount of time
@@ -41,7 +41,7 @@ def main():
     print("Running JavaScript and Python work in parallel threads")
     start = time.time()
 
-    js_thread = threading.Thread(target=run_peno_eval)
+    js_thread = threading.Thread(target=run_pydeno_eval)
     python_results = [0, 0]
 
     def python_worker(index):

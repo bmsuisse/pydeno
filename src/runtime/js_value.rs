@@ -45,7 +45,7 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 ///
 /// `python_to_js_value` recurses on the thread that **called** -- it needs
 /// that thread's GIL and its Python objects -- so this reservation is
-/// irrelevant to it. A `threading.Thread` gets 512 KB on macOS and `peno`
+/// irrelevant to it. A `threading.Thread` gets 512 KB on macOS and `pydeno`
 /// cannot set the stack of a thread it did not spawn. The headroom check in
 /// [`LimitTracker::enter`] is a no-op on such a thread (no anchor was ever
 /// recorded there), so this class of caller is bounded only by
@@ -129,7 +129,7 @@ pub fn record_stack_anchor() {
 /// Bytes of stack consumed between this thread's recorded anchor and `here`.
 ///
 /// Returns `None` when no anchor was recorded on this thread (the check is
-/// then skipped by the caller). Stack grows down on every platform peno
+/// then skipped by the caller). Stack grows down on every platform pydeno
 /// supports, so a healthy `anchor - here` distance grows as recursion goes
 /// deeper.
 fn stack_used_since_anchor() -> Option<usize> {
@@ -164,7 +164,7 @@ impl Default for SerializationLimits {
     }
 }
 
-const TYPE_TAG: &str = "__peno_type";
+const TYPE_TAG: &str = "__pydeno_type";
 const UNDEFINED_TYPE: &str = "Undefined";
 const DATE_TYPE: &str = "Date";
 const DATE_EPOCH_KEY: &str = "epoch_ms";

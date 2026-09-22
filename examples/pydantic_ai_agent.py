@@ -2,9 +2,9 @@
 A pydantic-ai agent whose tool-calling loop includes ONE "code mode" tool:
 instead of the model making N separate tool calls (one per city, one per
 sum...), it submits a single JS script that loops/branches over several
-operations itself, executed safely in a peno sandbox.
+operations itself, executed safely in a pydeno sandbox.
 
-The peno execution (`run_js_batch`) is the real, fully-working part of
+The pydeno execution (`run_js_batch`) is the real, fully-working part of
 this example and needs no API key. Driving the LLM side without a key uses
 pydantic-ai's `FunctionModel` (https://ai.pydantic.dev/models/#function),
 its built-in mechanism for scripting exactly what a "model" replies with -
@@ -26,7 +26,7 @@ from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # A batch of numbers a "user" wants summary statistics for. In a real agent
 # this would come from the conversation; here it's fixed so the offline

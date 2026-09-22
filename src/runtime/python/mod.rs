@@ -43,7 +43,7 @@ pub fn _debug_active_runtime_threads() -> usize {
     runner::active_runtime_threads()
 }
 
-#[pyclass(module = "_peno")]
+#[pyclass(module = "_pydeno")]
 pub struct JsUndefined;
 
 #[pymethods]
@@ -51,7 +51,7 @@ impl JsUndefined {
     #[new]
     fn __new__() -> PyResult<Self> {
         Err(PyRuntimeError::new_err(
-            "JsUndefined is a singleton; use peno.undefined",
+            "JsUndefined is a singleton; use pydeno.undefined",
         ))
     }
 

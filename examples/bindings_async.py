@@ -1,7 +1,7 @@
 """Async function bindings - bridging Python async functions to JavaScript Promises."""
 
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 
 async def python_fetch(url):

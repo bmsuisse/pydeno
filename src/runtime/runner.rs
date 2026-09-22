@@ -207,7 +207,7 @@ impl Watchdog {
         let state_for_thread = state.clone();
 
         let handle = thread::Builder::new()
-            .name("peno-watchdog".to_string())
+            .name("pydeno-watchdog".to_string())
             .spawn(move || {
                 loop {
                     let mut armed = state_for_thread
@@ -1873,10 +1873,9 @@ impl RuntimeJob for EvalModuleAsyncJob {
                             ))
                         })?
                     } else {
-                        let base =
-                            deno_core::ModuleSpecifier::parse("peno://runtime/").map_err(|e| {
-                                RuntimeError::internal(format!("Failed to create base URL: {}", e))
-                            })?;
+                        let base = deno_core::ModuleSpecifier::parse("pydeno://runtime/").map_err(
+                            |e| RuntimeError::internal(format!("Failed to create base URL: {}", e)),
+                        )?;
                         base.join(&self.specifier).map_err(|e| {
                             RuntimeError::internal(format!(
                                 "Failed to resolve module specifier '{}': {}",
@@ -2106,7 +2105,7 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
     let (init_tx, init_rx): InitSignalChannel = std::sync::mpsc::channel();
 
     thread::Builder::new()
-        .name("peno-deno-runtime".to_string())
+        .name("pydeno-deno-runtime".to_string())
         // This thread owns the V8 isolate and runs the recursive JSValue
         // serializers, which descend once per nesting level up to
         // `MAX_JS_DEPTH`. See `RUNTIME_THREAD_STACK_SIZE` for the measurement.
@@ -2338,7 +2337,7 @@ impl RuntimeCoreState {
         // too. See RuntimeConfig::on_console for the full composition table.
         if let Some(callback) = on_console {
             let op_id = registry.register(
-                "__peno_console__".to_string(),
+                "__pydeno_console__".to_string(),
                 PythonOpMode::Sync,
                 callback.0,
             );
@@ -2449,10 +2448,11 @@ impl RuntimeCoreState {
                 let wait_for_connection = inspector_cfg.wait_for_connection;
                 let break_on_next_statement = inspector_cfg.break_on_next_statement;
                 let connection_state = InspectorConnectionState::default();
-                let server =
-                    InspectorServer::bind(inspector_cfg.socket_addr(), "peno").map_err(|err| {
+                let server = InspectorServer::bind(inspector_cfg.socket_addr(), "pydeno").map_err(
+                    |err| {
                         RuntimeError::internal(format!("Failed to start inspector server: {err}"))
-                    })?;
+                    },
+                )?;
 
                 let registration = server
                     .register_runtime(
@@ -2763,13 +2763,13 @@ impl RuntimeCoreState {
         let context = try_catch.get_current_context();
         let global = context.global(try_catch);
 
-        let helper_key = v8::String::new(try_catch, "__peno_bind_object")
+        let helper_key = v8::String::new(try_catch, "__pydeno_bind_object")
             .ok_or_else(|| RuntimeError::internal("Failed to allocate helper name"))?;
         let helper_value = global
             .get(try_catch, helper_key.into())
-            .ok_or_else(|| RuntimeError::internal("Missing __peno_bind_object helper"))?;
+            .ok_or_else(|| RuntimeError::internal("Missing __pydeno_bind_object helper"))?;
         let helper_fn = v8::Local::<v8::Function>::try_from(helper_value)
-            .map_err(|_| RuntimeError::internal("__peno_bind_object is not callable"))?;
+            .map_err(|_| RuntimeError::internal("__pydeno_bind_object is not callable"))?;
 
         let global_name = v8::String::new(try_catch, &name)
             .ok_or_else(|| RuntimeError::internal("Failed to allocate target name"))?;
@@ -2864,7 +2864,7 @@ impl RuntimeCoreState {
             Some(_) => {
                 // Exposure happens here, not at registration: the capability
                 // becomes dispatchable only once the binding it belongs to is
-                // actually installed in the guest's scope. A `__peno_bind_object`
+                // actually installed in the guest's scope. A `__pydeno_bind_object`
                 // that threw leaves the handlers registered but unreachable.
                 for token in op_tokens {
                     registry.expose(token);
@@ -2879,7 +2879,7 @@ impl RuntimeCoreState {
                     )))
                 } else {
                     Err(RuntimeError::internal(
-                        "__peno_bind_object invocation failed",
+                        "__pydeno_bind_object invocation failed",
                     ))
                 }
             }
@@ -2952,7 +2952,7 @@ impl RuntimeCoreState {
                 })?
             } else {
                 // Bare specifier - resolve relative to a synthetic base
-                let base = deno_core::ModuleSpecifier::parse("peno://runtime/").map_err(|e| {
+                let base = deno_core::ModuleSpecifier::parse("pydeno://runtime/").map_err(|e| {
                     RuntimeError::internal(format!("Failed to create base URL: {}", e))
                 })?;
                 base.join(specifier).map_err(|e| {
@@ -3337,18 +3337,20 @@ impl RuntimeCoreState {
             JSValue::PyStream { id } => {
                 let context = scope.get_current_context();
                 let global = context.global(scope);
-                let helper_key = v8::String::new(scope, "__peno_from_py_stream")
+                let helper_key = v8::String::new(scope, "__pydeno_from_py_stream")
                     .ok_or_else(|| RuntimeError::internal("Failed to allocate helper key"))?;
                 let helper_value = global.get(scope, helper_key.into()).ok_or_else(|| {
-                    RuntimeError::internal("Missing __peno_from_py_stream helper")
+                    RuntimeError::internal("Missing __pydeno_from_py_stream helper")
                 })?;
-                let helper_fn = v8::Local::<v8::Function>::try_from(helper_value)
-                    .map_err(|_| RuntimeError::internal("__peno_from_py_stream is not callable"))?;
+                let helper_fn =
+                    v8::Local::<v8::Function>::try_from(helper_value).map_err(|_| {
+                        RuntimeError::internal("__pydeno_from_py_stream is not callable")
+                    })?;
                 let id_value = v8::Number::new(scope, *id as f64);
                 helper_fn
                     .call(scope, global.into(), &[id_value.into()])
                     .ok_or_else(|| {
-                        RuntimeError::internal("__peno_from_py_stream invocation failed")
+                        RuntimeError::internal("__pydeno_from_py_stream invocation failed")
                     })
             }
             JSValue::JsStream { .. } => Err(RuntimeError::internal(

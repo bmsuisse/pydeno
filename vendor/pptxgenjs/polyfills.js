@@ -1,6 +1,6 @@
 /*
  * Host-supplied browser globals for running a real npm browser/UMD bundle
- * inside a bare peno V8 isolate.
+ * inside a bare pydeno V8 isolate.
  *
  * This file is HOST code, not vendored third-party code, and it is injected
  * SEPARATELY -- the bundle itself is never patched. Keeping it as its own
@@ -26,7 +26,7 @@
  * A bare V8 isolate has no window/global/self, so the expression falls
  * through to `this`.
  *
- * MEASURED, pptxgenjs 4.0.1 on peno: peno's `eval` runs the script as a
+ * MEASURED, pptxgenjs 4.0.1 on pydeno: pydeno's `eval` runs the script as a
  * sloppy-mode classic script whose top-level `this` IS globalThis, so the
  * fallback already lands on the real global object and the UMD assignment
  * works WITHOUT this section. It is kept for two reasons: (a) it removes the
@@ -61,7 +61,7 @@ globalThis.self = globalThis;
  * completion, and without one that both *defers* and *actually fires*,
  * `pres.write()` returns a promise that never settles.
  *
- * MEASURED, pptxgenjs 4.0.1 on peno, building the same deck:
+ * MEASURED, pptxgenjs 4.0.1 on pydeno, building the same deck:
  *
  *                              | section 1 absent | section 1 present
  *   setTimeout = f => {}       |      HANGS       |      HANGS
@@ -78,7 +78,7 @@ globalThis.self = globalThis;
  *
  * The bottom row is the only one that is correct independent of the rest of
  * the polyfill set. `Promise.resolve().then()` puts the callback on the
- * microtask queue, which is exactly what peno's `eval_async` promise-polling
+ * microtask queue, which is exactly what pydeno's `eval_async` promise-polling
  * loop drains, so the continuation runs on a later turn as JSZip expects.
  * Do not "simplify" it.
  *
@@ -120,7 +120,7 @@ globalThis.self = globalThis;
  * V8 has no browser base64 builtins; they live in the HTML spec, not in
  * ECMAScript.
  *
- * MEASURED, pptxgenjs 4.0.1 on peno: the deck in
+ * MEASURED, pptxgenjs 4.0.1 on pydeno: the deck in
  * `examples/pptxgenjs_presentation.py` -- including `addImage({data:
  * "image/png;base64,..."})` and `write({outputType: "base64"})` -- produces
  * byte-identical output WITHOUT this section, because JSZip carries its own

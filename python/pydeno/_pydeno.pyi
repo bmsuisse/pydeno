@@ -1,5 +1,5 @@
 """
-Type stubs for the peno Python extension module.
+Type stubs for the pydeno Python extension module.
 """
 
 import types
@@ -134,7 +134,7 @@ class RuntimeConfig:
                 (default 100). Raising it past roughly 900 is unsafe if you then
                 pass a deep argument from a small-stack thread: the Python-to-JS
                 conversion recurses on the *calling* thread, and a
-                ``threading.Thread`` gets 512 KB on macOS, which peno cannot
+                ``threading.Thread`` gets 512 KB on macOS, which pydeno cannot
                 change. The default has ~9x of headroom on such a thread; see
                 ``RUNTIME_THREAD_STACK_SIZE`` in ``src/runtime/js_value.rs``.
             max_serialization_bytes: Maximum serialized byte size when transferring values
@@ -253,7 +253,7 @@ class RuntimeStats:
     """
     Structured snapshot of runtime resource usage and execution counters.
 
-    Instances are returned from [`Runtime.get_stats()`][peno.Runtime.get_stats] and provide
+    Instances are returned from [`Runtime.get_stats()`][pydeno.Runtime.get_stats] and provide
     read-only insight into the V8 heap, total execution time, and active
     resources currently managed by the runtime.
 
@@ -1068,8 +1068,8 @@ class SnapshotBuilder:
     """
     Build a V8 snapshot covering a custom bootstrap script.
 
-    Use [`execute_script()`][peno.SnapshotBuilder.execute_script] to run multiple scripts before calling
-    [`build()`][peno.SnapshotBuilder.build] to produce the serialized bytes.
+    Use [`execute_script()`][pydeno.SnapshotBuilder.execute_script] to run multiple scripts before calling
+    [`build()`][pydeno.SnapshotBuilder.build] to produce the serialized bytes.
     """
 
     def __init__(

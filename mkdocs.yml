@@ -1,10 +1,10 @@
-site_name: peno
+site_name: pydeno
 site_description: JavaScript runtime for Python powered by V8 and Rust
 site_author: bmsuisse
-site_url: https://bmsuisse.github.io/peno
+site_url: https://bmsuisse.github.io/pydeno
 
-repo_name: bmsuisse/peno
-repo_url: https://github.com/bmsuisse/peno
+repo_name: bmsuisse/pydeno
+repo_url: https://github.com/bmsuisse/pydeno
 edit_uri: edit/main/docs/
 
 theme:
@@ -56,7 +56,7 @@ nav:
       - Serverless Runtime: use-cases/serverless-runtime.md
       - Workflow Orchestration: use-cases/workflow.md
   - API Reference:
-      - peno Module: api/peno.md
+      - pydeno Module: api/pydeno.md
       - Runtime: api/runtime.md
       - RuntimeConfig: api/config.md
       - Types: api/types.md

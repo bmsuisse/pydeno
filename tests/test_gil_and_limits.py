@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # CPU-bound JS: long enough that the round trip dominates Python overhead,
 # short enough to keep the suite fast.

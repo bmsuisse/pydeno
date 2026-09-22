@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrated benchmark suite for showcasing peno strengths."""
+"""Orchestrated benchmark suite for showcasing pydeno strengths."""
 from __future__ import annotations
 
 import argparse
@@ -19,7 +19,7 @@ def _print_title(title: str) -> None:
 
 
 def cmd_startup(iterations: int) -> None:
-    _print_title("1) Startup cost (peno vs subprocess)")
+    _print_title("1) Startup cost (pydeno vs subprocess)")
     bench_startup.main()
 
 

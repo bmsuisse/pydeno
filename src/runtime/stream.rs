@@ -77,7 +77,7 @@ impl StreamChunk {
     pub fn to_js_value(&self) -> JSValue {
         let mut map = IndexMap::new();
         map.insert(
-            "__peno_type".to_string(),
+            "__pydeno_type".to_string(),
             JSValue::String(STREAM_CHUNK_TYPE.to_string()),
         );
         map.insert(STREAM_CHUNK_DONE_KEY.to_string(), JSValue::Bool(self.done));
@@ -91,7 +91,7 @@ impl StreamChunk {
         match payload {
             JSValue::Object(mut map) => {
                 let tag = map
-                    .shift_remove("__peno_type")
+                    .shift_remove("__pydeno_type")
                     .and_then(|value| match value {
                         JSValue::String(s) => Some(s),
                         _ => None,

@@ -158,9 +158,9 @@ fn set_future_exception_immediate(py: Python<'_>, future: &Py<PyAny>, err: PyErr
 /// coroutine was expected` on a bare `Future`, which made "run two JS calls
 /// concurrently" -- the obvious reason to reach for these APIs at all -- fail
 /// on the first line. `await` and `asyncio.gather` already worked and still
-/// do. See `python/peno/_awaitable.py` for why this lives in Python.
+/// do. See `python/pydeno/_awaitable.py` for why this lives in Python.
 fn as_coroutine<'py>(py: Python<'py>, future: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    py.import(pyo3::intern!(py, "peno._awaitable"))?
+    py.import(pyo3::intern!(py, "pydeno._awaitable"))?
         .getattr(pyo3::intern!(py, "as_coroutine"))?
         .call1((future,))
 }

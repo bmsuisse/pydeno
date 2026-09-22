@@ -63,10 +63,10 @@ graph TB
 
 ## Creating Snapshots
 
-Use [`SnapshotBuilder`][peno.SnapshotBuilder] to create a snapshot:
+Use [`SnapshotBuilder`][pydeno.SnapshotBuilder] to create a snapshot:
 
 ```python
-from peno import SnapshotBuilder
+from pydeno import SnapshotBuilder
 
 # Create a builder
 builder = SnapshotBuilder()
@@ -88,7 +88,7 @@ Now `snapshot` contains the V8 heap state with `VERSION` and `add` already defin
 Pass the snapshot when creating runtimes:
 
 ```python
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 config = RuntimeConfig(snapshot=snapshot)
 
@@ -133,7 +133,7 @@ When you use `SnapshotBuilder`, the source is executed as a plain script via V8'
 
 ```python
 import requests
-from peno import Runtime, RuntimeConfig, SnapshotBuilder
+from pydeno import Runtime, RuntimeConfig, SnapshotBuilder
 
 builder = SnapshotBuilder()
 
@@ -169,7 +169,7 @@ You can use snapshots with static modules:
 
 ```python
 import asyncio
-from peno import Runtime, RuntimeConfig, SnapshotBuilder
+from pydeno import Runtime, RuntimeConfig, SnapshotBuilder
 
 async def main():
     # Create snapshot with core utilities
@@ -203,4 +203,4 @@ Snapshot provides globals, modules provide imports.
 ## Next Steps
 
 - Learn about [V8 Snapshot](https://v8.dev/blog/custom-startup-snapshots)
-- Check out the [SnapshotBuilder][peno.SnapshotBuilder] for complete snapshot builder options
+- Check out the [SnapshotBuilder][pydeno.SnapshotBuilder] for complete snapshot builder options

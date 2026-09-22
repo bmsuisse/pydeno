@@ -1,27 +1,27 @@
 <div align="center">
 
-# peno
+# pydeno
 
 **A JS sandbox for AI agents**
 
-`peno` = **p**ython + d**eno**: a Python-embeddable JavaScript sandbox built on
+`pydeno` = **py**thon + **deno**: a Python-embeddable JavaScript sandbox built on
 [deno_core][deno_core] and [V8][v8].
 
 Run untrusted, LLM-generated JavaScript safely in Python — real V8, real isolation, real tool-calling.
 
 <br />
 
-[![Publish](https://github.com/bmsuisse/peno/actions/workflows/workflow.yaml/badge.svg)][workflows-ci]
-[![PyPI](https://img.shields.io/pypi/v/peno.svg)][peno-pypi]
+[![Publish](https://github.com/bmsuisse/pydeno/actions/workflows/workflow.yaml/badge.svg)][workflows-ci]
+[![PyPI](https://img.shields.io/pypi/v/pydeno.svg)][pydeno-pypi]
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-bmsuisse.github.io%2Fpeno-blue)][peno-docs]
+[![Docs](https://img.shields.io/badge/docs-bmsuisse.github.io%2Fpydeno-blue)][pydeno-docs]
 
 <p align="center">
-  <a href="https://bmsuisse.github.io/peno/"><strong>Documentation</strong></a>
+  <a href="https://bmsuisse.github.io/pydeno/"><strong>Documentation</strong></a>
   ·
-  <a href="https://github.com/bmsuisse/peno/tree/main/examples"><strong>Examples</strong></a>
+  <a href="https://github.com/bmsuisse/pydeno/tree/main/examples"><strong>Examples</strong></a>
   ·
-  <a href="https://github.com/bmsuisse/peno/issues"><strong>Issues</strong></a>
+  <a href="https://github.com/bmsuisse/pydeno/issues"><strong>Issues</strong></a>
 </p>
 
 **Retain one `Runtime` per session.** A warm `Runtime` does a *complete*
@@ -38,7 +38,7 @@ see [`BENCHMARKS.md`](BENCHMARKS.md).
 Agent frameworks and tool-execution runtimes increasingly need to run
 **JavaScript the model itself wrote** — a code-generation step, a small data
 transform, a "call this JS snippet to compute the answer" tool. That code is
-untrusted by construction. `peno` embeds a real [V8][v8] isolate per
+untrusted by construction. `pydeno` embeds a real [V8][v8] isolate per
 runtime (via Rust/[PyO3][pyo3]) so that code runs with no filesystem, no
 network, and no ambient Node.js APIs by default, with heap and wall-clock
 limits you set, and a real way to kill it if it doesn't stop on its own.
@@ -48,10 +48,10 @@ interpreter reimplemented in Python — it's V8, the same engine behind
 Chrome and Node.js, so the JS your model writes actually behaves like JS.
 
 ```python
-import peno
+import pydeno
 
-peno.bind_function("add", lambda a, b: a + b)
-print(peno.eval("add(2, 3)"))  # 5
+pydeno.bind_function("add", lambda a, b: a + b)
+print(pydeno.eval("add(2, 3)"))  # 5
 ```
 
 ## Why it's different
@@ -100,10 +100,10 @@ print(peno.eval("add(2, 3)"))  # 5
 ## Get Started
 
 ```bash
-pip install peno  # or uv pip install peno
+pip install pydeno  # or uv pip install pydeno
 ```
 
-Requires Python 3.10+ on macOS or Linux. `peno` is experimental —
+Requires Python 3.10+ on macOS or Linux. `pydeno` is experimental —
 expect breaking changes between versions.
 
 ### Quickstart: sandboxed eval, tool-calling, and a timeout
@@ -111,7 +111,7 @@ expect breaking changes between versions.
 ```python
 import asyncio
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # Cap memory; the runtime terminates itself if JS tries to exceed it.
 config = RuntimeConfig(max_heap_size=10 * 1024 * 1024)  # 10 MB
@@ -140,7 +140,7 @@ asyncio.run(main())
 ```
 
 Running an untrusted sync `eval()` you can't await? Grab a
-[`TerminationHandle`](https://bmsuisse.github.io/peno/api/runtime/)
+[`TerminationHandle`](https://bmsuisse.github.io/pydeno/api/runtime/)
 before the call and `.terminate()` it from a watchdog thread — see
 [`tests/test_termination_handle.py`](tests/test_termination_handle.py) for
 the exact pattern (and the bug it fixed, in
@@ -152,7 +152,7 @@ When the model gets more than one tool, `ToolBridge` gives you the whole
 surface — budget, name checking, typed errors — in one object:
 
 ```python
-from peno import Runtime, ToolBridge
+from pydeno import Runtime, ToolBridge
 
 bridge = ToolBridge(
     {"get_weather": get_weather, "send_email": send_email},
@@ -172,21 +172,21 @@ gets a catchable `ToolBudgetError`.
 - [**FastMCP tool bridge**](examples/fastmcp_tool_bridge.py) - expose FastMCP tools to sandboxed JS via `bind_function` and an in-process `fastmcp.Client`
 - [**pydantic-ai "code mode" agent**](examples/pydantic_ai_agent.py) - an agent tool where the model submits one JS batch script instead of many separate tool calls, run safely with a timeout
 - [**ToolBridge**](examples/tool_bridge.py) - hand a sandbox several Python tools with a total call budget, typed errors the model's JS can branch on, and `console.log` routed back to Python
-- [**Vendored npm libraries**](examples/vendored_npm_libraries.py) - run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles inside the sandbox; see the [guide](https://bmsuisse.github.io/peno/guides/advanced/vendored-npm-libraries/) for what makes a library a good candidate
-- [**Arrow IPC dataframes**](examples/arrow_ipc_dataframes.py) - move 100k+ row tables into the sandbox as Arrow IPC `bytes` instead of JSON objects (5 ms vs 253 ms, and it works at the default 10 MB serialization limit that rejects the JSON payload); see the [guide](https://bmsuisse.github.io/peno/guides/advanced/arrow-ipc-dataframes/)
+- [**Vendored npm libraries**](examples/vendored_npm_libraries.py) - run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles inside the sandbox; see the [guide](https://bmsuisse.github.io/pydeno/guides/advanced/vendored-npm-libraries/) for what makes a library a good candidate
+- [**Arrow IPC dataframes**](examples/arrow_ipc_dataframes.py) - move 100k+ row tables into the sandbox as Arrow IPC `bytes` instead of JSON objects (5 ms vs 253 ms, and it works at the default 10 MB serialization limit that rejects the JSON payload); see the [guide](https://bmsuisse.github.io/pydeno/guides/advanced/arrow-ipc-dataframes/)
 
 ## Documentation
 
-- [Quick Start](https://bmsuisse.github.io/peno/quickstart/)
-- [Concepts](https://bmsuisse.github.io/peno/concepts/runtime/): runtimes, type conversion, resource controls
-- [Guides](https://bmsuisse.github.io/peno/guides/bindings/): binding functions, module loading, snapshots
-- [Use cases](https://bmsuisse.github.io/peno/use-cases/ai-agent/): AI agent sandboxes, workflow runners, plugin systems
-- [API reference](https://bmsuisse.github.io/peno/api/peno/)
+- [Quick Start](https://bmsuisse.github.io/pydeno/quickstart/)
+- [Concepts](https://bmsuisse.github.io/pydeno/concepts/runtime/): runtimes, type conversion, resource controls
+- [Guides](https://bmsuisse.github.io/pydeno/guides/bindings/): binding functions, module loading, snapshots
+- [Use cases](https://bmsuisse.github.io/pydeno/use-cases/ai-agent/): AI agent sandboxes, workflow runners, plugin systems
+- [API reference](https://bmsuisse.github.io/pydeno/api/pydeno/)
 - [Benchmarks](BENCHMARKS.md) — measured, reproducible numbers, including the pooling comparison above
 
 [v8]: https://v8.dev
 [deno_core]: https://crates.io/crates/deno_core
 [pyo3]: https://pyo3.rs/
-[peno-pypi]: https://pypi.org/project/peno/
-[peno-docs]: https://bmsuisse.github.io/peno/
-[workflows-ci]: https://github.com/bmsuisse/peno/actions/workflows/workflow.yaml
+[pydeno-pypi]: https://pypi.org/project/pydeno/
+[pydeno-docs]: https://bmsuisse.github.io/pydeno/
+[workflows-ci]: https://github.com/bmsuisse/pydeno/actions/workflows/workflow.yaml

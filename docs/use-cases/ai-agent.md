@@ -2,7 +2,7 @@
 
 ## Overview
 
-AI agents often need to execute dynamic code generated during their reasoning process. `peno` provides an isolated sandbox for AI agents to run JavaScript code without compromising the host system.
+AI agents often need to execute dynamic code generated during their reasoning process. `pydeno` provides an isolated sandbox for AI agents to run JavaScript code without compromising the host system.
 When combined with agent frameworks like [Pydantic AI](https://ai.pydantic.dev/), [OpenAI Agents SDK][openai-agents-python], [LangGraph][langgraph], etc., you can build AI agents with safe code execution capabilities.
 
 Key benefits:
@@ -11,14 +11,14 @@ Key benefits:
 - **Resource limits** for memory and CPU time to prevent runaway execution
 - **Customizable runtime environment** - provide built-in JavaScript functions via bootstrap scripts and bind Python functions/objects that agents can use directly
 
-This guide demonstrates how to build an AI agent that can safely execute JavaScript code using `peno` and [Pydantic AI][pydantic-ai] framework.
+This guide demonstrates how to build an AI agent that can safely execute JavaScript code using `pydeno` and [Pydantic AI][pydantic-ai] framework.
 
 ## Architecture
 
 ```mermaid
 graph LR
     A[User Query] -->|Request| B[AI Agent]
-    B -->|Generates<br/>JS Code| C[<code>peno</code> Tool]
+    B -->|Generates<br/>JS Code| C[<code>pydeno</code> Tool]
     C -->|Execute| D[V8 Runtime<br/>Sandboxed]
     D -->|Result| C
     C -->|Tool Response| B
@@ -36,7 +36,7 @@ Create an AI agent with JavaScript execution capabilities:
 ```python title="agent.py"
 import asyncio
 
-from peno import JavaScriptError, Runtime, RuntimeConfig
+from pydeno import JavaScriptError, Runtime, RuntimeConfig
 from pydantic_ai import Agent, RunContext
 
 # Define the agent with code execution tool
@@ -119,7 +119,7 @@ Build an agent that can analyze data using JavaScript:
 import asyncio
 import json
 
-from peno import Runtime
+from pydeno import Runtime
 from pydantic_ai import Agent, RunContext
 
 agent = Agent(
@@ -186,23 +186,23 @@ if __name__ == "__main__":
 
 When building AI agents with code execution, always keep security in mind:
 
-- **Set resource limits** - Use [`RuntimeConfig`][peno.RuntimeConfig] to limit memory ([`max_heap_size`][peno.RuntimeConfig.max_heap_size]) and always specify `timeout` in [`eval_async()`][peno.eval_async]
-- **Create fresh runtimes** - Use a new [`Runtime`][peno.Runtime] instance for each execution or user session to ensure isolation
+- **Set resource limits** - Use [`RuntimeConfig`][pydeno.RuntimeConfig] to limit memory ([`max_heap_size`][pydeno.RuntimeConfig.max_heap_size]) and always specify `timeout` in [`eval_async()`][pydeno.eval_async]
+- **Create fresh runtimes** - Use a new [`Runtime`][pydeno.Runtime] instance for each execution or user session to ensure isolation
 - **Validate code patterns** - Check generated code using LLM for dangerous patterns (infinite loops, excessive recursion) before execution
-- **Monitor execution** - Log code being executed and track memory usage via [`runtime.get_stats()`][peno.Runtime.get_stats]
+- **Monitor execution** - Log code being executed and track memory usage via [`runtime.get_stats()`][pydeno.Runtime.get_stats]
 
 ## Building on Top
 
 Enhance your AI agent sandbox with additional features:
 
-- **Custom JavaScript libraries**: Pre-load commonly-used libraries using [`RuntimeConfig.bootstrap`][peno.RuntimeConfig.bootstrap]
-- **Host functions and objects**: Expose Python functions and data to JavaScript using [`runtime.bind_function()`][peno.Runtime.bind_function] and [`runtime.bind_object()`][peno.Runtime.bind_object], allowing agents to call safe host operations directly from generated code
+- **Custom JavaScript libraries**: Pre-load commonly-used libraries using [`RuntimeConfig.bootstrap`][pydeno.RuntimeConfig.bootstrap]
+- **Host functions and objects**: Expose Python functions and data to JavaScript using [`runtime.bind_function()`][pydeno.Runtime.bind_function] and [`runtime.bind_object()`][pydeno.Runtime.bind_object], allowing agents to call safe host operations directly from generated code
 - **TypeScript**: Use bundler like [esbuild][esbuild] to transform TypeScript to JavaScript code for evaluation
 
 ## Runnable Examples
 
 The snippets above are illustrative; these two files in [`examples/`][examples-dir] are
-real, runnable, and use the actual current `peno` API:
+real, runnable, and use the actual current `pydeno` API:
 
 - [**fastmcp_tool_bridge.py**][fastmcp-example] - bridges a [FastMCP][fastmcp] server's
   tools into a `Runtime` via `bind_function`, so sandboxed JS calls real tools through an
@@ -213,7 +213,7 @@ real, runnable, and use the actual current `peno` API:
 
 ## Next Steps
 
-- [Runtime Configuration][peno.RuntimeConfig] for security settings
+- [Runtime Configuration][pydeno.RuntimeConfig] for security settings
 - [Code Playground](playground.md) for interactive execution environments
 - [Type Conversion](../concepts/types.md) for data exchange between Python and JavaScript
 
@@ -222,6 +222,6 @@ real, runnable, and use the actual current `peno` API:
 [langgraph]: https://docs.langchain.com/oss/python/langgraph/overview
 [esbuild]: https://esbuild.github.io/
 [fastmcp]: https://gofastmcp.com/
-[examples-dir]: https://github.com/bmsuisse/peno/tree/main/examples
-[fastmcp-example]: https://github.com/bmsuisse/peno/blob/main/examples/fastmcp_tool_bridge.py
-[pydantic-ai-example]: https://github.com/bmsuisse/peno/blob/main/examples/pydantic_ai_agent.py
+[examples-dir]: https://github.com/bmsuisse/pydeno/tree/main/examples
+[fastmcp-example]: https://github.com/bmsuisse/pydeno/blob/main/examples/fastmcp_tool_bridge.py
+[pydantic-ai-example]: https://github.com/bmsuisse/pydeno/blob/main/examples/pydantic_ai_agent.py

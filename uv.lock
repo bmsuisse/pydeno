@@ -1986,7 +1986,7 @@ wheels = [
 ]
 
 [[package]]
-name = "peno"
+name = "pydeno"
 source = { editable = "." }
 
 [package.dev-dependencies]

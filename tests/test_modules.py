@@ -3,7 +3,7 @@ Tests for JavaScript module loading and evaluation.
 """
 
 import pytest
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 
 class TestModuleStaticLoading:
@@ -73,7 +73,7 @@ class TestModuleResolver:
             def resolver(specifier, referrer):
                 # Map "bar" to "foo" - return a full URL
                 if specifier == "bar":
-                    return "peno://static/foo"
+                    return "pydeno://static/foo"
                 return ""
 
             rt.set_module_resolver(resolver)

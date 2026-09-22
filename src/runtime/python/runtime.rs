@@ -420,7 +420,7 @@ impl Runtime {
         }
 
         // `bind_object` exposes the op capabilities itself, but only after
-        // `__peno_bind_object` has actually installed them (see runner.rs).
+        // `__pydeno_bind_object` has actually installed them (see runner.rs).
         handle
             .bind_object(name, bindings)
             .map_err(|e| runtime_error_with_context("Failed to bind object", e))?;
@@ -545,7 +545,7 @@ impl Runtime {
 /// thread holds one of these and calls `.terminate()` on it while the main
 /// thread is blocked inside a synchronous `Runtime.eval()` on the runtime's
 /// owning thread.
-#[pyclass(module = "_peno", frozen)]
+#[pyclass(module = "_pydeno", frozen)]
 pub struct TerminationHandle {
     termination: TerminationController,
 }
@@ -834,7 +834,7 @@ impl JsFunction {
     }
 }
 
-#[pyclass(module = "_peno", name = "_JsFunctionFinalizer")]
+#[pyclass(module = "_pydeno", name = "_JsFunctionFinalizer")]
 pub(crate) struct JsFunctionFinalizer {
     handle: Mutex<Option<RuntimeHandle>>,
     fn_id: u32,
@@ -1022,7 +1022,7 @@ impl JsStream {
     }
 }
 
-#[pyclass(module = "_peno", name = "_JsStreamFinalizer")]
+#[pyclass(module = "_pydeno", name = "_JsStreamFinalizer")]
 pub(crate) struct JsStreamFinalizer {
     state: Arc<StreamSharedState>,
 }
@@ -1040,7 +1040,7 @@ impl JsStreamFinalizer {
     }
 }
 
-#[pyclass(module = "_peno", unsendable, weakref)]
+#[pyclass(module = "_pydeno", unsendable, weakref)]
 pub struct PyStreamSource {
     handle: std::cell::RefCell<Option<RuntimeHandle>>,
     stream_id: u32,
@@ -1113,7 +1113,7 @@ impl PyStreamSource {
     }
 }
 
-#[pyclass(module = "_peno", name = "_PyStreamFinalizer")]
+#[pyclass(module = "_pydeno", name = "_PyStreamFinalizer")]
 pub(crate) struct PyStreamFinalizer {
     handle: Mutex<Option<RuntimeHandle>>,
     stream_id: u32,

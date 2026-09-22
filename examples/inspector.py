@@ -1,5 +1,5 @@
 """
-Debug peno code via Chrome DevTools inspector.
+Debug pydeno code via Chrome DevTools inspector.
 
 This example demonstrates waiting for the debugger to attach before executing code.
 This is useful for debugging initialization code or when you want to step through
@@ -8,7 +8,7 @@ from the very beginning.
 Run this file, then open the chrome://inspect URL in Chrome to debug JavaScript execution.
 """
 
-from peno import InspectorConfig, Runtime, RuntimeConfig
+from pydeno import InspectorConfig, Runtime, RuntimeConfig
 
 
 def main() -> None:
@@ -17,7 +17,7 @@ def main() -> None:
 
     config = RuntimeConfig(
         inspector=InspectorConfig(
-            display_name="peno Inspector Demo",
+            display_name="pydeno Inspector Demo",
             wait_for_connection=True,  # Pause until debugger connects
         )
     )

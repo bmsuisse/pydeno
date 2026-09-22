@@ -12,7 +12,7 @@
 
 ## Quick Start
 
-1. **Clone**: `git clone https://github.com/bmsuisse/peno.git && cd peno`
+1. **Clone**: `git clone https://github.com/bmsuisse/pydeno.git && cd pydeno`
 2. **Install**: `make install` - Installs all Python dependencies using `uv`
 3. **Build**: `make build-dev` - Compiles Rust code using [maturin](https://www.maturin.rs/)
 4. **Test**: `make test` (or `make test-quiet` for less output)
@@ -30,7 +30,7 @@
 ## Development Workflow
 
 1. **Create a feature branch**: `git checkout -b feature/my-feature`
-2. **Make changes**: Edit Python code in `python/peno/` or Rust code in `src/`
+2. **Make changes**: Edit Python code in `python/pydeno/` or Rust code in `src/`
 3. **Rebuild**: Run `make build-dev` after Rust changes
 4. **Test**: Run `make test` to verify your changes
 5. **Format and lint**: Run `make format` and `make lint`
@@ -41,7 +41,7 @@
 ## Project Structure
 
 ```
-python/peno/        # Python API and bindings
+python/pydeno/        # Python API and bindings
 src/                 # Rust core implementation
     lib.rs          # PyO3 module definition
     runtime/        # V8 runtime implementation
@@ -63,4 +63,4 @@ pyproject.toml      # Python project configuration
 ## See Also
 
 - See [Architecture](architecture.md) for implementation details
-- Check existing [issues](https://github.com/bmsuisse/peno/issues) or open a new one
+- Check existing [issues](https://github.com/bmsuisse/pydeno/issues) or open a new one

@@ -3,7 +3,7 @@ requires = ["maturin>=1.9,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "peno"
+name = "pydeno"
 requires-python = ">=3.10"
 description = "Modern embedded JavaScript runtime for Python powered by V8 and Rust."
 readme = "README.md"
@@ -31,8 +31,8 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/bmsuisse/peno"
-Repository = "https://github.com/bmsuisse/peno"
+Homepage = "https://github.com/bmsuisse/pydeno"
+Repository = "https://github.com/bmsuisse/pydeno"
 
 [dependency-groups]
 dev = ["maturin"]
@@ -59,7 +59,7 @@ all = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
-module-name = "peno._peno"
+module-name = "pydeno._pydeno"
 python-source = "python"
 
 [tool.pytest.ini_options]

@@ -190,7 +190,7 @@ This is opt-in because it is not free. Comparing both arms in one process
 costs about **+2..6% on `eval('1+1')` and +9..13% on a bound-function call**.
 That is a bad trade to impose on every healthy call for a pathological case, so
 `force_kill_grace` defaults to `None`, where the wait is a literal `recv()` --
-the previous code path exactly. `peno.SUGGESTED_FORCE_KILL_GRACE` (0.1 s) is
+the previous code path exactly. `pydeno.SUGGESTED_FORCE_KILL_GRACE` (0.1 s) is
 ~25x the slowest polite kill observed above (4.02 ms), so a runtime that would
 have died politely always gets the chance to, with wide margin for a loaded
 machine.
@@ -332,7 +332,7 @@ to arm a single deadline. Measured on this checkout, release build:
 
 A timed eval now lands within noise of an untimed one, rather than ~3-6x it,
 matching the "timed eval ~= untimed eval" target. `Watchdog::arm`/`disarm`
-(one long-lived `peno-watchdog` thread per runtime, parked on a condvar over
+(one long-lived `pydeno-watchdog` thread per runtime, parked on a condvar over
 a small set of armed deadlines) replace the old spawn-and-join
 `SyncWatchdog`. See `bench_timed_eval_throughput` (Criterion) and
 `test_timed_eval_baseline` (pytest-benchmark) for the standing regression

@@ -1,5 +1,5 @@
 """
-Run vendored npm libraries inside a bare peno.Runtime.
+Run vendored npm libraries inside a bare pydeno.Runtime.
 
 This demonstrates a general PATTERN, not a built-in feature: the *host*
 fetches (or ships) a specific, versioned browser/UMD bundle of an npm
@@ -55,7 +55,7 @@ from io import BytesIO
 
 import httpx
 
-from peno import Runtime
+from pydeno import Runtime
 
 # Pinned exactly, not floated on `@4`: a bundle is only a meaningful thing to
 # have verified if you know which bytes you verified.
@@ -98,7 +98,7 @@ const pres = new PptxGenJS();
 pres.layout = "LAYOUT_WIDE";
 
 const s1 = pres.addSlide();
-s1.addText("Vendored npm libraries in peno", {
+s1.addText("Vendored npm libraries in pydeno", {
   x: 0.5, y: 2.2, w: 12.3, h: 1.2, fontSize: 32, bold: true, align: "center",
 });
 
@@ -121,7 +121,7 @@ PDF_SCRIPT = """
 (async () => {
   const doc = await PDFLib.PDFDocument.create();
   const page = doc.addPage([300, 200]);
-  page.drawText("Built with pdf-lib inside peno", { x: 20, y: 150, size: 12 });
+  page.drawText("Built with pdf-lib inside pydeno", { x: 20, y: 150, size: 12 });
   return doc.saveAsBase64();
 })()
 """

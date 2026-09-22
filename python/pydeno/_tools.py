@@ -67,7 +67,7 @@ class ToolBudgetError(ToolError):
 class ToolNotFoundError(ToolError):
     """For a tool to raise when the thing it was asked to look up is missing.
 
-    ``peno`` never raises this itself, and deliberately does not: a tool this
+    ``pydeno`` never raises this itself, and deliberately does not: a tool this
     bridge does not expose is simply not a property on the namespace object, so
     guest JS gets V8's own ``TypeError: tools.nope is not a function`` -- which
     is both the correct JS semantics and a better error than a host exception
@@ -106,7 +106,7 @@ class ToolBridge:
             ``"silent"`` returns ``None`` to JS without invoking the tool.
 
     Example:
-        >>> from peno import Runtime, ToolBridge
+        >>> from pydeno import Runtime, ToolBridge
         >>> bridge = ToolBridge({"add": lambda a, b: a + b}, max_calls=50)
         >>> with Runtime() as rt:
         ...     bridge.attach(rt)
@@ -142,7 +142,7 @@ class ToolBridge:
 
     **ToolBridge requires a full `Runtime`.** Binding a Python callable
     needs an op registry to attach to -- ``Deno.core.ops`` on a real
-    ``deno_core::JsRuntime`` -- which only :class:`peno.Runtime` provides.
+    ``deno_core::JsRuntime`` -- which only :class:`pydeno.Runtime` provides.
     """
 
     __slots__ = (
@@ -281,7 +281,7 @@ class ToolBridge:
         """Install this bridge's tools into `runtime`.
 
         Args:
-            runtime: A :class:`peno.Runtime`.
+            runtime: A :class:`pydeno.Runtime`.
 
         Raises:
             TypeError: If `runtime` is not a `Runtime`.
@@ -317,11 +317,11 @@ class ToolBridge:
 
     @staticmethod
     def _reject_non_runtime(runtime: object) -> None:
-        from ._peno import Runtime
+        from ._pydeno import Runtime
 
         if not isinstance(runtime, Runtime):
             raise TypeError(
-                f"ToolBridge.attach expects a peno.Runtime, got "
+                f"ToolBridge.attach expects a pydeno.Runtime, got "
                 f"{type(runtime).__name__}"
             )
 

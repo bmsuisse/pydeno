@@ -16,7 +16,7 @@ technique, with this docstring template:
         Source:      <URL or CVE>
         Disclosed:   <YYYY-MM>
         Root cause:  <the *class* of mistake, not the specific payload>
-        Relevance:   <why peno's design does or does not avoid it>
+        Relevance:   <why pydeno's design does or does not avoid it>
         Status:      not-applicable | mitigated | mitigated-by-design | VULNERABLE
         \"\"\"
 
@@ -39,7 +39,7 @@ import posixpath
 
 import pytest
 
-from peno import JavaScriptError, Runtime, RuntimeConfig
+from pydeno import JavaScriptError, Runtime, RuntimeConfig
 
 
 def _fresh_runtime(**kwargs: object) -> Runtime:
@@ -57,7 +57,7 @@ class TestHeapjack:
                  lived in the shared heap; untrusted JS snapshotted the heap,
                  brute-forced the token out of it, and used it to impersonate
                  the trusted side over IPC.
-    Relevance:   peno never puts a secret in the JS heap. Authorization
+    Relevance:   pydeno never puts a secret in the JS heap. Authorization
                  is "which op_id the host chose to bind", resolved in a
                  Rust-side registry (`PythonOpRegistry`, src/runtime/ops.rs)
                  that guest JS cannot read or forge. And each `Runtime` gets
@@ -160,7 +160,7 @@ class TestOverpatch:
                  write access to the whole filesystem root's children. The
                  class of mistake is deriving a permission *scope* from
                  attacker-influenced input.
-    Relevance:   peno ships no filesystem or network surface at all, by
+    Relevance:   pydeno ships no filesystem or network surface at all, by
                  design, so there is no permission scope to widen. The tests
                  below pin that absence: they fail if someone adds a
                  filesystem/network capability without a permission model,
@@ -253,11 +253,11 @@ class TestAmbientOpRegistryForgedId:
     """Reaching an unexposed host capability by guessing its integer id.
 
     Source:      docs/stable-release-review.md, finding M5 (internal review of
-                 peno 0.2.0); same class as the "ambient authority" family
+                 pydeno 0.2.0); same class as the "ambient authority" family
                  described by the object-capability literature
     Disclosed:   2026-09
     Root cause:  Addressing a capability by a small, guessable, *ambient* name.
-                 peno's op ids were allocated sequentially from zero and
+                 pydeno's op ids were allocated sequentially from zero and
                  dispatch resolved any registered id, so the binding a guest
                  was actually given was decoration: `__host_op_sync__(0, ...)`
                  reached a handler that had never been put in its scope. The
@@ -386,7 +386,7 @@ class TestErrorMessageDisclosure:
     Relevance:   JS exceptions surfaced to Python should carry JS-side stack
                  info (script name, line) and not Rust source paths or
                  absolute host paths. Symmetrically, errors surfaced *to guest
-                 JS* must not name peno's internals. Until 0.2.0 they did:
+                 JS* must not name pydeno's internals. Until 0.2.0 they did:
                  `serde_v8 error: recursion limit exceeded` and
                  `GlobalTaskLocals not found in OpState` were both observable
                  from sandboxed code, and the tests here checked only for host
@@ -437,7 +437,7 @@ class TestErrorMessageDisclosure:
             "__host_op_sync__(7)",
         ],
     )
-    def test_guest_visible_op_errors_do_not_name_peno_internals(
+    def test_guest_visible_op_errors_do_not_name_pydeno_internals(
         self, payload: str
     ) -> None:
         """Whatever refuses a host call, the guest must not learn *what*.
@@ -510,7 +510,7 @@ class TestErrorMessageDisclosure:
 
         assert '"name":"ValueError"' in details
         assert '"message":"just the message"' in details
-        # Note: `ext:peno/python_bridge.js` may appear in a stack. That is
+        # Note: `ext:pydeno/python_bridge.js` may appear in a stack. That is
         # the extension's virtual module specifier, not a host filesystem
         # path, so it is not a disclosure -- only real host paths and Python
         # traceback machinery are.
@@ -526,7 +526,7 @@ class TestResourceExhaustion:
     Root cause:  A sandbox that cannot be *stopped* is not a sandbox: guest
                  code that loops forever or allocates without bound takes the
                  host down with it.
-    Relevance:   peno has a cross-thread termination handle
+    Relevance:   pydeno has a cross-thread termination handle
                  and a heap limit that terminates execution. These are the
                  regression tests for that being reachable from the public
                  API; the fuzz suite generates many more such programs.

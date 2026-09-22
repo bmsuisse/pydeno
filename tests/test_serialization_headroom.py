@@ -36,7 +36,7 @@ import pytest
 _CHAIN_SCRIPT = textwrap.dedent(
     """
     import sys
-    from peno import Runtime, RuntimeConfig
+    from pydeno import Runtime, RuntimeConfig
 
     depth = {depth}
     js = (
@@ -122,7 +122,7 @@ def test_process_survives_and_runtime_still_usable_after_headroom_error() -> Non
     """A headroom rejection must not leave the runtime (or the process) in a
     broken state -- same runtime, same process, still usable immediately
     after."""
-    from peno import Runtime, RuntimeConfig
+    from pydeno import Runtime, RuntimeConfig
 
     depth = 5000
     js = (
@@ -142,7 +142,7 @@ def test_genuine_cycle_is_still_rejected() -> None:
     """The headroom check is layered on top of cycle detection, not instead
     of it -- an actual cycle must still be caught (and caught *before* it
     could ever consume unbounded stack, since it's O(depth) not O(never))."""
-    from peno import Runtime, RuntimeConfig
+    from pydeno import Runtime, RuntimeConfig
 
     with Runtime(RuntimeConfig()) as rt:
         with pytest.raises(Exception, match="circular reference"):
@@ -157,7 +157,7 @@ def test_distinct_acyclic_siblings_do_not_spuriously_collide() -> None:
     mistaken for a cycle. A path-based check (`Vec<Local<Object>>` +
     `strict_equals`) only ever compares an object against its own current
     ancestors, so this cannot false-positive regardless of hash collisions."""
-    from peno import Runtime, RuntimeConfig
+    from pydeno import Runtime, RuntimeConfig
 
     with Runtime(RuntimeConfig()) as rt:
         result = rt.eval(

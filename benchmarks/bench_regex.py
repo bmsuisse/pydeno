@@ -6,7 +6,7 @@ import re
 import time
 from typing import Tuple
 
-from peno import Runtime
+from pydeno import Runtime
 
 
 def generate_email_corpus(domains: int = 50, per_domain: int = 1000) -> str:
@@ -32,7 +32,7 @@ def _benchmark_python_regex(text: str, iterations: int) -> Tuple[float, int]:
     return time.perf_counter() - started, matches
 
 
-def _benchmark_peno_regex(text: str, iterations: int) -> Tuple[float, int]:
+def _benchmark_pydeno_regex(text: str, iterations: int) -> Tuple[float, int]:
     with Runtime() as runtime:
         escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
@@ -61,10 +61,10 @@ class RegexResult:
 def run_benchmark(iterations: int = 250) -> list[RegexResult]:
     text = generate_email_corpus()
     python_elapsed, python_matches = _benchmark_python_regex(text, iterations)
-    peno_elapsed, peno_matches = _benchmark_peno_regex(text, iterations)
+    pydeno_elapsed, pydeno_matches = _benchmark_pydeno_regex(text, iterations)
     return [
         RegexResult("Python re", python_elapsed, python_matches),
-        RegexResult("peno / V8", peno_elapsed, peno_matches),
+        RegexResult("pydeno / V8", pydeno_elapsed, pydeno_matches),
     ]
 
 
@@ -79,7 +79,7 @@ def main() -> None:
 
     py, js = results
     print("-" * 60)
-    print(f"peno speedup: {py.elapsed / js.elapsed:.2f}x")
+    print(f"pydeno speedup: {py.elapsed / js.elapsed:.2f}x")
 
 
 if __name__ == "__main__":

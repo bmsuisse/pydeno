@@ -1,3 +1,3 @@
 # `Runtime`
 
-::: peno.Runtime
+::: pydeno.Runtime

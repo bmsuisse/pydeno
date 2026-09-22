@@ -13,7 +13,7 @@ import sys
 import textwrap
 import threading
 
-from peno import Runtime
+from pydeno import Runtime
 
 # Pre-fix growth at 2,000 cycles was ~340MB. Post-fix it is under 1MB. 50MB
 # is far above the real figure and far below the regression, so this fails
@@ -92,7 +92,7 @@ class TestRuntimeChurnWithOpsDoesNotLeak:
 
     def test_create_close_churn_with_bound_ops_does_not_ratchet_rss(self) -> None:
         result = _run_in_fresh_process(f"""
-            from peno import Runtime
+            from pydeno import Runtime
 
             def cycle():
                 rt = Runtime()
@@ -180,7 +180,7 @@ class TestConcurrentRuntimes:
         """Creating and closing many runtimes must not leak isolates or
         threads -- either would show up here."""
         result = _run_in_fresh_process("""
-            from peno import Runtime
+            from pydeno import Runtime
             for _ in range(10):
                 with Runtime() as rt:
                     rt.eval("1")

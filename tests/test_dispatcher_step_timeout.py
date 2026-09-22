@@ -28,7 +28,7 @@ import asyncio
 
 import pytest
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 
 @pytest.mark.asyncio

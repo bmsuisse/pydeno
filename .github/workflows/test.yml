@@ -214,7 +214,7 @@ jobs:
       # then a deliberate commit that clears the new rules, which is what a
       # lint gate is for.
       - name: ruff check
-        run: uv tool run ruff@0.15.10 check python/peno tests scripts
+        run: uv tool run ruff@0.15.10 check python/pydeno tests scripts
 
       - name: ruff format
-        run: uv tool run ruff@0.15.10 format --check python/peno tests scripts
+        run: uv tool run ruff@0.15.10 format --check python/pydeno tests scripts

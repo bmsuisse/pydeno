@@ -1,6 +1,6 @@
 # Type Conversion
 
-`peno` automatically converts data between Python and JavaScript when you pass values across the language boundary. This makes it seamless to work with both languages without manual conversion.
+`pydeno` automatically converts data between Python and JavaScript when you pass values across the language boundary. This makes it seamless to work with both languages without manual conversion.
 
 ## Basic Type Mapping
 
@@ -20,7 +20,7 @@ Most common Python types have direct JavaScript equivalents:
 ### Example: Basic Types
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     # Numbers
@@ -48,15 +48,15 @@ with Runtime() as runtime:
 
 ### Undefined
 
-JavaScript has both [`null`][javascript-null] and [`undefined`][javascript-undefined], but Python only has `None`. To distinguish them, `peno` provides a special sentinel value [`undefined`][peno.undefined]:
+JavaScript has both [`null`][javascript-null] and [`undefined`][javascript-undefined], but Python only has `None`. To distinguish them, `pydeno` provides a special sentinel value [`undefined`][pydeno.undefined]:
 
 ```python
-import peno
-from peno import undefined
+import pydeno
+from pydeno import undefined
 
 # Pass undefined to JavaScript
-peno.eval("let x")  # x is undefined
-result = peno.eval("x")
+pydeno.eval("let x")  # x is undefined
+result = pydeno.eval("x")
 assert result is undefined
 
 # Check if a value is undefined
@@ -64,7 +64,7 @@ if result is undefined:
     print("Value is undefined")
 ```
 
-When JavaScript returns `undefined`, you'll receive [`undefined`][peno.undefined] in Python.
+When JavaScript returns `undefined`, you'll receive [`undefined`][pydeno.undefined] in Python.
 When JavaScript returns `null`, you'll receive Python's `None`.
 
 ### BigInt
@@ -227,13 +227,13 @@ If you need to pass unsupported types, consider:
 
 ## Conversion Limits
 
-To prevent excessive memory usage, `peno` enforces default limits on data conversion:
+To prevent excessive memory usage, `pydeno` enforces default limits on data conversion:
 
 - **Maximum depth**: 64 levels of nesting (arrays/objects)
 - **Maximum size**: 10 MB total for a single value
 
 These limits apply when passing data across the language boundary. Exceeding them raises a `RuntimeError`.
-You can customize these limits when creating a runtime (see [`RuntimeConfig`][peno.RuntimeConfig]).
+You can customize these limits when creating a runtime (see [`RuntimeConfig`][pydeno.RuntimeConfig]).
 
 ## Performance Considerations
 
@@ -254,7 +254,7 @@ Python and JavaScript have different type systems. Keep these differences in min
 Always validate and sanitize data at the boundary:
 
 ```python
-from peno import Runtime, undefined
+from pydeno import Runtime, undefined
 
 with Runtime() as runtime:
     result = runtime.eval("({missing: undefined})")

@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := all
-sources = python/peno tests
+sources = python/pydeno tests
 
 # using pip install cargo (via maturin via pip) doesn't get the tty handle
 # so doesn't render color without some help
@@ -22,17 +22,17 @@ rebuild-lockfiles: .uv
 
 .PHONY: build-dev  ## Build the development version of the package
 build-dev:
-	@rm -f python/peno/*.so
+	@rm -f python/pydeno/*.so
 	uv run maturin develop --uv
 
 .PHONY: build-prod  ## Build the production version of the package
 build-prod:
-	@rm -f python/peno/*.so
+	@rm -f python/pydeno/*.so
 	uv run maturin develop --uv --release
 
 .PHONY: build-profiling  ## Build the profiling version of the package
 build-profiling:
-	@rm -f python/peno/*.so
+	@rm -f python/pydeno/*.so
 	uv run maturin develop --uv --profile profiling
 
 .PHONY: format  ## Auto-format rust and python source files
@@ -90,7 +90,7 @@ clean:
 	rm -rf *.egg-info
 	rm -rf build
 	rm -rf site
-	rm -f python/peno/*.so
+	rm -f python/pydeno/*.so
 
 .PHONY: help  ## Display this message
 help:

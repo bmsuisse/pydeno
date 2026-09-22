@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from peno import (
+from pydeno import (
     JavaScriptError,
     JsFunction,
     JsStream,
@@ -1157,7 +1157,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_default(self):
         """Test default RuntimeConfig creation."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig()
         assert config is not None
@@ -1166,7 +1166,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_constructor_with_kwargs(self):
         """Test RuntimeConfig constructor with keyword arguments."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig(
             max_heap_size=100 * 1024 * 1024,
@@ -1184,7 +1184,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_property_methods(self):
         """Test RuntimeConfig with property setters."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig()
         config.max_heap_size = 100 * 1024 * 1024
@@ -1201,7 +1201,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_serialization_kwargs(self):
         """RuntimeConfig should accept serialization limits via kwargs."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig(
             max_serialization_depth=200,
@@ -1213,7 +1213,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_serialization_setters(self):
         """Serialization limit setters should validate values."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig()
         config.max_serialization_depth = 128
@@ -1229,7 +1229,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_with_bootstrap(self):
         """Test Runtime with bootstrap script."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(bootstrap="globalThis.bootstrapped = true;")
 
@@ -1239,7 +1239,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_without_bootstrap(self):
         """Test Runtime without bootstrap script (should not have bootstrapped variable)."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig()  # No bootstrap
 
@@ -1250,7 +1250,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_initial_requires_max(self):
         """Providing initial heap size without max should raise on runtime creation."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(initial_heap_size=1 * 1024 * 1024)
         with pytest.raises(RuntimeError) as exc_info:
@@ -1260,7 +1260,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_initial_exceeds_max(self):
         """initial_heap_size greater than max_heap_size should raise."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(
             initial_heap_size=8 * 1024 * 1024, max_heap_size=4 * 1024 * 1024
@@ -1272,7 +1272,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_timeout_formats(self):
         """Test RuntimeConfig timeout with different formats."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         # Test float timeout
         config1 = RuntimeConfig(timeout=30.5)
@@ -1293,7 +1293,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_invalid_timeout(self):
         """Test RuntimeConfig with invalid timeout."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig()
 
@@ -1321,7 +1321,7 @@ class TestRuntimeConfig:
         self, timeout_value, expected_error
     ):
         """Test RuntimeConfig constructor rejects invalid timeout values."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         with pytest.raises(ValueError, match=expected_error):
             RuntimeConfig(timeout=timeout_value)
@@ -1347,7 +1347,7 @@ class TestRuntimeConfig:
         self, timeout_value, expected_error
     ):
         """Test RuntimeConfig timeout setter rejects invalid timeout values."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig()
         with pytest.raises(ValueError, match=expected_error):
@@ -1356,7 +1356,7 @@ class TestRuntimeConfig:
     @pytest.mark.asyncio
     async def test_runtime_config_execution_timeout_applies_to_eval_async(self):
         """RuntimeConfig.timeout should act as default timeout for eval_async."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(timeout=0.1)
         with Runtime(config) as runtime:
@@ -1371,7 +1371,7 @@ class TestRuntimeConfig:
     @pytest.mark.asyncio
     async def test_eval_async_timeout_interrupts_sync_loop(self):
         """Explicit eval_async timeout should terminate blocking JavaScript loops."""
-        from peno import Runtime
+        from pydeno import Runtime
 
         with Runtime() as runtime:
             start = time.monotonic()
@@ -1384,7 +1384,7 @@ class TestRuntimeConfig:
     @pytest.mark.asyncio
     async def test_eval_module_async_timeout_interrupts_sync_loop(self):
         """Explicit eval_module_async timeout should terminate blocking module execution."""
-        from peno import Runtime
+        from pydeno import Runtime
 
         with Runtime() as runtime:
             runtime.add_static_module("loop", "while (true) {}")
@@ -1397,7 +1397,7 @@ class TestRuntimeConfig:
 
     def test_runtime_with_config(self):
         """Test Runtime creation with RuntimeConfig."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(bootstrap="globalThis.configured = true;")
 
@@ -1407,7 +1407,7 @@ class TestRuntimeConfig:
 
     def test_runtime_without_config(self):
         """Test Runtime creation without RuntimeConfig (default behavior)."""
-        from peno import Runtime
+        from pydeno import Runtime
 
         # Should work the same as before
         with Runtime() as runtime:
@@ -1416,7 +1416,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_property_chaining(self):
         """Test that RuntimeConfig property setters work correctly."""
-        from peno import RuntimeConfig
+        from pydeno import RuntimeConfig
 
         config = RuntimeConfig()
         config.max_heap_size = 100 * 1024 * 1024
@@ -1432,7 +1432,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_multiple_instances(self):
         """Test that multiple RuntimeConfig instances are independent."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config1 = RuntimeConfig(bootstrap="globalThis.instance1 = true;")
         config2 = RuntimeConfig(bootstrap="globalThis.instance2 = true;")
@@ -1455,7 +1455,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_console_disabled_by_default(self):
         """Test that console is disabled by default."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig()
         assert config.enable_console is False
@@ -1475,7 +1475,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_console_can_be_enabled(self):
         """Test that console can be explicitly enabled."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(enable_console=True)
         assert config.enable_console is True
@@ -1496,7 +1496,7 @@ class TestRuntimeConfig:
 
     def test_runtime_config_console_disabled(self):
         """Test that console can be disabled."""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         config = RuntimeConfig(enable_console=False)
         assert config.enable_console is False

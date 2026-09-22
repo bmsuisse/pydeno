@@ -71,7 +71,7 @@ def test_deeply_nested_literals_never_kill_the_host_process(depth: int) -> None:
     and were fatal too.
     """
     completed = _run_child(f"""
-        from peno import Runtime
+        from pydeno import Runtime
 
         with Runtime() as rt:
             for source in ("[" * {depth} + "]" * {depth},
@@ -97,7 +97,7 @@ def test_the_depth_guard_refuses_before_recursing_past_the_limit() -> None:
     ran on the way down.
     """
     completed = _run_child("""
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         with Runtime(RuntimeConfig(max_serialization_depth=5)) as rt:
             source = "let a={};let c=a;" \\
@@ -120,7 +120,7 @@ def test_the_depth_guard_refuses_before_recursing_past_the_limit() -> None:
 def test_a_deeply_nested_tool_argument_never_kills_the_host_process() -> None:
     """The inbound (JS->Python) direction runs on the same runtime thread."""
     completed = _run_child("""
-        from peno import Runtime
+        from pydeno import Runtime
 
         with Runtime() as rt:
             rt.bind_function("sink", lambda v: "ok")
@@ -150,7 +150,7 @@ def test_a_zero_column_syntax_error_does_not_kill_the_runtime_thread() -> None:
     which would make the debug job flake red rather than fail honestly.
     """
     completed = _run_child(r"""
-        from peno import Runtime
+        from pydeno import Runtime
 
         with Runtime() as rt:
             for source in ("`\\", "`${", "'"):
@@ -178,7 +178,7 @@ def test_a_deep_python_argument_from_a_small_thread_does_not_kill_the_host() -> 
     `python_to_js_value` runs on whichever thread *called* -- it has to, it
     needs the caller's GIL and its objects -- so the 16 MiB reservation on the
     runtime thread does nothing for it. A `threading.Thread` gets 512 KB on
-    macOS and `peno` cannot change that from inside the call.
+    macOS and `pydeno` cannot change that from inside the call.
 
     At the default `max_serialization_depth` of 100 there is roughly 9x of
     headroom: measured on a debug build, a 512 KB caller thread survives depth
@@ -194,7 +194,7 @@ def test_a_deep_python_argument_from_a_small_thread_does_not_kill_the_host() -> 
     """
     completed = _run_child(f"""
         import threading
-        from peno import Runtime
+        from pydeno import Runtime
 
         def deep(n):
             obj = {{"leaf": 1}}

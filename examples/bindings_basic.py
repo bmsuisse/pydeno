@@ -7,7 +7,7 @@ Bindings are the bridge between Python and JavaScript. They let you:
 - Keep your API surface clean and controlled
 """
 
-from peno import Runtime
+from pydeno import Runtime
 
 
 def function_bindings():

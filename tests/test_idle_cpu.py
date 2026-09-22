@@ -1,6 +1,6 @@
 """Regression tests for the dispatcher parking instead of busy-spinning.
 
-Before peno 0.2.0, `RuntimeDispatcher::run` selected between `cmd_rx.recv()` and
+Before pydeno 0.2.0, `RuntimeDispatcher::run` selected between `cmd_rx.recv()` and
 `tokio::task::yield_now()`. `yield_now` is always immediately ready, so the loop
 never blocked and every live `Runtime` burned CPU for its entire lifetime
 whether or not it had any work to do. On an 8-core machine that measured at
@@ -29,7 +29,7 @@ import time
 
 import pytest
 
-import peno
+import pydeno
 
 
 IDLE_WINDOW = 2.0
@@ -41,15 +41,15 @@ def _cpu_seconds() -> float:
     return usage.ru_utime + usage.ru_stime
 
 
-def _make_runtime() -> peno.Runtime:
-    runtime = peno.Runtime()
+def _make_runtime() -> pydeno.Runtime:
+    runtime = pydeno.Runtime()
     runtime.bind_function("host_add", lambda a, b: a + b)
     runtime.eval("host_add(1, 2)")  # warm the bridge so nothing is lazy
     return runtime
 
 
 def _idle_cpu_percent(
-    runtimes: list[peno.Runtime], window: float = IDLE_WINDOW
+    runtimes: list[pydeno.Runtime], window: float = IDLE_WINDOW
 ) -> float:
     """Percent of one core this process burns while every runtime sits idle."""
     time.sleep(0.3)  # let construction settle
@@ -59,7 +59,7 @@ def _idle_cpu_percent(
     return 100.0 * (cpu_after - cpu_before) / (wall_after - wall_before)
 
 
-def _median_call_us(runtime: peno.Runtime, calls: int = 600) -> float:
+def _median_call_us(runtime: pydeno.Runtime, calls: int = 600) -> float:
     for _ in range(300):  # warm up; the first few hundred calls are slower
         runtime.eval("host_add(1, 2)")
     samples = []

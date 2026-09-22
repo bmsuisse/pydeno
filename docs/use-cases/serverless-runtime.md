@@ -2,7 +2,7 @@
 
 ## Overview
 
-A serverless function runtime allows users to deploy and execute JavaScript functions on-demand without managing infrastructure. `peno` provides the isolation and resource controls needed to run user-submitted code in a multi-tenant environment.
+A serverless function runtime allows users to deploy and execute JavaScript functions on-demand without managing infrastructure. `pydeno` provides the isolation and resource controls needed to run user-submitted code in a multi-tenant environment.
 
 Key features:
 
@@ -10,7 +10,7 @@ Key features:
 - **Resource limits** - Memory and execution time controls per invocation
 - **API bindings** - Expose platform APIs (database, storage, HTTP) to user functions
 
-This guide demonstrates how to build a serverless function runtime using `peno`.
+This guide demonstrates how to build a serverless function runtime using `pydeno`.
 
 ## Architecture
 
@@ -38,7 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 
 @dataclass
@@ -237,8 +237,8 @@ Output:
 ## Optimization Strategies
 
 - **Runtime pooling** - Keep runtimes warm between invocations, implement TTL-based eviction
-- **Snapshotting** - Use [`SnapshotBuilder`][peno.SnapshotBuilder] to pre-initialize libraries (~50ms → ~5ms cold start)
-- **Resource limits** - Configure [`max_heap_size`][peno.RuntimeConfig.max_heap_size] per tier, set aggressive timeouts
+- **Snapshotting** - Use [`SnapshotBuilder`][pydeno.SnapshotBuilder] to pre-initialize libraries (~50ms → ~5ms cold start)
+- **Resource limits** - Configure [`max_heap_size`][pydeno.RuntimeConfig.max_heap_size] per tier, set aggressive timeouts
 - **Per-tenant isolation** - Each tenant's functions run in separate V8 isolates
 
 ## Security Considerations
@@ -254,6 +254,6 @@ Output:
 
 ## Next Steps
 
-- [Runtime Configuration][peno.RuntimeConfig] for resource limit tuning
+- [Runtime Configuration][pydeno.RuntimeConfig] for resource limit tuning
 - [Type Conversion](../concepts/types.md) for passing data between Python and JavaScript
 - [Code Playground](playground.md) for an interactive function editor

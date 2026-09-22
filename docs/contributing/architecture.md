@@ -1,11 +1,11 @@
 # Architecture Overview
 
 !!! note "Advanced Technical Content"
-    This section is intended for contributors, library developers, and users who need deep technical understanding of peno's internals. For general usage, see the [Concepts](../concepts/runtime.md) section.
+    This section is intended for contributors, library developers, and users who need deep technical understanding of pydeno's internals. For general usage, see the [Concepts](../concepts/runtime.md) section.
 
 ## Multi-Layer Design
 
-peno is built with three distinct layers that communicate via well-defined boundaries:
+pydeno is built with three distinct layers that communicate via well-defined boundaries:
 
 ```mermaid
 graph TB
@@ -45,11 +45,11 @@ graph TB
 
 ### Layer 1: Python API
 
-**Location**: `python/peno/__init__.py`
+**Location**: `python/pydeno/__init__.py`
 
 The user-facing Python interface that provides:
 
-- Convenience functions (`peno.eval()`, `peno.eval_async()`)
+- Convenience functions (`pydeno.eval()`, `pydeno.eval_async()`)
 - High-level abstractions over the Rust runtime
 - Pythonic API design
 
@@ -189,7 +189,7 @@ V8 isolates are **NOT thread-safe**:
 - Cannot be accessed from multiple threads (not `Sync`)
 - All V8 operations must happen on the thread that created the isolate
 
-peno handles this by:
+pydeno handles this by:
 
 1. Creating each isolate on a dedicated thread
 2. Never moving the isolate
@@ -239,7 +239,7 @@ This enables true parallelism: Python threads can run while JavaScript executes.
 
 ### Special Cases
 
-**Undefined**: JavaScript `undefined` uses a sentinel (`peno.undefined`) because Python has no native equivalent.
+**Undefined**: JavaScript `undefined` uses a sentinel (`pydeno.undefined`) because Python has no native equivalent.
 
 **Binary data**: 
 - JS `Uint8Array`/`ArrayBuffer` → Python `bytes`
@@ -429,7 +429,7 @@ class TestTechniqueName:
     Source:      <URL or CVE>
     Disclosed:   <YYYY-MM>
     Root cause:  <the *class* of mistake, not the specific payload>
-    Relevance:   <why peno's design does or does not avoid it>
+    Relevance:   <why pydeno's design does or does not avoid it>
     Status:      not-applicable | mitigated | mitigated-by-design | VULNERABLE
     """
 ```
@@ -441,7 +441,7 @@ Two conventions matter more than the template:
   The design property it attacked is what has to keep holding, so assert
   that.
 - **`not-applicable` still gets assertions.** If a technique cannot apply
-  because the surface does not exist — peno ships no filesystem and no
+  because the surface does not exist — pydeno ships no filesystem and no
   network by default — pin the *absence* of that surface anyway. That turns
   "we don't have that feature" into a tripwire that fails the moment someone
   adds the capability without a permission model, which is exactly when the

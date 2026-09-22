@@ -1,7 +1,7 @@
 //! Python op registry and deno_core integration.
 //!
-//! This module exposes two ops (`op_peno_call_python_sync` and
-//! `op_peno_call_python_async`) that bridge JavaScript calls into Python
+//! This module exposes two ops (`op_pydeno_call_python_sync` and
+//! `op_pydeno_call_python_async`) that bridge JavaScript calls into Python
 //! handlers. Python handlers are registered dynamically at runtime and
 //! addressed by a **capability token**.
 //!
@@ -107,7 +107,7 @@ pub const OPAQUE_INTERNAL_ERROR: &str = "Host call failed: internal runtime erro
 const UNKNOWN_OP_ERROR: &str = "Unknown host op";
 
 fn opaque_internal_error(detail: &str) -> JsErrorBox {
-    log::error!("peno internal op failure: {detail}");
+    log::error!("pydeno internal op failure: {detail}");
     JsErrorBox::type_error(OPAQUE_INTERNAL_ERROR)
 }
 
@@ -163,7 +163,7 @@ struct PythonOpRegistryInner {
 /// Thread-safe registry of Python operations.
 ///
 /// Manages dynamic registration and lookup of Python callables that can be invoked
-/// from JavaScript via `op_peno_call_python_sync` and `op_peno_call_python_async`.
+/// from JavaScript via `op_pydeno_call_python_sync` and `op_pydeno_call_python_async`.
 #[derive(Clone, Default)]
 pub struct PythonOpRegistry {
     inner: Arc<PythonOpRegistryInner>,
@@ -299,7 +299,7 @@ fn map_pyerr(err: PyErr) -> JsErrorBox {
 /// invokes the handler, and returns the result as a JSValue.
 #[op2]
 #[serde]
-fn op_peno_call_python_sync(
+fn op_pydeno_call_python_sync(
     state: &mut OpState,
     op_id: f64,
     #[serde] args: Vec<JSValue>,
@@ -333,7 +333,7 @@ fn op_peno_call_python_sync(
 /// be awaited from JavaScript.
 #[op2(async(deferred))]
 #[serde]
-fn op_peno_call_python_async(
+fn op_pydeno_call_python_async(
     state: &mut OpState,
     op_id: f64,
     #[serde] args: Vec<JSValue>,
@@ -401,7 +401,7 @@ fn op_peno_call_python_async(
 
 #[op2(async(deferred), fast)]
 #[serde]
-fn op_peno_stream_pull_py(
+fn op_pydeno_stream_pull_py(
     state: &mut OpState,
     #[smi] stream_id: u32,
 ) -> Result<impl std::future::Future<Output = Result<JSValue, JsErrorBox>>, JsErrorBox> {
@@ -420,7 +420,7 @@ fn op_peno_stream_pull_py(
 }
 
 #[op2(async(deferred), fast)]
-fn op_peno_stream_cancel_py(
+fn op_pydeno_stream_cancel_py(
     state: &mut OpState,
     #[smi] stream_id: u32,
 ) -> Result<impl std::future::Future<Output = Result<(), JsErrorBox>>, JsErrorBox> {
@@ -446,7 +446,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // Delete every guest-reachable deno_core scaffolding global after caching
   // `ops`. `Deno` and `__bootstrap` both expose `core.ops`, which is a raw,
   // unmetered, untimed call surface into the host process (e.g.
-  // `op_print` writes straight to the host's stdout/stderr, bypassing peno's
+  // `op_print` writes straight to the host's stdout/stderr, bypassing pydeno's
   // own I/O entirely). `__infra` is deno_core's other bootstrap scaffolding
   // global; it isn't always present, but is deleted defensively since a
   // deno_core bump could start installing it unconditionally. See
@@ -528,18 +528,18 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       return value.map((entry, index) => prepare(entry, at + "[" + index + "]"));
     }
     if (value instanceof Date) {
-      return { __peno_type: "Date", epoch_ms: value.valueOf() };
+      return { __pydeno_type: "Date", epoch_ms: value.valueOf() };
     }
     if (value instanceof Set) {
       return {
-        __peno_type: "Set",
+        __pydeno_type: "Set",
         values: Array.from(value, (entry, index) =>
           prepare(entry, at + ".<set item " + index + ">")
         ),
       };
     }
     if (typeof value === "bigint") {
-      return { __peno_type: "BigInt", value: value.toString() };
+      return { __pydeno_type: "BigInt", value: value.toString() };
     }
     if (typeof value === "object") {
       const result = {};
@@ -556,7 +556,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   }
 
   function reviveStreamChunk(entry) {
-    if (!entry || entry.__peno_type !== "StreamChunk") {
+    if (!entry || entry.__pydeno_type !== "StreamChunk") {
       return entry;
     }
     return {
@@ -573,7 +573,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       if (Array.isArray(value)) {
         return value.map(revive);
       }
-      const tag = value.__peno_type;
+      const tag = value.__pydeno_type;
       switch (tag) {
         case "Undefined":
           return undefined;
@@ -591,8 +591,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         case "BigInt":
           return BigInt(value.value);
         case "PyStream":
-          if (typeof globalThis.__peno_from_py_stream === "function") {
-            return globalThis.__peno_from_py_stream(value.id);
+          if (typeof globalThis.__pydeno_from_py_stream === "function") {
+            return globalThis.__pydeno_from_py_stream(value.id);
           }
           return value;
         default: {
@@ -638,7 +638,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     return restored;
   }
 
-  // Internal-implementation strings must not cross into guest JS. peno's own
+  // Internal-implementation strings must not cross into guest JS. pydeno's own
   // messages are already name-free and opaque (see OPAQUE_INTERNAL_ERROR in
   // ops.rs), but `deno_core` builds its own errors *above* the op body -- an
   // argument list it cannot deserialize yields `serde_v8 error: recursion
@@ -676,25 +676,25 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     return err;
   }
 
-  globalThis.__penoCallSync = function (opId, ...args) {
+  globalThis.__pydenoCallSync = function (opId, ...args) {
     const prepared = prepareArgs(args);
     try {
-      return revive(ops.op_peno_call_python_sync(opId, prepared));
+      return revive(ops.op_pydeno_call_python_sync(opId, prepared));
     } catch (err) {
       throw sanitizeHostError(restoreHostError(err));
     }
   };
-  globalThis.__penoCallAsync = function (opId, ...args) {
+  globalThis.__pydenoCallAsync = function (opId, ...args) {
     const prepared = prepareArgs(args);
-    return ops.op_peno_call_python_async(opId, prepared).then(revive, (err) => {
+    return ops.op_pydeno_call_python_async(opId, prepared).then(revive, (err) => {
       throw sanitizeHostError(restoreHostError(err));
     });
   };
-  globalThis.__host_op_sync__ = globalThis.__penoCallSync;
+  globalThis.__host_op_sync__ = globalThis.__pydenoCallSync;
   globalThis.__host_op_async__ = function (opId, ...args) {
-    return globalThis.__penoCallAsync(opId, ...args);
+    return globalThis.__pydenoCallAsync(opId, ...args);
   };
-  globalThis.__peno_bind_object = function (globalName, assignments) {
+  globalThis.__pydeno_bind_object = function (globalName, assignments) {
     if (typeof globalName !== "string" || !Array.isArray(assignments)) {
       return;
     }
@@ -720,7 +720,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
 
   if (typeof globalThis.ReadableStream !== "function") {
     // Note: This minimal polyfill does not implement backpressure or BYOB readers.
-    class PenoReadableStream {
+    class PydenoReadableStream {
       constructor(underlying = {}) {
         this._queue = [];
         this._closed = false;
@@ -791,15 +791,15 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         };
       }
     }
-    globalThis.ReadableStream = PenoReadableStream;
+    globalThis.ReadableStream = PydenoReadableStream;
   }
 
-  globalThis.__peno_from_py_stream = function (id) {
+  globalThis.__pydeno_from_py_stream = function (id) {
     return new ReadableStream({
       async pull(controller) {
         let raw;
         try {
-          raw = await ops.op_peno_stream_pull_py(id);
+          raw = await ops.op_pydeno_stream_pull_py(id);
         } catch (err) {
           throw sanitizeHostError(restoreHostError(err));
         }
@@ -811,7 +811,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         controller.enqueue(chunk.value);
       },
       cancel(reason) {
-        return ops.op_peno_stream_cancel_py(id);
+        return ops.op_pydeno_stream_cancel_py(id);
       },
     });
   };
@@ -821,15 +821,15 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     let registry_for_state = registry.clone();
 
     Extension {
-        name: "peno_python",
+        name: "pydeno_python",
         ops: std::borrow::Cow::Owned(vec![
-            op_peno_call_python_sync(),
-            op_peno_call_python_async(),
-            op_peno_stream_pull_py(),
-            op_peno_stream_cancel_py(),
+            op_pydeno_call_python_sync(),
+            op_pydeno_call_python_async(),
+            op_pydeno_stream_pull_py(),
+            op_pydeno_stream_cancel_py(),
         ]),
         js_files: std::borrow::Cow::Owned(vec![ExtensionFileSource::new(
-            "ext:peno/python_bridge.js",
+            "ext:pydeno/python_bridge.js",
             bridge_code,
         )]),
         op_state_fn: Some(Box::new(move |state| {

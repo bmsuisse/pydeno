@@ -1,6 +1,6 @@
 # Upstream provenance and the three founding fixes
 
-`peno` is a fork. This page records where it came from and the three fixes
+`pydeno` is a fork. This page records where it came from and the three fixes
 that made forking worth doing, because that is the part of the history that is
 still load-bearing: each one is a bug class this codebase now has permanent
 tests against, and knowing *why* those tests exist is what keeps someone from
@@ -20,10 +20,10 @@ ended.
 |---|---|
 | Upstream | [imfing/jsrun](https://github.com/imfing/jsrun) |
 | Upstream base commit | `34b786d2db410cdd264e9c8607ad7cb57e873a64` (tag-less `main`, fetched 2026-09-20) |
-| Licence | MIT, retained with the original copyright — see [`LICENSE`](https://github.com/bmsuisse/peno/blob/main/LICENSE) |
-| This repo | [bmsuisse/peno](https://github.com/bmsuisse/peno) — standalone, not a tracking fork |
+| Licence | MIT, retained with the original copyright — see [`LICENSE`](https://github.com/bmsuisse/pydeno/blob/main/LICENSE) |
+| This repo | [bmsuisse/pydeno](https://github.com/bmsuisse/pydeno) — standalone, not a tracking fork |
 
-The name is `peno` = **p**ython + d**eno**. The package was renamed on the
+The name is `pydeno` = **py**thon + **deno**. The package was renamed on the
 fork; `jsrun` no longer appears in this codebase.
 
 ## 1. Cross-thread termination (`TerminationHandle`)
@@ -66,7 +66,7 @@ runtime context and the delay cannot be honored.
 
 Not a panic and not catchable from Python: `deno_core` calls
 `std::process::abort()` from a frame Rust cannot unwind. It reproduced through
-every entry point (`eval`, `eval_async`, module-level `peno.eval_async`,
+every entry point (`eval`, `eval_async`, module-level `pydeno.eval_async`,
 `RuntimeConfig(bootstrap=...)`) and independently under tight heap limits,
 because the trigger is source size or GC pressure, not the call path.
 

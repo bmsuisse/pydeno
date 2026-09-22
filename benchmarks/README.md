@@ -3,7 +3,7 @@
 ## Prerequisites
 
 ```bash
-# Build peno in release mode (important for accurate benchmarks!)
+# Build pydeno in release mode (important for accurate benchmarks!)
 make build-prod  # or: uv run maturin develop --uv --release
 
 # Install psutil for memory benchmarks
@@ -30,27 +30,27 @@ uv run suite.py memory
 ## Results
 
 ```
-1) Startup cost (peno vs subprocess)
+1) Startup cost (pydeno vs subprocess)
 -------------------------------------
 Comparing 100 JavaScript evaluations:
-  • peno: create Runtime → eval → destroy
+  • pydeno: create Runtime → eval → destroy
   • Node.js: spawn process → eval → terminate
 ------------------------------------------------------------
-peno Runtime:      0.363s total, 3.63ms per cycle
+pydeno Runtime:      0.363s total, 3.63ms per cycle
 Node.js subprocess: 3.978s total, 39.78ms per cycle
 ------------------------------------------------------------
-peno is 10.95x faster
+pydeno is 10.95x faster
 
 2) Threaded CPU workloads
 -------------------------
 Python (GIL bound)    :  3.750s (4 threads, fib(35))
-peno (GIL released)  :  0.132s (4 threads, fib(35))
+pydeno (GIL released)  :  0.132s (4 threads, fib(35))
 Speedup: 28.37x
 
 3) Regex heavy parsing
 ----------------------
 Python re       : 11.027s (50000 matches)
-peno / V8      :  4.376s (50000 matches)
+pydeno / V8      :  4.376s (50000 matches)
 Speedup: 2.52x
 
 4) Runtime memory footprint

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
-from peno import Runtime, RuntimeConfig, ToolBridge, ToolNotFoundError
+from pydeno import Runtime, RuntimeConfig, ToolBridge, ToolNotFoundError
 
 # --------------------------------------------------------------------------
 # The tools. Sync and async both work; ToolBridge detects which is which.

@@ -1,5 +1,5 @@
 """Proof that the TerminationHandle fix works: the exact watchdog-thread test
-that broke unpatched peno. See `docs/contributing/upstream-divergence.md`
+that broke unpatched pydeno. See `docs/contributing/upstream-divergence.md`
 section 1 for the root cause. Run directly with the patched interpreter:
 
     python tests/test_termination_handle.py
@@ -14,14 +14,14 @@ import sys
 import threading
 import time
 
-import peno
+import pydeno
 
 
 def test_fixed_termination_handle_kills_runaway_loop() -> None:
     """Watchdog thread calls TerminationHandle.terminate() after 2s on a
     runtime stuck in `while(true){}`. Must not panic, must actually stop the
     loop, and eval() must return/raise promptly."""
-    runtime = peno.Runtime()
+    runtime = pydeno.Runtime()
     handle = runtime.termination_handle()
 
     watchdog_error: list[BaseException] = []
@@ -56,14 +56,14 @@ def test_fixed_termination_handle_kills_runaway_loop() -> None:
 
 
 def test_regression_basic_eval() -> None:
-    runtime = peno.Runtime()
+    runtime = pydeno.Runtime()
     assert runtime.eval("1 + 1") == 2
     assert runtime.eval("'a' + 'b'") == "ab"
     runtime.close()
 
 
 def test_regression_bind_function() -> None:
-    runtime = peno.Runtime()
+    runtime = pydeno.Runtime()
     calls = []
 
     def host_fn(x):
@@ -78,7 +78,7 @@ def test_regression_bind_function() -> None:
 
 
 def test_regression_fs_network_blocked() -> None:
-    runtime = peno.Runtime()
+    runtime = pydeno.Runtime()
     for snippet in ("typeof require", "typeof process", "typeof fetch"):
         result = runtime.eval(snippet)
         assert result == "undefined", f"{snippet} -> {result!r}"
@@ -89,7 +89,7 @@ def test_regression_eval_async_timeout() -> None:
     import asyncio
 
     async def _run() -> str:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         try:
             await runtime.eval_async("while(true){}", timeout=2.0)
         except Exception as exc:  # noqa: BLE001

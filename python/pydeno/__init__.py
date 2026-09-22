@@ -1,4 +1,4 @@
-"""High-level Python bindings for the peno runtime."""
+"""High-level Python bindings for the pydeno runtime."""
 
 import contextvars
 import asyncio
@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, TypeVar, cast, overload
 
-from ._peno import (
+from ._pydeno import (
     InspectorConfig,
     InspectorEndpoints,
     JavaScriptError,
@@ -100,7 +100,7 @@ setattr(Runtime, "bind", _runtime_bind)
 
 
 _default_runtime_var: contextvars.ContextVar[_RuntimeSlot | None] = (
-    contextvars.ContextVar("peno_default_runtime", default=None)
+    contextvars.ContextVar("pydeno_default_runtime", default=None)
 )
 
 
@@ -165,10 +165,10 @@ def eval(code: str) -> Any:
         JavaScriptError: If the JavaScript code throws an exception.
 
     Example:
-        >>> import peno
-        >>> peno.eval("2 + 2")
+        >>> import pydeno
+        >>> pydeno.eval("2 + 2")
         4
-        >>> peno.eval("Math.sqrt(16)")
+        >>> pydeno.eval("Math.sqrt(16)")
         4.0
     """
     return get_default_runtime().eval(code)
@@ -195,8 +195,8 @@ async def eval_async(code: str, **kwargs) -> Any:
 
     Example:
         >>> import asyncio
-        >>> import peno
-        >>> asyncio.run(peno.eval_async("Promise.resolve(42)"))
+        >>> import pydeno
+        >>> asyncio.run(pydeno.eval_async("Promise.resolve(42)"))
         42
     """
     return await get_default_runtime().eval_async(code, **kwargs)
@@ -216,9 +216,9 @@ def bind_function(name: str, handler: Callable[..., Any]) -> int:
         The op's capability token, for :meth:`Runtime.revoke_op`.
 
     Example:
-        >>> import peno
-        >>> peno.bind_function("add", lambda a, b: a + b)
-        >>> peno.eval("add(2, 3)")
+        >>> import pydeno
+        >>> pydeno.bind_function("add", lambda a, b: a + b)
+        >>> pydeno.eval("add(2, 3)")
         5
     """
     return get_default_runtime().bind_function(name, handler)
@@ -236,9 +236,9 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
         :meth:`Runtime.revoke_op`.
 
     Example:
-        >>> import peno
-        >>> peno.bind_object("config", {"version": "1.0", "debug": True})
-        >>> peno.eval("config.version")
+        >>> import pydeno
+        >>> pydeno.bind_object("config", {"version": "1.0", "debug": True})
+        >>> pydeno.eval("config.version")
         '1.0'
     """
     return get_default_runtime().bind_object(name, obj)

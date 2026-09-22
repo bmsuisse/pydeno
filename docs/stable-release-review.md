@@ -11,7 +11,7 @@ only -- no source was changed by this pass.
 > (`call_async` returns a coroutine), T1 (the op-registry leak has a
 > regression test). Two findings were answered rather than implemented, with
 > reasons, and the docs now say so: **S4** -- `ToolNotFoundError` stays as
-> vocabulary for user tools and its docstring no longer claims `peno` raises
+> vocabulary for user tools and its docstring no longer claims `pydeno` raises
 > it, because an unexposed tool name correctly produces V8's own `TypeError`;
 > **S5** -- there is no permission model and none is missing, the real boundary
 > being capability tokens plus `ToolBridge` scoping (see
@@ -38,9 +38,9 @@ and watched it happen" are not the same claim:
 
 Two builds were used, and the difference matters for one finding:
 
-- `peno 0.2.0` built from this tree with `make build-dev` (debug), the
+- `pydeno 0.2.0` built from this tree with `make build-dev` (debug), the
   documented developer build.
-- `peno 0.1.1` from PyPI (release profile). `git diff 71d73ea main` touches
+- `pydeno 0.1.1` from PyPI (release profile). `git diff 71d73ea main` touches
   only `runner.rs`, `BENCHMARKS.md`, `docs/tool-calling-at-pool-speed.md`,
   `tests/test_idle_cpu.py` and the version, so `ops.rs`, `conversion.rs`,
   `js_value.rs` and `pool.rs` are byte-identical between the two. Findings in
@@ -97,7 +97,7 @@ never executes.
 Minimal repro, debug build:
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 with Runtime() as rt:
     rt.eval("[" * 80 + "]" * 80)     # SIGBUS, whole process
 ```
@@ -173,7 +173,7 @@ host-side Python and Rust allocation, outside the V8 heap.
 ### M3b. Depth: the configured limit is silently ignored inbound
 
 ```python
-cfg = peno.RuntimeConfig(max_serialization_depth=3)
+cfg = pydeno.RuntimeConfig(max_serialization_depth=3)
 with Runtime(cfg) as rt:
     rt.bind_function("sink", lambda v: "ok")
     rt.eval("let a={};let c=a;for(let i=0;i<10;i++){c.n={};c=c.n};sink(a)")
@@ -278,12 +278,12 @@ namespaces are cosmetic; (c) decide whether `revoke`/per-binding
 unguessable ids are worth adding now, because adding them later is a breaking
 change to the JS-side convention.
 
-## M6. peno's own internal error strings reach guest JS. [ran] [read]
+## M6. pydeno's own internal error strings reach guest JS. [ran] [read]
 
 The existing leak tests
 (`tests/test_known_escape_techniques.py:278-315`) check a JS-thrown error and a
 Python-raised tool error, and check for host paths, `.cargo`, `site-packages`
-and `Traceback`. They cannot fail on peno's *own* error text, which is where
+and `Traceback`. They cannot fail on pydeno's *own* error text, which is where
 the leakage actually is:
 
 ```
@@ -347,7 +347,7 @@ number that is 21x off. Concretely: rewrite `README.md:176-190` to lead with
 "a fresh context per call, ~195 µs, no ops -- use this only when a fresh
 context is the requirement; otherwise retain a `Runtime`", and put the
 comparison table in the docs next to it. If you would rather not commit to the
-names at all, moving it behind `peno.experimental` before 1.0 is the cheaper
+names at all, moving it behind `pydeno.experimental` before 1.0 is the cheaper
 door to walk through than deprecating it after.
 
 ## S2. Two error types mean "the runtime is gone". [ran]
@@ -377,7 +377,7 @@ reaches for when they want two tool calls in flight.
 
 ## S4. `ToolNotFoundError` documents behaviour that does not exist. [read]
 
-`python/peno/_tools.py:63-64`: "Raised when JS asks for a tool the bridge does
+`python/pydeno/_tools.py:63-64`: "Raised when JS asks for a tool the bridge does
 not expose." Nothing in the module raises it, and there is no code path that
 could: a tool the bridge does not expose is simply not a property on the
 namespace object, so JS gets a plain `TypeError: ... is not a function` from
@@ -727,18 +727,18 @@ Recorded so the punch list is not mistaken for the whole picture.
 
 - **Guest globals are clean [ran].** `delete globalThis.Deno` works;
   `typeof globalThis.Deno` is `"undefined"` and the surviving globals are
-  stock ECMAScript intrinsics plus peno's own `__peno*` / `__host_op*` hooks.
+  stock ECMAScript intrinsics plus pydeno's own `__pydeno*` / `__host_op*` hooks.
   No `require`, no `process`, no `fetch`, no timers.
 - **Prototype pollution via `__proto__` is fixed and tested**, with the
   rationale in the source and a named regression test. I looked for siblings:
   `setOwn` is used at every object-construction site in the bridge JS
   (`prepare`'s object arm `:362`, `revive`'s default arm `:412`,
-  `__peno_bind_object` `:488` and `:490`), so the fix is applied uniformly
+  `__pydeno_bind_object` `:488` and `:490`), so the fix is applied uniformly
   rather than at the one site the fuzzer happened to hit.
-- **Tag forgery is contained [read].** Guest JS *can* put `__peno_type` on an
+- **Tag forgery is contained [read].** Guest JS *can* put `__pydeno_type` on an
   object it hands to a host op, and `JSValue`'s `Deserialize` will honour
   `Undefined` / `Date` / `Set` / `BigInt` tags -- a type-confusion primitive
-  (the host sees `peno.undefined` or an `int` where the guest returned an
+  (the host sees `pydeno.undefined` or an `int` where the guest returned an
   object). But the two tags that would matter, `JsStream` and `PyStream`, cannot
   be turned into host handles: `js_value_to_python` is called with
   `handle: None` on the op path, so both arms refuse
@@ -789,7 +789,7 @@ Recorded so the punch list is not mistaken for the whole picture.
 | M3 | JS→Python enforces neither byte nor depth limit (37.7 MB vs a 10 MB cap) | ran + read |
 | M4 | A JS function passed to a host tool silently becomes `{}` | ran |
 | M5 | Op registry is ambient, unrevocable, and leaks op names in errors | ran + read |
-| M6 | peno's own internal error strings reach guest JS | ran + read |
+| M6 | pydeno's own internal error strings reach guest JS | ran + read |
 | S1 | `IsolatePool` is 21x slower than a warm `Runtime`; README recommends it | ran + read |
 | S2 | `RuntimeError` and `RuntimeTerminated` both mean "runtime is gone" | ran |
 | S3 | `call_async` returns a `Future`, not a coroutine | ran |

@@ -1,4 +1,4 @@
-"""Adapter that makes `peno`'s async entry points look like coroutines.
+"""Adapter that makes `pydeno`'s async entry points look like coroutines.
 
 Every async entry point (`Runtime.eval_async`, `Runtime.eval_module_async`,
 `JsFunction.call_async`, and `JsFunction.__call__` when the JS function returns

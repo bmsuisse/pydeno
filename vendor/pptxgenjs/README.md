@@ -2,7 +2,7 @@
 
 `pptxgen.bundle.js` in this directory is the **unmodified** UMD build of
 [`pptxgenjs`](https://www.npmjs.com/package/pptxgenjs), vendored so that
-`tests/test_vendored_bundle_execution.py` can prove peno still executes a
+`tests/test_vendored_bundle_execution.py` can prove pydeno still executes a
 real, large, third-party JavaScript bundle end-to-end **without touching the
 network**.
 
@@ -23,11 +23,11 @@ actually load-bearing (measured, not assumed).
 
 ## Why this is vendored rather than fetched
 
-peno's test suite is hermetic, and the regression being guarded — "a large
+pydeno's test suite is hermetic, and the regression being guarded — "a large
 real-world bundle still evaluates, and JSZip's async `write()` still
 completes" — is precisely the kind that a network-dependent test fails to
 catch, because it gets skipped on the machines where it matters. Pinning the
-exact bytes also means a failure is attributable to a change in peno rather
+exact bytes also means a failure is attributable to a change in pydeno rather
 than to npm republishing or CDN drift.
 
 The cost is modest: 461 KB of minified text (it is text, and compresses

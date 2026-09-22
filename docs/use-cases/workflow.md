@@ -2,7 +2,7 @@
 
 ## Overview
 
-Workflow orchestration systems allow users to define and execute multi-step processes with dependencies as [Directed Acyclic Graphs (DAGs)][dag]. `peno` enables you to build workflow engines where users can define steps using JavaScript while your Python application orchestrates execution, handles dependencies, and provides integration with external systems.
+Workflow orchestration systems allow users to define and execute multi-step processes with dependencies as [Directed Acyclic Graphs (DAGs)][dag]. `pydeno` enables you to build workflow engines where users can define steps using JavaScript while your Python application orchestrates execution, handles dependencies, and provides integration with external systems.
 
 Key features:
 
@@ -11,7 +11,7 @@ Key features:
 - **Integration points** - Expose Python functions for external system access
 - **Parallel execution** - Run independent steps concurrently for better performance
 
-This guide demonstrates building a simple DAG-based workflow orchestration system using `peno`.
+This guide demonstrates building a simple DAG-based workflow orchestration system using `pydeno`.
 
 ## Architecture
 
@@ -53,7 +53,7 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 
 class StepBuilder:
@@ -220,7 +220,7 @@ Note how `fetch_a` and `fetch_b` run in **parallel** (both start before either c
 ## Next Steps
 
 - [Type Conversion](../concepts/types.md) for passing complex data between Python and JavaScript
-- [Runtime Configuration][peno.RuntimeConfig] for resource limits
+- [Runtime Configuration][pydeno.RuntimeConfig] for resource limits
 - [AI Agent Sandbox](ai-agent.md) for another example of safe code execution
 
 [dag]: https://en.wikipedia.org/wiki/Directed_acyclic_graph

@@ -1,4 +1,4 @@
-"""Build a real PowerPoint deck with the real pptxgenjs bundle inside peno.
+"""Build a real PowerPoint deck with the real pptxgenjs bundle inside pydeno.
 
 This is the full, end-to-end version of the pattern sketched in
 `vendored_npm_libraries.py`: the host evaluates the pinned, **unmodified**
@@ -46,7 +46,7 @@ import zipfile
 import zlib
 from io import BytesIO
 
-from peno import Runtime
+from pydeno import Runtime
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 VENDOR = REPO_ROOT / "vendor" / "pptxgenjs"
@@ -108,8 +108,8 @@ def make_png(width: int, height: int) -> bytes:
 DECK_SCRIPT_TEMPLATE = """
 const pres = new PptxGenJS();
 pres.layout = "LAYOUT_WIDE";
-pres.author = "peno";
-pres.title = "Real pptxgenjs inside peno";
+pres.author = "pydeno";
+pres.title = "Real pptxgenjs inside pydeno";
 
 // --- 1. title ---
 const s1 = pres.addSlide();
@@ -122,7 +122,7 @@ s1.addText("460,889 bytes of unmodified UMD bundle, three host polyfills", {
   x: 0.6, y: 3.1, w: 12.1, h: 0.6,
   fontSize: 16, color: "AAB6D3", align: "center",
 });
-s1.addNotes("Built inside a bare V8 isolate via peno, with no Node.js.");
+s1.addNotes("Built inside a bare V8 isolate via pydeno, with no Node.js.");
 
 // --- 2. table ---
 const s2 = pres.addSlide();
@@ -409,7 +409,7 @@ async def main() -> int:
     print("Building a six-slide deck with the vendored pptxgenjs 4.0.1 bundle...")
     raw = await build_deck()
 
-    path = OUT_DIR / "peno_pptxgenjs.pptx"
+    path = OUT_DIR / "pydeno_pptxgenjs.pptx"
     path.write_bytes(raw)
     print(f"\nWrote {path} ({len(raw):,} bytes)\n")
 

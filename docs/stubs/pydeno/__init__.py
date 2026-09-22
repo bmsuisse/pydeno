@@ -1,7 +1,7 @@
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from ._peno import (
+from ._pydeno import (
     InspectorConfig,
     InspectorEndpoints,
     JavaScriptError,

@@ -11,7 +11,7 @@ We use marked.js, a popular markdown parser, to convert markdown to HTML.
 
 import asyncio
 import httpx
-from peno import Runtime
+from pydeno import Runtime
 
 
 async def load_marked_library() -> str:
@@ -65,7 +65,7 @@ async def main() -> None:
 
         print("=== Parsing Markdown ===\n")
         markdown = """
-# Hello from peno!
+# Hello from pydeno!
 
 This is **bold** and this is *italic*.
 

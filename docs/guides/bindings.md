@@ -14,10 +14,10 @@ Instead of passing data back and forth with `eval()`, you bind once and call man
 
 ## Binding Functions
 
-Use [`bind_function()`][peno.Runtime.bind_function] to expose a Python function to JavaScript:
+Use [`bind_function()`][pydeno.Runtime.bind_function] to expose a Python function to JavaScript:
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     # Define a Python function
@@ -79,7 +79,7 @@ JavaScript doesn't need to know the function is async, it just awaits the Promis
 
 ## Binding Objects
 
-Use [`bind_object()`][peno.Runtime.bind_object] to pass Python data to JavaScript:
+Use [`bind_object()`][pydeno.Runtime.bind_object] to pass Python data to JavaScript:
 
 ```python
 with Runtime() as runtime:
@@ -252,15 +252,15 @@ with Runtime() as runtime:
 For quick scripts, use the module-level functions (they use a context-local runtime):
 
 ```python
-import peno
+import pydeno
 
 # Bind to the default runtime
-peno.bind_function("add", lambda a, b: a + b)
-peno.bind_object("config", {"version": "1.0"})
+pydeno.bind_function("add", lambda a, b: a + b)
+pydeno.bind_object("config", {"version": "1.0"})
 
 # Use them immediately
-print(peno.eval("add(2, 3)"))        # 5
-print(peno.eval("config.version"))   # "1.0"
+print(pydeno.eval("add(2, 3)"))        # 5
+print(pydeno.eval("config.version"))   # "1.0"
 ```
 
 This is perfect for interactive sessions or simple scripts where you don't need explicit runtime management.
@@ -272,7 +272,7 @@ When a bound Python function raises, JavaScript gets a real `Error` whose
 exception's message:
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 
 class RateLimited(Exception):
@@ -305,7 +305,7 @@ with Runtime() as runtime:
 ```
 
 This is the same `name`/`message` shape that a JavaScript exception reaching
-Python carries on [`JavaScriptError`][peno.JavaScriptError], so the two
+Python carries on [`JavaScriptError`][pydeno.JavaScriptError], so the two
 directions are symmetric. An *uncaught* tool exception therefore arrives in
 Python with the class name preserved as well:
 
@@ -328,7 +328,7 @@ By default `console.log` from sandboxed JavaScript goes nowhere. Pass
 `on_console` to get it back in Python:
 
 ```python
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 lines = []
 
@@ -372,7 +372,7 @@ Other semantics worth knowing:
 - Passing a JS function (or a `Symbol`) to a host tool is **refused** with a
   `TypeError` naming the argument path -- it does not arrive as `{}`. See
   [Capabilities and revocation](#capabilities-and-revocation).
-- `null`/`undefined` both arrive as the [`undefined`][peno.undefined]
+- `null`/`undefined` both arrive as the [`undefined`][pydeno.undefined]
   sentinel, as everywhere else on the host-callback path.
 
 ## Capabilities and revocation
@@ -391,8 +391,8 @@ That matters for two reasons:
   `ToolBridge`es with different trust levels on one `Runtime` no longer
   collapse into one trust level, because neither can address the other's ops.
 
-Revoke with [`revoke_op`][peno.Runtime.revoke_op], or
-[`ToolBridge.detach`][peno.ToolBridge.detach] for a whole bridge:
+Revoke with [`revoke_op`][pydeno.Runtime.revoke_op], or
+[`ToolBridge.detach`][pydeno.ToolBridge.detach] for a whole bridge:
 
 ```python
 token = runtime.bind_function("dangerous", do_something)
@@ -425,7 +425,7 @@ the three things you would otherwise write yourself: a total call budget,
 fail-closed name checking, and the typed errors described above.
 
 ```python
-from peno import Runtime, ToolBridge
+from pydeno import Runtime, ToolBridge
 
 
 def get_weather(city: str) -> str:
@@ -462,19 +462,19 @@ with Runtime() as runtime:
 - `calls_made`, `calls_remaining`, `tool_names` and `reset_budget()` let you
   inspect and recycle the budget between turns.
 
-`peno` ships `ToolError`, `ToolBudgetError` and `ToolNotFoundError` as a
+`pydeno` ships `ToolError`, `ToolBudgetError` and `ToolNotFoundError` as a
 shared vocabulary, but typed errors work for *any* Python exception class —
 you do not have to inherit from them.
 
 Only `ToolBudgetError` is raised by the library. `ToolNotFoundError` is there
-for *your* tools to raise when a lookup inside one of them misses; `peno`
+for *your* tools to raise when a lookup inside one of them misses; `pydeno`
 never raises it for an unknown tool *name*, because a name this bridge does
 not expose is not a property on the namespace object at all, so guest JS gets
 V8's own `TypeError: tools.nope is not a function`.
 
 ### `ToolBridge` requires `Runtime`
 
-`ToolBridge.attach()` takes a [`Runtime`][peno.Runtime] and raises
+`ToolBridge.attach()` takes a [`Runtime`][pydeno.Runtime] and raises
 `TypeError` immediately for anything else, because binding a Python callable
 needs a real op registry (`deno_core::JsRuntime`) to attach to.
 
@@ -494,5 +494,5 @@ needs a real op registry (`deno_core::JsRuntime`) to attach to.
 
 - Learn about [Type Conversion](../concepts/types.md) to understand how Python and JavaScript types map
 - Explore [Modules](modules.md) to organize code with imports and exports
-- See [`examples/tool_bridge.py`](https://github.com/bmsuisse/peno/blob/main/examples/tool_bridge.py)
+- See [`examples/tool_bridge.py`](https://github.com/bmsuisse/pydeno/blob/main/examples/tool_bridge.py)
   for a runnable `ToolBridge` + console-capture walkthrough

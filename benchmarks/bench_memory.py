@@ -8,7 +8,7 @@ import time
 
 import psutil
 
-from peno import Runtime
+from pydeno import Runtime
 
 
 def _rss_mb() -> float:

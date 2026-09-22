@@ -1,12 +1,12 @@
-# peno Examples
+# pydeno Examples
 
-This directory contains practical examples demonstrating peno's features and use cases.
+This directory contains practical examples demonstrating pydeno's features and use cases.
 
 ## Getting Started
 
 ### Basic Usage
 
-- [**basic_eval.py**](basic_eval.py) - Introduction to peno with both context-local API and explicit Runtime usage
+- [**basic_eval.py**](basic_eval.py) - Introduction to pydeno with both context-local API and explicit Runtime usage
 - [**context_local_api.py**](context_local_api.py) - Comprehensive guide to the context-local API with automatic runtime management
 
 ### Bindings
@@ -55,10 +55,10 @@ This directory contains practical examples demonstrating peno's features and use
 
 ### Agent Frameworks
 
-- [**fastmcp_tool_bridge.py**](fastmcp_tool_bridge.py) - Bridge a FastMCP server's tools into a `peno.Runtime` via `bind_function`, so sandboxed JS can call real tools through an in-process `fastmcp.Client`
+- [**fastmcp_tool_bridge.py**](fastmcp_tool_bridge.py) - Bridge a FastMCP server's tools into a `pydeno.Runtime` via `bind_function`, so sandboxed JS can call real tools through an in-process `fastmcp.Client`
 - [**pydantic_ai_agent.py**](pydantic_ai_agent.py) - A `pydantic-ai` `Agent` with a "code mode" tool: the model submits one JS batch script instead of N separate tool calls, run safely with a timeout (uses `FunctionModel` so it runs offline, no API key)
 
-Both examples need extra dependencies not required by `peno` itself: `uv sync --group examples` (or `pip install pydantic-ai fastmcp`).
+Both examples need extra dependencies not required by `pydeno` itself: `uv sync --group examples` (or `pip install pydantic-ai fastmcp`).
 
 `pptxgenjs_presentation.py` also uses `python-pptx` (in the same `examples` group) to read its output back, and optionally LibreOffice + Poppler (`soffice`, `pdftoppm`) to render slides to PNG. The render step is skipped with a clear message if those aren't installed; validation still runs.
 

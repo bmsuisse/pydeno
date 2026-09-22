@@ -1,6 +1,6 @@
 """Regression tests for arming `timeout=` being nearly free.
 
-Through peno 0.2.0, `SyncWatchdog` discovered its own cancellation by polling
+Through pydeno 0.2.0, `SyncWatchdog` discovered its own cancellation by polling
 an `AtomicBool` from a `thread::sleep(10ms)` loop, while the runtime thread
 cancelled it and then *joined* it. The join therefore blocked until the
 watchdog's current sleep chunk elapsed, so every call with a deadline armed
@@ -11,7 +11,7 @@ on the deadline's *value* at all: 0.5s and 300s cost the same.
 That made the library's whole advertised fast path unreachable in any safe
 configuration, because a production caller must arm a timeout -- it is the only
 kill switch for runaway guest code. Every tool-calling latency figure ever
-quoted for peno had been measured on the unarmed path.
+quoted for pydeno had been measured on the unarmed path.
 
 0.2.1 replaces the poll loop with a `Condvar`, so a cancel is *signalled* and
 the join returns immediately.
@@ -42,7 +42,7 @@ import time
 
 import pytest
 
-from peno import Runtime, ToolBridge
+from pydeno import Runtime, ToolBridge
 
 #: Samples per arm. Enough that the median is stable, small enough to stay fast.
 SAMPLES = 60

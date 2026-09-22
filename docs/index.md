@@ -1,15 +1,15 @@
-# peno
+# pydeno
 
 **A JS sandbox for AI agents**
 
-[![PyPI](https://img.shields.io/pypi/v/peno.svg)](https://pypi.org/project/peno/)
+[![PyPI](https://img.shields.io/pypi/v/pydeno.svg)](https://pypi.org/project/pydeno/)
 
-`peno` (**p**ython + d**eno**) is a Python-embeddable JavaScript sandbox built
+`pydeno` (**py**thon + **deno**) is a Python-embeddable JavaScript sandbox built
 on [deno_core][deno_core] and the [V8][v8] engine. Run untrusted,
 LLM-generated JavaScript safely from Python — real V8, real isolation, real
 tool-calling.
 
-Whether you need to run user scripts, integrate JavaScript libraries, execute code for AI agents, or build extensible Python applications, `peno` provides a robust solution.
+Whether you need to run user scripts, integrate JavaScript libraries, execute code for AI agents, or build extensible Python applications, `pydeno` provides a robust solution.
 
 ## Highlights
 
@@ -26,19 +26,19 @@ Whether you need to run user scripts, integrate JavaScript libraries, execute co
 ## Quick Example
 
 ```python
-import peno
+import pydeno
 
-result = peno.eval("2 + 2")
+result = pydeno.eval("2 + 2")
 print(result)  # 4
 
 # Bind Python function
-peno.bind_function("add", lambda a, b: a + b)
-print(peno.eval("add(2, 3)"))  # 5
+pydeno.bind_function("add", lambda a, b: a + b)
+print(pydeno.eval("add(2, 3)"))  # 5
 ```
 
 ## About the Name
 
-`peno` is **p**ython + d**eno**: the [deno_core][deno_core] JavaScript engine,
+`pydeno` is **py**thon + **deno**: the [deno_core][deno_core] JavaScript engine,
 wrapped in Rust and bolted onto Python via [PyO3][pyo3].
 
 ## Next Steps
@@ -47,7 +47,7 @@ wrapped in Rust and bolted onto Python via [PyO3][pyo3].
 - **[Core Concepts](concepts/runtime.md)** - Understand the runtime architecture and execution model
 - **[Type Conversion](concepts/types.md)** - Learn how data types map between Python and JavaScript
 - **[Use Cases](use-cases/playground.md)** - Explore practical examples and real-world applications
-- **[API Reference](api/peno.md)** - Comprehensive API documentation for all classes and functions
+- **[API Reference](api/pydeno.md)** - Comprehensive API documentation for all classes and functions
 
 [v8]: https://v8.dev/
 [promise]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises

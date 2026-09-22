@@ -1,13 +1,13 @@
 # JavaScript Evaluation
 
-When you run JavaScript code with `peno`, you're evaluating code snippets or expressions and getting results back in Python. This page explains how evaluation works, what you get back, and how to handle different execution scenarios.
+When you run JavaScript code with `pydeno`, you're evaluating code snippets or expressions and getting results back in Python. This page explains how evaluation works, what you get back, and how to handle different execution scenarios.
 
 ## Basic Evaluation
 
-The simplest way to run JavaScript is with [`eval()`][peno.Runtime.eval]:
+The simplest way to run JavaScript is with [`eval()`][pydeno.Runtime.eval]:
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     result = runtime.eval("2 + 2")
@@ -41,10 +41,10 @@ with Runtime() as runtime:
 
 ### Statements vs Expressions
 
-Statements like variable declarations don't return values, instead it returns a [`undefined`][peno.undefined] object:
+Statements like variable declarations don't return values, instead it returns a [`undefined`][pydeno.undefined] object:
 
 ```python
-from peno import undefined
+from pydeno import undefined
 
 with Runtime() as runtime:
     # Variable declaration returns undefined
@@ -71,7 +71,7 @@ with Runtime() as runtime:
 
 ## Sync vs Async
 
-`peno` offers two evaluation methods:
+`pydeno` offers two evaluation methods:
 
 ### Synchronous: `eval()`
 
@@ -120,7 +120,7 @@ asyncio.run(main())
 - Integration with async Python code (asyncio, aiohttp, etc.)
 
 !!! tip "Prefer `eval_async()` in async contexts"
-    If you're already in an async Python function, use [`eval_async()`][peno.Runtime.eval_async]. It won't block your event loop and handles Promises naturally.
+    If you're already in an async Python function, use [`eval_async()`][pydeno.Runtime.eval_async]. It won't block your event loop and handles Promises naturally.
 
 
 ## Resource Limits
@@ -155,7 +155,7 @@ The timeout is specified in seconds (float). Without a timeout, infinite loops w
 You can limit the JavaScript heap size to prevent excessive memory usage:
 
 ```python
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 config = RuntimeConfig(max_heap_size=10 * 1024 * 1024)  # 10MB limit
 
@@ -205,7 +205,7 @@ with Runtime(RuntimeConfig(timeout=0.2)) as runtime:
 
 `terminate()` is for a script you want gone *now*, from a watchdog thread,
 and it does end the runtime: subsequent calls raise
-[`RuntimeTerminated`][peno.RuntimeTerminated]. It works on every parked
+[`RuntimeTerminated`][pydeno.RuntimeTerminated]. It works on every parked
 shape — a promise nobody resolves, an `await` on one, a `.then` chain built
 on one — because the runtime's dispatcher checks for a termination request
 between event-loop polls. V8's own `terminate_execution()` cannot do this
@@ -219,14 +219,14 @@ returns**. The runtime thread is then blocked inside your Python code, so it
 cannot notice a termination request and V8 cannot unwind anything.
 
 ```python
-config = RuntimeConfig(force_kill_grace=peno.SUGGESTED_FORCE_KILL_GRACE)
+config = RuntimeConfig(force_kill_grace=pydeno.SUGGESTED_FORCE_KILL_GRACE)
 with Runtime(config) as runtime:
     ...
 ```
 
 With `force_kill_grace` set, a blocked caller waits that long for the runtime
 to acknowledge a termination and then gives up, raising
-[`RuntimeForceKilled`][peno.RuntimeForceKilled] (a subclass of
+[`RuntimeForceKilled`][pydeno.RuntimeForceKilled] (a subclass of
 `RuntimeTerminated`, so existing handlers keep working).
 
 !!! warning "`force_kill_grace` is opt-in for two real reasons"
@@ -243,7 +243,7 @@ to acknowledge a termination and then gives up, raising
 
 ## Error Handling
 
-JavaScript errors are exposed as [`JavaScriptError`][peno.JavaScriptError], which includes the JavaScript stack trace, making debugging easier:
+JavaScript errors are exposed as [`JavaScriptError`][pydeno.JavaScriptError], which includes the JavaScript stack trace, making debugging easier:
 
 ```python
 with Runtime() as runtime:
@@ -294,10 +294,10 @@ with Runtime() as runtime2:
 ### Quick Calculation
 
 ```python
-import peno
+import pydeno
 
 # Using the module-level eval for one-off calculations
-result = peno.eval("Math.pow(2, 10)")
+result = pydeno.eval("Math.pow(2, 10)")
 print(result)  # 1024
 ```
 
@@ -334,7 +334,7 @@ result = await safe_eval("Promise.resolve(42)")
 
 ## Performance Tips
 
-- **Load libraries once** via bootstrap code in [`RuntimeConfig`][peno.RuntimeConfig] rather than re-evaluating them
+- **Load libraries once** via bootstrap code in [`RuntimeConfig`][pydeno.RuntimeConfig] rather than re-evaluating them
 - **Minimize data transfer** do heavy computation in JavaScript, only return final results
 - **Use snapshots** for frequently-used initialization code (see [Snapshots guide](../guides/advanced/snapshots.md))
 

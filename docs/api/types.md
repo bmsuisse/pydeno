@@ -1,8 +1,8 @@
 # Types
 
-Useful Python types used in `peno`.
+Useful Python types used in `pydeno`.
 
-::: peno
+::: pydeno
     options:
       show_source: false
       members:

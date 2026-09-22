@@ -5,13 +5,13 @@ from __future__ import annotations
 import threading
 import time
 
-import peno
+import pydeno
 import pytest
 
 
 def test_cold_start(benchmark):
     def cold_start():
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         result = runtime.eval("1 + 41")
         runtime.close()
         return result
@@ -21,7 +21,7 @@ def test_cold_start(benchmark):
 
 @pytest.fixture
 def warm_runtime():
-    runtime = peno.Runtime()
+    runtime = pydeno.Runtime()
     runtime.eval("1")  # warm up the isolate before timing
     yield runtime
     runtime.close()
@@ -56,7 +56,7 @@ def test_host_callback_round_trip(benchmark, warm_runtime):
 # but with a short delay so pedantic rounds finish quickly while still exercising
 # the real cross-thread TerminationHandle.terminate() path.
 def _watchdog_terminate_scenario(delay_s: float = 0.05) -> float:
-    runtime = peno.Runtime()
+    runtime = pydeno.Runtime()
     handle = runtime.termination_handle()
 
     def watchdog() -> None:
@@ -93,7 +93,7 @@ def warm_timed_runtime():
     every `eval` arms a deadline on the persistent per-runtime watchdog
     thread (see `Watchdog` in `src/runtime/runner.rs`) instead of leaving one
     unset."""
-    runtime = peno.Runtime(peno.RuntimeConfig(timeout=5.0))
+    runtime = pydeno.Runtime(pydeno.RuntimeConfig(timeout=5.0))
     runtime.eval("1")  # warm up the isolate before timing
     yield runtime
     runtime.close()

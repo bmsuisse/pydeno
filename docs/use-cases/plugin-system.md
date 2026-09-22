@@ -2,7 +2,7 @@
 
 ## Overview
 
-A plugin system allows users to extend application functionality with custom JavaScript code. With `peno`, plugins code could run in isolated V8 contexts with resource controls.
+A plugin system allows users to extend application functionality with custom JavaScript code. With `pydeno`, plugins code could run in isolated V8 contexts with resource controls.
 
 Key features:
 
@@ -10,7 +10,7 @@ Key features:
 - **Resource control** - Set memory and execution time limits per plugin
 - **Host API exposure** - Expose Python functions/objects that plugins can use
 
-This guide demonstrates how to build a plugin system using `peno`.
+This guide demonstrates how to build a plugin system using `pydeno`.
 
 ## Architecture
 
@@ -51,7 +51,7 @@ Here's a minimal plugin manager that does exactly that. It reads JavaScript file
 from pathlib import Path
 from typing import Any
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 
 class PluginManager:
@@ -166,12 +166,12 @@ Result: Goodbye, John Doe!
 
 When building plugin systems with user code:
 
-- **Set resource limits** - Configure [`max_heap_size`][peno.RuntimeConfig.max_heap_size] and use `timeout` for plugin operations
-- **Isolate plugins** - Each plugin gets its own [`Runtime`][peno.Runtime] instance
+- **Set resource limits** - Configure [`max_heap_size`][pydeno.RuntimeConfig.max_heap_size] and use `timeout` for plugin operations
+- **Isolate plugins** - Each plugin gets its own [`Runtime`][pydeno.Runtime] instance
 - **Whitelist host API** - Only expose necessary functions, never expose sensitive operations unless you trust them
 
 ## Next Steps
 
-- [Runtime Configuration][peno.RuntimeConfig] for plugin isolation settings
+- [Runtime Configuration][pydeno.RuntimeConfig] for plugin isolation settings
 - [Type Conversion](../concepts/types.md) for data exchange
 - [Code Playground](playground.md) for plugin development

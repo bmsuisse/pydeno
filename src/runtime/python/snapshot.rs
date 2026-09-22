@@ -1,4 +1,4 @@
-//! Snapshot builder bindings surfaced as `peno.SnapshotBuilder`.
+//! Snapshot builder bindings surfaced as `pydeno.SnapshotBuilder`.
 use crate::runtime::snapshot::{SnapshotBuilder, SnapshotBuilderConfig};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -6,7 +6,7 @@ use pyo3::types::PyBytes;
 
 use super::error::runtime_error_to_py;
 
-#[pyclass(name = "SnapshotBuilder", module = "peno", unsendable)]
+#[pyclass(name = "SnapshotBuilder", module = "pydeno", unsendable)]
 pub struct SnapshotBuilderPy {
     builder: std::cell::RefCell<Option<SnapshotBuilder>>,
 }

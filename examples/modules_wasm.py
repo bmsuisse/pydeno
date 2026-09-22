@@ -2,7 +2,7 @@
 
 import asyncio
 from pathlib import Path
-from peno import Runtime
+from pydeno import Runtime
 
 
 async def main() -> None:

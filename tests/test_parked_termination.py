@@ -34,7 +34,7 @@ from typing import Any, Callable
 
 import pytest
 
-import peno
+import pydeno
 
 # Every parked shape: a promise nobody resolves, an `await` on one, and a
 # `.then` chain built on one. The fix must be structural, not pattern-matched
@@ -99,7 +99,9 @@ def classify(exc: BaseException | None) -> tuple[type | None, str]:
     return type(exc), str(exc)
 
 
-def _terminate_after(handle: peno.TerminationHandle, delay: float) -> threading.Thread:
+def _terminate_after(
+    handle: pydeno.TerminationHandle, delay: float
+) -> threading.Thread:
     def watchdog() -> None:
         time.sleep(delay)
         handle.terminate()
@@ -120,7 +122,7 @@ def test_terminate_kills_runtime_parked_on_pending_promise(shape: str) -> None:
     script = PARKED_SHAPES[shape]
 
     async def amain() -> tuple[type | None, str, float]:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         handle = runtime.termination_handle()
         _terminate_after(handle, TERMINATE_AFTER_S)
         started = time.monotonic()
@@ -136,7 +138,7 @@ def test_terminate_kills_runtime_parked_on_pending_promise(shape: str) -> None:
 
     exc_type, message, elapsed = run_bounded(lambda: asyncio.run(amain()))
 
-    assert exc_type is not None and issubclass(exc_type, peno.RuntimeTerminated), (
+    assert exc_type is not None and issubclass(exc_type, pydeno.RuntimeTerminated), (
         f"expected RuntimeTerminated for {shape}, got {exc_type} ({message})"
     )
     kill_latency = elapsed - TERMINATE_AFTER_S
@@ -156,7 +158,7 @@ def test_timeout_still_fires_on_parked_promise(shape: str) -> None:
     timeout_s = 0.2
 
     async def amain() -> tuple[type | None, str, float]:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         started = time.monotonic()
         caught: BaseException | None = None
         try:
@@ -186,7 +188,7 @@ def test_terminate_beats_a_long_timeout() -> None:
     timeout_s = 5.0
 
     async def amain() -> tuple[type | None, str, float]:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         handle = runtime.termination_handle()
         _terminate_after(handle, TERMINATE_AFTER_S)
         started = time.monotonic()
@@ -202,7 +204,7 @@ def test_terminate_beats_a_long_timeout() -> None:
 
     exc_type, message, elapsed = run_bounded(lambda: asyncio.run(amain()))
 
-    assert exc_type is not None and issubclass(exc_type, peno.RuntimeTerminated), (
+    assert exc_type is not None and issubclass(exc_type, pydeno.RuntimeTerminated), (
         f"expected RuntimeTerminated, got {exc_type} ({message})"
     )
     assert elapsed < timeout_s / 2, (
@@ -223,7 +225,7 @@ def test_spin_and_parked_kills_are_both_bounded_and_the_spin_path_stays_cheap() 
     """
 
     def spin_kill() -> float:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         handle = runtime.termination_handle()
         _terminate_after(handle, TERMINATE_AFTER_S)
         started = time.monotonic()
@@ -236,7 +238,7 @@ def test_spin_and_parked_kills_are_both_bounded_and_the_spin_path_stays_cheap() 
         return elapsed
 
     async def parked_kill_async() -> float:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         handle = runtime.termination_handle()
         _terminate_after(handle, TERMINATE_AFTER_S)
         started = time.monotonic()
@@ -272,7 +274,7 @@ def test_polite_kill_does_not_recreate_the_runtime() -> None:
     """
 
     def body() -> Any:
-        runtime = peno.Runtime(peno.RuntimeConfig(timeout=0.2))
+        runtime = pydeno.Runtime(pydeno.RuntimeConfig(timeout=0.2))
         runtime.bind_function("marker", lambda: "still-here")
         runtime.eval("globalThis.kept = 7")
         with pytest.raises(Exception):  # noqa: B017 - any failure is fine
@@ -297,7 +299,7 @@ def test_unresolved_then_resolved_promise_still_works() -> None:
         return "resolved"
 
     async def amain() -> Any:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         # There is no `setTimeout` global here, so the pend-then-resolve comes
         # from a real async host op -- which also exercises the dispatcher's
         # waker path rather than just a microtask.
@@ -326,7 +328,7 @@ def test_terminate_settles_a_pending_js_function_call_async() -> None:
     """
 
     async def amain() -> tuple[type | None, str, float]:
-        runtime = peno.Runtime()
+        runtime = pydeno.Runtime()
         handle = runtime.termination_handle()
         js_func = runtime.eval("(() => new Promise(() => {}))")
         pending = asyncio.ensure_future(js_func.call_async())
@@ -349,7 +351,7 @@ def test_terminate_settles_a_pending_js_function_call_async() -> None:
     assert exc_type is not None and not issubclass(exc_type, asyncio.TimeoutError), (
         f"call_async never settled after terminate(): {exc_type} ({message})"
     )
-    assert issubclass(exc_type, peno.RuntimeTerminated), (
+    assert issubclass(exc_type, pydeno.RuntimeTerminated), (
         f"expected RuntimeTerminated, got {exc_type} ({message})"
     )
     kill_latency = elapsed - TERMINATE_AFTER_S
@@ -367,20 +369,20 @@ class TestForceKillEscalation:
     """
 
     def test_disabled_by_default(self) -> None:
-        assert peno.RuntimeConfig().force_kill_grace is None, (
+        assert pydeno.RuntimeConfig().force_kill_grace is None, (
             "force_kill_grace must stay opt-in: enabling it slows every "
             "synchronous call by ~10%"
         )
 
     def test_configurable(self) -> None:
-        assert peno.RuntimeConfig(force_kill_grace=0.25).force_kill_grace == 0.25
-        config = peno.RuntimeConfig()
-        config.force_kill_grace = peno.SUGGESTED_FORCE_KILL_GRACE
+        assert pydeno.RuntimeConfig(force_kill_grace=0.25).force_kill_grace == 0.25
+        config = pydeno.RuntimeConfig()
+        config.force_kill_grace = pydeno.SUGGESTED_FORCE_KILL_GRACE
         assert config.force_kill_grace == pytest.approx(0.1)
 
     def test_force_killed_is_a_kind_of_terminated(self) -> None:
         """Existing `except RuntimeTerminated` handlers must keep working."""
-        assert issubclass(peno.RuntimeForceKilled, peno.RuntimeTerminated)
+        assert issubclass(pydeno.RuntimeForceKilled, pydeno.RuntimeTerminated)
 
     def test_escalation_kills_a_wedged_host_callback(self) -> None:
         """A runtime wedged in a host callback is abandoned, not waited on.
@@ -397,10 +399,10 @@ class TestForceKillEscalation:
         grace = 0.15
         script = textwrap.dedent(
             f"""
-            import threading, time, json, peno
+            import threading, time, json, pydeno
 
             release = threading.Event()
-            runtime = peno.Runtime(peno.RuntimeConfig(force_kill_grace={grace}))
+            runtime = pydeno.Runtime(pydeno.RuntimeConfig(force_kill_grace={grace}))
             runtime.bind_function("blockForever", lambda: release.wait(60))
             handle = runtime.termination_handle()
 
@@ -457,8 +459,8 @@ class TestForceKillEscalation:
         unchanged -- no spurious ForceKilled."""
 
         def body() -> Any:
-            runtime = peno.Runtime(
-                peno.RuntimeConfig(timeout=0.2, force_kill_grace=0.1)
+            runtime = pydeno.Runtime(
+                pydeno.RuntimeConfig(timeout=0.2, force_kill_grace=0.1)
             )
             runtime.bind_function("double", lambda x: x * 2)
             doubled = runtime.eval("double(21)")

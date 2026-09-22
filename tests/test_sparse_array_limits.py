@@ -15,7 +15,7 @@ serialization quirk.
 
 import pytest
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # Comfortably above the per-element cost of a few thousand real elements and
 # far below the ~80 MB a ten-million-element array would have to charge.

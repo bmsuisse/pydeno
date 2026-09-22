@@ -4,7 +4,7 @@ The rest of the suite is example-driven: it checks behaviours someone thought
 of. These tests instead generate inputs nobody thought of and assert the one
 invariant that must hold for *every* input a sandbox is handed:
 
-    peno either returns a result or raises a catchable Python
+    pydeno either returns a result or raises a catchable Python
     exception -- never SIGABRT, never a Rust panic, never a hang.
 
 That invariant is the whole product promise of a sandbox, and it is exactly
@@ -26,7 +26,7 @@ import pytest
 from hypothesis import HealthCheck, Verbosity, given, settings
 from hypothesis import strategies as st
 
-from peno import JavaScriptError, Runtime, RuntimeConfig, undefined
+from pydeno import JavaScriptError, Runtime, RuntimeConfig, undefined
 
 # V8 isolate creation costs ~2.5ms, so a per-example Runtime would dominate.
 # These profiles keep the suite honest but fast; raise max_examples locally
@@ -124,7 +124,7 @@ class TestValueRoundTrip:
     @given(
         text=st.text(
             # "Cs" (lone surrogates) is excluded deliberately: those are not
-            # encodable text, and peno refusing them with a clean
+            # encodable text, and pydeno refusing them with a clean
             # RuntimeError is the correct behaviour, asserted separately in
             # TestKnownConversionResiduals.
             alphabet=st.characters(
@@ -148,7 +148,7 @@ class TestValueRoundTrip:
     @given(value=st.floats(allow_nan=True, allow_infinity=True))
     @FUZZ
     def test_special_floats_do_not_crash(self, value: float) -> None:
-        """NaN/Infinity have no JSON representation; whatever peno does
+        """NaN/Infinity have no JSON representation; whatever pydeno does
         with them, it must not be crash or hang."""
         with Runtime() as rt:
             rt.bind_function("produce", lambda: value)

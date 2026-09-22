@@ -1,5 +1,5 @@
 """
-Bridging FastMCP tools into a peno sandbox.
+Bridging FastMCP tools into a pydeno sandbox.
 
 This is the real pattern behind "AI agent writes JS that calls tools safely":
 
@@ -27,7 +27,7 @@ import threading
 
 from fastmcp import Client, FastMCP
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # --- 1. A normal FastMCP server with a couple of simple tools ---
 

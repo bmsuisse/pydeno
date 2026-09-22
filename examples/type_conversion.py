@@ -1,7 +1,7 @@
 """
 Type conversion between Python and JavaScript.
 
-peno automatically converts types between Python and JavaScript, making it
+pydeno automatically converts types between Python and JavaScript, making it
 easy to work with familiar types on both sides.
 
 This example demonstrates:
@@ -12,7 +12,7 @@ This example demonstrates:
 """
 
 from datetime import datetime, timezone
-from peno import Runtime, undefined
+from pydeno import Runtime, undefined
 
 
 def primitive_types():
@@ -102,7 +102,7 @@ def special_types():
         # undefined sentinel
         result = runtime.eval("undefined")
         print(f"JavaScript undefined → Python: {result}")
-        print(f"  Is peno.undefined: {result is undefined}\n")
+        print(f"  Is pydeno.undefined: {result is undefined}\n")
 
         # Binary data (Uint8Array)
         result = runtime.eval("new Uint8Array([72, 101, 108, 108, 111])")
@@ -127,7 +127,7 @@ def python_to_js():
             "nothing": None,
             "items": [1, 2, 3],
             "user": {"name": "Alice", "id": 123},
-            "tags": {"python", "javascript", "peno"},
+            "tags": {"python", "javascript", "pydeno"},
             "timestamp": datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc),
             "binary": b"Hello",
         })
@@ -252,7 +252,7 @@ def main():
     - set ↔ Set
 
     Special types:
-    - peno.undefined ↔ undefined (distinct from None/null)
+    - pydeno.undefined ↔ undefined (distinct from None/null)
     - int (large) ↔ BigInt
     - datetime ↔ Date
     - bytes/bytearray/memoryview ↔ Uint8Array

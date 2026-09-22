@@ -29,9 +29,9 @@ have somewhere real to land.
 
 import asyncio
 
-import peno
+import pydeno
 import pytest
-from peno import Runtime, RuntimeConfig, SnapshotBuilder
+from pydeno import Runtime, RuntimeConfig, SnapshotBuilder
 
 
 def _filler(byte_size: int) -> str:
@@ -58,7 +58,7 @@ def test_large_script_eval_async_does_not_crash(size_bytes):
 
 def test_large_script_module_level_eval_async_does_not_crash():
     async def run():
-        return await peno.eval_async(_filler(1_000_000) + "\n1 + 1")
+        return await pydeno.eval_async(_filler(1_000_000) + "\n1 + 1")
 
     assert asyncio.run(run()) == 2
 
@@ -71,7 +71,7 @@ def test_large_bootstrap_script_does_not_crash():
 
 def test_large_script_can_still_call_a_host_function():
     """Not just "doesn't crash" -- large scripts must still work correctly:
-    the host-callback bridge (op_peno_call_python_sync) must still
+    the host-callback bridge (op_pydeno_call_python_sync) must still
     function after a large script has been compiled/evaluated."""
     calls = []
 

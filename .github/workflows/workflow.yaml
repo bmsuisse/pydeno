@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/peno
+      url: https://pypi.org/p/pydeno
     permissions:
       id-token: write  # required for PyPI Trusted Publishing (OIDC) -- no API token secret needed
     steps:

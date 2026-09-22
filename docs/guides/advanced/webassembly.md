@@ -1,6 +1,6 @@
 # WebAssembly
 
-[WebAssembly][webassembly] (Wasm) lets you run compiled code inside JavaScript. With `peno`, you can load Wasm modules and call them from JavaScript, all within your Python application.
+[WebAssembly][webassembly] (Wasm) lets you run compiled code inside JavaScript. With `pydeno`, you can load Wasm modules and call them from JavaScript, all within your Python application.
 
 ## Why Use WebAssembly?
 
@@ -13,10 +13,10 @@ WebAssembly offers portable, near-native performance. Use it when:
 
 ## Loading WebAssembly
 
-JavaScript's [`WebAssembly`][webassembly-mdn] API works in `peno`:
+JavaScript's [`WebAssembly`][webassembly-mdn] API works in `pydeno`:
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     # Load a .wasm file from Python

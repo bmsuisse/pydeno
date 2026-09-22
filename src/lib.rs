@@ -6,11 +6,11 @@ mod runtime;
 pub use runtime::ops::PythonOpMode;
 pub use runtime::{RuntimeConfig, RuntimeHandle};
 
-/// Python peno module
+/// Python pydeno module
 ///
-/// This module provides Python bindings to the peno JavaScript runtime.
+/// This module provides Python bindings to the pydeno JavaScript runtime.
 #[pymodule]
-fn _peno(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<runtime::python::Runtime>()?;
     m.add_class::<runtime::python::TerminationHandle>()?;
     m.add_class::<runtime::python::JsFunction>()?;
@@ -26,14 +26,14 @@ fn _peno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<runtime::RuntimeConfig>()?;
     m.add_class::<runtime::config::InspectorConfig>()?;
     let js_error_type = m.py().get_type::<runtime::python::JavaScriptError>();
-    js_error_type.setattr("__module__", "peno")?;
+    js_error_type.setattr("__module__", "pydeno")?;
     m.add("JavaScriptError", js_error_type)?;
 
     let runtime_terminated_type = m.py().get_type::<runtime::python::RuntimeTerminated>();
-    runtime_terminated_type.setattr("__module__", "peno")?;
+    runtime_terminated_type.setattr("__module__", "pydeno")?;
     m.add("RuntimeTerminated", runtime_terminated_type)?;
     let runtime_force_killed_type = m.py().get_type::<runtime::python::RuntimeForceKilled>();
-    runtime_force_killed_type.setattr("__module__", "peno")?;
+    runtime_force_killed_type.setattr("__module__", "pydeno")?;
     m.add("RuntimeForceKilled", runtime_force_killed_type)?;
     m.add(
         "SUGGESTED_FORCE_KILL_GRACE",

@@ -1,7 +1,7 @@
 """
 Move large tabular datasets into sandboxed JS via Arrow IPC.
 
-This demonstrates a PATTERN, not a built-in feature. `peno` needs no
+This demonstrates a PATTERN, not a built-in feature. `pydeno` needs no
 new code, no Rust dependency and no optional extra for this -- it already
 passes Python `bytes` straight through to a JS `Uint8Array`
 (`src/runtime/conversion.rs`, the `PyBytes` -> `JSValue::Bytes` arm). Arrow
@@ -22,8 +22,8 @@ roughly 1k rows plain JSON is simply faster and much less code. The
 crossover measured here sits around 5,000 rows.
 
 `pyarrow` is required only on the PYTHON side of this script, to build the
-IPC buffer. It is NOT a `peno` dependency and there is no
-`peno[arrow]` extra -- the library itself needs nothing at all for
+IPC buffer. It is NOT a `pydeno` dependency and there is no
+`pydeno[arrow]` extra -- the library itself needs nothing at all for
 this. Install it alongside if you want to run this example:
 
     pip install pyarrow httpx
@@ -38,7 +38,7 @@ import time
 import httpx
 import pyarrow as pa
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # apache-arrow's package metadata declares this file for `unpkg`/`jsdelivr`:
 # a self-contained 188 KB UMD build with flatbuffers inlined and zero

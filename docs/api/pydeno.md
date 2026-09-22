@@ -1,9 +1,9 @@
-# `peno`
+# `pydeno`
 
-The top-level package provides convenience functions that automatically manage a context-local [`Runtime`][peno.Runtime] instance for you.
+The top-level package provides convenience functions that automatically manage a context-local [`Runtime`][pydeno.Runtime] instance for you.
 Each asyncio task or thread gets its own isolated runtime, created lazily and cleaned up automatically.
 
-::: peno
+::: pydeno
     options:
       members:
         - eval

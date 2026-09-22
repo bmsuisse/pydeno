@@ -1,4 +1,4 @@
-"""Tests for `peno.ToolBridge` -- "give this sandbox N callable tools
+"""Tests for `pydeno.ToolBridge` -- "give this sandbox N callable tools
 safely" out of the box.
 
 `ToolBridge` is a pure-Python layer over `Runtime.bind_object`; it adds the
@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from peno import (
+from pydeno import (
     JavaScriptError,
     Runtime,
     ToolBridge,
@@ -293,7 +293,7 @@ class TestTypedErrors:
 
     def test_an_uncaught_tool_error_reaches_python_with_its_name(self) -> None:
         """Symmetry: the same name/message shape build_js_exception produces."""
-        from peno import JavaScriptError
+        from pydeno import JavaScriptError
 
         def failing() -> None:
             raise ToolNotFoundError("nope")
@@ -399,7 +399,7 @@ class TestAttachRequiresARuntime:
 
     def test_attaching_to_an_unrelated_object_raises(self) -> None:
         bridge = ToolBridge({"ping": lambda: 1})
-        with pytest.raises(TypeError, match="expects a peno.Runtime"):
+        with pytest.raises(TypeError, match="expects a pydeno.Runtime"):
             bridge.attach("not a runtime")
 
 

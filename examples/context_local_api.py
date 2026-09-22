@@ -1,8 +1,8 @@
 """
 Context-local API demonstration.
 
-The peno module provides convenience functions that automatically manage
-a per-task/thread runtime. This is the easiest way to use peno for simple
+The pydeno module provides convenience functions that automatically manage
+a per-task/thread runtime. This is the easiest way to use pydeno for simple
 scripts and interactive sessions.
 
 Key features:
@@ -13,25 +13,25 @@ Key features:
 """
 
 import asyncio
-import peno
+import pydeno
 
 
 def basic_usage():
-    """Simplest way to use peno - just call peno.eval()."""
+    """Simplest way to use pydeno - just call pydeno.eval()."""
     print("=== Basic Usage ===\n")
 
     # Evaluate JavaScript directly
-    result = peno.eval("2 + 2")
+    result = pydeno.eval("2 + 2")
     print(f"2 + 2 = {result}")
 
-    result = peno.eval("Math.sqrt(144)")
+    result = pydeno.eval("Math.sqrt(144)")
     print(f"Math.sqrt(144) = {result}")
 
     # State persists across evaluations in the same context
-    peno.eval("let counter = 0;")
-    peno.eval("counter++;")
-    peno.eval("counter++;")
-    result = peno.eval("counter")
+    pydeno.eval("let counter = 0;")
+    pydeno.eval("counter++;")
+    pydeno.eval("counter++;")
+    result = pydeno.eval("counter")
     print(f"counter = {result}")
 
     print()
@@ -45,8 +45,8 @@ def bindings_example():
     def greet(name):
         return f"Hello, {name}!"
 
-    peno.bind_function("greet", greet)
-    result = peno.eval("greet('World')")
+    pydeno.bind_function("greet", greet)
+    result = pydeno.eval("greet('World')")
     print(f"greet('World') = {result}")
 
     # Bind a Python object
@@ -55,12 +55,12 @@ def bindings_example():
         "timeout": 30,
         "version": "1.0.0",
     }
-    peno.bind_object("config", config)
+    pydeno.bind_object("config", config)
 
-    result = peno.eval("config.version")
+    result = pydeno.eval("config.version")
     print(f"config.version = {result}")
 
-    result = peno.eval("config.debug && config.timeout > 0")
+    result = pydeno.eval("config.debug && config.timeout > 0")
     print(f"config.debug && config.timeout > 0 = {result}")
 
     print()
@@ -71,7 +71,7 @@ async def async_example():
     print("=== Async Example ===\n")
 
     # Evaluate async JavaScript
-    result = await peno.eval_async("Promise.resolve(42)")
+    result = await pydeno.eval_async("Promise.resolve(42)")
     print(f"Promise.resolve(42) = {result}")
 
     # Bind async Python function for delayed operations
@@ -79,10 +79,10 @@ async def async_example():
         await asyncio.sleep(0.1)
         return "done"
 
-    peno.bind_function("delayedOp", delayed_operation)
+    pydeno.bind_function("delayedOp", delayed_operation)
 
     # Call it from JavaScript - it becomes a Promise
-    result = await peno.eval_async(
+    result = await pydeno.eval_async(
         "delayedOp()",
         timeout=1.0,
     )
@@ -97,15 +97,15 @@ async def per_task_isolation():
 
     async def task_worker(task_id, delay):
         # Each task has its own runtime with isolated state
-        peno.eval(f"globalThis.taskId = {task_id};")
-        peno.eval("globalThis.counter = 0;")
+        pydeno.eval(f"globalThis.taskId = {task_id};")
+        pydeno.eval("globalThis.counter = 0;")
 
         for _ in range(3):
             await asyncio.sleep(delay)
-            peno.eval("counter++;")
+            pydeno.eval("counter++;")
 
-        counter = peno.eval("counter")
-        tid = peno.eval("taskId")
+        counter = pydeno.eval("counter")
+        tid = pydeno.eval("taskId")
         print(f"Task {task_id}: counter={counter}, taskId={tid}")
 
     # Run multiple tasks concurrently - each gets its own runtime
@@ -123,14 +123,14 @@ def get_default_runtime_example():
     print("=== Accessing Default Runtime ===\n")
 
     # Get the context-local runtime
-    runtime = peno.get_default_runtime()
+    runtime = pydeno.get_default_runtime()
 
     # You can use it like any other Runtime instance
     runtime.eval("globalThis.data = []")
     runtime.eval("data.push(1, 2, 3)")
 
-    # Or continue using peno.eval() - same runtime
-    peno.eval("data.push(4, 5)")
+    # Or continue using pydeno.eval() - same runtime
+    pydeno.eval("data.push(4, 5)")
 
     result = runtime.eval("data")
     print(f"data = {result}")

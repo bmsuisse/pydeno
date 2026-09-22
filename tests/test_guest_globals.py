@@ -11,8 +11,8 @@ Python-side visibility.
 
 This file is the boundary: it does not special-case `__bootstrap`, it lists
 every own key `Reflect.ownKeys(globalThis)` is allowed to return, drawn from
-ECMAScript intrinsics plus what peno itself installs. A future deno_core
-bump that starts installing a new bootstrap global -- or a peno change that
+ECMAScript intrinsics plus what pydeno itself installs. A future deno_core
+bump that starts installing a new bootstrap global -- or a pydeno change that
 adds a new bridge global without updating this list -- fails this test
 immediately, rather than silently reopening an escape.
 """
@@ -23,9 +23,9 @@ import subprocess
 import sys
 import textwrap
 
-from peno import Runtime, RuntimeConfig, SnapshotBuilder
+from pydeno import Runtime, RuntimeConfig, SnapshotBuilder
 
-# ECMAScript/V8 intrinsics peno does not (and should not) hide.
+# ECMAScript/V8 intrinsics pydeno does not (and should not) hide.
 _ECMASCRIPT_INTRINSICS = {
     "Object",
     "Function",
@@ -98,21 +98,21 @@ _ECMASCRIPT_INTRINSICS = {
     "WebAssembly",
 }
 
-# Globals peno's own bridge installs deliberately (src/runtime/ops.rs).
+# Globals pydeno's own bridge installs deliberately (src/runtime/ops.rs).
 # `ReadableStream` is a conditional polyfill only installed when V8's build
-# doesn't already provide a native one; on this V8 build it is peno's own
+# doesn't already provide a native one; on this V8 build it is pydeno's own
 # polyfill, not a deno_core global.
-_PENO_BRIDGE_GLOBALS = {
-    "__penoCallSync",
-    "__penoCallAsync",
+_PYDENO_BRIDGE_GLOBALS = {
+    "__pydenoCallSync",
+    "__pydenoCallAsync",
     "__host_op_sync__",
     "__host_op_async__",
-    "__peno_bind_object",
-    "__peno_from_py_stream",
+    "__pydeno_bind_object",
+    "__pydeno_from_py_stream",
     "ReadableStream",
 }
 
-ALLOWED_GLOBALS = _ECMASCRIPT_INTRINSICS | _PENO_BRIDGE_GLOBALS
+ALLOWED_GLOBALS = _ECMASCRIPT_INTRINSICS | _PYDENO_BRIDGE_GLOBALS
 
 # Globals deno_core's own bootstrap is known to install ambiently and that
 # must never survive the bridge's cleanup, regardless of whether this V8
@@ -131,8 +131,8 @@ def test_guest_global_surface_matches_allowlist() -> None:
         unexpected = keys - ALLOWED_GLOBALS
         assert not unexpected, (
             f"unexpected guest-visible global(s): {sorted(unexpected)} -- "
-            "if this is a legitimate new peno bridge global, add it to "
-            "_PENO_BRIDGE_GLOBALS deliberately; if it came from deno_core, "
+            "if this is a legitimate new pydeno bridge global, add it to "
+            "_PYDENO_BRIDGE_GLOBALS deliberately; if it came from deno_core, "
             "it must be deleted in the bridge bootstrap (src/runtime/ops.rs) "
             "before this test is widened"
         )
@@ -164,13 +164,13 @@ def test_guest_global_surface_matches_allowlist_under_snapshot() -> None:
 def test_bootstrap_op_print_escape_is_closed() -> None:
     """Regression test for the specific disclosed escape: before the fix,
     `__bootstrap.core.ops.op_print` wrote straight to the host's fd 1,
-    bypassing peno entirely. Runs in a subprocess with fd 1 captured so a
+    bypassing pydeno entirely. Runs in a subprocess with fd 1 captured so a
     regression is an assertion failure, not contamination of the pytest
     session's own stdout.
     """
     body = """
         import sys
-        from peno import Runtime, RuntimeConfig
+        from pydeno import Runtime, RuntimeConfig
 
         with Runtime(RuntimeConfig()) as rt:
             result = rt.eval(

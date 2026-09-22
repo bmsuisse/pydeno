@@ -1,17 +1,17 @@
-"""Command-line interface for peno."""
+"""Command-line interface for pydeno."""
 
 import argparse
 import sys
 from pathlib import Path
 
-from peno import JavaScriptError, Runtime, undefined
+from pydeno import JavaScriptError, Runtime, undefined
 
 
 def main() -> None:
-    """Main entry point for the peno CLI."""
+    """Main entry point for the pydeno CLI."""
     parser = argparse.ArgumentParser(
-        description="Execute JavaScript code using peno",
-        prog="python -m peno",
+        description="Execute JavaScript code using pydeno",
+        prog="python -m pydeno",
     )
     parser.add_argument(
         "-c",

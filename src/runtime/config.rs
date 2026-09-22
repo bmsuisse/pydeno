@@ -57,7 +57,7 @@ fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
 /// Configures the WebSocket server that enables debugging via Chrome DevTools
 /// or compatible debuggers. The inspector runs on a separate thread from the
 /// runtime thread.
-#[pyclass(module = "peno")]
+#[pyclass(module = "pydeno")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectorConfig {
     /// Socket address (IP and port) for the inspector server.
@@ -206,7 +206,7 @@ impl Clone for ConsoleCallback {
 ///
 /// Defines heap limits, optional bootstrap code, inspector settings, and
 /// serialization constraints for a V8 runtime instance.
-#[pyclass(module = "peno")]
+#[pyclass(module = "pydeno")]
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Maximum heap size in bytes (None = V8 default ~1.4 GB).

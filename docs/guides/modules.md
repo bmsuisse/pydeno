@@ -1,6 +1,6 @@
 # Modules
 
-JavaScript modules let you organize code into reusable pieces. With `peno`, you can provide JavaScript modules to your runtime and use them with standard `import` statements.
+JavaScript modules let you organize code into reusable pieces. With `pydeno`, you can provide JavaScript modules to your runtime and use them with standard `import` statements.
 
 ## Why Use Modules?
 
@@ -12,11 +12,11 @@ Instead of cramming everything into one big eval:
 
 ## Static Modules
 
-The simplest way is to register modules upfront with [`add_static_module()`][peno.Runtime.add_static_module]:
+The simplest way is to register modules upfront with [`add_static_module()`][pydeno.Runtime.add_static_module]:
 
 ```python
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 async def main():
     with Runtime() as runtime:
@@ -59,7 +59,7 @@ with Runtime() as runtime:
 
 ## Custom Module Resolution
 
-For more control, use [`set_module_resolver()`][peno.Runtime.set_module_resolver] to intercept import statements:
+For more control, use [`set_module_resolver()`][pydeno.Runtime.set_module_resolver] to intercept import statements:
 
 ```python
 async def main():
@@ -83,7 +83,7 @@ Return the resolved module URL, or `None` to let other resolvers handle it.
 
 ## Custom Module Loader
 
-Use [`set_module_loader()`][peno.Runtime.set_module_loader] to fetch module code dynamically:
+Use [`set_module_loader()`][pydeno.Runtime.set_module_loader] to fetch module code dynamically:
 
 ```python
 async def main():
@@ -118,7 +118,7 @@ asyncio.run(main())
 
 ## Evaluating Modules Directly
 
-Instead of using `import` inside `eval`, you can evaluate a module directly with [`eval_module_async()`][peno.Runtime.eval_module_async]:
+Instead of using `import` inside `eval`, you can evaluate a module directly with [`eval_module_async()`][pydeno.Runtime.eval_module_async]:
 
 ```python
 async def main():
@@ -147,7 +147,7 @@ This is cleaner when you want to evaluate a module once and access its exports f
 
 ```python
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 async def main():
     with Runtime() as runtime:

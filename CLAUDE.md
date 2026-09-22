@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-peno is a Python library providing JavaScript runtime capabilities via Rust and V8. It exposes a Python API for executing JavaScript code in isolated V8 contexts, with async support and a capability-token host-function boundary. There is **no permission model** -- see "Ops System" below; a `Runtime` grants nothing by default, so what a guest can reach is exactly what a host bound.
+pydeno is a Python library providing JavaScript runtime capabilities via Rust and V8. It exposes a Python API for executing JavaScript code in isolated V8 contexts, with async support and a capability-token host-function boundary. There is **no permission model** -- see "Ops System" below; a `Runtime` grants nothing by default, so what a guest can reach is exactly what a host bound.
 
 **Tech Stack:**
 - Rust (core runtime using deno_core)
@@ -96,11 +96,11 @@ The project has three distinct layers that communicate via well-defined boundari
 
 1. **Rust Core** (`src/runtime/`): V8 isolate management, async execution, ops system
 2. **Rust-Python Bridge** (`src/runtime/python/`, `src/lib.rs`): PyO3 bindings
-3. **Python API** (`python/peno/__init__.py`): User-facing interface
+3. **Python API** (`python/pydeno/__init__.py`): User-facing interface
 
 ### Type Conversion Notes
 
-- JavaScript `undefined` now round-trips via the `JsUndefined` sentinel (`peno.undefined`), distinct from Python `None` / JS `null`.
+- JavaScript `undefined` now round-trips via the `JsUndefined` sentinel (`pydeno.undefined`), distinct from Python `None` / JS `null`.
 - Binary types (`Uint8Array`, `ArrayBuffer`) map to Python `bytes`; Python `bytes`, `bytearray`, and `memoryview` map back to `Uint8Array`.
 - Temporal values (`Date` ↔ `datetime`), sets (`Set` ↔ `set`), and arbitrary precision integers (`BigInt` ↔ Python `int`) are handled natively, including op arguments/results.
 
@@ -202,7 +202,7 @@ For ops: JS → Rust callback → JSON → Python function → JSON → Rust →
 
 ### Context-Local Runtime Management
 
-The `python/peno/__init__.py` module provides convenience functions (`peno.eval()`, `peno.bind_function()`) that use a context-local runtime:
+The `python/pydeno/__init__.py` module provides convenience functions (`pydeno.eval()`, `pydeno.bind_function()`) that use a context-local runtime:
 
 1. Each asyncio task or thread gets its own isolated `Runtime` instance
 2. Stored in `contextvars.ContextVar` for per-task isolation
@@ -266,26 +266,26 @@ When adding new features, update relevant documentation in `docs/`. API document
 
 ### Using the context-local runtime API
 ```python
-import peno
+import pydeno
 
 # The easiest way - automatic per-task/thread isolation
-result = peno.eval("2 + 2")
+result = pydeno.eval("2 + 2")
 
 # Bind Python functions to JavaScript
-peno.bind_function("notify", lambda msg: print("JS:", msg))
-peno.eval("notify('hello')")
+pydeno.bind_function("notify", lambda msg: print("JS:", msg))
+pydeno.eval("notify('hello')")
 
 # Bind Python objects to JavaScript
-peno.bind_object("config", {"debug": True, "version": "1.0"})
-peno.eval("config.version")
+pydeno.bind_object("config", {"debug": True, "version": "1.0"})
+pydeno.eval("config.version")
 
 # Get explicit access to the context-local runtime
-runtime = peno.get_default_runtime()
+runtime = pydeno.get_default_runtime()
 ```
 
 ### Spawning a runtime explicitly (Python)
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     result = runtime.eval("2 + 2")
@@ -305,7 +305,7 @@ async def main():
 
 ### Binding Python functions to JavaScript
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     # Bind a simple function
@@ -327,7 +327,7 @@ with Runtime() as runtime:
 ### Module loading with custom resolver and loader
 ```python
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 async def main():
     with Runtime() as rt:
@@ -355,7 +355,7 @@ async def main():
 ### Threading and GIL release
 ```python
 import threading
-from peno import Runtime
+from pydeno import Runtime
 
 def run_js_in_thread():
     with Runtime() as rt:
@@ -372,7 +372,7 @@ js_thread.join()
 
 ### Inspector for debugging
 ```python
-from peno import Runtime, InspectorConfig, RuntimeConfig
+from pydeno import Runtime, InspectorConfig, RuntimeConfig
 
 # Configure inspector at runtime creation
 inspector_config = InspectorConfig(
@@ -393,7 +393,7 @@ with Runtime(config) as rt:
 
 ### Creating snapshots for faster startup
 ```python
-from peno import SnapshotBuilder
+from pydeno import SnapshotBuilder
 
 # Create snapshot with bootstrap code
 builder = SnapshotBuilder()
@@ -401,7 +401,7 @@ builder.execute_script("myLib.js", "globalThis.myLib = { version: '1.0' };")
 snapshot = builder.create_snapshot()
 
 # Use snapshot when creating runtimes
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 config = RuntimeConfig(snapshot=snapshot)
 with Runtime(config) as rt:
@@ -412,7 +412,7 @@ with Runtime(config) as rt:
 ### Streaming between JavaScript and Python
 ```python
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 async def main():
     with Runtime() as rt:
@@ -423,7 +423,7 @@ async def main():
                 await asyncio.sleep(0.1)
 
         stream_id = await rt.create_js_stream_from_python(data_generator())
-        rt.eval(f"globalThis.myStream = __peno_get_stream__({stream_id})")
+        rt.eval(f"globalThis.myStream = __pydeno_get_stream__({stream_id})")
 
         # Consume in JavaScript
         result = await rt.eval_async("""
@@ -459,14 +459,14 @@ asyncio.run(main())
 - `src/runtime/inspector.rs`: Chrome DevTools protocol server
 - `src/runtime/snapshot.rs`: Snapshot creation and management
 - `src/runtime/stream.rs`: Streaming bridge (JS ↔ Python)
-- `python/peno/__init__.py`: Python package with context-local runtime API
+- `python/pydeno/__init__.py`: Python package with context-local runtime API
 - `tests/`: Python integration tests
 - `examples/`: Usage examples including threading, modules, inspector
 - `docs/`: MkDocs documentation site
 
 ## Common Pitfalls
 
-1. **Not closing runtimes**: When using `Runtime()` explicitly, always use context manager or call `.close()`. The context-local API (`peno.eval()`) handles cleanup automatically.
+1. **Not closing runtimes**: When using `Runtime()` explicitly, always use context manager or call `.close()`. The context-local API (`pydeno.eval()`) handles cleanup automatically.
 
 2. **Expecting a permission model**: there isn't one, and this file used to claim there was. An op is addressed by an unguessable token and is dispatchable only after a successful bind; `Runtime.revoke_op` / `ToolBridge.detach` revoke it. Do not look for a `RuntimeConfig` permission field -- the question is what you bound, not what you permitted.
 
@@ -476,6 +476,6 @@ asyncio.run(main())
 
 5. **Streaming lifecycle**: JavaScript streams created from Python iterables must be consumed completely or explicitly released to avoid resource leaks.
 
-6. **Context-local runtime confusion**: Each asyncio task and thread gets its own isolated runtime via `peno.eval()`. If you need shared state, use `Runtime()` explicitly and pass it around.
+6. **Context-local runtime confusion**: Each asyncio task and thread gets its own isolated runtime via `pydeno.eval()`. If you need shared state, use `Runtime()` explicitly and pass it around.
 
 7. **Inspector blocking**: Setting `wait_for_connection=True` in InspectorConfig will pause execution until DevTools connects. Use `False` for non-blocking debugging.

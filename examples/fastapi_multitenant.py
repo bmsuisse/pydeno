@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from peno import JavaScriptError, Runtime, RuntimeConfig
+from pydeno import JavaScriptError, Runtime, RuntimeConfig
 
 
 class EvalRequest(BaseModel):
@@ -61,7 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             print(f"  Closed runtime for tenant: {tenant_id}")
 
 
-app = FastAPI(title="peno multi-tenant playground", lifespan=lifespan)
+app = FastAPI(title="pydeno multi-tenant playground", lifespan=lifespan)
 
 
 @app.post("/tenants/{tenant_id}/eval", response_model=EvalResponse)

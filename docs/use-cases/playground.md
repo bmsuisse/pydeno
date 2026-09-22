@@ -2,14 +2,14 @@
 
 ## Overview
 
-A code playground is a web application that allows users to write and execute JavaScript code in their browser with real-time results. `peno` provides the foundation for building such playgrounds with:
+A code playground is a web application that allows users to write and execute JavaScript code in their browser with real-time results. `pydeno` provides the foundation for building such playgrounds with:
 
 - Sandboxed execution in separate V8 isolates
 - Resource limits for memory and execution time
 - Async support for long-running computations
 - Custom APIs for playground-specific features
 
-This guide demonstrates how to build a code playground using `peno` with FastAPI.
+This guide demonstrates how to build a code playground using `pydeno` with FastAPI.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ Start with a minimal FastAPI server that executes JavaScript code:
 
 ```python title="playground.py"
 from fastapi import FastAPI
-from peno import Runtime
+from pydeno import Runtime
 from pydantic import BaseModel
 
 app = FastAPI(title="JS Playground")
@@ -85,10 +85,10 @@ curl -X POST http://localhost:8000/execute \
 
 Once you have the basic playground working, here are tips for further enhancements:
 
-- **Resource Limits**: Use [`RuntimeConfig`][peno.RuntimeConfig] to set [`max_heap_size`][peno.RuntimeConfig.max_heap_size] and cap [`timeout`][peno.RuntimeConfig.timeout] parameters to protect against malicious code
-- **Custom APIs**: Use [`runtime.bind_function()`][peno.Runtime.bind_function] to expose safe Python functionality like database queries or HTTP requests
-- **Error Handling**: Distinguish between [`TimeoutError`][TimeoutError], [`RuntimeError`][RuntimeError], and [`JavaScriptError`][peno.JavaScriptError] for better user feedback
-- **Session Management**: Store [`Runtime`][peno.Runtime] instances keyed by session ID to maintain state across executions
+- **Resource Limits**: Use [`RuntimeConfig`][pydeno.RuntimeConfig] to set [`max_heap_size`][pydeno.RuntimeConfig.max_heap_size] and cap [`timeout`][pydeno.RuntimeConfig.timeout] parameters to protect against malicious code
+- **Custom APIs**: Use [`runtime.bind_function()`][pydeno.Runtime.bind_function] to expose safe Python functionality like database queries or HTTP requests
+- **Error Handling**: Distinguish between [`TimeoutError`][TimeoutError], [`RuntimeError`][RuntimeError], and [`JavaScriptError`][pydeno.JavaScriptError] for better user feedback
+- **Session Management**: Store [`Runtime`][pydeno.Runtime] instances keyed by session ID to maintain state across executions
 
 ## Next Steps
 

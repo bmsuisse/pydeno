@@ -6,7 +6,7 @@ import dataclasses
 import time
 from typing import Callable
 
-from peno import Runtime
+from pydeno import Runtime
 
 
 def _fibonacci_python(n: int) -> int:
@@ -15,7 +15,7 @@ def _fibonacci_python(n: int) -> int:
     return _fibonacci_python(n - 1) + _fibonacci_python(n - 2)
 
 
-def _fibonacci_peno(n: int) -> int:
+def _fibonacci_pydeno(n: int) -> int:
     with Runtime() as runtime:
         code = f"""
         function fib(n) {{
@@ -44,11 +44,11 @@ class ThreadingResult:
 
 def run_benchmark(n: int = 35, threads: int = 4) -> list[ThreadingResult]:
     python_elapsed = _run_in_threads(_fibonacci_python, n, threads)
-    peno_elapsed = _run_in_threads(_fibonacci_peno, n, threads)
+    pydeno_elapsed = _run_in_threads(_fibonacci_pydeno, n, threads)
 
     return [
         ThreadingResult("Python (GIL bound)", threads, n, python_elapsed),
-        ThreadingResult("peno (GIL released)", threads, n, peno_elapsed),
+        ThreadingResult("pydeno (GIL released)", threads, n, pydeno_elapsed),
     ]
 
 
@@ -64,7 +64,7 @@ def main() -> None:
 
     py, js = results
     print("-" * 60)
-    print(f"peno speedup vs CPython threads: {py.elapsed / js.elapsed:.2f}x")
+    print(f"pydeno speedup vs CPython threads: {py.elapsed / js.elapsed:.2f}x")
 
 
 if __name__ == "__main__":

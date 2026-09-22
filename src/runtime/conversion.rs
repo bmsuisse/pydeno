@@ -13,7 +13,7 @@ use pyo3::types::{
 };
 use std::collections::HashSet;
 
-const TYPE_TAG: &str = "__peno_type";
+const TYPE_TAG: &str = "__pydeno_type";
 const UNDEFINED_TYPE: &str = "Undefined";
 const DATE_TYPE: &str = "Date";
 const DATE_EPOCH_KEY: &str = "epoch_ms";

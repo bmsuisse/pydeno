@@ -1,6 +1,6 @@
 # Running vendored npm libraries safely
 
-`peno` gives sandboxed JS a real V8 engine but no Node.js, no `require()`,
+`pydeno` gives sandboxed JS a real V8 engine but no Node.js, no `require()`,
 no filesystem, and no network by default. That's exactly the isolation you
 want for LLM-generated code -- but a lot of genuinely useful JS lives in npm
 packages, not in code the model writes from scratch. This page covers a
@@ -37,7 +37,7 @@ library-specific:
 
 ```python
 import pathlib
-from peno import Runtime
+from pydeno import Runtime
 
 polyfills = pathlib.Path("vendor/pptxgenjs/polyfills.js").read_text()
 
@@ -76,7 +76,7 @@ lets you assert it is byte-identical to the published tarball.
     `global` polyfill for an unrelated bundle.
 
     Back `setTimeout` with `Promise.resolve().then()`. It puts the callback on
-    the microtask queue, which is what peno's `eval_async` promise-polling
+    the microtask queue, which is what pydeno's `eval_async` promise-polling
     loop drains, and it is the only option that is correct independent of the
     rest of the polyfill set. A no-op or synchronous shim leaves
     `pres.write()`'s promise pending forever -- and with no `timeout=`
@@ -111,7 +111,7 @@ has two halves, and only one of them is relevant to this pattern:
 - **Deck creation** is a `pptxgenjs` script (the skill's `SKILL.md` documents
   the real API usage: `pres.layout`, `addSlide()`, `addText()`, `addTable()`,
   `addChart()`, `addImage()`, hex colors, speaker notes via `addNotes()`).
-  This half runs unmodified inside a `peno.Runtime` with the two
+  This half runs unmodified inside a `pydeno.Runtime` with the two
   polyfills above -- verified here with a multi-slide deck containing a
   title slide, a table, a native chart, and an image, round-tripped through
   `python-pptx` to confirm it's a real, openable file.
@@ -120,12 +120,12 @@ has two halves, and only one of them is relevant to this pattern:
   `scripts/office/validate.py` (schema/relationship validation),
   `scripts/office/soffice.py` (LibreOffice conversion), `scripts/add_slide.py`
   and `scripts/clean.py` (raw OOXML XML manipulation). None of that runs in
-  peno, and it isn't meant to -- don't confuse "the JS half of one
-  skill works in a JS sandbox" with "the whole skill runs in peno."
+  pydeno, and it isn't meant to -- don't confuse "the JS half of one
+  skill works in a JS sandbox" with "the whole skill runs in pydeno."
 
 ## pptxgenjs API footguns
 
-Two of these have nothing to do with peno -- they are pptxgenjs behaviours
+Two of these have nothing to do with pydeno -- they are pptxgenjs behaviours
 that produce a file which passes a structural check and is broken for real
 consumers. They are worth knowing before you blame the sandbox.
 
@@ -189,7 +189,7 @@ alternatives were worse:
 - **Fetch the bundle at test time.** This breaks hermeticity, and a test that
   is skipped when the network is unavailable is worse than no test: it looks
   like coverage. Pinning the bytes also means a failure is attributable to a
-  change in peno rather than to npm republishing or CDN drift.
+  change in pydeno rather than to npm republishing or CDN drift.
 - **A synthetic stand-in** -- 460 KB of generated JS plus the polyfill
   surface, with pptxgenjs left as a documented example. This protects the
   cheap half of the property and misses the expensive half. The failure mode

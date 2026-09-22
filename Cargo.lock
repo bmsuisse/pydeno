@@ -1332,33 +1332,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "peno"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "criterion",
- "deno_core",
- "deno_error",
- "fastwebsockets",
- "futures",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "indexmap",
- "log",
- "num-bigint",
- "pyo3",
- "pyo3-async-runtimes",
- "pyo3-build-config 0.25.1",
- "serde",
- "serde_bytes",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1461,6 +1434,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pydeno"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "deno_core",
+ "deno_error",
+ "fastwebsockets",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indexmap",
+ "log",
+ "num-bigint",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "pyo3-build-config 0.25.1",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

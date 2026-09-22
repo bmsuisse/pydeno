@@ -59,7 +59,7 @@ impl PythonModuleLoader {
 
     /// Register a static module with pre-defined source.
     ///
-    /// Static modules are resolved using `peno://static/<name>` URLs and do not
+    /// Static modules are resolved using `pydeno://static/<name>` URLs and do not
     /// require a custom loader.
     pub fn add_static_module(&self, name: String, source: String) {
         self.inner.borrow_mut().static_modules.insert(name, source);
@@ -77,7 +77,7 @@ impl PythonModuleLoader {
         *self.task_locals.borrow_mut() = None;
     }
 
-    /// Resolve a static module specifier to a peno:// URL.
+    /// Resolve a static module specifier to a pydeno:// URL.
     ///
     /// Returns `None` if the module is not registered as a static module.
     fn resolve_static(&self, specifier: &str) -> Option<String> {
@@ -91,8 +91,8 @@ impl PythonModuleLoader {
             .static_modules
             .contains_key(bare_specifier)
         {
-            // Return a synthetic URL using peno: scheme to make it valid
-            Some(format!("peno://static/{}", bare_specifier))
+            // Return a synthetic URL using pydeno: scheme to make it valid
+            Some(format!("pydeno://static/{}", bare_specifier))
         } else {
             None
         }
@@ -125,8 +125,8 @@ impl ModuleLoader for PythonModuleLoader {
         referrer: &str,
         _kind: deno_core::ResolutionKind,
     ) -> Result<deno_core::url::Url, JsErrorBox> {
-        // Handle peno://runtime/module_name - strip the base and treat as bare specifier
-        let actual_specifier = if let Some(bare) = specifier.strip_prefix("peno://runtime/") {
+        // Handle pydeno://runtime/module_name - strip the base and treat as bare specifier
+        let actual_specifier = if let Some(bare) = specifier.strip_prefix("pydeno://runtime/") {
             bare
         } else {
             specifier
@@ -206,7 +206,7 @@ impl ModuleLoader for PythonModuleLoader {
     /// Load module source code for a resolved URL.
     ///
     /// Loading order:
-    /// 1. Static modules (peno://static/...) - returns immediately from registry
+    /// 1. Static modules (pydeno://static/...) - returns immediately from registry
     /// 2. Custom Python loader (if set) - calls loader with specifier
     ///    - Supports both sync and async loaders
     ///    - Async loaders require task_locals to be set
@@ -224,9 +224,9 @@ impl ModuleLoader for PythonModuleLoader {
         let module_type = Self::module_type_from_request(&options.requested_module_type);
         let inner = self.inner.borrow();
 
-        // Handle static modules (peno://static/module_name)
-        if specifier.starts_with("peno://static/") {
-            let name = specifier.strip_prefix("peno://static/").unwrap();
+        // Handle static modules (pydeno://static/module_name)
+        if specifier.starts_with("pydeno://static/") {
+            let name = specifier.strip_prefix("pydeno://static/").unwrap();
             if let Some(source) = inner.static_modules.get(name) {
                 let module = ModuleSource::new(
                     module_type.clone(),

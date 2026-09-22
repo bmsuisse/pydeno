@@ -1,6 +1,6 @@
 //! Rust-level Criterion benches for the core runtime, bypassing the Python API.
 //! Run with: cargo bench --features bench
-use _peno::{PythonOpMode, RuntimeConfig, RuntimeHandle};
+use _pydeno::{PythonOpMode, RuntimeConfig, RuntimeHandle};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pyo3::prelude::*;
 use std::hint::black_box;

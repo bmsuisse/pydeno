@@ -3,7 +3,7 @@ use crate::runtime::inspector::InspectorMetadata;
 use crate::runtime::stats::{RuntimeCallKind, RuntimeStatsSnapshot};
 use pyo3::prelude::*;
 
-#[pyclass(module = "_peno")]
+#[pyclass(module = "_pydeno")]
 pub struct RuntimeStats {
     #[pyo3(get)]
     heap_total_bytes: u64,
@@ -106,7 +106,7 @@ impl RuntimeStats {
     }
 }
 
-#[pyclass(module = "peno")]
+#[pyclass(module = "pydeno")]
 #[derive(Clone)]
 pub struct InspectorEndpoints {
     #[pyo3(get)]

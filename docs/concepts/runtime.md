@@ -2,7 +2,7 @@
 
 ## What is a Runtime?
 
-A [`Runtime`][peno.Runtime] is an isolated JavaScript execution environment. Think of it as a sandboxed JavaScript VM running inside your Python application.
+A [`Runtime`][pydeno.Runtime] is an isolated JavaScript execution environment. Think of it as a sandboxed JavaScript VM running inside your Python application.
 
 Use a runtime when you need persistent JavaScript state, custom execution configuration, or safe parallel execution from Python.
 
@@ -11,7 +11,7 @@ Use a runtime when you need persistent JavaScript state, custom execution config
 - **Parallel execution** - Multiple runtimes can run simultaneously
 - **Safety** - JavaScript code runs in a controlled environment
 
-When you create a [`Runtime`][peno.Runtime], `peno` starts a dedicated thread with its own JavaScript environment (V8 isolate). All runtimes share a single V8 platform that's initialized once per Python process.
+When you create a [`Runtime`][pydeno.Runtime], `pydeno` starts a dedicated thread with its own JavaScript environment (V8 isolate). All runtimes share a single V8 platform that's initialized once per Python process.
 
 ```mermaid
 graph TB
@@ -45,7 +45,7 @@ Each runtime has its own isolated JavaScript environment and cannot access varia
 ### Basic Usage
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 # Create a runtime
 runtime = Runtime()
@@ -75,10 +75,10 @@ with Runtime() as runtime:
 
 ### Custom Configuration
 
-You can customize runtime behavior via [`RuntimeConfig`][peno.RuntimeConfig]:
+You can customize runtime behavior via [`RuntimeConfig`][pydeno.RuntimeConfig]:
 
 ```python
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 config = RuntimeConfig(
     max_heap_size=10 * 1024 * 1024,  # Limit heap to 10MB
@@ -119,7 +119,7 @@ with Runtime() as runtime:
 Use `eval_async()` to work with JavaScript async primitives:
 
 !!! note
-    [`eval_async()`][peno.Runtime.eval_async] is **recommended**, as it avoids blocking the Python event loop. Use `eval()` only for simple synchronous code.
+    [`eval_async()`][pydeno.Runtime.eval_async] is **recommended**, as it avoids blocking the Python event loop. Use `eval()` only for simple synchronous code.
 
 ```python
 import asyncio
@@ -161,32 +161,32 @@ with Runtime() as runtime:
 
 Common use cases include building stateful applications, caching computed values, managing session data, and running scripts incrementally.
 
-## Runtime vs peno Module
+## Runtime vs pydeno Module
 
-[`peno`][peno] provides two ways to run JavaScript:
+[`pydeno`][pydeno] provides two ways to run JavaScript:
 
-### Quick and Simple: `peno.eval()`
+### Quick and Simple: `pydeno.eval()`
 
 For simple JavaScript execution or scripting:
 
 ```python
-import peno
+import pydeno
 
 # Just run JavaScript and get the result
-result = peno.eval("Math.random()")
+result = pydeno.eval("Math.random()")
 print(result)
 
 # No setup or cleanup needed
 ```
 
-Under the hood, `peno` manages the [`Runtime`][peno.Runtime] for you.
+Under the hood, `pydeno` manages the [`Runtime`][pydeno.Runtime] for you.
 
 ### Full Control: `Runtime` class
 
 For more control and advanced features:
 
 ```python
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 config = RuntimeConfig(max_heap_size=50_000_000)
 with Runtime(config) as runtime:
@@ -199,13 +199,13 @@ Use this when you need custom configuration (like memory limits or timeouts), mo
 ## Thread Safety and Limitations
 
 !!! warning "Runtime instance is not thread-safe"
-    A [`Runtime`][peno.Runtime] instance cannot be safely passed between threads or used from multiple threads simultaneously. Each runtime is bound to the thread where it was created.
+    A [`Runtime`][pydeno.Runtime] instance cannot be safely passed between threads or used from multiple threads simultaneously. Each runtime is bound to the thread where it was created.
 
 ### What Won't Work
 
 ```python
 import threading
-from peno import Runtime
+from pydeno import Runtime
 
 runtime = Runtime()
 
@@ -251,7 +251,7 @@ For async applications, use context-local runtimes or create them per-request:
 
 ```python
 import asyncio
-from peno import Runtime
+from pydeno import Runtime
 
 async def handle_request():
     # Create a new runtime for each request/task
@@ -264,13 +264,13 @@ async def handle_request():
 
 - Prefer `with Runtime()` context manager to ensure memory is released.
 - Create one runtime instance per session/task rather than sharing a single global runtime.
-- Use [`eval_async()`][peno.Runtime.eval_async] to avoid blocking the Python event loop.
-- For performance, avoid repeatedly reloading large scripts — load them once via [`RuntimeConfig`][peno.RuntimeConfig].
-- Never pass [`Runtime`][peno.Runtime] instance across thread boundaries - create a new instance in each thread instead.
+- Use [`eval_async()`][pydeno.Runtime.eval_async] to avoid blocking the Python event loop.
+- For performance, avoid repeatedly reloading large scripts — load them once via [`RuntimeConfig`][pydeno.RuntimeConfig].
+- Never pass [`Runtime`][pydeno.Runtime] instance across thread boundaries - create a new instance in each thread instead.
 
 ## JavaScript Environment
 
-`peno` provides a **bare V8 runtime** with core JavaScript (ECMAScript) support. It does **not** include Node.js APIs or Web Platform APIs.
+`pydeno` provides a **bare V8 runtime** with core JavaScript (ECMAScript) support. It does **not** include Node.js APIs or Web Platform APIs.
 
 ### What's Available
 

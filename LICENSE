@@ -3,7 +3,7 @@ MIT License
 Copyright (c) 2025 Xin Fu
 Copyright (c) 2026 Building Material Suisse
 
-This software ("peno") is derived from imfing/jsrun
+This software ("pydeno") is derived from imfing/jsrun
 (https://github.com/imfing/jsrun), which is distributed under the MIT License.
 The original copyright notice above is retained as required by that license.
 See docs/contributing/upstream-divergence.md for the upstream base commit and

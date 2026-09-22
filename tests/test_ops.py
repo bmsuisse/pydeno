@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timezone
 
 import pytest
-from peno import JsUndefined, Runtime, undefined
+from pydeno import JsUndefined, Runtime, undefined
 
 
 class TestOpRegistration:

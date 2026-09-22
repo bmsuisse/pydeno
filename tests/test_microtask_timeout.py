@@ -23,7 +23,7 @@ import time
 
 import pytest
 
-from peno import Runtime, RuntimeConfig
+from pydeno import Runtime, RuntimeConfig
 
 # `f` re-queues itself as a microtask forever. The outer script itself
 # returns immediately (`execute_script` only runs top-level code), so this

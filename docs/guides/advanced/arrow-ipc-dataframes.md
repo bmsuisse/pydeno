@@ -1,7 +1,7 @@
 # Moving large tabular datasets in with Arrow IPC
 
 The ordinary way to hand data to sandboxed JS is to pass a Python object and
-let `peno` convert it -- a list of dicts becomes an array of objects,
+let `pydeno` convert it -- a list of dicts becomes an array of objects,
 and that is the right answer most of the time. It stops being the right
 answer once the table gets big: the conversion is per-value, it materializes
 every row as a JS object, and it runs into a hard size limit.
@@ -13,7 +13,7 @@ byte stream, pass those bytes straight through, and let a vendored
 isolate. Arrow IPC is self-describing -- the schema travels in the stream --
 so there is no schema negotiation to write on either side.
 
-**`peno` needs no new code for this.** The `PyBytes` arm of
+**`pydeno` needs no new code for this.** The `PyBytes` arm of
 `src/runtime/conversion.rs` already maps Python `bytes` to `JSValue::Bytes`,
 which surfaces in JS as a `Uint8Array`. There is no Rust dependency to add,
 no optional extra to install, and nothing to enable -- the numbers below
@@ -105,7 +105,7 @@ list of dicts, `pa.Table.from_pylist` adds a real cost -- about 21 ms for
 ### 4. Pass the bytes and read them JS-side
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 with Runtime() as runtime:
     runtime.eval(TEXT_CODEC_POLYFILLS)
@@ -158,7 +158,7 @@ end to end against 253 ms.
 
 !!! note "These numbers are machine-dependent"
     Measured on macOS 15 / Apple Silicon, CPython 3.14, a `--release` build
-    of `peno` 0.3.0, `pyarrow` 25.0.1 and `apache-arrow` 21.2.0.
+    of `pydeno` 0.3.0, `pyarrow` 25.0.1 and `apache-arrow` 21.2.0.
     Treat them as one data point about the *shape* of the curve -- roughly
     flat for Arrow, roughly linear for JSON -- not as universal figures.
     Re-run `examples/arrow_ipc_dataframes.py` to get your own; it prints
@@ -173,11 +173,11 @@ rows also required raising the serialization limit by hand.
 ## `pyarrow` is a *your-side* dependency
 
 `pyarrow` appears in this recipe only to build the IPC buffer, on the
-Python side, in your own code. It is **not** a `peno` dependency and
-`peno` never imports it. The library's side of this pattern is the
+Python side, in your own code. It is **not** a `pydeno` dependency and
+`pydeno` never imports it. The library's side of this pattern is the
 `bytes` -> `Uint8Array` conversion it already does.
 
-There is no `peno[arrow]` extra, and none is planned. Anything that can
+There is no `pydeno[arrow]` extra, and none is planned. Anything that can
 produce Arrow IPC bytes works just as well -- Polars, DuckDB's
 `.arrow()`/`fetch_record_batch()`, a Parquet reader, or a byte stream that
 arrived over the network already in IPC format. If you already hold IPC

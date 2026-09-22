@@ -8,7 +8,7 @@ Create or activate a virtual environment inside your project and install the pac
 python -m venv .venv
 source .venv/bin/activate
 
-pip install peno  # or `uv install peno`
+pip install pydeno  # or `uv install pydeno`
 ```
 
 !!! warning "Platform Support"
@@ -18,31 +18,31 @@ pip install peno  # or `uv install peno`
 
 ## Run JavaScript from Python
 
-Use [`peno.eval`][peno.eval] to evaluate JavaScript code directly:
+Use [`pydeno.eval`][pydeno.eval] to evaluate JavaScript code directly:
 
 ```python
->>> import peno
+>>> import pydeno
 >>>
->>> print(peno.eval("2 + 2"))
+>>> print(pydeno.eval("2 + 2"))
 4
->>> print(peno.eval("Math.sqrt(25)"))
+>>> print(pydeno.eval("Math.sqrt(25)"))
 5
 ```
 
-`peno.eval()` runs synchronously and returns the result immediately.
+`pydeno.eval()` runs synchronously and returns the result immediately.
 
 ## Share functions and data
 
 Bind Python callables or objects so they are visible from JavaScript:
 
 ```python
-import peno
+import pydeno
 
-peno.bind_function("notify", lambda msg: print("JS:", msg))
-peno.eval("notify('hello from JS')")
+pydeno.bind_function("notify", lambda msg: print("JS:", msg))
+pydeno.eval("notify('hello from JS')")
 
-peno.bind_object("config", {"debug": True})
-peno.eval("config.debug")
+pydeno.bind_object("config", {"debug": True})
+pydeno.eval("config.debug")
 ```
 
 Once bound, they will remain available to all subsequent evaluations.
@@ -57,10 +57,10 @@ import asyncio
 
 async def main():
     # JavaScript expression
-    result = await peno.eval_async("42")
+    result = await pydeno.eval_async("42")
 
     # Code that returns a Promise is also supported
-    result = await peno.eval_async("Promise.resolve('done')")
+    result = await pydeno.eval_async("Promise.resolve('done')")
     print(result)
 
 asyncio.run(main())
@@ -68,11 +68,11 @@ asyncio.run(main())
 
 ## Keep types familiar
 
-`peno` automatically converts common data types between Python and JavaScript, so you can work with familiar types on both sides. Numbers, strings, booleans, lists, dictionaries, and more are converted seamlessly.
+`pydeno` automatically converts common data types between Python and JavaScript, so you can work with familiar types on both sides. Numbers, strings, booleans, lists, dictionaries, and more are converted seamlessly.
 
 ```python
 # Python → JavaScript → Python
-result = peno.eval("[1, 2, 3].map(x => x * 2)")
+result = pydeno.eval("[1, 2, 3].map(x => x * 2)")
 print(result)  # [2, 4, 6]
 ```
 
@@ -80,16 +80,16 @@ For complete details on type conversion, including special types like `undefined
 
 ## Working with Runtime directly
 
-!!! note "peno vs. Runtime"
+!!! note "pydeno vs. Runtime"
 
-    The [`peno`][peno] module provides a convenient interface that automatically manages a context-local [`Runtime`][peno.Runtime] for you.
+    The [`pydeno`][pydeno] module provides a convenient interface that automatically manages a context-local [`Runtime`][pydeno.Runtime] for you.
     Each asyncio task or thread gets its own isolated runtime instance, created lazily and cleaned up automatically.
     This makes it perfect for everyday use where you just want to run JavaScript without managing runtime lifecycle.
 
-For more control, you can work with the [`Runtime`][peno.Runtime] class directly:
+For more control, you can work with the [`Runtime`][pydeno.Runtime] class directly:
 
 ```python
-from peno import Runtime
+from pydeno import Runtime
 
 runtime = Runtime()  # Create a runtime instance
 
@@ -107,10 +107,10 @@ with Runtime() as runtime:
     print(runtime.eval("42"))
 ```
 
-Each [`Runtime`][peno.Runtime] runs on a dedicated thread with its own V8 isolate, where state persists across evaluations.
+Each [`Runtime`][pydeno.Runtime] runs on a dedicated thread with its own V8 isolate, where state persists across evaluations.
 
 ## Next steps
 
-- Learn more about [`Runtime`][peno.Runtime] in [Concepts](concepts/runtime.md)
+- Learn more about [`Runtime`][pydeno.Runtime] in [Concepts](concepts/runtime.md)
 
 [promise]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise

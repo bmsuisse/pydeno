@@ -13,7 +13,7 @@ Key controls:
 """
 
 import asyncio
-from peno import JavaScriptError, Runtime, RuntimeConfig
+from pydeno import JavaScriptError, Runtime, RuntimeConfig
 
 
 def memory_limits():

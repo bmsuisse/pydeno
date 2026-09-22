@@ -6,7 +6,7 @@ import inspect
 import weakref
 
 import pytest
-from peno import JavaScriptError, Runtime
+from pydeno import JavaScriptError, Runtime
 
 
 def test_basic_function_call_sync():
