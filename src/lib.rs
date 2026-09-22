@@ -4,7 +4,6 @@ mod runtime;
 
 // Re-exported so benches/ (an external crate target) can drive the runtime directly.
 pub use runtime::ops::PythonOpMode;
-pub use runtime::pool::IsolatePool;
 pub use runtime::{RuntimeConfig, RuntimeHandle};
 
 /// Python peno module
@@ -24,8 +23,6 @@ fn _peno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<runtime::python::PyStreamSource>()?;
     m.add_class::<runtime::python::PyStreamFinalizer>()?;
     m.add_class::<runtime::python::SnapshotBuilderPy>()?;
-    m.add_class::<runtime::python::IsolatePoolPy>()?;
-    m.add_class::<runtime::python::PooledIsolatePy>()?;
     m.add_class::<runtime::RuntimeConfig>()?;
     m.add_class::<runtime::config::InspectorConfig>()?;
     let js_error_type = m.py().get_type::<runtime::python::JavaScriptError>();

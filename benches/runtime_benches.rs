@@ -1,6 +1,6 @@
 //! Rust-level Criterion benches for the core runtime, bypassing the Python API.
 //! Run with: cargo bench --features bench
-use _peno::{IsolatePool, PythonOpMode, RuntimeConfig, RuntimeHandle};
+use _peno::{PythonOpMode, RuntimeConfig, RuntimeHandle};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pyo3::prelude::*;
 use std::hint::black_box;
@@ -80,29 +80,11 @@ fn bench_termination_handle(c: &mut Criterion) {
     group.finish();
 }
 
-// Pooled isolate reuse: checkout (reuses a warm isolate, fresh context) + eval
-// + release, compared directly against `isolate_creation_and_close` above
-// (brand-new isolate + thread spawned and torn down every time).
-fn bench_pooled_isolate_checkout(c: &mut Criterion) {
-    let pool = IsolatePool::new(4);
-    {
-        let warm = pool.checkout();
-        warm.eval("1").unwrap(); // warm up before timing
-    }
-    c.bench_function("pooled_isolate_checkout_eval_release", |b| {
-        b.iter(|| {
-            let isolate = pool.checkout();
-            black_box(isolate.eval("1 + 41").unwrap())
-        });
-    });
-}
-
 criterion_group!(
     benches,
     bench_isolate_creation,
     bench_eval_throughput,
     bench_op_dispatch,
-    bench_termination_handle,
-    bench_pooled_isolate_checkout
+    bench_termination_handle
 );
 criterion_main!(benches);

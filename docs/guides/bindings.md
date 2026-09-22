@@ -472,27 +472,11 @@ never raises it for an unknown tool *name*, because a name this bridge does
 not expose is not a property on the namespace object at all, so guest JS gets
 V8's own `TypeError: tools.nope is not a function`.
 
-### `ToolBridge` requires `Runtime`, not `IsolatePool`
+### `ToolBridge` requires `Runtime`
 
-`ToolBridge.attach()` takes a [`Runtime`][peno.Runtime]. Passing a
-`PooledIsolate` raises `TypeError` immediately.
-
-**This is a permanent constraint, not a missing feature.** `IsolatePool`'s
-speed comes from driving a bare `v8::Isolate` directly, with no
-`deno_core::JsRuntime` behind it — which is also why it has no op registry to
-bind a Python callable into. Letting one `JsRuntime` serve several contexts
-(what "pooled tools" would require) needs `deno_core`'s `JsRealm` type, which
-is `pub(crate)` and unreachable from outside that crate without vendoring or
-forking it.
-
-So the split is:
-
-- **`Runtime`** — tools, modules, streams, `console` capture, async. Costs
-  ~3 ms to start.
-- **`IsolatePool`** — fast, self-contained synchronous `eval` only, ~170 µs
-  per checkout.
-
-Choose per call site. A sandbox that needs tools needs a `Runtime`.
+`ToolBridge.attach()` takes a [`Runtime`][peno.Runtime] and raises
+`TypeError` immediately for anything else, because binding a Python callable
+needs a real op registry (`deno_core::JsRuntime`) to attach to.
 
 ## Tips and Best Practices
 

@@ -172,27 +172,6 @@ def test_a_zero_column_syntax_error_does_not_kill_the_runtime_thread() -> None:
     assert "survived" in completed.stdout
 
 
-def test_deeply_nested_literals_never_kill_a_pooled_isolate() -> None:
-    """`IsolatePool` workers are a second thread family that runs V8 and the
-    serializer, and they had the same missing `.stack_size()`."""
-    completed = _run_child(f"""
-        from peno import IsolatePool
-
-        pool = IsolatePool(size=2)
-        for _ in range(3):
-            isolate = pool.checkout()
-            try:
-                isolate.eval("[" * {2 * MAX_JS_DEPTH} + "]" * {2 * MAX_JS_DEPTH})
-            except Exception as exc:  # noqa: BLE001
-                print(f"refused: {{type(exc).__name__}}")
-            finally:
-                isolate.release()
-        print("survived")
-    """)
-    _assert_child_survived(completed)
-    assert "survived" in completed.stdout
-
-
 def test_a_deep_python_argument_from_a_small_thread_does_not_kill_the_host() -> None:
     """The one recursion `RUNTIME_THREAD_STACK_SIZE` cannot cover.
 

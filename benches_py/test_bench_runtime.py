@@ -85,22 +85,3 @@ def test_watchdog_termination_overhead(benchmark):
 def test_normal_completing_eval_baseline(benchmark, warm_runtime):
     """Baseline for comparison against the termination path: an eval that just finishes."""
     benchmark(lambda: warm_runtime.eval("1 + 41"))
-
-
-# IsolatePool: checkout (reuses a warm isolate, fresh context) + eval + release,
-# compared directly against test_cold_start (brand-new Runtime + eval + close).
-@pytest.fixture
-def warm_pool():
-    pool = peno.IsolatePool(size=4)
-    with pool.checkout() as isolate:
-        isolate.eval("1")  # warm up before timing
-    yield pool
-    pool.close()
-
-
-def test_pooled_checkout_eval_release(benchmark, warm_pool):
-    def pooled_eval():
-        with warm_pool.checkout() as isolate:
-            return isolate.eval("1 + 41")
-
-    assert benchmark(pooled_eval) == 42

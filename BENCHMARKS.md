@@ -24,16 +24,6 @@ decision on different hardware.
 | `host_callback_op_dispatch` (real Python callable via `register_op`) | 13.14 µs |
 | `termination_handle/is_terminated_check` | 0.92 ns |
 | `termination_handle/terminate_round_trip` (idle runtime) | 87.16 µs |
-| `pooled_isolate_checkout_eval_release` (`IsolatePool`, size 4) | 167.20 µs |
-
-`pooled_isolate_checkout_eval_release` re-measures the exact same unit of
-work as `isolate_creation_and_close` above (get a ready-to-use isolate, run
-one eval, give it back) but through `IsolatePool::checkout()` instead of
-`RuntimeHandle::spawn()`/`close()` -- i.e. it's the direct before/after
-comparison for the pooling work in this release. **3.01 ms &rarr; 167.2 µs,
-~18x.** The gap is the OS thread spawn/join and V8 `Isolate` construction
-that pooling amortizes away; both benches still pay for a fresh `v8::Context`
-per call, since that's the whole point (see "Isolate reuse" below).
 
 `is_terminated()` is a single atomic load -- effectively free to poll. The
 206x-larger `terminate_round_trip` number is the cost of the full path:
@@ -50,36 +40,11 @@ and waiting for the runtime thread to acknowledge shutdown.
 | `test_host_callback_round_trip` (`bind_function` + call from JS) | 13.98 µs |
 | `test_normal_completing_eval_baseline` | 3.77 µs |
 | `test_watchdog_termination_overhead` | 59.62 ms |
-| `test_pooled_checkout_eval_release` (`IsolatePool(size=4)`, checkout+eval+release) | 184.67 µs |
 
-`test_pooled_checkout_eval_release` is the Python-layer version of the same
-before/after comparison as the Rust benches above: **`test_cold_start`
-2.99 ms &rarr; `test_pooled_checkout_eval_release` 184.7 µs, ~16x**, measured
-in the same run (`pytest benches_py/test_bench_runtime.py::test_cold_start
-benches_py/test_bench_runtime.py::test_pooled_checkout_eval_release
---benchmark-only`). That's the real, user-facing speedup pooling buys: still
-paying full isolate-creation cost is ~16-18x slower than reusing a warm one.
-
-**Read that 16-18x against the right baseline.** It compares pooling to
-*constructing a new `Runtime` per call*, not to *retaining* one. The figure
-that was missing here for a long time, and whose absence invited the wrong
-conclusion, is the cost of a call on a `Runtime` you simply kept:
-
-| Operation | Cost | Hosts ops / tool calls? |
-|---|---|---|
-| Warm `Runtime`, full host tool call (`bind_function` → JS → host → value) | **13.4 µs** | yes |
-| Warm `Runtime`, plain `eval` (`1+41`) | 3.77 µs | yes |
-| `IsolatePool` checkout + eval + release | 167-185 µs | **no** |
-
-So a retained warm `Runtime` is **~12x faster than a pool checkout** and can
-host tool calls, which the pool cannot. `IsolatePool` is the fast path for
-the *stateless, mutually-untrusting, one-eval-each* case, where a fresh
-`Context` per call is the product requirement — it is **not** the fast path
-for tool-calling workloads, where retaining one `Runtime` per session wins on
-both speed and capability. See
-[`docs/tool-calling-at-pool-speed.md`](docs/tool-calling-at-pool-speed.md)
-for the full measurement run and the session-affinity design that follows
-from it (including why a `reset()` is deliberately not offered).
+A retained warm `Runtime` does a full host tool call
+(`bind_function` → JS → host → value) in **13.4 µs**, and a plain `eval`
+(`1+41`) in 3.77 µs — retaining one `Runtime` per session is the fast path
+for tool-calling workloads.
 
 Per-eval cost at the Python layer (~3.5-3.8 µs) matches the Rust-level
 `simple_eval_throughput` number closely -- the Python binding adds negligible
@@ -98,26 +63,6 @@ the runtime thread unwinds and returns control to Python) -- consistent with
 the Rust-level `terminate_round_trip` number once you add Python's own
 call/exception overhead on top.
 
-## Isolate reuse (`IsolatePool`, v0.2.0)
-
-Creating a `v8::Isolate` (~3 ms above) is the expensive part of starting a
-JS runtime; a fresh `v8::Context` inside an already-live isolate is cheap
-and is V8's own isolation boundary for JS-visible global state
-(`globalThis`, prototypes, etc. all live on the `Context`, not the
-`Isolate`). `IsolatePool` keeps a small set of isolates warm across calls
-but always hands out a brand-new, empty `Context` per checkout, so no state
-is JS-visible across two checkouts even when they land on the same
-underlying isolate -- see `src/runtime/pool.rs` for the full reasoning and
-the documented residual risks (isolate-wide compilation cache, microtask
-queue) that were checked and found not to leak data. This is a narrower,
-additive fast path (`eval()` only, JSON-safe values only, no ops/modules/host
-bindings) that sits next to `Runtime`, not a replacement for it.
-
-`tests/test_isolate_pool.py` and the Rust unit tests in `src/runtime/pool.rs`
-both include a dedicated leakage test: check out an isolate, set
-`globalThis.leaked`, release it, check out the *same* isolate again
-(guaranteed via a pool of size 1), and assert `typeof leaked === 'undefined'`.
-
 ## Retained runtimes: idle cost and scaling (v0.2.0)
 
 Until v0.2.0, `RuntimeDispatcher::run` (`src/runtime/runner.rs`) selected
@@ -129,9 +74,9 @@ is queued, and waits on a real waker (plus the active job's exact deadline)
 while async work is in flight.
 
 This matters because retaining one warm `Runtime` per session is the fastest
-thing this library does (see the warm-tool-call figures in
-`docs/tool-calling-at-pool-speed.md`), and the busy-spin was what capped that
-pattern at roughly the core count. Measured on the environment above, with K
+thing this library does (see the warm-tool-call figures above), and the
+busy-spin was what capped that pattern at roughly the core count. Measured
+on the environment above, with K
 retained runtimes each holding a bound host function, idle after one call:
 
 | K retained | idle CPU, v0.1.0 | idle CPU, v0.2.0 | per-call, v0.1.0 | per-call, v0.2.0 |
@@ -265,16 +210,16 @@ thread, so the old behaviour shows up as a readable failure in seconds instead
 of hanging the suite -- and nothing in it is `skipif`-gated, since the absence
 of exactly this test is what let the gap survive two releases.
 
-## Known pre-existing environment flake (not caused by this pooling work)
+## Known pre-existing environment flake (not caused by this release's work)
 
 While re-running these benchmarks, `cargo bench --features bench` and the
 full `pytest benches_py/`/`pytest tests/` runs intermittently abort the whole
 process with a V8-internal panic ("`V8 posted a delayed task, but this
 isolate was created outside of a tokio runtime context`" or a GC-time
 `SIGABRT` under heap-limit/high-concurrency scenarios). This reproduces
-identically on a clean checkout of `main` with none of the `IsolatePool`
-changes present, so it predates this work -- it looks like a `deno_core`
-0.409.0 / `v8` 150.4.0 interaction, not something `IsolatePool` introduces.
+identically on a clean checkout of `main` predating this release's own
+changes, so it predates this work -- it looks like a `deno_core` 0.409.0 /
+`v8` 150.4.0 interaction, not something introduced here.
 Affected pre-existing tests: `TestRuntimeHeapLimits::test_*_eval_triggers_heap_termination`
 and `TestRuntimeTimeout::test_concurrent_sync_operations_different_timeouts`
 in `tests/test_runtime.py`, and the `simple_eval_throughput`/`host_callback_op_dispatch`/

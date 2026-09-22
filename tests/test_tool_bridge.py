@@ -14,7 +14,6 @@ from typing import Any
 import pytest
 
 from peno import (
-    IsolatePool,
     JavaScriptError,
     Runtime,
     ToolBridge,
@@ -391,39 +390,17 @@ class TestFailClosedNames:
             ToolBridge({"a": lambda: 1}, max_calls=bad)  # type: ignore[arg-type]
 
 
-class TestIsolatePoolIsAnApiWall:
-    """ToolBridge needs a full Runtime. This is permanent, not a todo.
-
-    Pooled isolates drive a bare `v8::Isolate` with no
-    `deno_core::JsRuntime`, so there is no op registry to bind a Python
-    callable into. Multiplexing contexts within one JsRuntime would need
-    deno_core's `JsRealm`, which is `pub(crate)`. `attach` must therefore
-    fail immediately and explain itself, rather than failing confusingly
-    later.
+class TestAttachRequiresARuntime:
+    """ToolBridge needs a full Runtime to bind a Python callable into --
+    there must be a real op registry (`Deno.core.ops` on a
+    `deno_core::JsRuntime`) for the bound function to attach to. `attach`
+    rejects anything else immediately and explains itself.
     """
-
-    def test_attaching_to_a_pooled_isolate_raises_immediately(self) -> None:
-        bridge = ToolBridge({"ping": lambda: 1})
-        pool = IsolatePool(size=1)
-        with pool.checkout() as isolate:
-            with pytest.raises(TypeError) as caught:
-                bridge.attach(isolate)
-
-        message = str(caught.value)
-        assert "PooledIsolate" in message
-        assert "JsRealm" in message, "the message must say why this is permanent"
-        assert "Runtime" in message, "the message must point at the alternative"
 
     def test_attaching_to_an_unrelated_object_raises(self) -> None:
         bridge = ToolBridge({"ping": lambda: 1})
         with pytest.raises(TypeError, match="expects a peno.Runtime"):
             bridge.attach("not a runtime")
-
-    def test_pool_eval_still_works_without_tools(self) -> None:
-        """The wall is only about tools; the pool's own fast path is fine."""
-        pool = IsolatePool(size=1)
-        with pool.checkout() as isolate:
-            assert isolate.eval("1 + 41") == 42
 
 
 class TestTheBridgeIsALoadBearingBoundary:

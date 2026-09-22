@@ -9,8 +9,6 @@ use std::sync::OnceLock;
 mod bridge;
 /// JsRuntime error translation helpers.
 pub(crate) mod error;
-/// `IsolatePool`/`PooledIsolate` PyO3 wrappers.
-pub(crate) mod pool;
 /// Primary runtime bindings exposed to Python (`Runtime`, streams, functions).
 pub(crate) mod runtime;
 /// Snapshot builder PyO3 wrapper and helpers.
@@ -23,7 +21,6 @@ pub(crate) mod utils;
 pub(crate) use error::runtime_error_to_py;
 #[allow(unused_imports)]
 pub(crate) use error::runtime_error_with_context;
-pub use pool::{IsolatePoolPy, PooledIsolatePy};
 pub use runtime::{JsFunction, JsStream, PyStreamSource, Runtime, TerminationHandle};
 pub(crate) use runtime::{JsFunctionFinalizer, JsStreamFinalizer, PyStreamFinalizer};
 pub use snapshot::SnapshotBuilderPy;

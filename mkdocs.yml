@@ -60,8 +60,6 @@ nav:
       - Runtime: api/runtime.md
       - RuntimeConfig: api/config.md
       - Types: api/types.md
-  - Design Notes:
-      - Tool-calling at pool speed: tool-calling-at-pool-speed.md
   - Contributing:
       - Development: contributing/development.md
       - Architecture: contributing/architecture.md

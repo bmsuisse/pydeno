@@ -140,19 +140,9 @@ class ToolBridge:
 
     Use :meth:`detach` to revoke everything this bridge installed.
 
-    **ToolBridge requires a full `Runtime`. It cannot be used with
-    `IsolatePool`, and this is permanent, not a todo.** Pooled isolates
-    drive a bare ``v8::Isolate`` with no ``deno_core::JsRuntime`` behind it
-    (see ``src/runtime/pool.rs``), so there is no op registry to bind a
-    Python callable into -- no ``Deno.core.ops``, nothing for the host-call
-    ops to attach to. Giving one a realm of its own would require
-    ``deno_core``'s ``JsRealm``, which is ``pub(crate)`` and unreachable
-    from outside that crate without vendoring or forking it. So this is an
-    API wall, not a missing feature: :meth:`attach` rejects a
-    ``PooledIsolate`` immediately with a message saying so, rather than
-    letting you discover it three calls later as a confusing "unknown op
-    id". Use ``Runtime`` when a sandbox needs tools; use ``IsolatePool``
-    when it needs only fast, self-contained ``eval``.
+    **ToolBridge requires a full `Runtime`.** Binding a Python callable
+    needs an op registry to attach to -- ``Deno.core.ops`` on a real
+    ``deno_core::JsRuntime`` -- which only :class:`peno.Runtime` provides.
     """
 
     __slots__ = (
@@ -291,13 +281,10 @@ class ToolBridge:
         """Install this bridge's tools into `runtime`.
 
         Args:
-            runtime: A :class:`peno.Runtime`. A ``PooledIsolate`` is
-                rejected -- see the class docstring for why that is
-                permanent.
+            runtime: A :class:`peno.Runtime`.
 
         Raises:
-            TypeError: If `runtime` is not a `Runtime` (in particular, if it
-                is a `PooledIsolate`).
+            TypeError: If `runtime` is not a `Runtime`.
         """
         self._reject_non_runtime(runtime)
 
@@ -330,18 +317,8 @@ class ToolBridge:
 
     @staticmethod
     def _reject_non_runtime(runtime: object) -> None:
-        from ._peno import PooledIsolate, Runtime
+        from ._peno import Runtime
 
-        if isinstance(runtime, PooledIsolate):
-            raise TypeError(
-                "ToolBridge requires a Runtime, not a PooledIsolate. Pooled "
-                "isolates drive a bare v8::Isolate with no deno_core::JsRuntime, "
-                "so they have no op registry to bind Python callables into. This "
-                "is permanent: multiplexing contexts in one JsRuntime needs "
-                "deno_core's JsRealm, which is pub(crate). Use Runtime() for a "
-                "sandbox that needs tools, and IsolatePool only for fast, "
-                "self-contained eval."
-            )
         if not isinstance(runtime, Runtime):
             raise TypeError(
                 f"ToolBridge.attach expects a peno.Runtime, got "

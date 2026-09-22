@@ -27,8 +27,6 @@ __all__ = [
     "RuntimeForceKilled",
     "SUGGESTED_FORCE_KILL_GRACE",
     "SnapshotBuilder",
-    "IsolatePool",
-    "PooledIsolate",
     "undefined",
 ]
 
@@ -1107,86 +1105,3 @@ class SnapshotBuilder:
         """
         Finalize the snapshot and return its serialized bytes.
         """
-        ...
-
-class PooledIsolate:
-    """
-    One isolate checked out from an [`IsolatePool`][peno.IsolatePool].
-
-    Every checkout starts in a brand-new, empty JS `Context` -- no
-    JS-visible global state (``globalThis``, etc.) survives from a previous
-    checkout of the same isolate. Only plain synchronous evaluation of
-    JSON-safe values is supported here (no ops, modules, or host bindings);
-    reach for [`Runtime`][peno.Runtime] for those.
-
-    Use as a context manager, or call `release()` explicitly. If neither is
-    done, the isolate is returned to the pool automatically once this object
-    is garbage collected.
-    """
-
-    def eval(self, code: str) -> Any:
-        """
-        Evaluate `code` in a fresh context on this pooled isolate.
-
-        Only JSON-safe return values are supported: numbers, strings,
-        booleans, ``None``/``null``, arrays, and plain objects.
-        """
-        ...
-
-    def release(self) -> None:
-        """Return this isolate to the pool for reuse. Idempotent."""
-        ...
-
-    def __enter__(self) -> Self: ...
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: types.TracebackType | None,
-    ) -> bool: ...
-
-class IsolatePool:
-    """
-    A small pool of pre-warmed V8 isolates for fast, context-isolated `eval`.
-
-    Creating a V8 isolate is the expensive part of starting a JS runtime
-    (see `BENCHMARKS.md`); a fresh `Context` inside an already-live isolate
-    is cheap and is V8's own isolation boundary for JS-visible global state.
-    This pool keeps isolates warm across [`checkout()`][peno.IsolatePool.checkout]
-    calls but always hands out a brand-new context, so no state leaks
-    between logically separate callers even when they reuse the same
-    isolate.
-
-    Example:
-        >>> pool = IsolatePool(size=4)
-        >>> with pool.checkout() as isolate:
-        ...     isolate.eval("1 + 41")
-        42
-
-    If the pool is exhausted, `checkout()` spins up a brand-new isolate on
-    demand instead of blocking -- throughput degrades gracefully rather than
-    stalling callers.
-    """
-
-    def __init__(self, size: int = 4) -> None:
-        """
-        Create a pool of `size` pre-warmed isolates.
-
-        Args:
-            size: Number of isolates to pre-warm and the maximum number kept
-                idle for reuse. Extra isolates created while the pool is
-                exhausted are torn down instead of queued once returned.
-        """
-        ...
-
-    def checkout(self) -> PooledIsolate:
-        """Check out a warm isolate (or spin up a fresh one; never blocks)."""
-        ...
-
-    def idle_count(self) -> int:
-        """Number of pre-warmed isolates currently idle in the pool."""
-        ...
-
-    def close(self) -> None:
-        """Shut down every currently-idle pooled isolate."""
-        ...

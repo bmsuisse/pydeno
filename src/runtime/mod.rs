@@ -12,7 +12,6 @@ pub mod inspector;
 pub mod js_value;
 pub mod loader;
 pub mod ops;
-pub mod pool;
 pub mod python;
 pub mod runner;
 pub mod snapshot;

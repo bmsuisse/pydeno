@@ -28,15 +28,8 @@ Run untrusted, LLM-generated JavaScript safely in Python — real V8, real isola
 host tool call — JS calls a bound Python function, the op crosses the
 boundary, a value comes back — in **~13.4&nbsp;µs**, and ~3.8&nbsp;µs for a
 bare `eval`. That is the fast path, and it is the one that supports tool
-calling.
-
-`IsolatePool` is **~167-185&nbsp;µs** per checkout+eval and **cannot host a
-tool call at all**; what it buys is a *guaranteed-fresh context per call*,
-which is ~16x cheaper than constructing a new `Runtime` (~3&nbsp;ms) for the
-stateless, mutually-untrusting, one-eval-each case. Pick it for that property,
-not for speed. Measured with Criterion and pytest-benchmark — proven, not
-claimed: see [`BENCHMARKS.md`](BENCHMARKS.md) and
-[`docs/tool-calling-at-pool-speed.md`](docs/tool-calling-at-pool-speed.md).
+calling. Measured with Criterion and pytest-benchmark — proven, not claimed:
+see [`BENCHMARKS.md`](BENCHMARKS.md).
 
 </div>
 
@@ -85,19 +78,6 @@ print(peno.eval("add(2, 3)"))  # 5
   at ~0.12 ms and a killed runtime keeps its bound functions. See
   [`BENCHMARKS.md`](BENCHMARKS.md) and
   [`tests/test_parked_termination.py`](tests/test_parked_termination.py).
-- **Context-isolated pooling, so speed doesn't cost you isolation.** A cold
-  V8 isolate costs ~3 ms to create; `IsolatePool` keeps a small set of them
-  warm and hands out a brand-new, empty V8 `Context` on every checkout — the
-  isolate is reused, but no JS-visible global state (`globalThis`, etc.)
-  ever survives from one caller to the next, even when they land on the same
-  underlying isolate. Measured: **~3 ms cold-start &rarr; ~170-185 µs pooled,
-  ~16-18x**, with a dedicated test proving a `globalThis` value set in one
-  checkout is gone (`typeof x === 'undefined'`) in the next. That 16-18x is
-  against *constructing* a runtime per call, not against retaining one — a
-  warm `Runtime` is ~14x cheaper still and can host tool calls, so the pool is
-  for the fresh-context requirement rather than for throughput. See
-  [`BENCHMARKS.md`](BENCHMARKS.md) and `src/runtime/pool.rs` for the numbers
-  and the reasoning.
 - **A host-callback bridge for tool-calling from JS.** `bind_function`/
   `bind_object` let the sandboxed JS call back into Python — the primitive
   an agent needs when the model's JS wants to invoke a real tool, not just
@@ -185,35 +165,7 @@ with Runtime() as runtime:
 ```
 
 The call that exceeds `max_calls` never reaches your Python function — JS
-gets a catchable `ToolBudgetError`. Note `ToolBridge` needs a full `Runtime`:
-pooled isolates have no op registry to bind tools into, which is a permanent
-architectural boundary, not a todo — see the
-[bindings guide](https://bmsuisse.github.io/peno/guides/bindings/) for
-why.
-
-### A fresh context per call, when that is the requirement
-
-`IsolatePool` hands out an isolate whose globals start empty every time, at
-~195 µs per checkout instead of the ~3 ms a new `Runtime` costs. The isolation
-is verified, not asserted: set `globalThis.__leak` in one checkout and it is
-`undefined` in the next (`tests/test_isolate_pool.py`).
-
-```python
-from peno import IsolatePool
-
-pool = IsolatePool(size=4)
-with pool.checkout() as isolate:
-    print(isolate.eval("1 + 41"))  # 42
-```
-
-**This is not the fast path, and it is not a general-purpose alternative to
-`Runtime`.** A `PooledIsolate` exposes `eval` and `release` and nothing else —
-no `bind_function`, no `register_op`, no `eval_async`, no modules, no
-`ToolBridge` — because a pooled isolate has no op registry behind it. And a
-retained `Runtime` does a *full host tool call* in ~13.4 µs, roughly **14x
-faster** than a bare `eval` on a pooled isolate. So reach for the pool when
-"this snippet must not see the last one's globals" is a hard requirement and
-ops are not needed; otherwise keep a `Runtime` warm.
+gets a catchable `ToolBudgetError`.
 
 ## Integrations
 

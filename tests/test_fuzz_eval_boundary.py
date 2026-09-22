@@ -519,43 +519,6 @@ class TestAdversarialHostCallArguments:
         assert out == f"caught:{exc_name}"
 
 
-class TestPoolFuzz:
-    """The pooled fast path has its own compiler entry point (a bare
-    `v8::Script::compile`, not deno_core), so it needs its own fuzzing.
-
-    These tests deliberately assert nothing beyond "the process survived":
-    the invariant under test is crash-freedom for arbitrary input, and
-    `_eval_must_not_crash`-style bodies express exactly that. Elsewhere in
-    this file an assertion-free body is a bug (see
-    `test_a_tool_called_with_a_deeply_nested_object`); here it is the point,
-    which is why it is called out rather than left to the reader.
-    """
-
-    @given(code=st.text(max_size=300))
-    @FUZZ
-    def test_pool_eval_never_crashes_on_arbitrary_text(self, code: str) -> None:
-        from peno import IsolatePool
-
-        pool = IsolatePool(size=1)
-        with pool.checkout() as isolate:
-            try:
-                isolate.eval(code)
-            except (JavaScriptError, RuntimeError, ValueError):
-                pass
-
-    @given(depth=st.integers(min_value=1, max_value=1500))
-    @FUZZ
-    def test_pool_eval_survives_deep_nesting(self, depth: int) -> None:
-        from peno import IsolatePool
-
-        pool = IsolatePool(size=1)
-        with pool.checkout() as isolate:
-            try:
-                isolate.eval("[" * depth + "]" * depth)
-            except (JavaScriptError, RuntimeError, ValueError):
-                pass
-
-
 class TestKnownConversionResiduals:
     """Behaviours the fuzz suite surfaced that are documented, not bugs.
 

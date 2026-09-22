@@ -39,7 +39,7 @@ import posixpath
 
 import pytest
 
-from peno import IsolatePool, JavaScriptError, Runtime, RuntimeConfig
+from peno import JavaScriptError, Runtime, RuntimeConfig
 
 
 def _fresh_runtime(**kwargs: object) -> Runtime:
@@ -129,25 +129,6 @@ class TestHeapjack:
         finally:
             rt_a.close()
             rt_b.close()
-
-    def test_pooled_isolate_reuse_does_not_share_globals(self) -> None:
-        """`IsolatePool` deliberately *does* reuse one isolate across logically
-        separate callers, which is the exact shape Heapjack exploited. It is
-        safe only because every checkout gets a brand-new `v8::Context`, so
-        this property is the one that must never regress.
-        """
-        pool = IsolatePool(size=1)  # size 1: the same isolate comes back.
-
-        first = pool.checkout()
-        assert first.eval("globalThis.token = 'sk-secret'; globalThis.token") == (
-            "sk-secret"
-        )
-        first.release()
-
-        second = pool.checkout()
-        assert second.eval("typeof token") == "undefined"
-        assert second.eval("typeof globalThis.token") == "undefined"
-        second.release()
 
     def test_host_callback_secrets_stay_in_python(self) -> None:
         """A closure's captured secret must not be reachable from JS.
