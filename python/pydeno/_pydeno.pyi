@@ -127,10 +127,10 @@ class RuntimeConfig:
                 a promise, say -- the other job can be stopped instead, and
                 reports a bare ``execution terminated`` error rather than a
                 timeout. Use a runtime per concurrent job if you need a
-                termination error to be about the call that raised it. Note
-                also that an *async* job timing out on a still-pending promise
-                leaves the isolate terminated, so that runtime should be
-                discarded rather than reused.
+                termination error to be about the call that raised it. A
+                timeout is otherwise recoverable: the runtime stays usable
+                afterwards, including when an async job times out on a
+                still-pending promise (that promise simply stays pending).
             enable_console: Whether ``console`` output reaches the *process's*
                 stdout/stderr (defaults to False, which stubs ``console`` to
                 no-ops). Independent of ``on_console``.

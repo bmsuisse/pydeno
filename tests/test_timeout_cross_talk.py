@@ -55,27 +55,35 @@ async def test_async_deadline_terminates_an_unrelated_inline_sync_call() -> None
 
 
 @pytest.mark.asyncio
-async def test_runtime_is_unusable_after_an_async_deadline_fires() -> None:
-    """Pinned as found, and *not* a design property -- a defect.
+async def test_runtime_survives_an_async_deadline_on_a_pending_promise() -> None:
+    """The async timeout is recoverable, like the sync one below.
 
-    `PendingJob::expired` calls `terminate_execution()` and nothing ever calls
-    `cancel_terminate_execution()` for it: only the synchronous path does, in
-    `resolve_sync_watchdog`. So an async job that times out on a pending
-    promise leaves the isolate with a termination still latched, and every
-    later call on that runtime fails with a bare `execution terminated` --
-    even one issued long afterwards, with nothing else in flight.
+    This replaces `test_runtime_is_unusable_after_an_async_deadline_fires`,
+    which pinned the opposite as a known defect: `JobCommon::expired` asked V8
+    to terminate and nothing cancelled it, because the only cancel was
+    conditional on the job's *watchdog token* coming back fired -- and this
+    check routinely beats the watchdog thread to the same deadline, so
+    `disarm` returned `false`. The isolate stayed latched and every later
+    call, with nothing in flight, died with `execution terminated`.
 
-    This is pre-existing (confirmed against this branch's `runner.rs` with the
-    0.4.1 changes reverted), out of the scope the 0.4.1 follow-ups were
-    defined by, and it is what makes the cross-talk above so visible in
-    practice. It is pinned here so it is *known*: whoever fixes it should
-    delete this test and assert reuse instead.
+    `respond` now clears the termination it latched, so the runtime is handed
+    back usable -- synchronously and asynchronously, and it still closes.
     """
     with Runtime(RuntimeConfig()) as rt:
         with pytest.raises(RuntimeTimeout):
             await rt.eval_async("new Promise(() => {})", timeout=0.3)
-        with pytest.raises(JavaScriptError, match="execution terminated"):
-            rt.eval("2 + 2")
+
+        assert rt.eval("1 + 1") == 2
+        assert await rt.eval_async("Promise.resolve(41 + 1)") == 42
+
+        # A second timeout must leave it just as usable as the first.
+        with pytest.raises(RuntimeTimeout):
+            await rt.eval_async("new Promise(() => {})", timeout=0.3)
+        assert rt.eval("1 + 1") == 2
+
+    # Leaving the `with` block closed the runtime; if `close()` hung, this
+    # line is never reached.
+    assert rt.is_closed()
 
 
 def test_sync_deadline_leaves_the_runtime_usable() -> None:

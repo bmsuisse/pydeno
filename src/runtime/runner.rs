@@ -187,14 +187,14 @@ struct TerminationState {
 /// bare termination error is not necessarily about the call that raised it.
 /// If that matters, use a runtime per concurrent job.
 ///
-/// Found while pinning the above, pre-existing and *not* fixed here because
-/// it is outside what 0.4.1 was scoped to: `PendingJob::expired` calls
-/// `terminate_execution()` and nothing ever calls
-/// `cancel_terminate_execution()` for it -- only the synchronous path does,
-/// in `resolve_sync_watchdog`. An async job that times out on a pending
-/// promise therefore leaves the isolate latched in termination, and every
-/// later call on that runtime fails. Pinned by
-/// `test_runtime_is_unusable_after_an_async_deadline_fires`.
+/// The cross-talk is the *only* thing left here. It used to be compounded by
+/// a real defect found while pinning it -- `JobCommon::expired` asked V8 to
+/// terminate and nothing cancelled it, so one async timeout on a pending
+/// promise latched the isolate and every later call failed -- which made a
+/// runtime unusable rather than merely confusing. That is fixed: `expired`
+/// records the request and `JobCommon::respond` clears it, the async
+/// counterpart of `resolve_sync_watchdog`. See
+/// `test_runtime_survives_an_async_deadline_on_a_pending_promise`.
 struct ArmedDeadline {
     id: u64,
     deadline: Instant,
@@ -1534,6 +1534,9 @@ struct JobCommon {
     /// Context string for `apply_watchdog_result`, used only when a watchdog
     /// is armed.
     watchdog_context: &'static str,
+    /// Set by `expired` when *it* asked V8 to terminate, so `respond` knows it
+    /// owns that request and has to clear it. See `expired`.
+    terminated_by_deadline: bool,
 }
 
 impl JobCommon {
@@ -1559,6 +1562,7 @@ impl JobCommon {
             kind,
             wording,
             watchdog_context,
+            terminated_by_deadline: false,
         }
     }
 
@@ -1584,12 +1588,23 @@ impl JobCommon {
             kind,
             wording,
             watchdog_context,
+            terminated_by_deadline: false,
         }
     }
 
     /// Returns the error to fail the job with if its deadline has passed,
     /// having first asked V8 to stop executing.
-    fn expired(&self, core: &mut RuntimeCoreState) -> Option<RuntimeError> {
+    ///
+    /// The termination requested here is *this job's*, and it has to be
+    /// cleared again in `respond` -- see `terminated_by_deadline`. It cannot be
+    /// left to `apply_watchdog_result`: that only cancels when the job's own
+    /// watchdog token comes back `fired`, and this check routinely wins the
+    /// race against the watchdog thread (both wake on the same deadline, and
+    /// the dispatcher parks until exactly that instant). When it does, `disarm`
+    /// returns `false`, nothing cancels, and a job that timed out on a pending
+    /// promise leaves the isolate latched -- every later call on the runtime
+    /// then fails with a bare `execution terminated`.
+    fn expired(&mut self, core: &mut RuntimeCoreState) -> Option<RuntimeError> {
         let deadline = self.deadline?;
         if Instant::now() < deadline {
             return None;
@@ -1598,6 +1613,7 @@ impl JobCommon {
         core.termination
             .ensure_reason(format!("{} timed out after {}ms", self.wording.reason, ms));
         core.termination.terminate_execution();
+        self.terminated_by_deadline = true;
         Some(RuntimeError::timeout(format!(
             "{} timed out after {}ms{}",
             self.wording.error, ms, self.wording.error_suffix
@@ -1621,6 +1637,14 @@ impl JobCommon {
     fn respond(mut self, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
         let result =
             core.apply_watchdog_result(result, self.watchdog.take(), self.watchdog_context);
+        // The job is over, so whatever `expired` latched has nothing left to
+        // stop: clear it, or it stops the *next* call instead. This is the
+        // async counterpart of what `resolve_sync_watchdog` does for a sync
+        // timeout, and it is safe for the same reason -- one isolate on one
+        // thread, so no other job can be executing while this runs.
+        if self.terminated_by_deadline {
+            core.cancel_pending_termination();
+        }
         let _ = self.responder.send(result);
     }
 }
@@ -2725,10 +2749,16 @@ impl RuntimeCoreState {
         let duration = watchdog.duration;
         let fired = self.watchdog.disarm(watchdog);
         if fired {
-            let isolate = self.js_runtime.v8_isolate();
-            let _ = isolate.cancel_terminate_execution();
+            self.cancel_pending_termination();
         }
         Ok((fired, duration))
+    }
+
+    /// Clear a termination request that has already done its job, so it cannot
+    /// latch and kill the next, unrelated, call. A no-op when none is pending.
+    fn cancel_pending_termination(&mut self) {
+        let isolate = self.js_runtime.v8_isolate();
+        let _ = isolate.cancel_terminate_execution();
     }
 
     fn apply_watchdog_result<T>(

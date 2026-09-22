@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **An async job that timed out on a pending promise left the runtime
+  permanently unusable.** After `await rt.eval_async("new Promise(() => {})",
+  timeout=0.3)` raised its `RuntimeTimeout`, every later call on that runtime
+  — a plain `rt.eval("1 + 1")` issued long afterwards, with nothing else in
+  flight — failed with a bare `execution terminated`. The runtime did not
+  error and recover; it stopped working while still reporting itself open.
+
+  The job's own deadline check asked V8 to terminate and nothing cancelled
+  that request. The cancel that exists, in `resolve_sync_watchdog`, runs only
+  when the job's watchdog token comes back *fired* — and the in-job check
+  routinely wins the race against the watchdog thread, since both wake on the
+  same deadline and the dispatcher parks until exactly that instant, so
+  `disarm` returned `false` and the isolate stayed latched. `JobCommon::expired`
+  now records the request it made and `JobCommon::respond` clears it, the
+  async counterpart of what the synchronous path already did. Pre-existing:
+  0.4.1 pinned it as found rather than fixing it.
+
+  The timed-out promise itself stays pending, as before — nothing on the
+  Python side awaits it, so nothing hangs.
+  `tests/test_timeout_cross_talk.py` now asserts reuse (sync and async, and
+  across a second timeout) where it used to assert the breakage.
+
 ## 0.4.1
 
 Follow-ups to the 0.4.0 review (`docs/reviews/2026-09-22-0.4.0-review.md`).
