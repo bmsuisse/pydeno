@@ -317,6 +317,70 @@ ratio), `test_idle_cpu.py` (idle budget and latency flatness to K=3x cores),
 `test_parked_termination.py` (15 cases over both kill tiers) and
 `test_tool_bridge.py` (budgets across the op boundary).
 
+## One watchdog thread per runtime, not one per call (0.4.0)
+
+Every timed call -- sync eval, sync function call, sync module eval, and any
+async job with a timeout -- used to spawn *and join* a whole OS thread just
+to arm a single deadline. Measured on this checkout, release build:
+
+| Benchmark | Before (thread per call) | After (persistent watchdog) |
+|---|---|---|
+| `timed_eval_throughput` (Criterion, 5s timeout armed) | ~28.5 us | **9.5 us** |
+| `simple_eval_throughput` (Criterion, no timeout, for comparison) | 6.9-10.4 us | 6.9-10.4 us (unchanged) |
+| `test_timed_eval_baseline` (pytest-benchmark) | not previously benched | **9.1 us** |
+| `test_normal_completing_eval_baseline` (pytest-benchmark, for comparison) | 7.4 us | 7.4 us (unchanged) |
+
+A timed eval now lands within noise of an untimed one, rather than ~3-6x it,
+matching the "timed eval ~= untimed eval" target. `Watchdog::arm`/`disarm`
+(one long-lived `peno-watchdog` thread per runtime, parked on a condvar over
+a small set of armed deadlines) replace the old spawn-and-join
+`SyncWatchdog`. See `bench_timed_eval_throughput` (Criterion) and
+`test_timed_eval_baseline` (pytest-benchmark) for the standing regression
+checks.
+
+`RuntimeDispatcher::run` also now arms this same watchdog around each
+`poll_event_loop` call whenever no job currently holds a deadline (S3b): a
+fire-and-forget host call whose continuation starts a self-requeuing
+microtask loop after the job that started it has already completed used to
+ignore `execution_timeout` entirely, hanging the runtime. See
+`tests/test_dispatcher_step_timeout.py`.
+
+## P2 (code cache) and P3 (measured optimization) -- release notes
+
+**P2 -- not implemented; blocked by the public API surface.** The plan called
+for `execute_script_with_cache`, keyed by source hash, for sources over
+64 KiB. That method exists only on `deno_core::JsRealm`
+(`runtime/jsrealm.rs`), and the only way to obtain a `JsRealm` handle from a
+`JsRuntime` is `JsRuntime::main_realm()`, which is `pub(crate)` inside
+`deno_core` -- not reachable from an external crate. Implementing this would
+mean hand-rolling V8 script compilation and caching directly against the
+`v8` crate (bypassing `execute_script` entirely, including its source-map
+and error-reporting behavior), which is a materially larger and riskier
+change than the plan's "use `execute_script_with_cache`" framing describes.
+Skipped rather than attempted as a from-scratch reimplementation; a real fix
+needs either a `deno_core` upstream change exposing this, or a deliberate
+follow-up scoped as its own review item.
+
+**P3 -- measured, and the named candidate does not clear the 20% bar.**
+`samply` and Linux `perf` are unavailable in this environment (macOS,
+sandboxed, no `dtrace`/Instruments access), so this used direct timing
+instead of a real profiler. Isolating the fixed per-object overhead
+(`hostFn({})` vs `hostFn([])`, i.e. an empty object vs an empty array, so
+neither pays for iterating properties/elements) gives a delta of ~1.85-2.0
+us against a ~12.5 us baseline -- real, but well under 20%. Swapping the
+named candidate, `is_readable_stream`'s `v8::Value::instance_of` call, for a
+prototype-chain identity walk (avoiding `[[HasInstance]]`'s
+`Symbol.hasInstance` lookup) was implemented and A/B measured directly
+(same build, same benchmark, only that one function changed): the
+object-vs-array delta was 1.851 us before and 2.006 us after -- no
+measurable improvement, within noise. `instance_of` is not the dominant cost
+of that fixed overhead (likely `get_own_property_names` and the `IndexMap`
+allocation, paid even for zero keys); per the plan's own instruction to act
+only on something confirmed and significant, this change was reverted rather
+than landed. The other named candidate (the JS `prepare()` deep map) was not
+separately investigated given the first candidate already failed the bar and
+no profiler was available to attribute cost with confidence.
+
 ## Reproducing
 
 ```bash
