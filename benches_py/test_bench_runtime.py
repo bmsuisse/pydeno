@@ -85,3 +85,25 @@ def test_watchdog_termination_overhead(benchmark):
 def test_normal_completing_eval_baseline(benchmark, warm_runtime):
     """Baseline for comparison against the termination path: an eval that just finishes."""
     benchmark(lambda: warm_runtime.eval("1 + 41"))
+
+
+@pytest.fixture
+def warm_timed_runtime():
+    """Same as `warm_runtime`, but with `execution_timeout` configured, so
+    every `eval` arms a deadline on the persistent per-runtime watchdog
+    thread (see `Watchdog` in `src/runtime/runner.rs`) instead of leaving one
+    unset."""
+    runtime = peno.Runtime(peno.RuntimeConfig(timeout=5.0))
+    runtime.eval("1")  # warm up the isolate before timing
+    yield runtime
+    runtime.close()
+
+
+def test_timed_eval_baseline(benchmark, warm_timed_runtime):
+    """The direct before/after for P1: before, every timed call spawned *and
+    joined* a whole OS thread just to arm a deadline, on top of the eval
+    itself. After, `arm`/`disarm` on the persistent per-runtime watchdog
+    thread only take a mutex. Compare directly against
+    `test_normal_completing_eval_baseline` -- the two should land within
+    noise of each other, not the ~2-3x spawn/join gap this replaced."""
+    benchmark(lambda: warm_timed_runtime.eval("1 + 41"))

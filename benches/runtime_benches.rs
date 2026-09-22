@@ -4,6 +4,7 @@ use _peno::{PythonOpMode, RuntimeConfig, RuntimeHandle};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pyo3::prelude::*;
 use std::hint::black_box;
+use std::time::Duration;
 
 fn bench_isolate_creation(c: &mut Criterion) {
     c.bench_function("isolate_creation_and_close", |b| {
@@ -53,6 +54,23 @@ fn bench_op_dispatch(c: &mut Criterion) {
     });
 }
 
+// P1's direct before/after: every timed call used to spawn *and join* a
+// whole OS thread just to arm a deadline, on top of the eval itself. Compare
+// directly against `simple_eval_throughput` above (same eval, no timeout
+// configured) -- after the persistent per-runtime watchdog thread
+// (`Watchdog` in `src/runtime/runner.rs`), `arm`/`disarm` only take a mutex,
+// so the two should land within noise of each other.
+fn bench_timed_eval_throughput(c: &mut Criterion) {
+    let config = RuntimeConfig {
+        execution_timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let handle = RuntimeHandle::spawn(config).unwrap();
+    c.bench_function("timed_eval_throughput", |b| {
+        b.iter(|| black_box(handle.eval_sync("1 + 41").unwrap()));
+    });
+}
+
 fn bench_termination_handle(c: &mut Criterion) {
     let mut group = c.benchmark_group("termination_handle");
 
@@ -72,7 +90,10 @@ fn bench_termination_handle(c: &mut Criterion) {
         |b, _| {
             b.iter_with_setup(
                 || RuntimeHandle::spawn(RuntimeConfig::default()).unwrap(),
-                |handle: RuntimeHandle| black_box(handle.terminate().unwrap()),
+                |handle: RuntimeHandle| {
+                    handle.terminate().unwrap();
+                    black_box(())
+                },
             );
         },
     );
@@ -84,6 +105,7 @@ criterion_group!(
     benches,
     bench_isolate_creation,
     bench_eval_throughput,
+    bench_timed_eval_throughput,
     bench_op_dispatch,
     bench_termination_handle
 );
