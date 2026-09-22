@@ -94,7 +94,15 @@ jobs:
       - name: Install the wheel and run the suite against it
         run: |
           uv venv .wheel-venv
-          uv pip install --python .wheel-venv/bin/python dist/*.whl
+          # Same as `test.yml`'s `pytest-linux-wheel`: the `linux` job's
+          # `--find-interpreter` produces one wheel per CPython minor, so a
+          # bare `dist/*.whl` is a multi-wheel glob that `uv pip install`
+          # rejects. Pick the one matching this venv's ABI tag.
+          PYTAG=$(.wheel-venv/bin/python -c \
+            'import sys; print("cp%d%d" % sys.version_info[:2])')
+          WHEEL=$(ls dist/*-${PYTAG}-${PYTAG}-*.whl)
+          echo "Installing $WHEEL into a $PYTAG venv"
+          uv pip install --python .wheel-venv/bin/python "$WHEEL"
           uv pip install --python .wheel-venv/bin/python \
             "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
           .wheel-venv/bin/python -m pytest tests/ -q \

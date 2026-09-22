@@ -139,7 +139,16 @@ jobs:
       - name: Install the built wheel (not the editable dev build)
         run: |
           uv venv .wheel-venv
-          uv pip install --python .wheel-venv/bin/python dist/*.whl
+          # `--find-interpreter` builds one wheel per CPython minor found in
+          # the manylinux container (cp310..cp313), so `dist/*.whl` expands to
+          # several and `uv pip install` refuses them: "Requirements contain
+          # conflicting URLs for package `pydeno`". Install only the wheel
+          # whose ABI tag matches this venv's interpreter.
+          PYTAG=$(.wheel-venv/bin/python -c \
+            'import sys; print("cp%d%d" % sys.version_info[:2])')
+          WHEEL=$(ls dist/*-${PYTAG}-${PYTAG}-*.whl)
+          echo "Installing $WHEEL into a $PYTAG venv"
+          uv pip install --python .wheel-venv/bin/python "$WHEEL"
           # Matches the `testing` dependency group in pyproject.toml -- the
           # test *runner's* deps, deliberately installed on top of the built
           # wheel rather than an editable `maturin develop` install.
