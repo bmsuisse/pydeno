@@ -712,10 +712,62 @@ impl RuntimeDispatcher {
             // and polling below.
             let event_loop_drained;
 
+            // An active job's own watchdog (armed for its whole lifetime, via
+            // `effective_timeout_ms` falling back to `execution_timeout` when
+            // no per-call timeout is given) already bounds every
+            // `poll_event_loop` call made while that job is active. But a
+            // script can queue work that outlives the job that queued it --
+            // an async IIFE whose *outer* promise resolves (finishing the
+            // job and clearing `active_job`) while an inner
+            // `queueMicrotask`/promise chain keeps re-queuing itself forever
+            // is still live on this isolate, and `poll_event_loop` keeps
+            // getting called for it every iteration regardless. With no job
+            // present, nothing was arming a deadline around that call, so a
+            // runaway of this shape ignored `execution_timeout` entirely and
+            // could hang the dispatcher (and therefore the whole runtime)
+            // indefinitely. Arming here too, whenever no job holds the
+            // deadline, closes that gap; the ~1us cost of an arm/disarm pair
+            // added to every idle iteration is what P1's persistent watchdog
+            // thread made affordable. See tests/test_dispatcher_step_timeout.py.
+            let step_watchdog = if self.active_job.is_none() {
+                match self
+                    .core
+                    .start_sync_watchdog("Event loop step exceeded execution_timeout")
+                {
+                    Ok(token) => token,
+                    Err(err) => {
+                        log::warn!("Failed to arm the dispatcher-step watchdog: {err}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // Check for event loop errors
             // Note: Termination errors (from timeout/abort) are expected and will be handled
             // by the job's own poll() method. Only fail the job on unexpected fatal errors.
-            match self.core.js_runtime.poll_event_loop(&mut cx, poll_opts) {
+            let poll_result = self.core.js_runtime.poll_event_loop(&mut cx, poll_opts);
+
+            if let Some(watchdog) = step_watchdog {
+                match self.core.resolve_sync_watchdog(watchdog) {
+                    Ok((true, duration)) => {
+                        log::warn!(
+                            "Event loop step exceeded execution_timeout ({}ms) with no job \
+                             active -- terminated a runaway async chain (e.g. a \
+                             self-requeuing microtask/promise) that outlived the job \
+                             that queued it",
+                            duration.as_millis()
+                        );
+                    }
+                    Ok((false, _)) => {}
+                    Err(err) => {
+                        log::warn!("Failed to resolve the dispatcher-step watchdog: {err}");
+                    }
+                }
+            }
+
+            match poll_result {
                 std::task::Poll::Ready(Err(err)) => {
                     // An error means the loop is not going to make further
                     // progress on its own, so treat it as drained and let the
