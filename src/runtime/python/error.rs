@@ -4,7 +4,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use super::{JavaScriptError, RuntimeForceKilled, RuntimeTerminated};
+use super::{JavaScriptError, RuntimeForceKilled, RuntimeTerminated, RuntimeTimeout};
 
 fn set_optional_attr(py: Python<'_>, value: &Bound<'_, PyAny>, name: &str, attr: Option<String>) {
     match attr {
@@ -60,7 +60,7 @@ fn runtime_error_to_py_with(py: Python<'_>, err: RuntimeError, context: Option<&
                 Some(prefix) => format!("{prefix}: {msg}"),
                 None => msg,
             };
-            PyRuntimeError::new_err(message)
+            PyErr::new::<RuntimeTimeout, _>(message)
         }
         RuntimeError::Internal { context: msg } => {
             let message = match context {

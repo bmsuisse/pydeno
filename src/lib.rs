@@ -35,6 +35,9 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let runtime_force_killed_type = m.py().get_type::<runtime::python::RuntimeForceKilled>();
     runtime_force_killed_type.setattr("__module__", "pydeno")?;
     m.add("RuntimeForceKilled", runtime_force_killed_type)?;
+    let runtime_timeout_type = m.py().get_type::<runtime::python::RuntimeTimeout>();
+    runtime_timeout_type.setattr("__module__", "pydeno")?;
+    m.add("RuntimeTimeout", runtime_timeout_type)?;
     m.add(
         "SUGGESTED_FORCE_KILL_GRACE",
         runtime::config::SUGGESTED_FORCE_KILL_GRACE.as_secs_f64(),

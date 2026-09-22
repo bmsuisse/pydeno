@@ -37,6 +37,18 @@ create_exception!(
     RuntimeForceKilled,
     RuntimeTerminated
 );
+// Subclasses `RuntimeError` deliberately, for the same reason
+// `RuntimeForceKilled` subclasses `RuntimeTerminated`: through 0.4.0 a
+// timeout arrived as a bare `PyRuntimeError`, so the only way to tell one
+// from an internal failure was to match `"timed out"` in the message -- which
+// this repo's own tests did. Every existing `except RuntimeError` keeps
+// catching it; callers that actually care can now name the type.
+//
+// Named `RuntimeTimeout` rather than `TimeoutError` on purpose: Python
+// already has a builtin `TimeoutError`, and it derives from `OSError`, not
+// `RuntimeError`. A same-named subclass of a different base would be a trap
+// for anyone who writes `except TimeoutError` after a stray import.
+create_exception!(crate::runtime::python, RuntimeTimeout, PyRuntimeError);
 
 #[pyfunction]
 pub fn _debug_active_runtime_threads() -> usize {

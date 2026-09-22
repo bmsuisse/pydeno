@@ -25,6 +25,7 @@ __all__ = [
     "JsUndefined",
     "RuntimeTerminated",
     "RuntimeForceKilled",
+    "RuntimeTimeout",
     "SUGGESTED_FORCE_KILL_GRACE",
     "SnapshotBuilder",
     "undefined",
@@ -586,6 +587,23 @@ class RuntimeForceKilled(RuntimeTerminated):
     functions, module state and globals do not carry over.
 
     Subclasses ``RuntimeTerminated``, so existing handlers keep working.
+    """
+
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
+
+class RuntimeTimeout(RuntimeError):
+    """Raised when an operation exceeded its ``timeout``.
+
+    Subclasses ``RuntimeError``, which is what every timeout raised through
+    0.4.0 was, so ``except RuntimeError`` keeps catching it. Before this type
+    existed the only way to tell a timeout from an internal failure was to
+    match ``"timed out"`` in the message.
+
+    Named ``RuntimeTimeout`` rather than ``TimeoutError`` because Python's
+    builtin of that name derives from ``OSError``, not ``RuntimeError``.
+
+    Added in 0.4.1.
     """
 
     def __str__(self) -> str: ...
