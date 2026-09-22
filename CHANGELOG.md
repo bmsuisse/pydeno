@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.4.1
+
+Follow-ups to the 0.4.0 review (`docs/reviews/2026-09-22-0.4.0-review.md`).
+No breaking changes.
+
+### Added
+
+- **`pydeno.RuntimeTimeout`**, raised instead of a bare `RuntimeError` when an
+  operation exceeds its `timeout`. Until now a timeout was indistinguishable
+  from an internal failure except by matching `"timed out"` in the message,
+  which is not an API — rewording the message would have broken every caller
+  keying off it. `RuntimeTimeout` subclasses `RuntimeError`, so existing
+  `except RuntimeError` handlers keep catching timeouts unchanged:
+
+  ```python
+  from pydeno import Runtime, RuntimeConfig, RuntimeTimeout
+
+  with Runtime(RuntimeConfig(timeout=1.0)) as rt:
+      try:
+          rt.eval("while (true) {}")
+      except RuntimeTimeout:
+          ...  # only a timeout reaches here
+  ```
+
+  It is deliberately not called `TimeoutError`: Python's builtin of that name
+  derives from `OSError`, and a same-named subclass of a different base would
+  be a trap.
+
+### Fixed
+
+- **The reason attached to a multi-expiry watchdog pass is no longer
+  arbitrary.** When several deadlines expired in the same pass, the reason was
+  taken from the last fired entry in a `Vec` whose order `swap_remove` makes
+  meaningless. It is now the deadline that expired first.
+
+- **`CLAUDE.md`'s streaming example called API that never existed.**
+  `rt.create_js_stream_from_python(...)` and the guest global
+  `__pydeno_get_stream__(id)` appear only in that example — `git log -S` puts
+  both in the initial commit and nowhere else, and the `peno` → `pydeno`
+  rename dutifully renamed a symbol that was never real. The example now uses
+  `rt.stream_from_async_iterable(...)`, and `tests/test_claude_md_api_references.py`
+  checks that every `Runtime` attribute and guest global the file names
+  actually resolves.
+
+### Documented
+
+Two known limitations are now stated where callers will meet them, and pinned
+by tests so they cannot drift silently.
+
+- **A debug build cannot reach the default `max_serialization_depth`.** The
+  native stack-headroom backstop that keeps a deeply nested value from
+  aborting the process (`Check failed: IsOnCentralStack()`) trips around depth
+  22 in an unoptimized build, against ~743 in an optimized one, because an
+  unoptimized serializer frame is ~33x larger. Released wheels are optimized
+  builds and are unaffected; anyone working on pydeno itself is not. No single
+  budget can serve both profiles, so the backstop is unchanged — but its error
+  message now names the build profile as the cause instead of reading as a
+  fault in the caller's data, `RuntimeConfig.max_serialization_depth`
+  documents the ceiling, and `tests/test_serialization_headroom.py` covers the
+  22–99 band at the default configuration that nothing exercised before.
+
+- **A fired deadline terminates whatever the isolate is running, not the job
+  that timed out.** `terminate_execution` is isolate-wide and the isolate is
+  single-threaded, so a synchronous call dispatched while an async job is
+  parked on a promise can be stopped by that async job's deadline, and reports
+  a bare `execution terminated` error rather than a timeout. There is nothing
+  finer to aim at, so the behaviour stands; it is described on
+  `RuntimeConfig.timeout` and on `ArmedDeadline`, and pinned by
+  `tests/test_timeout_cross_talk.py`. Use a runtime per concurrent job if a
+  termination error has to be about the call that raised it.
+
+
 ## 0.4.0
 
 The package was renamed from `peno` to `pydeno`. Import `pydeno`; there is no
