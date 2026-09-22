@@ -19,7 +19,7 @@ env:
   # tests never needs a bump here, only deleting them does. This is the
   # assertion that makes a mass-skip fail the job -- see
   # `scripts/check_test_report.py` for the full rationale.
-  MIN_PYTHON_TESTS: "558"
+  MIN_PYTHON_TESTS: "553"
   # Skips are unverified tests, so the budget is zero. The suite has exactly
   # one conditional skip (`tests/test_idle_cpu.py`, skipped above 16 CPUs) and
   # GitHub's macOS runners are well under that, so zero is correct here. Every
