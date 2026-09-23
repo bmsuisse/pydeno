@@ -22,22 +22,12 @@ __all__ = [
     "ToolNotFoundError",
 ]
 
-# A JS identifier that is also safe to install as an object property and to
-# reference as `namespace.name`. Deliberately stricter than JS itself allows:
-# no leading digits, no dots, no unicode, no `__proto__`-style surprises.
+# Safe as a JS property and as `namespace.name`; stricter than JS identifiers.
 _SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Property names that would shadow or corrupt the JS object/prototype machinery
-# if a tool were allowed to claim them.
+# Names that would shadow or corrupt the JS object/prototype machinery.
 _RESERVED_NAMES = frozenset(
-    {
-        "__proto__",
-        "constructor",
-        "prototype",
-        "hasOwnProperty",
-        "toString",
-        "valueOf",
-    }
+    {"__proto__", "constructor", "prototype", "hasOwnProperty", "toString", "valueOf"}
 )
 
 
@@ -190,8 +180,6 @@ class ToolBridge:
         self._calls = 0
         self._tokens: list[int] = []
 
-    # ------------------------------------------------------------------ names
-
     @staticmethod
     def _check_name(name: object, *, what: str) -> None:
         """Fail closed on anything that isn't a plain, safe JS identifier."""
@@ -206,8 +194,6 @@ class ToolBridge:
             raise ValueError(
                 f"Invalid {what} {name!r}: shadows a JavaScript object/prototype member"
             )
-
-    # ----------------------------------------------------------------- budget
 
     @property
     def calls_made(self) -> int:
@@ -231,11 +217,7 @@ class ToolBridge:
         self._calls = 0
 
     def _spend(self, name: str) -> bool:
-        """Charge one call against the budget.
-
-        Returns True if the call may proceed. Raises :class:`ToolBudgetError`
-        when the budget is exhausted and ``on_exhausted="raise"``.
-        """
+        """Charge one call; False (``"silent"``) or raise once the budget is spent."""
         if self._max_calls is not None and self._calls >= self._max_calls:
             if self._on_exhausted == "raise":
                 raise ToolBudgetError(
@@ -246,16 +228,11 @@ class ToolBridge:
         self._calls += 1
         return True
 
-    # ------------------------------------------------------------------ shims
-
     def _wrap(self, name: str, func: Callable[..., Any]) -> Callable[..., Any]:
-        """Wrap one tool in a budget-checking shim.
+        """Wrap one tool in a budget-checking shim of the same sync/async kind.
 
-        The shim must preserve sync-vs-async, because `bind_object` detects
-        the mode with `inspect.iscoroutinefunction` on whatever it is handed
-        -- wrapping an async tool in a sync shim would register it as a sync
-        op and break it. So the mode is decided once, here, and each kind
-        gets its own shim.
+        `bind_object` picks the op mode from the shim it is handed, so an async
+        tool behind a sync shim would be registered as a sync op and break.
         """
         if _is_async_callable(func):
 
@@ -264,18 +241,14 @@ class ToolBridge:
                     return None
                 return await func(*args)
 
-            async_shim.__name__ = f"{name}_budgeted"
-            return async_shim
+            shim: Callable[..., Any] = async_shim
+        else:
 
-        def sync_shim(*args: Any) -> Any:
-            if not self._spend(name):
-                return None
-            return func(*args)
+            def shim(*args: Any) -> Any:
+                return func(*args) if self._spend(name) else None
 
-        sync_shim.__name__ = f"{name}_budgeted"
-        return sync_shim
-
-    # ----------------------------------------------------------------- attach
+        shim.__name__ = f"{name}_budgeted"
+        return shim
 
     def attach(self, runtime: Any) -> None:
         """Install this bridge's tools into `runtime`.
@@ -290,8 +263,7 @@ class ToolBridge:
 
         wrapped = {name: self._wrap(name, func) for name, func in self._tools.items()}
 
-        # Keep the capability tokens so `detach` can revoke them. Nothing
-        # reads them out of here and hands them to JS; they are the host's.
+        # Kept (host-side only) so `detach` can revoke them.
         if self._namespace is None:
             for name, shim in wrapped.items():
                 self._tokens.append(runtime.bind_function(name, shim))
@@ -334,12 +306,7 @@ class ToolBridge:
 
 
 def _is_async_callable(func: Callable[..., Any]) -> bool:
-    """Async-detection matching `Runtime::detect_async` in the Rust bindings.
-
-    Checks `__call__` too, so an async callable *object* is classified the
-    same way the Rust side would classify it.
-    """
-    if inspect.iscoroutinefunction(func):
-        return True
-    call = getattr(func, "__call__", None)  # noqa: B004
-    return call is not None and inspect.iscoroutinefunction(call)
+    """Mirror `Runtime::detect_async` (Rust), which also checks `__call__`."""
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(
+        getattr(func, "__call__", None)  # noqa: B004
+    )
