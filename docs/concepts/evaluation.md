@@ -138,14 +138,17 @@ async def main():
                 "while(true) {}",  # Infinite loop
                 timeout=1.0
             )
-        except RuntimeError as e:
-            if "timed out" in str(e).lower():
-                print("JavaScript took too long!")
+        except RuntimeTimeout:
+            print("JavaScript took too long!")
 
 asyncio.run(main())
 ```
 
 The timeout is specified in seconds (float). Without a timeout, infinite loops will run forever.
+
+A timeout raises `pydeno.RuntimeTimeout` (new in 0.4.1), a
+subclass of `RuntimeError`, so `except RuntimeError` still catches it. It is
+*not* Python's builtin `TimeoutError`, which `except TimeoutError` would need.
 
 !!! warning "Always set timeouts for untrusted code"
     If you're running user-provided JavaScript, always set a reasonable timeout to prevent resource exhaustion.
@@ -323,7 +326,7 @@ async def safe_eval(code: str, timeout: float = 5.0):
     with Runtime() as runtime:
         try:
             return await runtime.eval_async(code, timeout=timeout)
-        except TimeoutError:
+        except RuntimeTimeout:
             return "Execution timed out"
         except Exception as e:
             return f"Error: {e}"

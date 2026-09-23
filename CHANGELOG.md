@@ -1,35 +1,12 @@
 # Changelog
 
-## Unreleased
-
-### Fixed
-
-- **An async job that timed out on a pending promise left the runtime
-  permanently unusable.** After `await rt.eval_async("new Promise(() => {})",
-  timeout=0.3)` raised its `RuntimeTimeout`, every later call on that runtime
-  — a plain `rt.eval("1 + 1")` issued long afterwards, with nothing else in
-  flight — failed with a bare `execution terminated`. The runtime did not
-  error and recover; it stopped working while still reporting itself open.
-
-  The job's own deadline check asked V8 to terminate and nothing cancelled
-  that request. The cancel that exists, in `resolve_sync_watchdog`, runs only
-  when the job's watchdog token comes back *fired* — and the in-job check
-  routinely wins the race against the watchdog thread, since both wake on the
-  same deadline and the dispatcher parks until exactly that instant, so
-  `disarm` returned `false` and the isolate stayed latched. `JobCommon::expired`
-  now records the request it made and `JobCommon::respond` clears it, the
-  async counterpart of what the synchronous path already did. Pre-existing:
-  0.4.1 pinned it as found rather than fixing it.
-
-  The timed-out promise itself stays pending, as before — nothing on the
-  Python side awaits it, so nothing hangs.
-  `tests/test_timeout_cross_talk.py` now asserts reuse (sync and async, and
-  across a second timeout) where it used to assert the breakage.
-
 ## 0.4.1
 
 Follow-ups to the 0.4.0 review (`docs/reviews/2026-09-22-0.4.0-review.md`).
-No breaking changes.
+No breaking changes. The one observable type change: a timeout's exception is
+now `RuntimeTimeout` rather than exactly `RuntimeError`, so `except
+RuntimeError` is unaffected but a check such as `type(exc) is RuntimeError`
+(or matching on `repr(exc)`) is not.
 
 ### Added
 
@@ -54,7 +31,62 @@ No breaking changes.
   derives from `OSError`, and a same-named subclass of a different base would
   be a trap.
 
+  **Not yet on `JsFunction` calls.** When a JS function called from Python
+  is still *running* (not merely awaiting) at its deadline:
+
+  - `fn(...)` under `RuntimeConfig(timeout=...)` raises `JavaScriptError:
+    Uncaught null` — neither `RuntimeTimeout` nor any `RuntimeError` —
+    because V8 reports that termination as a null exception and the watchdog
+    result mapping does not recognise it. A per-call `fn(..., timeout=...)`
+    without a runtime-wide timeout arms no watchdog for the synchronous part
+    and does not interrupt it.
+  - `fn.call_async(...)`, and the awaited half of a `fn(...)` that returned a
+    promise, arm no watchdog at all, so JS that spins there is not
+    interrupted by either timeout.
+
+  `eval`, `eval_async`, `eval_module`, `eval_module_async`, and a function
+  call whose *promise* is still pending at the deadline, do raise
+  `RuntimeTimeout`.
+
 ### Fixed
+
+- **An async job that timed out on a pending promise left the runtime
+  permanently unusable.** After `await rt.eval_async("new Promise(() => {})",
+  timeout=0.3)` raised its `RuntimeTimeout`, every later call on that runtime
+  — a plain `rt.eval("1 + 1")` issued long afterwards, with nothing else in
+  flight — failed with a bare `execution terminated`. The runtime did not
+  error and recover; it stopped working while still reporting itself open.
+
+  The job's own deadline check asked V8 to terminate and nothing cancelled
+  that request. The cancel that exists, in `resolve_sync_watchdog`, runs only
+  when the job's watchdog token comes back *fired* — and the in-job check
+  routinely wins the race against the watchdog thread, since both wake on the
+  same deadline and the dispatcher parks until exactly that instant, so
+  `disarm` returned `false` and the isolate stayed latched. `JobCommon::expired`
+  now records the request it made and `JobCommon::respond` clears it, the
+  async counterpart of what the synchronous path already did. Pre-existing
+  in 0.4.0.
+
+  The timed-out promise itself stays pending, as before — nothing on the
+  Python side awaits it, so nothing hangs.
+  `tests/test_timeout_cross_talk.py` asserts reuse (sync and async, and
+  across a second timeout).
+
+- **A timeout that raced its own deadline could kill the next, unrelated
+  call.** The watchdog thread marked an expired deadline as fired, released
+  its lock, and only then asked V8 to terminate. A call that finished on its
+  own just past its deadline could be disarmed in that gap — seeing `fired`,
+  cancelling a termination that had not been requested yet — and the
+  watchdog's late request then latched the isolate, so the *next* call failed
+  with a bare `execution terminated`. The watchdog now holds its lock until
+  the termination has been issued. Pre-existing in 0.4.0; the window is
+  microseconds wide, so it was rare rather than impossible.
+
+- **`Runtime.close()` could hang.** `Watchdog::drop` set the shutdown flag
+  without holding the mutex the watchdog thread's condition variable is
+  paired with, so the wake-up could be lost and the watchdog thread parked
+  forever, blocking the `join` in `close()`. It now holds that mutex across
+  the write.
 
 - **The reason attached to a multi-expiry watchdog pass is no longer
   arbitrary.** When several deadlines expired in the same pass, the reason was
@@ -72,8 +104,12 @@ No breaking changes.
 
 ### Documented
 
-Two known limitations are now stated where callers will meet them, and pinned
+Known limitations are now stated where callers will meet them, and pinned
 by tests so they cannot drift silently.
+
+- **`SnapshotBuilder` input is not sandboxed.** Its docstring now says so:
+  snapshot scripts run with the raw `Deno.core.ops` table, no timeout and no
+  serialization limit, so they are host code, never untrusted JavaScript.
 
 - **A debug build cannot reach the default `max_serialization_depth`.** The
   native stack-headroom backstop that keeps a deeply nested value from

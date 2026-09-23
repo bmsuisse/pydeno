@@ -192,7 +192,7 @@ async def eval_async(code: str, **kwargs) -> Any:
 
     Raises:
         JavaScriptError: If the JavaScript code throws an exception.
-        TimeoutError: If timeout is specified and exceeded.
+        RuntimeTimeout: If timeout is specified and exceeded.
 
     Example:
         >>> import asyncio
