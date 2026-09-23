@@ -3,10 +3,18 @@
 ## 0.4.1
 
 Follow-ups to the 0.4.0 review (`docs/reviews/2026-09-22-0.4.0-review.md`).
-No breaking changes. The one observable type change: a timeout's exception is
-now `RuntimeTimeout` rather than exactly `RuntimeError`, so `except
-RuntimeError` is unaffected but a check such as `type(exc) is RuntimeError`
-(or matching on `repr(exc)`) is not.
+No breaking API changes, but three changes a caller can observe:
+
+- A timeout's exception is now `RuntimeTimeout` rather than exactly
+  `RuntimeError`, so `except RuntimeError` is unaffected but a check such as
+  `type(exc) is RuntimeError` (or matching on `repr(exc)`) is not.
+- A timed-out JS *function call* (`fn(...)`, `fn.call_async(...)`) used to
+  raise `JavaScriptError: Uncaught null`, which is not a `RuntimeError` at
+  all. It now raises `RuntimeTimeout`, so an `except JavaScriptError` that
+  happened to catch it no longer does.
+- Function calls that used to hang past their `timeout=` (see *Fixed*) now
+  raise at the deadline, and an async function call's deadline can now stop
+  an unrelated inline sync call (see *Documented*).
 
 ### Added
 
