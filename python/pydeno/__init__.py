@@ -1,8 +1,9 @@
 """High-level Python bindings for the pydeno runtime."""
 
-import contextvars
 import asyncio
 import atexit
+import contextlib
+import contextvars
 import threading
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -60,10 +61,8 @@ def _runtime_bind(
 
     if func is None:
         return _register
-
     if not callable(func):
         raise TypeError("runtime.bind expects a callable or to be used as a decorator")
-
     return _register(cast(F, func))
 
 
@@ -81,23 +80,15 @@ class _RuntimeSlot:
             self.runtime.close()
 
 
-def _current_runtime_owner() -> object:
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:
-        task = None
-    if task is not None:
-        return task
-    return threading.current_thread()
-
-
-def _schedule_owner_cleanup(slot: _RuntimeSlot) -> None:
-    owner = slot.owner
-    if isinstance(owner, asyncio.Task):
-        owner.add_done_callback(lambda _: slot.close())
-
-
 setattr(Runtime, "bind", _runtime_bind)
+
+
+def _current_runtime_owner() -> object:
+    """The running asyncio task, else the current thread."""
+    try:
+        return asyncio.current_task() or threading.current_thread()
+    except RuntimeError:
+        return threading.current_thread()
 
 
 _default_runtime_var: contextvars.ContextVar[_RuntimeSlot | None] = (
@@ -122,7 +113,8 @@ def get_default_runtime() -> Runtime:
     if slot is None or slot.runtime.is_closed() or slot.owner is not owner:
         slot = _RuntimeSlot(runtime=Runtime(), owner=owner)
         _default_runtime_var.set(slot)
-        _schedule_owner_cleanup(slot)
+        if isinstance(owner, asyncio.Task):
+            owner.add_done_callback(lambda _: slot.close())
     return slot.runtime
 
 
@@ -138,14 +130,10 @@ def close_default_runtime() -> None:
     _default_runtime_var.set(None)
 
 
+@atexit.register
 def _close_default_runtime_on_exit() -> None:
-    try:
+    with contextlib.suppress(RuntimeError):
         close_default_runtime()
-    except RuntimeError:
-        pass
-
-
-atexit.register(_close_default_runtime_on_exit)
 
 
 def eval(code: str) -> Any:
@@ -175,7 +163,7 @@ def eval(code: str) -> Any:
     return get_default_runtime().eval(code)
 
 
-async def eval_async(code: str, **kwargs) -> Any:
+async def eval_async(code: str, **kwargs: Any) -> Any:
     """Evaluate JavaScript code asynchronously using the default context-local runtime.
 
     This is a convenience function for simple async use cases. Each asyncio task or
