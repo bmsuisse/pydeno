@@ -1302,10 +1302,15 @@ impl RuntimeDispatcher {
                 } else if let Err(err) = self.core.ensure_inspector_ready() {
                     Err(err)
                 } else {
-                    match self
-                        .core
-                        .start_sync_watchdog("Synchronous function call timed out")
-                    {
+                    // Armed on the *effective* timeout: `start_sync_watchdog`
+                    // only knows `execution_timeout`, so a per-call
+                    // `fn(timeout=...)` on a runtime without one armed nothing
+                    // and JS spinning in the call was never interrupted.
+                    let effective_timeout = self.core.effective_timeout_ms(timeout_ms);
+                    match self.core.start_timeout_watchdog(
+                        effective_timeout,
+                        "Synchronous function call timed out",
+                    ) {
                         Ok(watchdog) => {
                             let result = self.core.call_function_sync(fn_id, args, timeout_ms);
                             self.core
@@ -1366,7 +1371,7 @@ impl RuntimeDispatcher {
                     }
                 };
 
-                let job = resume_function_call_job(pending, task_locals, responder);
+                let job = resume_function_call_job(pending, task_locals, responder, &self.core);
                 self.submit_job(Box::new(job));
                 false
             }
@@ -1588,6 +1593,7 @@ impl JobCommon {
         pending: &PendingFunctionCall,
         task_locals: Option<TaskLocals>,
         responder: oneshot::Sender<RuntimeResult<JSValue>>,
+        watchdog: Option<WatchdogToken>,
     ) -> Self {
         Self {
             timeout_ms: pending.timeout_ms,
@@ -1595,7 +1601,7 @@ impl JobCommon {
             responder,
             start_time: pending.start_time,
             deadline: pending.deadline,
-            watchdog: None,
+            watchdog,
             kind,
             wording,
             watchdog_context,
@@ -2104,15 +2110,18 @@ fn call_function_async_job(
     // An explicit `timeout=` wins; otherwise the runtime-wide execution
     // timeout applies, so an async call is bounded by the same clock as a
     // synchronous one.
-    let effective_timeout = timeout_ms.or_else(|| {
-        core.execution_timeout.map(|d| {
-            let millis = d.as_millis();
-            if millis > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                millis as u64
-            }
-        })
+    let effective_timeout = core.effective_timeout_ms(timeout_ms);
+
+    // Armed for the job's whole lifetime, exactly as `EvalAsync` arms its own.
+    // The job's `expired` check only runs *between* event-loop steps and the
+    // dispatcher's step watchdog is armed only while no job is active, so
+    // without this nothing could interrupt JS spinning inside the call
+    // (`async () => { await 0; while (true) {} }`) and it hung forever.
+    let watchdog = effective_timeout.map(|ms| {
+        core.watchdog.arm(
+            Duration::from_millis(ms),
+            "Asynchronous function call timed out",
+        )
     });
 
     let common = JobCommon::new(
@@ -2122,7 +2131,7 @@ fn call_function_async_job(
         effective_timeout,
         task_locals,
         responder,
-        None,
+        watchdog,
     );
 
     PromiseJob::new(
@@ -2136,56 +2145,60 @@ fn call_function_async_job(
                 )));
             }
 
-            let promise_result: Result<Result<v8::Global<v8::Promise>, JsError>, RuntimeError> =
-                (|| {
-                    deno_core::scope!(scope, core.js_runtime);
-                    v8::tc_scope!(let try_catch, scope);
+            // `Err(None)`: V8 terminated the call (see `terminated_call_error`).
+            let promise_result: Result<
+                Result<v8::Global<v8::Promise>, Option<Box<JsError>>>,
+                RuntimeError,
+            > = (|| {
+                deno_core::scope!(scope, core.js_runtime);
+                v8::tc_scope!(let try_catch, scope);
 
-                    // Get function and receiver from registry
-                    let (func, receiver) = {
-                        let registry = core.fn_registry.borrow();
-                        let stored = registry.get(&fn_id).unwrap(); // Safe: checked above
-                        let func = v8::Local::new(try_catch, &stored.function);
-                        let receiver = stored
-                            .receiver
-                            .as_ref()
-                            .map(|r| v8::Local::new(try_catch, r));
-                        (func, receiver)
-                    };
+                // Get function and receiver from registry
+                let (func, receiver) = {
+                    let registry = core.fn_registry.borrow();
+                    let stored = registry.get(&fn_id).unwrap(); // Safe: checked above
+                    let func = v8::Local::new(try_catch, &stored.function);
+                    let receiver = stored
+                        .receiver
+                        .as_ref()
+                        .map(|r| v8::Local::new(try_catch, r));
+                    (func, receiver)
+                };
 
-                    // Convert arguments
-                    let mut v8_args = Vec::with_capacity(args.len());
-                    for arg in &args {
-                        let v8_val =
-                            RuntimeCoreState::js_value_to_v8(&core.fn_registry, try_catch, arg)?;
-                        v8_args.push(v8_val);
+                // Convert arguments
+                let mut v8_args = Vec::with_capacity(args.len());
+                for arg in &args {
+                    let v8_val =
+                        RuntimeCoreState::js_value_to_v8(&core.fn_registry, try_catch, arg)?;
+                    v8_args.push(v8_val);
+                }
+
+                let call_receiver = receiver
+                    .unwrap_or_else(|| try_catch.get_current_context().global(try_catch).into());
+
+                match func.call(try_catch, call_receiver, &v8_args) {
+                    Some(result_value) => {
+                        let promise = PromiseJob::as_promise(try_catch, result_value)?;
+                        Ok(Ok(v8::Global::new(try_catch, promise)))
                     }
-
-                    let call_receiver = receiver.unwrap_or_else(|| {
-                        try_catch.get_current_context().global(try_catch).into()
-                    });
-
-                    match func.call(try_catch, call_receiver, &v8_args) {
-                        Some(result_value) => {
-                            let promise = PromiseJob::as_promise(try_catch, result_value)?;
-                            Ok(Ok(v8::Global::new(try_catch, promise)))
+                    None if try_catch.has_terminated() => Ok(Err(None)),
+                    None => match try_catch.exception() {
+                        Some(exception) => {
+                            let js_error = JsError::from_v8_exception(try_catch, exception);
+                            Ok(Err(Some(js_error)))
                         }
-                        None => match try_catch.exception() {
-                            Some(exception) => {
-                                let js_error = JsError::from_v8_exception(try_catch, exception);
-                                Ok(Err(*js_error))
-                            }
-                            None => Err(RuntimeError::internal(
-                                "Function call failed with no exception",
-                            )),
-                        },
-                    }
-                })();
+                        None => Err(RuntimeError::internal(
+                            "Function call failed with no exception",
+                        )),
+                    },
+                }
+            })();
 
             // Handle the result outside the scope, so `core` is free again.
             match promise_result {
                 Ok(Ok(promise)) => Ok(promise),
-                Ok(Err(js_error)) => Err(core.translate_js_error(js_error)),
+                Ok(Err(Some(js_error))) => Err(core.translate_js_error(*js_error)),
+                Ok(Err(None)) => Err(core.terminated_call_error()),
                 Err(err) => Err(err),
             }
         }),
@@ -2198,7 +2211,23 @@ fn resume_function_call_job(
     pending: PendingFunctionCall,
     task_locals: Option<TaskLocals>,
     responder: oneshot::Sender<RuntimeResult<JSValue>>,
+    core: &RuntimeCoreState,
 ) -> PromiseJob {
+    // Same reason as in `call_function_async_job`: JS spinning in the resumed
+    // promise's continuation is otherwise uninterruptible. Armed for what is
+    // left of the original call's clock, but reporting the original timeout so
+    // the message names the number the caller passed.
+    let watchdog = pending.deadline.map(|deadline| {
+        let mut token = core.watchdog.arm(
+            deadline.saturating_duration_since(Instant::now()),
+            "Asynchronous function call timed out",
+        );
+        if let Some(ms) = pending.timeout_ms {
+            token.duration = Duration::from_millis(ms);
+        }
+        token
+    });
+
     let common = JobCommon::resumed(
         RuntimeCallKind::CallFunctionAsync,
         TimeoutWording::CALL_FUNCTION,
@@ -2206,6 +2235,7 @@ fn resume_function_call_job(
         &pending,
         task_locals,
         responder,
+        watchdog,
     );
 
     let promise = pending.promise;
@@ -2811,7 +2841,29 @@ impl RuntimeCoreState {
     }
 
     fn translate_js_error(&mut self, err: JsError) -> RuntimeError {
-        let details = JsExceptionDetails::from_js_error(err);
+        self.translate_js_details(JsExceptionDetails::from_js_error(err))
+    }
+
+    /// The error for a `func.call` that V8 terminated mid-flight.
+    ///
+    /// V8 reports that as a *null* exception, which `JsError` renders as
+    /// `Uncaught null` -- text `runtime_error_indicates_termination` cannot
+    /// recognise, so `apply_watchdog_result` passed it through instead of
+    /// turning it into a timeout. Name it the way deno_core names a terminated
+    /// `execute_script`, so a function call is classified exactly like `eval`:
+    /// a timeout when its own watchdog fired, `RuntimeTerminated` after
+    /// `terminate()`, and a bare `execution terminated` in the cross-talk case
+    /// described on `ArmedDeadline`.
+    fn terminated_call_error(&mut self) -> RuntimeError {
+        self.translate_js_details(JsExceptionDetails {
+            name: Some("Error".to_string()),
+            message: Some("execution terminated".to_string()),
+            stack: Some("Error: execution terminated".to_string()),
+            frames: Vec::new(),
+        })
+    }
+
+    fn translate_js_details(&mut self, details: JsExceptionDetails) -> RuntimeError {
         if self.should_reject_new_work() && Self::js_error_indicates_termination(&details) {
             let _ = self.finalize_termination();
             self.terminated_error()
@@ -3187,6 +3239,8 @@ impl RuntimeCoreState {
             // inline variant makes every `Ok` return on this path pay for the
             // error case (clippy::result_large_err).
             Js(Box<JsError>),
+            /// V8 terminated the call; see `terminated_call_error`.
+            Terminated,
         }
 
         let call_outcome: Result<SyncCallOutcome, SyncCallError> = (|| {
@@ -3217,6 +3271,13 @@ impl RuntimeCoreState {
             match func.call(try_catch, call_receiver, &v8_args) {
                 Some(result_value) => {
                     try_catch.perform_microtask_checkpoint();
+                    // The function returned, but a continuation it queued
+                    // (`async () => { await 0; while (true) {} }`) spun in the
+                    // checkpoint and was terminated there. Report that, rather
+                    // than parking a promise nobody will ever resume.
+                    if try_catch.is_execution_terminating() {
+                        return Err(SyncCallError::Terminated);
+                    }
 
                     if result_value.is_promise() {
                         let promise =
@@ -3263,6 +3324,7 @@ impl RuntimeCoreState {
                         .map_err(SyncCallError::Runtime)
                     }
                 }
+                None if try_catch.has_terminated() => Err(SyncCallError::Terminated),
                 None => match try_catch.exception() {
                     Some(exception) => {
                         let js_error = JsError::from_v8_exception(try_catch, exception);
@@ -3284,6 +3346,7 @@ impl RuntimeCoreState {
             }
             Err(SyncCallError::Runtime(err)) => Err(err),
             Err(SyncCallError::Js(js_error)) => Err(self.translate_js_error(*js_error)),
+            Err(SyncCallError::Terminated) => Err(self.terminated_call_error()),
         }
     }
 

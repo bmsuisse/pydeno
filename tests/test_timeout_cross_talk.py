@@ -55,6 +55,34 @@ async def test_async_deadline_terminates_an_unrelated_inline_sync_call() -> None
 
 
 @pytest.mark.asyncio
+async def test_async_function_call_deadline_has_the_same_cross_talk() -> None:
+    """Function calls follow the same contract, on both sides.
+
+    An async function call's deadline is now enforced by the watchdog thread
+    (it used to be checked only between event-loop steps, which is also why
+    spinning JS inside one hung forever), so like `eval_async` it can stop an
+    inline sync call. And a *function call* victim reports the same bare
+    `execution terminated` as an `eval` one -- it used to say `Uncaught null`.
+    """
+    with Runtime(RuntimeConfig()) as rt:
+        parked_fn = rt.eval("(() => new Promise(() => {}))")
+        busy_fn = rt.eval(f"(() => {_BUSY})")
+        parked = asyncio.ensure_future(parked_fn.call_async(timeout=0.3))
+        await asyncio.sleep(0.1)
+
+        with pytest.raises(JavaScriptError) as sync_exc:
+            busy_fn()
+        assert "execution terminated" in str(sync_exc.value)
+        assert not isinstance(sync_exc.value, RuntimeTimeout)
+
+        with pytest.raises(RuntimeTimeout) as async_exc:
+            await parked
+        assert "timed out after 300ms" in str(async_exc.value)
+
+        assert rt.eval("1 + 1") == 2
+
+
+@pytest.mark.asyncio
 async def test_runtime_survives_an_async_deadline_on_a_pending_promise() -> None:
     """The async timeout is recoverable, like the sync one below.
 

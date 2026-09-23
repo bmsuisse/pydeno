@@ -31,24 +31,39 @@ RuntimeError` is unaffected but a check such as `type(exc) is RuntimeError`
   derives from `OSError`, and a same-named subclass of a different base would
   be a trap.
 
-  **Not yet on `JsFunction` calls.** When a JS function called from Python
-  is still *running* (not merely awaiting) at its deadline:
-
-  - `fn(...)` under `RuntimeConfig(timeout=...)` raises `JavaScriptError:
-    Uncaught null` — neither `RuntimeTimeout` nor any `RuntimeError` —
-    because V8 reports that termination as a null exception and the watchdog
-    result mapping does not recognise it. A per-call `fn(..., timeout=...)`
-    without a runtime-wide timeout arms no watchdog for the synchronous part
-    and does not interrupt it.
-  - `fn.call_async(...)`, and the awaited half of a `fn(...)` that returned a
-    promise, arm no watchdog at all, so JS that spins there is not
-    interrupted by either timeout.
-
-  `eval`, `eval_async`, `eval_module`, `eval_module_async`, and a function
-  call whose *promise* is still pending at the deadline, do raise
-  `RuntimeTimeout`.
+  Every timeout path raises it: `eval`, `eval_async`, `eval_module`,
+  `eval_module_async`, `fn(...)`, `fn.call_async(...)`, and the awaited half
+  of a `fn(...)` that returned a promise. `tests/test_timeout_every_path.py`
+  has one row per path, each asserting the type, a wall-clock bound, and that
+  the runtime is still usable and closes afterwards.
 
 ### Fixed
+
+- **A JS function call whose JS was still running at its deadline hung, or
+  raised the wrong error.** Pre-existing in 0.4.0.
+
+  - `fn.call_async(...)`, and the awaited half of a `fn(...)` that returned a
+    promise, armed no watchdog. Their deadline was only checked *between*
+    event-loop steps, and the dispatcher's own step watchdog is armed only
+    while no job is active, so `async () => { await 0; while (true) {} }`
+    hung forever, `timeout=` and `RuntimeConfig.timeout` notwithstanding.
+    Both now arm one for the job's lifetime, as `eval_async` does; a resumed
+    call arms it for what is left of the original call's clock.
+  - `fn(..., timeout=...)` on a runtime without `RuntimeConfig.timeout`
+    armed nothing either: the synchronous call only consulted the
+    runtime-wide timeout. It now uses the per-call one when given.
+  - When a watchdog did stop a function call, the caller got `JavaScriptError:
+    Uncaught null` — not `RuntimeTimeout`, not even a `RuntimeError` — because
+    V8 reports a terminated `func.call` as a null exception, which the timeout
+    mapping did not recognise. It is now reported as `execution terminated`,
+    exactly as a terminated `eval` is, so it becomes `RuntimeTimeout` when the
+    call's own deadline fired and `RuntimeTerminated` after `terminate()`.
+
+  Because async function calls now have a real deadline, they take part in
+  the cross-talk described under *Documented* below, exactly as `eval_async`
+  already did: an async call's deadline can stop an unrelated synchronous
+  call dispatched inline while it is parked. A function-call victim of that
+  reports `execution terminated`, where it used to say `Uncaught null`.
 
 - **An async job that timed out on a pending promise left the runtime
   permanently unusable.** After `await rt.eval_async("new Promise(() => {})",
