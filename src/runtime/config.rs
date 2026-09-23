@@ -1,7 +1,4 @@
 //! Runtime configuration for isolate-per-tenant execution.
-//!
-//! This module defines the configuration structure for JavaScript runtimes,
-//! including heap limits and bootstrap options.
 
 use crate::runtime::js_value::{SerializationLimits, MAX_JS_BYTES, MAX_JS_DEPTH};
 use crate::runtime::python::utils::validate_timeout_seconds;
@@ -10,25 +7,9 @@ use pyo3::prelude::*;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// Suggested grace period for [`RuntimeConfig::force_kill_grace`], for
-/// callers that want the escalation without picking a number themselves.
-///
-/// Chosen from measured polite-kill latency: a `while(true){}` interrupted by
-/// `terminate_execution()` returns in a median ~0.2ms, and the slowest polite
-/// tier -- a runtime parked on a pending promise, which only the dispatcher's
-/// termination-flag check can end -- has a median of ~0.3-0.4ms and a worst
-/// case of ~1.6ms across repeated 20-sample runs. 100ms is ~60x that worst
-/// case, so a runtime that was going to die politely always gets to, with a
-/// wide margin for a loaded machine, while still converting an unbounded hang
-/// into a bounded one. See BENCHMARKS.md.
-///
-/// Since 0.2.1 `TerminationController::request` signals the dispatcher's waker
-/// directly, so that check is reached on the next loop iteration rather than
-/// on the next `PENDING_WORK_TICK`; before that it was tick-bound at
-/// ~1.4-1.9ms.
-///
-/// Not a default: `force_kill_grace` is `None` unless asked for, because
-/// enabling it costs ~10% per call. See `RuntimeHandle::recv_result`.
+/// Suggested [`RuntimeConfig::force_kill_grace`]: ~60x the measured worst-case
+/// polite-kill latency (see BENCHMARKS.md). Not a default, since enabling
+/// force-kill costs ~10% per call (see `RuntimeHandle::recv_result`).
 pub const SUGGESTED_FORCE_KILL_GRACE: Duration = Duration::from_millis(100);
 
 fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
@@ -50,6 +31,37 @@ fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
     candidate.parse::<SocketAddr>().map_err(|err| {
         PyValueError::new_err(format!("Invalid inspector address '{candidate}': {err}"))
     })
+}
+
+fn conflict_error() -> PyErr {
+    PyValueError::new_err("snapshot and bootstrap cannot be used together")
+}
+
+fn check_callable(callback: &Py<PyAny>) -> PyResult<()> {
+    Python::attach(|py| {
+        if callback.bind(py).is_callable() {
+            Ok(())
+        } else {
+            Err(PyValueError::new_err("on_console must be callable"))
+        }
+    })
+}
+
+fn snapshot_bytes(data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let bytes = data.extract::<Vec<u8>>()?;
+    if bytes.is_empty() {
+        return Err(PyValueError::new_err("Snapshot bytes cannot be empty"));
+    }
+    Ok(bytes)
+}
+
+fn positive(value: usize, name: &str) -> PyResult<usize> {
+    if value == 0 {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be a positive integer"
+        )));
+    }
+    Ok(value)
 }
 
 /// Inspector configuration for Chrome DevTools Protocol debugging.
@@ -187,12 +199,8 @@ impl InspectorConfig {
     }
 }
 
-/// A Python callable held in a config value.
-///
-/// Exists only so [`RuntimeConfig`] can keep `#[derive(Clone)]`: `Py<PyAny>` is
-/// deliberately not `Clone` in pyo3 (bumping a refcount needs the GIL), so the
-/// clone goes through `Python::attach` + `clone_ref` here -- the same pattern
-/// `PythonOpEntry` (src/runtime/ops.rs) already uses.
+/// A Python callable in a config value; `Clone` goes through the GIL so
+/// [`RuntimeConfig`] can keep `#[derive(Clone)]`.
 #[derive(Debug)]
 pub struct ConsoleCallback(pub Py<PyAny>);
 
@@ -300,58 +308,33 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// Accepts seconds (int/float, which `f64` extraction covers) or a `timedelta`.
     fn duration_from_py_timeout(timeout_value: &Bound<'_, PyAny>) -> PyResult<Duration> {
-        if let Ok(seconds) = timeout_value.extract::<f64>() {
-            validate_timeout_seconds(seconds)?;
-            return Ok(Duration::from_secs_f64(seconds));
-        }
-
-        if let Ok(seconds) = timeout_value.extract::<u64>() {
-            let seconds_f64 = seconds as f64;
-            validate_timeout_seconds(seconds_f64)?;
-            return Ok(Duration::from_secs(seconds));
-        }
-
-        if let Ok(seconds) = timeout_value.extract::<i64>() {
-            let seconds_f64 = seconds as f64;
-            validate_timeout_seconds(seconds_f64)?;
-            return Ok(Duration::from_secs(seconds as u64));
-        }
-
-        let py = timeout_value.py();
-        let timedelta = py.import("datetime")?.getattr("timedelta")?;
-        if timeout_value.is_instance(&timedelta)? {
-            let total_seconds: f64 = timeout_value.getattr("total_seconds")?.call0()?.extract()?;
-            validate_timeout_seconds(total_seconds)?;
-            Ok(Duration::from_secs_f64(total_seconds))
+        let seconds = if let Ok(seconds) = timeout_value.extract::<f64>() {
+            seconds
         } else {
-            Err(PyValueError::new_err(
-                "Timeout must be a number (seconds) or datetime.timedelta object",
-            ))
-        }
+            let timedelta = timeout_value
+                .py()
+                .import("datetime")?
+                .getattr("timedelta")?;
+            if !timeout_value.is_instance(&timedelta)? {
+                return Err(PyValueError::new_err(
+                    "Timeout must be a number (seconds) or datetime.timedelta object",
+                ));
+            }
+            timeout_value.getattr("total_seconds")?.call0()?.extract()?
+        };
+        validate_timeout_seconds(seconds)?;
+        Ok(Duration::from_secs_f64(seconds))
+    }
+
+    fn optional_duration(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Duration>> {
+        value.map(Self::duration_from_py_timeout).transpose()
     }
 
     pub fn serialization_limits(&self) -> SerializationLimits {
         SerializationLimits::new(self.max_serialization_depth, self.max_serialization_bytes)
     }
-}
-
-fn validate_serialization_depth(depth: usize) -> PyResult<()> {
-    if depth == 0 {
-        return Err(PyValueError::new_err(
-            "max_serialization_depth must be a positive integer",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_serialization_bytes(bytes: usize) -> PyResult<()> {
-    if bytes == 0 {
-        return Err(PyValueError::new_err(
-            "max_serialization_bytes must be a positive integer",
-        ));
-    }
-    Ok(())
 }
 
 #[pymethods]
@@ -386,75 +369,33 @@ impl RuntimeConfig {
         force_kill_grace: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         if bootstrap.is_some() && snapshot.is_some() {
-            return Err(PyValueError::new_err(
-                "snapshot and bootstrap cannot be used together",
-            ));
+            return Err(conflict_error());
         }
-
-        let mut config = RuntimeConfig {
+        let execution_timeout = Self::optional_duration(timeout)?;
+        if let Some(callback) = &on_console {
+            check_callable(callback)?;
+        }
+        let snapshot = snapshot.map(snapshot_bytes).transpose()?;
+        let defaults = RuntimeConfig::default();
+        Ok(RuntimeConfig {
+            max_heap_size,
+            initial_heap_size,
+            execution_timeout,
+            bootstrap_script: bootstrap,
+            enable_console: enable_console.or(defaults.enable_console),
+            on_console: on_console.map(ConsoleCallback),
             inspector,
-            ..RuntimeConfig::default()
-        };
-
-        // Set max heap size if provided
-        if let Some(size) = max_heap_size {
-            config.max_heap_size = Some(size);
-        }
-
-        // Set initial heap size if provided
-        if let Some(size) = initial_heap_size {
-            config.initial_heap_size = Some(size);
-        }
-
-        // Set bootstrap script if provided
-        if let Some(script) = bootstrap {
-            config.bootstrap_script = Some(script);
-        }
-
-        // Set timeout if provided
-        if let Some(timeout_value) = timeout {
-            let duration = RuntimeConfig::duration_from_py_timeout(timeout_value)?;
-            config.execution_timeout = Some(duration);
-        }
-
-        // Set enable console if provided
-        if let Some(enable) = enable_console {
-            config.enable_console = Some(enable);
-        }
-
-        if let Some(callback) = on_console {
-            Python::attach(|py| -> PyResult<()> {
-                if !callback.bind(py).is_callable() {
-                    return Err(PyValueError::new_err("on_console must be callable"));
-                }
-                Ok(())
-            })?;
-            config.on_console = Some(ConsoleCallback(callback));
-        }
-
-        if let Some(snapshot_obj) = snapshot {
-            let bytes = snapshot_obj.extract::<Vec<u8>>()?;
-            if bytes.is_empty() {
-                return Err(PyValueError::new_err("Snapshot bytes cannot be empty"));
-            }
-            config.snapshot = Some(bytes);
-        }
-
-        if let Some(depth) = max_serialization_depth {
-            validate_serialization_depth(depth)?;
-            config.max_serialization_depth = depth;
-        }
-
-        if let Some(bytes) = max_serialization_bytes {
-            validate_serialization_bytes(bytes)?;
-            config.max_serialization_bytes = bytes;
-        }
-
-        if let Some(grace) = force_kill_grace {
-            config.force_kill_grace = Some(RuntimeConfig::duration_from_py_timeout(grace)?);
-        }
-
-        Ok(config)
+            snapshot,
+            max_serialization_depth: max_serialization_depth
+                .map(|d| positive(d, "max_serialization_depth"))
+                .transpose()?
+                .unwrap_or(defaults.max_serialization_depth),
+            max_serialization_bytes: max_serialization_bytes
+                .map(|b| positive(b, "max_serialization_bytes"))
+                .transpose()?
+                .unwrap_or(defaults.max_serialization_bytes),
+            force_kill_grace: Self::optional_duration(force_kill_grace)?,
+        })
     }
 
     /// Get maximum heap size in bytes.
@@ -491,9 +432,7 @@ impl RuntimeConfig {
     #[setter]
     fn set_bootstrap(&mut self, source: String) -> PyResult<()> {
         if self.snapshot.is_some() {
-            return Err(PyValueError::new_err(
-                "snapshot and bootstrap cannot be used together",
-            ));
+            return Err(conflict_error());
         }
         self.bootstrap_script = Some(source);
         Ok(())
@@ -509,7 +448,7 @@ impl RuntimeConfig {
     /// Accepts float/int as seconds or datetime.timedelta object.
     #[setter]
     fn set_timeout<'py>(&mut self, timeout: &Bound<'py, PyAny>) -> PyResult<()> {
-        self.execution_timeout = Some(RuntimeConfig::duration_from_py_timeout(timeout)?);
+        self.execution_timeout = Some(Self::duration_from_py_timeout(timeout)?);
         Ok(())
     }
 
@@ -529,12 +468,7 @@ impl RuntimeConfig {
     #[setter]
     fn set_on_console(&mut self, callback: Option<Py<PyAny>>) -> PyResult<()> {
         if let Some(cb) = &callback {
-            Python::attach(|py| -> PyResult<()> {
-                if !cb.bind(py).is_callable() {
-                    return Err(PyValueError::new_err("on_console must be callable"));
-                }
-                Ok(())
-            })?;
+            check_callable(cb)?;
         }
         self.on_console = callback.map(ConsoleCallback);
         Ok(())
@@ -564,20 +498,14 @@ impl RuntimeConfig {
     /// Set snapshot bytes.
     #[setter]
     fn set_snapshot(&mut self, data: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        if data.is_none() {
+        let Some(data) = data else {
             self.snapshot = None;
             return Ok(());
-        }
+        };
         if self.bootstrap_script.is_some() {
-            return Err(PyValueError::new_err(
-                "snapshot and bootstrap cannot be used together",
-            ));
+            return Err(conflict_error());
         }
-        let bytes = data.unwrap().extract::<Vec<u8>>()?;
-        if bytes.is_empty() {
-            return Err(PyValueError::new_err("Snapshot bytes cannot be empty"));
-        }
-        self.snapshot = Some(bytes);
+        self.snapshot = Some(snapshot_bytes(data)?);
         Ok(())
     }
 
@@ -590,8 +518,7 @@ impl RuntimeConfig {
     /// Set maximum serialization depth for Python<->JS transfers.
     #[setter]
     fn set_max_serialization_depth(&mut self, depth: usize) -> PyResult<()> {
-        validate_serialization_depth(depth)?;
-        self.max_serialization_depth = depth;
+        self.max_serialization_depth = positive(depth, "max_serialization_depth")?;
         Ok(())
     }
 
@@ -611,18 +538,14 @@ impl RuntimeConfig {
     /// Accepts float/int as seconds or a `datetime.timedelta`; `None` disables.
     #[setter]
     fn set_force_kill_grace(&mut self, grace: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        self.force_kill_grace = match grace {
-            Some(value) => Some(RuntimeConfig::duration_from_py_timeout(value)?),
-            None => None,
-        };
+        self.force_kill_grace = Self::optional_duration(grace)?;
         Ok(())
     }
 
     /// Set maximum serialized byte size for Python<->JS transfers.
     #[setter]
     fn set_max_serialization_bytes(&mut self, bytes: usize) -> PyResult<()> {
-        validate_serialization_bytes(bytes)?;
-        self.max_serialization_bytes = bytes;
+        self.max_serialization_bytes = positive(bytes, "max_serialization_bytes")?;
         Ok(())
     }
 
