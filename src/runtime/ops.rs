@@ -264,8 +264,11 @@ fn op_pydeno_call_python_sync(
         "Host op is not synchronous",
     )?;
     let limits = state_get::<SerializationLimits>(state, "SerializationLimits")?;
-    let result = Python::attach(|py| call_handler(py, &entry, &args, &limits))?;
-    to_js(result, &limits)
+    // One GIL acquisition for the call and the result conversion.
+    Python::attach(|py| {
+        let result = call_handler(py, &entry, &args, &limits)?;
+        python_to_js_value(result.into_bound(py), &limits).map_err(map_pyerr)
+    })
 }
 
 /// Asynchronously call a Python handler from JavaScript, awaiting the returned
