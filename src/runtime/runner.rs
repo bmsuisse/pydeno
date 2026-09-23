@@ -295,11 +295,22 @@ impl Watchdog {
                             .filter(|entry| entry.fired)
                             .min_by_key(|entry| entry.deadline)
                             .map(|entry| entry.reason.clone());
-                        drop(armed);
+                        // Keep holding `armed` until `terminate_execution` has
+                        // been issued. `disarm` reads `fired` under this lock
+                        // and its caller cancels the termination when it sees
+                        // `true`. Released any earlier, a call that finished
+                        // on its own just past its deadline could be disarmed
+                        // (`fired == true`) and cancel a termination not yet
+                        // requested -- after which this thread's late
+                        // `terminate_execution` latched the isolate and the
+                        // *next*, unrelated, call failed with a bare
+                        // `execution terminated`. Neither call below takes
+                        // `armed`, so this adds no lock-order edge.
                         if let Some(reason) = reason {
                             termination.ensure_reason(reason);
                         }
                         termination.terminate_execution();
+                        drop(armed);
                         continue;
                     }
 
