@@ -182,6 +182,7 @@ gets a catchable `ToolBudgetError`.
 - [Guides](https://bmsuisse.github.io/pydeno/guides/bindings/): binding functions, module loading, snapshots
 - [Use cases](https://bmsuisse.github.io/pydeno/use-cases/ai-agent/): AI agent sandboxes, workflow runners, plugin systems
 - [API reference](https://bmsuisse.github.io/pydeno/api/pydeno/)
+- [Agent skill](skills/pydeno/SKILL.md): an [Agent Skills](https://agentskills.io) `SKILL.md` that teaches coding agents (Claude Code and others) to use pydeno correctly. Copy `skills/pydeno/` into your agent's skills directory, e.g. `.claude/skills/`
 - [Benchmarks](BENCHMARKS.md) — measured, reproducible numbers, including the pooling comparison above
 
 [v8]: https://v8.dev
