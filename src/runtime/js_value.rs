@@ -1,8 +1,4 @@
-//! Internal JSValue type for accurate JavaScript value representation.
-//!
-//! This module provides a replacement for `serde_json::Value` that can accurately
-//! represent JavaScript values including NaN, ±Infinity, and properly detect
-//! circular references and enforce depth/size limits.
+//! `JSValue`: lossless JavaScript value representation plus conversion limits.
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use indexmap::IndexMap;
@@ -11,134 +7,39 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_bytes::Bytes;
 
-/// Maximum depth for JavaScript value serialization
+/// Default serialization depth / byte limits.
 pub const MAX_JS_DEPTH: usize = 100;
-/// Maximum size in bytes for JavaScript value serialization
-pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
+pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024;
 
-/// Stack size for every thread that may run V8 or the recursive
-/// `JSValue` serializers.
+/// Stack reserved for every thread that may run V8 or the recursive `JSValue`
+/// converters (Rust's 2 MiB default is too small for unoptimized frames at
+/// [`MAX_JS_DEPTH`]). Only a lazily committed reservation; V8's own ~984 KB
+/// limit is the real bound, enforced by [`LimitTracker::enter`].
 ///
-/// Rust's default for a spawned thread is 2 MiB, which is **not** enough. The
-/// V8<->`JSValue` converters (`value_to_js_value_internal`, `js_value_to_v8`,
-/// `js_value_to_python`, `python_to_js_value`) recurse once per nesting level
-/// up to [`MAX_JS_DEPTH`], and an unoptimized build does not merge or shrink
-/// those frames.
-///
-/// This 16 MiB figure is the OS thread's *own* reservation, and it is not the
-/// bound that actually matters once `max_serialization_depth` is raised past
-/// its default: **V8 imposes its own, much smaller stack limit -- roughly
-/// 984 KB -- on anything that enters the isolate**, independent of how much
-/// native stack the hosting OS thread was given. A caller can only raise
-/// `max_serialization_depth` far enough to run past that V8-side budget while
-/// still comfortably inside this 16 MiB OS reservation, so a generous OS
-/// stack does not, by itself, make deep recursion safe; see
-/// [`record_stack_anchor`] and [`LimitTracker::enter`] for the headroom check
-/// that actually enforces the real budget rather than this one.
-///
-/// 16 MiB leaves room for V8's own stack limit, the `deno_core`/tokio frames
-/// above the converter, and future growth in the converters themselves. It is
-/// only a *reservation*: pages are committed lazily, so an idle runtime
-/// thread does not pay for it.
-///
-/// # What this does *not* cover
-///
-/// `python_to_js_value` recurses on the thread that **called** -- it needs
-/// that thread's GIL and its Python objects -- so this reservation is
-/// irrelevant to it. A `threading.Thread` gets 512 KB on macOS and `pydeno`
-/// cannot set the stack of a thread it did not spawn. The headroom check in
-/// [`LimitTracker::enter`] is a no-op on such a thread (no anchor was ever
-/// recorded there), so this class of caller is bounded only by
-/// `max_serialization_depth` and the OS thread's own stack size, same as
-/// before.
-///
-/// Measured (debug, macOS arm64, 512 KB caller thread): a nested-dict
-/// argument converts safely to depth **900** and dies with SIGBUS at
-/// **1000**, i.e. ~512 bytes per frame -- 55x cheaper than the V8-side
-/// serializer, because these frames carry `Bound<PyAny>` handles rather than
-/// V8 scopes. Against the default [`MAX_JS_DEPTH`] of 100 that is ~9x of
-/// headroom, which is why the default configuration is safe from any thread;
-/// `tests/test_thread_stack_size.py` pins it.
-///
-/// It is *not* safe to raise `max_serialization_depth` past ~900 and then
-/// convert from a small-stack thread. Closing that properly means moving the
-/// Python->JS conversion onto the runtime thread, which changes where the GIL
-/// is held across the boundary and is a bigger change than a constant.
+/// `python_to_js_value` recurses on the *calling* Python thread (it needs the
+/// GIL), so this does not cover it: e.g. a 512 KB macOS `threading.Thread`
+/// handles ~900 levels, ~9x the default depth
+/// (`tests/test_thread_stack_size.py`). Raising `max_serialization_depth` past
+/// that and converting from a small-stack thread is unsafe.
 pub const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-/// Headroom, in bytes, that [`LimitTracker::enter`] reserves below the
-/// runtime thread's recorded stack anchor before it refuses to recurse
-/// further.
+/// Stack budget below the runtime thread's anchor before [`LimitTracker::enter`]
+/// refuses to recurse. Approximates V8's native stack limit, whose overflow
+/// aborts the process (`Check failed: IsOnCentralStack()`) instead of raising.
 ///
-/// This approximates **V8's own native stack limit (~984 KB)**, which is the
-/// real boundary for anything that enters the isolate and is independent of
-/// the 16 MiB the runtime thread actually reserves
-/// ([`RUNTIME_THREAD_STACK_SIZE`]). Crossing it is not a catchable error: V8
-/// aborts the process with `Check failed: IsOnCentralStack()` from inside
-/// `Isolate::StackOverflow`. Without this check, `LimitTracker` only counted
-/// *logical* nesting levels, so `max_serialization_depth = 10**6` -- an
-/// explicit, supported configuration -- corrupted the process instead of
-/// raising a Python exception (reproducible on `main` @ a51a0a4).
-///
-/// # This check is unconditional, and in a debug build it binds first
-///
-/// It runs on *every* [`LimitTracker::enter`], not only when
-/// `max_serialization_depth` has been raised, because the stack does not
-/// care why the recursion is deep. Re-measured on macOS arm64 against this
-/// checkout by bisecting the first rejected depth of a `{n: {n: ...}}`
-/// chain:
-///
-/// | profile | frame cost | trips at depth | V8's abort boundary |
-/// |---------|-----------|----------------|---------------------|
-/// | `unoptimized + debuginfo` | ~29.5 KB | **22** | ~40 |
-/// | `release` | ~0.9 KB | **743** | ~1100-1200 |
-///
-/// So in an `unoptimized + debuginfo` build **nesting deeper than 21 is
-/// rejected regardless of `max_serialization_depth`, and the documented
-/// default of 100 is unreachable**. Published wheels are release builds, so
-/// users are unaffected; developers and the debug CI job are not, and the
-/// rejection lands on perfectly legal input.
-///
-/// That is a build-profile ceiling, not a tuning mistake, and 0.4.1
-/// deliberately leaves it in place: an `unoptimized + debuginfo` frame is
-/// ~33x the optimized one, so a budget large enough for depth 100 there is
-/// far past V8's real limit. Raising this constant to 6 MiB was tried and
-/// reproduced the abort above at depth ~50, with the C stack trace running
-/// straight through `value_to_js_value_internal` -- the check is the only
-/// thing standing between a debug build and that abort, so it stays a hard
-/// backstop. `v8::CreateParams::set_stack_limit` does not move the boundary
-/// either: `StackGuard::InitThread` overwrites it from `v8_flags.stack_size`
-/// when the isolate is entered on a thread, and that flag is process-global,
-/// so raising it would also apply to `SnapshotBuilder` isolates, which are
-/// created on whatever Python thread calls them -- possibly a 512 KB one.
-///
-/// What 0.4.1 does change is the *message*: it now names the build profile
-/// as the cause rather than reading as a fault in the caller's data or
-/// configuration. Closing the gap properly means shrinking the debug frame
-/// (`value_to_js_value_internal` is one large function whose every branch
-/// gets its own stack slots unoptimized), which is a refactor, not a patch.
-///
-/// The budget is measured from the *thread* anchor, not from the
-/// serializer's entry frame, so whatever frames are already on the runtime
-/// thread's stack count against it: converting a value from inside a host op
-/// callback (itself invoked from an `eval`) has slightly less headroom than
-/// converting the same value from a top-level `eval`. Conservative in the
-/// safe direction, but it means the effective ceiling is context-dependent.
-///
+/// Checked unconditionally, so in a debug build (~29.5 KB/frame) it trips at
+/// depth ~22, below the default `max_serialization_depth`; release builds
+/// (~0.9 KB/frame) trip at ~743. Raising it reproduces the V8 abort, and
+/// `set_stack_limit` cannot move V8's boundary (process-global flag). Measured
+/// from the thread anchor, so frames already on the stack count against it.
 /// See `tests/test_serialization_headroom.py`.
 const STACK_HEADROOM_BYTES: usize = 640 * 1024;
 
-/// How this build describes itself in the headroom rejection, so a reader
-/// hitting the check at depth 22 can tell at a glance that they are on a
-/// debug build rather than at a limit released wheels impose. See
-/// [`STACK_HEADROOM_BYTES`] for the measurements.
 #[cfg(debug_assertions)]
 const PROFILE_LABEL: &str = "unoptimized (debug_assertions on)";
 #[cfg(not(debug_assertions))]
 const PROFILE_LABEL: &str = "optimized";
 
-/// The approximate nesting depth at which [`STACK_HEADROOM_BYTES`] trips in
-/// this build profile, measured on macOS arm64.
 #[cfg(debug_assertions)]
 const PROFILE_CEILING: &str = "around depth 22 -- below the default \
                                `max_serialization_depth` of 100";
@@ -147,40 +48,25 @@ const PROFILE_CEILING: &str = "around depth 743 -- far past the default \
                                `max_serialization_depth` of 100";
 
 thread_local! {
-    /// The runtime thread's stack anchor: the address of a local variable
-    /// captured near the top of that thread's closure, before `JsRuntime::new`
-    /// runs. `None` on every other thread (e.g. the Python caller thread that
-    /// runs `python_to_js_value` directly), which is what makes the headroom
-    /// check in [`LimitTracker::enter`] a no-op there.
+    /// Runtime thread's stack anchor; `None` elsewhere, which disables the
+    /// headroom check (e.g. on Python caller threads).
     static STACK_ANCHOR: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// Record the current thread's stack anchor for the headroom check in
-/// [`LimitTracker::enter`].
-///
-/// Must be called once, near the top of the runtime thread's closure and
-/// before `JsRuntime::new`, while the stack is still shallow. Calling it a
-/// second time on the same thread, or from any other thread, is harmless but
-/// pointless -- only the runtime thread's recursive serializer calls benefit
-/// from the check this enables.
+/// Record the current thread's stack anchor for [`LimitTracker::enter`]. Call
+/// once near the top of the runtime thread, before `JsRuntime::new`.
 pub fn record_stack_anchor() {
     let local_probe: u8 = 0;
     let addr = &local_probe as *const u8 as usize;
     STACK_ANCHOR.with(|cell| cell.set(Some(addr)));
 }
 
-/// Bytes of stack consumed between this thread's recorded anchor and `here`.
-///
-/// Returns `None` when no anchor was recorded on this thread (the check is
-/// then skipped by the caller). Stack grows down on every platform pydeno
-/// supports, so a healthy `anchor - here` distance grows as recursion goes
-/// deeper.
+/// Stack bytes used since this thread's anchor (stack grows down), or `None`.
 fn stack_used_since_anchor() -> Option<usize> {
     STACK_ANCHOR.with(|cell| {
         cell.get().map(|anchor| {
             let here_probe: u8 = 0;
-            let here = &here_probe as *const u8 as usize;
-            anchor.saturating_sub(here)
+            anchor.saturating_sub(&here_probe as *const u8 as usize)
         })
     })
 }
@@ -219,48 +105,56 @@ const JS_STREAM_TYPE: &str = "JsStream";
 const PY_STREAM_TYPE: &str = "PyStream";
 const STREAM_ID_KEY: &str = "id";
 
-/// Internal representation of JavaScript values that can round-trip accurately.
-///
-/// Unlike `serde_json::Value`, this enum can represent special numeric values
-/// (NaN, ±Infinity) and enforces proper depth/size limits during conversion.
-///
-/// Note: The Serialize/Deserialize implementations are manually implemented
-/// because the Function variant cannot be serialized.
+/// JavaScript value that round-trips accurately (NaN, ±Infinity, BigInt,
+/// Date, ...). Serde impls are manual: `Function` cannot be serialized.
 #[derive(Clone, Debug, PartialEq)]
 pub enum JSValue {
-    /// JavaScript undefined
     Undefined,
-    /// JavaScript null
     Null,
-    /// JavaScript boolean
     Bool(bool),
-    /// JavaScript integer (within i64 range)
+    /// Integer within i64 range.
     Int(i64),
-    /// JavaScript BigInt
     BigInt(BigInt),
-    /// JavaScript float (including NaN and ±Infinity)
+    /// Float, including NaN and ±Infinity.
     Float(f64),
-    /// JavaScript string
     String(String),
-    /// JavaScript bytes (Uint8Array / ArrayBuffer)
+    /// Uint8Array / ArrayBuffer.
     Bytes(Vec<u8>),
-    /// JavaScript array (preserves order)
     Array(Vec<JSValue>),
-    /// JavaScript object (uses IndexMap to preserve insertion order)
+    /// Object in insertion order.
     Object(IndexMap<String, JSValue>),
-    /// JavaScript Date (epoch milliseconds, UTC)
+    /// Epoch milliseconds, UTC.
     Date(i64),
-    /// JavaScript Set (preserves insertion order captured from JS)
+    /// Set in insertion order.
     Set(Vec<JSValue>),
-    /// JavaScript function (proxy via registry ID)
-    Function { id: u32 },
-    /// JavaScript ReadableStream (proxied via runtime stream registry)
-    JsStream { id: u32 },
-    /// Python async iterable placeholder forwarded into JavaScript
-    PyStream { id: u32 },
+    /// Function proxied via registry id.
+    Function {
+        id: u32,
+    },
+    /// ReadableStream proxied via the runtime stream registry.
+    JsStream {
+        id: u32,
+    },
+    /// Python async iterable placeholder forwarded into JavaScript.
+    PyStream {
+        id: u32,
+    },
 }
 
-// Manual Serialize implementation that errors on Function variant
+/// Serialize `{TYPE_TAG: tag}` plus an optional payload entry.
+fn serialize_tagged<S: serde::Serializer, V: Serialize + ?Sized>(
+    serializer: S,
+    tag: &str,
+    entry: Option<(&str, &V)>,
+) -> Result<S::Ok, S::Error> {
+    let mut map = serializer.serialize_map(Some(1 + entry.is_some() as usize))?;
+    map.serialize_entry(TYPE_TAG, tag)?;
+    if let Some((key, value)) = entry {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
+}
+
 impl Serialize for JSValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -268,58 +162,40 @@ impl Serialize for JSValue {
     {
         use serde::ser::Error;
         match self {
-            JSValue::Undefined => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry(TYPE_TAG, UNDEFINED_TYPE)?;
-                map.end()
-            }
+            JSValue::Undefined => serialize_tagged::<S, ()>(serializer, UNDEFINED_TYPE, None),
             JSValue::Null => serializer.serialize_none(),
             JSValue::Bool(b) => serializer.serialize_bool(*b),
             JSValue::Int(i) => serializer.serialize_i64(*i),
-            JSValue::BigInt(bigint) => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry(TYPE_TAG, BIGINT_TYPE)?;
-                map.serialize_entry(BIGINT_VALUE_KEY, &bigint.to_str_radix(10))?;
-                map.end()
-            }
+            JSValue::BigInt(bigint) => serialize_tagged(
+                serializer,
+                BIGINT_TYPE,
+                Some((BIGINT_VALUE_KEY, &bigint.to_str_radix(10))),
+            ),
             JSValue::Float(f) => serializer.serialize_f64(*f),
             JSValue::String(s) => serializer.serialize_str(s),
             JSValue::Bytes(bytes) => Bytes::new(bytes).serialize(serializer),
             JSValue::Array(arr) => arr.serialize(serializer),
             JSValue::Object(obj) => obj.serialize(serializer),
             JSValue::Date(epoch_ms) => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry(TYPE_TAG, DATE_TYPE)?;
-                map.serialize_entry(DATE_EPOCH_KEY, epoch_ms)?;
-                map.end()
+                serialize_tagged(serializer, DATE_TYPE, Some((DATE_EPOCH_KEY, epoch_ms)))
             }
             JSValue::Set(values) => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry(TYPE_TAG, SET_TYPE)?;
-                map.serialize_entry(SET_VALUES_KEY, values)?;
-                map.end()
+                serialize_tagged(serializer, SET_TYPE, Some((SET_VALUES_KEY, values)))
             }
             JSValue::Function { id } => Err(Error::custom(format!(
                 "Cannot serialize JSValue::Function (id: {}). Functions must be called, not serialized.",
                 id
             ))),
             JSValue::JsStream { id } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry(TYPE_TAG, JS_STREAM_TYPE)?;
-                map.serialize_entry(STREAM_ID_KEY, id)?;
-                map.end()
+                serialize_tagged(serializer, JS_STREAM_TYPE, Some((STREAM_ID_KEY, id)))
             }
             JSValue::PyStream { id } => {
-                let mut map = serializer.serialize_map(Some(2))?;
-                map.serialize_entry(TYPE_TAG, PY_STREAM_TYPE)?;
-                map.serialize_entry(STREAM_ID_KEY, id)?;
-                map.end()
+                serialize_tagged(serializer, PY_STREAM_TYPE, Some((STREAM_ID_KEY, id)))
             }
         }
     }
 }
 
-// Manual Deserialize implementation that rejects Function variant
 impl<'de> Deserialize<'de> for JSValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -328,6 +204,15 @@ impl<'de> Deserialize<'de> for JSValue {
         use serde::de;
 
         struct JSValueVisitor;
+
+        /// Decode the `id` of a tagged stream placeholder.
+        fn stream_id<E: de::Error>(kind: &str, entry: &JSValue) -> Result<u32, E> {
+            match entry {
+                JSValue::Int(v) if *v >= 0 => Ok(*v as u32),
+                JSValue::Float(f) if f.is_finite() && *f >= 0.0 => Ok(*f as u32),
+                other => Err(E::custom(format!("Invalid {kind} id payload: {:?}", other))),
+            }
+        }
 
         impl<'de> de::Visitor<'de> for JSValueVisitor {
             type Value = JSValue;
@@ -346,11 +231,7 @@ impl<'de> Deserialize<'de> for JSValue {
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-                if value <= i64::MAX as u64 {
-                    Ok(JSValue::Int(value as i64))
-                } else {
-                    Ok(JSValue::Float(value as f64))
-                }
+                Ok(i64::try_from(value).map_or(JSValue::Float(value as f64), JSValue::Int))
             }
 
             fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
@@ -400,94 +281,56 @@ impl<'de> Deserialize<'de> for JSValue {
                 let mut tag: Option<String> = None;
 
                 while let Some((key, value)) = map.next_entry::<String, JSValue>()? {
-                    if key == TYPE_TAG {
-                        if let JSValue::String(tag_value) = value {
-                            tag = Some(tag_value);
-                        } else {
+                    match value {
+                        JSValue::String(tag_value) if key == TYPE_TAG => tag = Some(tag_value),
+                        value => {
                             object.insert(key, value);
                         }
-                    } else {
-                        object.insert(key, value);
                     }
                 }
 
-                if let Some(tag_value) = tag.clone() {
-                    match tag_value.as_str() {
-                        UNDEFINED_TYPE => {
-                            return Ok(JSValue::Undefined);
+                // A recognised tag with a malformed payload falls through to a
+                // plain object that keeps the tag.
+                if let Some(tag_value) = tag {
+                    match (tag_value.as_str(), object.get(tag_payload_key(&tag_value))) {
+                        (UNDEFINED_TYPE, _) => return Ok(JSValue::Undefined),
+                        (DATE_TYPE, Some(JSValue::Int(epoch_ms))) => {
+                            return Ok(JSValue::Date(*epoch_ms))
                         }
-                        DATE_TYPE => {
-                            if let Some(epoch_value) = object.get(DATE_EPOCH_KEY) {
-                                if let JSValue::Int(epoch_ms) = epoch_value {
-                                    return Ok(JSValue::Date(*epoch_ms));
-                                } else if let JSValue::Float(epoch_float) = epoch_value {
-                                    if epoch_float.is_finite() {
-                                        return Ok(JSValue::Date(*epoch_float as i64));
-                                    }
-                                }
-                            }
+                        (DATE_TYPE, Some(JSValue::Float(f))) if f.is_finite() => {
+                            return Ok(JSValue::Date(*f as i64))
                         }
-                        SET_TYPE => {
-                            if let Some(JSValue::Array(values)) = object.get(SET_VALUES_KEY) {
-                                return Ok(JSValue::Set(values.clone()));
-                            }
+                        (SET_TYPE, Some(JSValue::Array(values))) => {
+                            return Ok(JSValue::Set(values.clone()))
                         }
-                        BIGINT_TYPE => {
-                            if let Some(entry) = object.get(BIGINT_VALUE_KEY) {
-                                return match entry {
-                                    JSValue::String(value) => {
-                                        let parsed = BigInt::parse_bytes(value.as_bytes(), 10)
-                                            .ok_or_else(|| {
-                                                de::Error::custom(format!(
-                                                    "Invalid BigInt literal '{}'",
-                                                    value
-                                                ))
-                                            })?;
-                                        Ok(JSValue::BigInt(parsed))
-                                    }
-                                    JSValue::Int(i) => Ok(JSValue::BigInt(BigInt::from(*i))),
-                                    other => Err(de::Error::custom(format!(
-                                        "Invalid BigInt payload: expected string, got {:?}",
-                                        other
-                                    ))),
-                                };
-                            }
+                        (BIGINT_TYPE, Some(JSValue::String(value))) => {
+                            return BigInt::parse_bytes(value.as_bytes(), 10)
+                                .map(JSValue::BigInt)
+                                .ok_or_else(|| {
+                                    de::Error::custom(format!("Invalid BigInt literal '{}'", value))
+                                })
                         }
-                        JS_STREAM_TYPE => {
-                            if let Some(entry) = object.get(STREAM_ID_KEY) {
-                                let id = match entry {
-                                    JSValue::Int(v) if *v >= 0 => *v as u32,
-                                    JSValue::Float(f) if f.is_finite() && *f >= 0.0 => *f as u32,
-                                    other => {
-                                        return Err(de::Error::custom(format!(
-                                            "Invalid JsStream id payload: {:?}",
-                                            other
-                                        )))
-                                    }
-                                };
-                                return Ok(JSValue::JsStream { id });
-                            }
+                        (BIGINT_TYPE, Some(JSValue::Int(i))) => {
+                            return Ok(JSValue::BigInt(BigInt::from(*i)))
                         }
-                        PY_STREAM_TYPE => {
-                            if let Some(entry) = object.get(STREAM_ID_KEY) {
-                                let id = match entry {
-                                    JSValue::Int(v) if *v >= 0 => *v as u32,
-                                    JSValue::Float(f) if f.is_finite() && *f >= 0.0 => *f as u32,
-                                    other => {
-                                        return Err(de::Error::custom(format!(
-                                            "Invalid PyStream id payload: {:?}",
-                                            other
-                                        )))
-                                    }
-                                };
-                                return Ok(JSValue::PyStream { id });
-                            }
+                        (BIGINT_TYPE, Some(other)) => {
+                            return Err(de::Error::custom(format!(
+                                "Invalid BigInt payload: expected string, got {:?}",
+                                other
+                            )))
+                        }
+                        (JS_STREAM_TYPE, Some(entry)) => {
+                            return Ok(JSValue::JsStream {
+                                id: stream_id("JsStream", entry)?,
+                            })
+                        }
+                        (PY_STREAM_TYPE, Some(entry)) => {
+                            return Ok(JSValue::PyStream {
+                                id: stream_id("PyStream", entry)?,
+                            })
                         }
                         _ => {}
                     }
-                }
-
-                if let Some(tag_value) = tag {
                     object.insert(TYPE_TAG.to_string(), JSValue::String(tag_value));
                 }
 
@@ -499,10 +342,17 @@ impl<'de> Deserialize<'de> for JSValue {
     }
 }
 
-/// Tracks depth and size limits during JavaScript value conversion.
-///
-/// This is used to enforce limits while traversing V8 values to prevent
-/// excessive memory usage and stack overflow.
+/// Key holding a tagged value's payload.
+fn tag_payload_key(tag: &str) -> &'static str {
+    match tag {
+        DATE_TYPE => DATE_EPOCH_KEY,
+        SET_TYPE => SET_VALUES_KEY,
+        BIGINT_TYPE => BIGINT_VALUE_KEY,
+        _ => STREAM_ID_KEY,
+    }
+}
+
+/// Enforces depth, byte and stack-headroom limits during value conversion.
 pub struct LimitTracker {
     max_depth: usize,
     max_bytes: usize,
@@ -511,7 +361,6 @@ pub struct LimitTracker {
 }
 
 impl LimitTracker {
-    /// Create a new limit tracker with the specified limits.
     pub fn new(max_depth: usize, max_bytes: usize) -> Self {
         Self {
             max_depth,
@@ -521,18 +370,9 @@ impl LimitTracker {
         }
     }
 
-    /// Enter a new depth level.
-    ///
-    /// Returns an error if the depth limit is exceeded, or if this thread has
-    /// a recorded stack anchor ([`record_stack_anchor`]) and recursing this
-    /// deep has consumed more than [`STACK_HEADROOM_BYTES`] of real stack
-    /// since that anchor. The depth counter alone cannot catch this: a caller
-    /// is free to configure `max_serialization_depth` far higher than V8's
-    /// own stack budget can actually sustain, and without this check that
-    /// configuration corrupts the process instead of raising a Python
-    /// exception. On a thread with no anchor recorded (e.g. a Python caller
-    /// thread running `python_to_js_value` directly) this check is a no-op,
-    /// exactly as before.
+    /// Enter a depth level. Errors past `max_depth`, or when more than
+    /// [`STACK_HEADROOM_BYTES`] of stack were used since this thread's anchor
+    /// (a no-op on threads without one).
     pub fn enter(&mut self) -> RuntimeResult<()> {
         self.current_depth = self.current_depth.saturating_add(1);
         if self.current_depth > self.max_depth {
@@ -559,24 +399,18 @@ impl LimitTracker {
         Ok(())
     }
 
-    /// Exit a depth level.
     pub fn exit(&mut self) {
         self.current_depth = self.current_depth.saturating_sub(1);
     }
 
-    /// The configured byte ceiling, for the one caller that needs to reject a
-    /// single oversized value by its own size rather than by the running
-    /// total.
+    /// The configured byte ceiling, for rejecting a single oversized value.
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
     }
 
-    /// Add to the byte count.
-    ///
-    /// Returns an error if the size limit is exceeded.
+    /// Add to the byte count; errors past `max_bytes`. Saturating so an
+    /// "unlimited" (`usize::MAX`) tracker cannot overflow.
     pub fn add_bytes(&mut self, bytes: usize) -> RuntimeResult<()> {
-        // Saturating: an "unlimited" tracker (`usize::MAX`) plus a large
-        // payload would otherwise overflow and panic in a debug build.
         self.current_bytes = self.current_bytes.saturating_add(bytes);
         if self.current_bytes > self.max_bytes {
             return Err(RuntimeError::internal(byte_limit_message(
@@ -588,13 +422,8 @@ impl LimitTracker {
     }
 }
 
-/// The user-facing message for a depth rejection.
-///
-/// It names `max_serialization_depth` on purpose: the review of v0.2.0 found
-/// that a bare "Depth exceeded maximum limit of 100" gives the reader no way
-/// to discover that the limit is a knob they own, so a tunable limit reads as
-/// a hard wall. Every depth rejection on either direction of the boundary
-/// goes through here.
+/// User-facing depth rejection (both directions); names the config knob so the
+/// limit reads as tunable.
 pub fn depth_limit_message(max_depth: usize) -> String {
     format!(
         "Serialization depth exceeded the configured limit of {max_depth} \
@@ -602,8 +431,7 @@ pub fn depth_limit_message(max_depth: usize) -> String {
     )
 }
 
-/// The user-facing message for a byte rejection. Names
-/// `max_serialization_bytes` for the same reason as [`depth_limit_message`].
+/// User-facing byte rejection; see [`depth_limit_message`].
 pub fn byte_limit_message(current_bytes: usize, max_bytes: usize) -> String {
     format!(
         "Serialization size ({current_bytes} bytes) exceeded the configured limit of \
@@ -617,35 +445,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_js_value_creation() {
-        // Test that we can create various JSValue types
-        let _null = JSValue::Null;
-        let _bool = JSValue::Bool(true);
-        let _int = JSValue::Int(42);
-        let _float = JSValue::Float(2.5);
-        let _string = JSValue::String("hello".to_string());
-        let _array = JSValue::Array(vec![JSValue::Int(1), JSValue::Int(2)]);
-        let mut map = IndexMap::new();
-        map.insert("key".to_string(), JSValue::String("value".to_string()));
-        let _object = JSValue::Object(map);
-    }
-
-    #[test]
-    fn test_js_value_special_floats() {
-        let nan = JSValue::Float(f64::NAN);
-        let inf = JSValue::Float(f64::INFINITY);
-        let neg_inf = JSValue::Float(f64::NEG_INFINITY);
-
-        // Verify they can be created without panicking
-        assert!(matches!(nan, JSValue::Float(_)));
-        assert!(matches!(inf, JSValue::Float(_)));
-        assert!(matches!(neg_inf, JSValue::Float(_)));
-    }
-
-    #[test]
     fn test_limit_tracker_basic() {
         let mut tracker = LimitTracker::new(10, 1000);
-
         assert!(tracker.enter().is_ok());
         assert!(tracker.add_bytes(100).is_ok());
         tracker.exit();
@@ -654,19 +455,17 @@ mod tests {
     #[test]
     fn test_limit_tracker_depth_exceeded() {
         let mut tracker = LimitTracker::new(3, 1000);
-
-        assert!(tracker.enter().is_ok()); // depth 1
-        assert!(tracker.enter().is_ok()); // depth 2
-        assert!(tracker.enter().is_ok()); // depth 3
-        assert!(tracker.enter().is_err()); // depth 4 - should fail
+        for _ in 0..3 {
+            assert!(tracker.enter().is_ok());
+        }
+        assert!(tracker.enter().is_err());
     }
 
     #[test]
     fn test_limit_tracker_size_exceeded() {
         let mut tracker = LimitTracker::new(10, 100);
-
         assert!(tracker.add_bytes(50).is_ok());
         assert!(tracker.add_bytes(40).is_ok());
-        assert!(tracker.add_bytes(20).is_err()); // Total 110 - should fail
+        assert!(tracker.add_bytes(20).is_err());
     }
 }
