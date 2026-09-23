@@ -1,6 +1,5 @@
-//! Inspector server that mirrors Deno's DevTools bridge while exposing
-//! pydeno-friendly metadata. The server runs on a dedicated thread that drives
-//! a single-threaded Tokio runtime so that runtime threads can remain isolated.
+//! DevTools inspector server (mirrors Deno's bridge), run on its own thread
+//! with a single-threaded Tokio runtime.
 
 use anyhow::{Context, Result};
 use deno_core::futures::channel::mpsc;
@@ -37,6 +36,27 @@ use tokio::task::LocalSet;
 use uuid::Uuid;
 
 type HttpResponse = Response<Box<http_body_util::Full<Bytes>>>;
+type InspectorMap = Rc<RefCell<HashMap<Uuid, InspectorInfo>>>;
+
+fn respond(
+    status: StatusCode,
+    content_type: Option<&str>,
+    body: impl Into<Bytes>,
+) -> http::Result<HttpResponse> {
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(http::header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Box::new(http_body_util::Full::new(body.into())))
+}
+
+fn respond_json(body: &impl Serialize) -> http::Result<HttpResponse> {
+    respond(
+        StatusCode::OK,
+        Some("application/json"),
+        serde_json::to_vec(body).unwrap(),
+    )
+}
 
 /// Metadata shared back to Python exposing debugger entry-points.
 #[derive(Debug, Clone, Serialize)]
@@ -119,25 +139,20 @@ impl InspectorServer {
         params: InspectorRegistrationParams,
         connection_state: InspectorConnectionState,
     ) -> Result<InspectorRegistration> {
-        let session_sender = inspector.get_session_sender();
-        let deregister_rx = inspector.add_deregister_handler();
-
-        let info = InspectorInfo::new(
-            self.host,
-            session_sender,
-            deregister_rx,
-            InspectorInfoConfig {
-                target_url: params
-                    .target_url
-                    .unwrap_or_else(|| "pydeno://runtime".to_string()),
-                display_name: params.display_name,
-                wait_for_session: params.wait_for_connection,
-                description: self.name.to_string(),
-                favicon_url: "https://deno.land/favicon.ico".to_string(),
-                connection_state,
-            },
-        );
-
+        let info = InspectorInfo {
+            host: self.host,
+            uuid: Uuid::new_v4(),
+            thread_name: thread::current().name().map(|n| n.to_owned()),
+            new_session_tx: inspector.get_session_sender(),
+            deregister_rx: inspector.add_deregister_handler(),
+            target_url: params
+                .target_url
+                .unwrap_or_else(|| "pydeno://runtime".to_string()),
+            wait_for_session: params.wait_for_connection,
+            display_name: params.display_name,
+            description: self.name.to_string(),
+            connection_state,
+        };
         let metadata = info.metadata_for_host(None);
         self.register_tx
             .unbounded_send(info)
@@ -160,7 +175,7 @@ impl Drop for InspectorServer {
 
 fn handle_ws_request(
     req: Request<Incoming>,
-    inspector_map: Rc<RefCell<HashMap<Uuid, InspectorInfo>>>,
+    inspector_map: InspectorMap,
 ) -> http::Result<HttpResponse> {
     let (parts, body) = req.into_parts();
     let req = Request::from_parts(parts, ());
@@ -172,17 +187,13 @@ fn handle_ws_request(
         .and_then(|s| Uuid::parse_str(s).ok());
 
     let Some(uuid) = maybe_uuid else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Box::new(Bytes::from("Malformed inspector UUID").into()));
+        return respond(StatusCode::BAD_REQUEST, None, "Malformed inspector UUID");
     };
 
     let (new_session_tx, connection_state) = {
         let inspector_map = inspector_map.borrow();
         let Some(info) = inspector_map.get(&uuid) else {
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Box::new(Bytes::from("Invalid inspector UUID").into()));
+            return respond(StatusCode::NOT_FOUND, None, "Invalid inspector UUID");
         };
         (info.new_session_tx.clone(), info.connection_state.clone())
     };
@@ -191,9 +202,7 @@ fn handle_ws_request(
     let mut req = Request::from_parts(parts, body);
 
     let Ok((resp, upgrade_fut)) = upgrade(&mut req) else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Box::new(Bytes::from("Invalid WebSocket upgrade").into()));
+        return respond(StatusCode::BAD_REQUEST, None, "Invalid WebSocket upgrade");
     };
 
     spawn(async move {
@@ -232,44 +241,13 @@ fn handle_ws_request(
     ))
 }
 
-fn handle_json_request(
-    inspector_map: Rc<RefCell<HashMap<Uuid, InspectorInfo>>>,
-    host: Option<String>,
-) -> http::Result<HttpResponse> {
-    let data = inspector_map
-        .borrow()
-        .values()
-        .map(|info| info.metadata_for_host(host.clone()))
-        .collect::<Vec<_>>();
-
-    let body = serde_json::to_vec(&data).unwrap();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Box::new(http_body_util::Full::from(Bytes::from(body))))
-}
-
-fn handle_json_version_request(name: &str) -> http::Result<HttpResponse> {
-    let body = json!({
-        "Browser": name,
-        "Protocol-Version": "1.3",
-        "V8-Version": deno_core::v8::VERSION_STRING,
-    });
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Box::new(http_body_util::Full::from(Bytes::from(
-            serde_json::to_vec(&body).unwrap(),
-        ))))
-}
-
 async fn server(
     listener: std::net::TcpListener,
     register_rx: UnboundedReceiver<InspectorInfo>,
     shutdown_rx: broadcast::Receiver<()>,
     name: &'static str,
 ) {
-    let registry = Rc::new(RefCell::new(HashMap::<Uuid, InspectorInfo>::new()));
+    let registry: InspectorMap = Rc::default();
 
     let register_task = listen_for_new_inspectors(register_rx, Rc::clone(&registry)).boxed_local();
 
@@ -290,7 +268,6 @@ async fn server(
     };
 
     let registry_for_server = Rc::clone(&registry);
-    let shutdown_rx = shutdown_rx;
     let server_loop = async move {
         loop {
             let mut shutdown_listener = shutdown_rx.resubscribe();
@@ -322,15 +299,19 @@ async fn server(
                         (&Method::GET, path) if path.starts_with("/ws/") => {
                             handle_ws_request(req, Rc::clone(&inspector_map))
                         }
-                        (&Method::GET, "/json") | (&Method::GET, "/json/list") => {
-                            handle_json_request(Rc::clone(&inspector_map), host)
-                        }
-                        (&Method::GET, "/json/version") => handle_json_version_request(name),
-                        _ => Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Box::new(http_body_util::Full::from(Bytes::from(
-                                "Not Found",
-                            )))),
+                        (&Method::GET, "/json") | (&Method::GET, "/json/list") => respond_json(
+                            &inspector_map
+                                .borrow()
+                                .values()
+                                .map(|info| info.metadata_for_host(host.clone()))
+                                .collect::<Vec<_>>(),
+                        ),
+                        (&Method::GET, "/json/version") => respond_json(&json!({
+                            "Browser": name,
+                            "Protocol-Version": "1.3",
+                            "V8-Version": deno_core::v8::VERSION_STRING,
+                        })),
+                        _ => respond(StatusCode::NOT_FOUND, None, "Not Found"),
                     }
                 })
             });
@@ -365,7 +346,7 @@ async fn server(
 
 async fn listen_for_new_inspectors(
     mut register_rx: UnboundedReceiver<InspectorInfo>,
-    inspector_map: Rc<RefCell<HashMap<Uuid, InspectorInfo>>>,
+    inspector_map: InspectorMap,
 ) {
     while let Some(info) = register_rx.next().await {
         let host = info.host.to_string();
@@ -424,42 +405,11 @@ struct InspectorInfo {
     target_url: String,
     wait_for_session: bool,
     display_name: Option<String>,
-    favicon_url: String,
     description: String,
-    connection_state: InspectorConnectionState,
-}
-
-struct InspectorInfoConfig {
-    target_url: String,
-    display_name: Option<String>,
-    wait_for_session: bool,
-    description: String,
-    favicon_url: String,
     connection_state: InspectorConnectionState,
 }
 
 impl InspectorInfo {
-    fn new(
-        host: SocketAddr,
-        new_session_tx: UnboundedSender<InspectorSessionProxy>,
-        deregister_rx: oneshot::Receiver<()>,
-        inspector_cfg: InspectorInfoConfig,
-    ) -> Self {
-        Self {
-            host,
-            uuid: Uuid::new_v4(),
-            thread_name: thread::current().name().map(|n| n.to_owned()),
-            new_session_tx,
-            deregister_rx,
-            target_url: inspector_cfg.target_url,
-            wait_for_session: inspector_cfg.wait_for_session,
-            display_name: inspector_cfg.display_name,
-            favicon_url: inspector_cfg.favicon_url,
-            description: inspector_cfg.description,
-            connection_state: inspector_cfg.connection_state,
-        }
-    }
-
     fn get_websocket_debugger_url(&self, host: &str) -> String {
         format!("ws://{host}/ws/{}", self.uuid)
     }
@@ -483,8 +433,7 @@ impl InspectorInfo {
     }
 
     fn metadata_for_host(&self, host_override: Option<String>) -> InspectorMetadata {
-        let host_listen = self.host.to_string();
-        let host = host_override.unwrap_or(host_listen);
+        let host = host_override.unwrap_or_else(|| self.host.to_string());
         InspectorMetadata {
             id: self.uuid.to_string(),
             websocket_url: self.get_websocket_debugger_url(&host),
@@ -492,7 +441,7 @@ impl InspectorInfo {
             title: self.title(),
             description: self.description.clone(),
             target_url: self.target_url.clone(),
-            favicon_url: self.favicon_url.clone(),
+            favicon_url: "https://deno.land/favicon.ico".to_string(),
             host,
             target_type: "node".to_string(),
         }
