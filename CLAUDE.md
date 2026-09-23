@@ -111,7 +111,7 @@ Each JavaScript runtime runs on a **dedicated OS thread** with its own:
 - Tokio single-threaded runtime for async operations
 - Command channel for host communication
 
-The main Python thread communicates with runtime threads via message passing (`HostCommand` enum in `runner.rs`).
+The main Python thread communicates with runtime threads via message passing (`RuntimeCommand` enum in `runner/mod.rs`).
 
 ### Key Components
 
@@ -121,7 +121,7 @@ The main Python thread communicates with runtime threads via message passing (`H
 - Does NOT auto-shutdown on drop (explicit `close()` required)
 - Thread-safe via Arc\<Mutex\> for shutdown state
 
-**Runtime Thread** (`src/runtime/runner.rs`):
+**Runtime Thread** (`src/runtime/runner/`):
 - `RuntimeCoreState` holds the V8 isolate (deno_core JsRuntime) and all runtime data
 - `RuntimeDispatcher` processes commands from host thread on the dedicated runtime thread
 - Handles promise polling with microtask checkpoints
@@ -459,7 +459,7 @@ asyncio.run(main())
 
 - `src/lib.rs`: PyO3 module definition, exception types
 - `src/runtime/mod.rs`: V8 platform initialization, re-exports
-- `src/runtime/runner.rs`: Thread spawning, event loop, RuntimeCoreState and RuntimeDispatcher
+- `src/runtime/runner/`: runtime thread, split into `mod.rs` (commands, thread spawning), `dispatcher.rs` (event loop, RuntimeDispatcher), `jobs.rs` (async jobs), `core.rs` (RuntimeCoreState), `convert.rs` (V8 <-> JSValue), `termination.rs` (TerminationController, watchdog)
 - `src/runtime/handle.rs`: RuntimeHandle API
 - `src/runtime/python/`: Python bindings split into modules:
   - `runtime.rs`: Python Runtime class

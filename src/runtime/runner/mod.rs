@@ -188,10 +188,20 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
                 .build()
                 .expect("failed to build tokio runtime");
 
-            // `JsRuntime::new` must see an entered tokio runtime: otherwise V8
-            // background compilation of large scripts (~148KB+) reaches
-            // deno_core's `spawn_delayed_task` with no handle and aborts.
-            let tokio_enter = tokio_rt.enter();
+            // `JsRuntime::new` (inside `RuntimeCoreState::new`) registers this
+            // isolate with deno_core's platform via
+            // `tokio::runtime::Handle::try_current()`. If no tokio runtime is
+            // entered on this thread at that moment, the isolate is registered
+            // with no handle, and V8 background compilation for large scripts
+            // (which schedules a delayed foreground task once source size
+            // crosses V8's internal streaming-compile threshold) later hits
+            // deno_core's `spawn_delayed_task`, finds no handle, and calls
+            // `std::process::abort()` -- an uncatchable SIGABRT, observed here
+            // starting at ~148KB of JS source. Entering the runtime before
+            // creating the isolate is exactly the fix deno_core's own abort
+            // message recommends. Deliberately long: see
+            // docs/contributing/upstream-divergence.md.
+            let _tokio_enter = tokio_rt.enter();
             let core = match RuntimeCoreState::new(config) {
                 Ok(core) => {
                     let _ = init_tx.send(Ok((
@@ -206,7 +216,7 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
                     return;
                 }
             };
-            drop(tokio_enter);
+            drop(_tokio_enter);
 
             tokio_rt.block_on(RuntimeDispatcher::new(core, cmd_rx).run());
         })
