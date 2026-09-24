@@ -5,49 +5,34 @@ use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
 use std::sync::OnceLock;
 
-/// Async bridge helpers shared across the bindings.
 mod bridge;
-/// JsRuntime error translation helpers.
 pub(crate) mod error;
-/// Primary runtime bindings exposed to Python (`Runtime`, streams, functions).
+mod function;
 pub(crate) mod runtime;
-/// Snapshot builder PyO3 wrapper and helpers.
 pub(crate) mod snapshot;
-/// Runtime statistics and inspector endpoints exposure.
 pub(crate) mod stats;
-/// Utility helpers (e.g., timeout normalization).
+mod stream;
 pub(crate) mod utils;
 
 pub(crate) use error::runtime_error_to_py;
-#[allow(unused_imports)]
-pub(crate) use error::runtime_error_with_context;
-pub use runtime::{JsFunction, JsStream, PyStreamSource, Runtime, TerminationHandle};
-pub(crate) use runtime::{JsFunctionFinalizer, JsStreamFinalizer, PyStreamFinalizer};
+pub use function::JsFunction;
+pub(crate) use function::JsFunctionFinalizer;
+pub use runtime::{Runtime, TerminationHandle};
 pub use snapshot::SnapshotBuilderPy;
 pub use stats::{InspectorEndpoints, RuntimeStats};
+pub use stream::{JsStream, PyStreamSource};
+pub(crate) use stream::{JsStreamFinalizer, PyStreamFinalizer};
 
 create_exception!(crate::runtime::python, JavaScriptError, PyException);
 create_exception!(crate::runtime::python, RuntimeTerminated, PyRuntimeError);
-// Subclasses `RuntimeTerminated` deliberately: a force-kill *is* a
-// termination, so code that already catches `RuntimeTerminated` keeps working
-// unchanged. Callers that specifically care whether their runtime was
-// abandoned rather than shut down cleanly catch this narrower type.
+// A force-kill *is* a termination, so `except RuntimeTerminated` still catches it.
 create_exception!(
     crate::runtime::python,
     RuntimeForceKilled,
     RuntimeTerminated
 );
-// Subclasses `RuntimeError` deliberately, for the same reason
-// `RuntimeForceKilled` subclasses `RuntimeTerminated`: through 0.4.0 a
-// timeout arrived as a bare `PyRuntimeError`, so the only way to tell one
-// from an internal failure was to match `"timed out"` in the message -- which
-// this repo's own tests did. Every existing `except RuntimeError` keeps
-// catching it; callers that actually care can now name the type.
-//
-// Named `RuntimeTimeout` rather than `TimeoutError` on purpose: Python
-// already has a builtin `TimeoutError`, and it derives from `OSError`, not
-// `RuntimeError`. A same-named subclass of a different base would be a trap
-// for anyone who writes `except TimeoutError` after a stray import.
+// Subclasses `RuntimeError` so pre-0.4.1 `except RuntimeError` handlers still
+// catch timeouts. Not named `TimeoutError`: the builtin derives from `OSError`.
 create_exception!(crate::runtime::python, RuntimeTimeout, PyRuntimeError);
 
 #[pyfunction]
@@ -84,11 +69,8 @@ static JS_UNDEFINED_SINGLETON: OnceLock<Py<JsUndefined>> = OnceLock::new();
 
 pub(crate) fn get_js_undefined(py: Python<'_>) -> PyResult<Py<JsUndefined>> {
     if let Some(existing) = JS_UNDEFINED_SINGLETON.get() {
-        Ok(existing.clone_ref(py))
-    } else {
-        let value = Py::new(py, JsUndefined)?;
-        let stored = value.clone_ref(py);
-        let _ = JS_UNDEFINED_SINGLETON.set(stored);
-        Ok(value)
+        return Ok(existing.clone_ref(py));
     }
+    let value = Py::new(py, JsUndefined)?;
+    Ok(JS_UNDEFINED_SINGLETON.get_or_init(|| value).clone_ref(py))
 }

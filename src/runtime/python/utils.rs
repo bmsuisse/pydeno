@@ -1,4 +1,4 @@
-//! Timeout normalization helpers shared by multiple bindings.
+//! Helpers shared by multiple bindings (timeout normalization, finalizers).
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::time::Duration;
@@ -28,31 +28,37 @@ pub(crate) fn normalize_timeout_to_ms(timeout: Option<&Bound<PyAny>>) -> PyResul
         validate_timeout_seconds(seconds)?;
         Duration::from_secs_f64(seconds)
     } else if let Ok(seconds) = timeout_value.extract::<u64>() {
-        let seconds_f64 = seconds as f64;
-        validate_timeout_seconds(seconds_f64)?;
+        validate_timeout_seconds(seconds as f64)?;
         Duration::from_secs(seconds)
     } else if let Ok(seconds) = timeout_value.extract::<i64>() {
-        let seconds_f64 = seconds as f64;
-        validate_timeout_seconds(seconds_f64)?;
+        validate_timeout_seconds(seconds as f64)?;
         Duration::from_secs(seconds as u64)
     } else {
         let py = timeout_value.py();
         let timedelta = py.import("datetime")?.getattr("timedelta")?;
-        if timeout_value.is_instance(&timedelta)? {
-            let total_seconds: f64 = timeout_value.getattr("total_seconds")?.call0()?.extract()?;
-            validate_timeout_seconds(total_seconds)?;
-            Duration::from_secs_f64(total_seconds)
-        } else {
+        if !timeout_value.is_instance(&timedelta)? {
             return Err(PyValueError::new_err(
                 "Timeout must be a number (seconds), datetime.timedelta, or None",
             ));
         }
+        let total_seconds: f64 = timeout_value.getattr("total_seconds")?.call0()?.extract()?;
+        validate_timeout_seconds(total_seconds)?;
+        Duration::from_secs_f64(total_seconds)
     };
 
-    let millis = duration.as_millis();
-    if millis > u128::from(u64::MAX) {
-        Ok(Some(u64::MAX))
-    } else {
-        Ok(Some(millis as u64))
-    }
+    Ok(Some(
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+    ))
+}
+
+/// Register `finalizer` to run via `weakref.finalize` when `target` is collected.
+pub(crate) fn attach_finalizer<T, F>(py: Python<'_>, target: &Py<T>, finalizer: F) -> PyResult<()>
+where
+    F: pyo3::PyClass + Into<pyo3::PyClassInitializer<F>>,
+{
+    let finalize = py
+        .import("weakref")?
+        .getattr(pyo3::intern!(py, "finalize"))?;
+    finalize.call1((target.clone_ref(py), Py::new(py, finalizer)?))?;
+    Ok(())
 }

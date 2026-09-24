@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.4.2 — internal cleanup, no API changes
+
+An internal refactor with no API or behaviour changes. The Python API, the
+`_pydeno` stubs, error messages, and runtime semantics are all unchanged, and
+the full test suite (589 tests) passes as it did on 0.4.1. Rust source is down
+from 11,749 to 9,210 lines, and the Python package from 713 to 645.
+
+### Changed (internal)
+
+- **`src/runtime/runner.rs` (3,904 lines) is now a `runner/` module** split by
+  responsibility: `termination.rs` (`TerminationController`, the deadline
+  watchdog), `dispatcher.rs` (event loop, command handling), `jobs.rs` (async
+  job state machines), `core.rs` (`RuntimeCoreState`, sync entry points),
+  `convert.rs` (V8 ↔ `JSValue`), and `mod.rs` (commands, thread spawn).
+  - Command handling shares one set of admission helpers instead of ~20
+    copies of the terminated/inspector checks.
+  - Sync and async function calls share one call path and error type.
+  - A single `Converter` replaces the 4–6 arguments that were threaded
+    through every value conversion.
+  - Sync and async module evaluation share specifier parsing, loading and
+    namespace extraction.
+- **`src/runtime/python/runtime.rs`** is split into `runtime.rs`,
+  `function.rs` and `stream.rs`. The stats pyclasses are generated from their
+  source structs.
+- **`handle.rs`** sends every command through generic request/response
+  helpers.
+- **`ops.rs`, `config.rs`, `loader.rs`, `error.rs`** share their OpState
+  lookup, handler call, validation, and loader-call helpers.
+- **`js_value.rs`, `stream.rs`, `inspector.rs`, `conversion.rs`, `stats.rs`**:
+  repeated match arms and helpers are deduplicated, and call counters are
+  indexed by call kind.
+- **`python/pydeno`**: `ToolBridge` internals, default-runtime helpers, the
+  CLI, and the awaitable adapter are simplified.
+- Over-long internal comments are condensed to the reasoning that isn't
+  obvious from the code. Python-visible docstrings and `SAFETY` comments are
+  kept verbatim.
+
 ## 0.4.1
 
 Follow-ups to the 0.4.0 review (`docs/reviews/2026-09-22-0.4.0-review.md`).

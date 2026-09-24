@@ -58,7 +58,7 @@ fn bench_op_dispatch(c: &mut Criterion) {
 // whole OS thread just to arm a deadline, on top of the eval itself. Compare
 // directly against `simple_eval_throughput` above (same eval, no timeout
 // configured) -- after the persistent per-runtime watchdog thread
-// (`Watchdog` in `src/runtime/runner.rs`), `arm`/`disarm` only take a mutex,
+// (`Watchdog` in `src/runtime/runner/termination.rs`), `arm`/`disarm` only take a mutex,
 // so the two should land within noise of each other.
 fn bench_timed_eval_throughput(c: &mut Criterion) {
     let config = RuntimeConfig {

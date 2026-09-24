@@ -1,6 +1,6 @@
 //! Async bridge between Tokio futures on the runtime thread and Python asyncio futures.
 use crate::runtime::conversion::js_value_to_python;
-use crate::runtime::error::{RuntimeError, RuntimeResult};
+use crate::runtime::error::RuntimeResult;
 use crate::runtime::handle::RuntimeHandle;
 use crate::runtime::js_value::JSValue;
 use pyo3::prelude::*;
@@ -11,12 +11,19 @@ use tokio::sync::oneshot;
 
 use super::error::runtime_error_with_context;
 
-/// Return true if the supplied Python future has been cancelled.
+fn python_future_flag(
+    future: &Bound<'_, PyAny>,
+    name: &Bound<'_, pyo3::types::PyString>,
+) -> PyResult<bool> {
+    future.getattr(name)?.call0()?.is_truthy()
+}
+
 fn python_future_cancelled(future: &Bound<'_, PyAny>) -> PyResult<bool> {
-    future
-        .getattr(pyo3::intern!(future.py(), "cancelled"))?
-        .call0()?
-        .is_truthy()
+    python_future_flag(future, pyo3::intern!(future.py(), "cancelled"))
+}
+
+fn python_future_done(future: &Bound<'_, PyAny>) -> PyResult<bool> {
+    python_future_flag(future, pyo3::intern!(future.py(), "done"))
 }
 
 #[pyclass]
@@ -38,29 +45,13 @@ impl JsAsyncCancelCallback {
     }
 }
 
-/// Result pending delivery back to Python once we hop onto the event loop.
-enum JsAsyncOutcome {
-    Value(JSValue, RuntimeHandle),
-    Error(RuntimeError),
-}
-
 #[pyclass]
 /// Helper that runs on the Python event loop to complete the awaiting future.
 struct JsAsyncResultSetter {
     future: Py<PyAny>,
-    outcome: Option<JsAsyncOutcome>,
-    error_context: String,
-}
-
-impl JsAsyncResultSetter {
-    /// Store the pending outcome and metadata until the loop thread executes the setter.
-    fn new(future: Py<PyAny>, outcome: JsAsyncOutcome, error_context: String) -> Self {
-        Self {
-            future,
-            outcome: Some(outcome),
-            error_context,
-        }
-    }
+    result: Option<RuntimeResult<JSValue>>,
+    handle: RuntimeHandle,
+    error_context: &'static str,
 }
 
 #[pymethods]
@@ -68,68 +59,53 @@ impl JsAsyncResultSetter {
     /// Execute the deferred conversion and resolve the Python `asyncio.Future`.
     fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
         let future = self.future.bind(py);
-
-        if future
-            .getattr(pyo3::intern!(py, "done"))?
-            .call0()?
-            .is_truthy()?
-        {
+        if python_future_done(future)? || python_future_cancelled(future)? {
             return Ok(());
         }
 
-        if python_future_cancelled(future)? {
-            return Ok(());
-        }
-
-        let outcome = self
-            .outcome
+        let result = self
+            .result
             .take()
             .expect("JsAsyncResultSetter invoked more than once");
-
-        match outcome {
-            JsAsyncOutcome::Value(value, handle) => {
-                let py_value = js_value_to_python(py, &value, Some(&handle))?;
+        match result {
+            Ok(value) => {
+                let py_value = js_value_to_python(py, &value, Some(&self.handle))?;
                 future.call_method1(pyo3::intern!(py, "set_result"), (py_value.into_bound(py),))?;
             }
-            JsAsyncOutcome::Error(err) => {
-                let exception = runtime_error_with_context(&self.error_context, err);
-                let exception_value = exception.into_value(py);
-                future.call_method1(pyo3::intern!(py, "set_exception"), (exception_value,))?;
+            Err(err) => {
+                let exception = runtime_error_with_context(self.error_context, err).into_value(py);
+                future.call_method1(pyo3::intern!(py, "set_exception"), (exception,))?;
             }
         }
-
         Ok(())
     }
 }
 
-/// Queue the conversion closure onto Python's event loop for execution.
+/// Queue the conversion onto Python's event loop (`call_soon_threadsafe`).
 fn schedule_js_future_result(
     py: Python<'_>,
     locals: &TaskLocals,
     future: &Py<PyAny>,
     result: RuntimeResult<JSValue>,
     handle: RuntimeHandle,
-    error_context: &str,
+    error_context: &'static str,
 ) -> PyResult<()> {
     let event_loop = locals.event_loop(py);
     let context = locals.context(py);
-
-    let outcome = match result {
-        Ok(value) => JsAsyncOutcome::Value(value, handle),
-        Err(err) => JsAsyncOutcome::Error(err),
-    };
-
     let setter = Py::new(
         py,
-        JsAsyncResultSetter::new(future.clone_ref(py), outcome, error_context.to_string()),
+        JsAsyncResultSetter {
+            future: future.clone_ref(py),
+            result: Some(result),
+            handle,
+            error_context,
+        },
     )?;
-    let setter_bound = setter.into_bound(py);
     let kwargs = PyDict::new(py);
     kwargs.set_item(pyo3::intern!(py, "context"), context)?;
-
     event_loop.call_method(
         pyo3::intern!(py, "call_soon_threadsafe"),
-        (setter_bound,),
+        (setter.into_bound(py),),
         Some(&kwargs),
     )?;
     Ok(())
@@ -137,28 +113,17 @@ fn schedule_js_future_result(
 
 /// Immediately propagate a PyErr to the awaiting future if scheduling cannot be completed.
 fn set_future_exception_immediate(py: Python<'_>, future: &Py<PyAny>, err: PyErr) -> PyResult<()> {
-    let future_bound = future.clone_ref(py).into_bound(py);
-    if future_bound
-        .getattr(pyo3::intern!(py, "done"))?
-        .call0()?
-        .is_truthy()?
-    {
+    let future = future.bind(py);
+    if python_future_done(future)? {
         err.restore(py);
         return Ok(());
     }
-
-    let exception_value = err.into_value(py);
-    future_bound.call_method1(pyo3::intern!(py, "set_exception"), (exception_value,))?;
+    future.call_method1(pyo3::intern!(py, "set_exception"), (err.into_value(py),))?;
     Ok(())
 }
 
-/// Wrap an `asyncio.Future` in a coroutine, so `asyncio.create_task` accepts it.
-///
-/// `create_task` requires a coroutine specifically and raises `TypeError: a
-/// coroutine was expected` on a bare `Future`, which made "run two JS calls
-/// concurrently" -- the obvious reason to reach for these APIs at all -- fail
-/// on the first line. `await` and `asyncio.gather` already worked and still
-/// do. See `python/pydeno/_awaitable.py` for why this lives in Python.
+/// Wrap an `asyncio.Future` in a coroutine, so `asyncio.create_task` accepts it
+/// (it rejects bare futures). See `python/pydeno/_awaitable.py`.
 fn as_coroutine<'py>(py: Python<'py>, future: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     py.import(pyo3::intern!(py, "pydeno._awaitable"))?
         .getattr(pyo3::intern!(py, "as_coroutine"))?
@@ -166,7 +131,7 @@ fn as_coroutine<'py>(py: Python<'py>, future: Bound<'py, PyAny>) -> PyResult<Bou
 }
 
 /// Convert a Tokio future returning `JSValue` into a Python coroutine resolved on the loop thread.
-pub(crate) fn bridge_js_future<'py, Fut>(
+fn bridge_js_future<'py, Fut>(
     py: Python<'py>,
     locals: TaskLocals,
     future: Fut,
@@ -176,8 +141,9 @@ pub(crate) fn bridge_js_future<'py, Fut>(
 where
     Fut: Future<Output = RuntimeResult<JSValue>> + Send + 'static,
 {
-    let event_loop = locals.event_loop(py);
-    let python_future = event_loop.call_method0(pyo3::intern!(py, "create_future"))?;
+    let python_future = locals
+        .event_loop(py)
+        .call_method0(pyo3::intern!(py, "create_future"))?;
 
     let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
     let cancel_callback = Py::new(
@@ -188,46 +154,46 @@ where
     )?;
     python_future.call_method1(pyo3::intern!(py, "add_done_callback"), (cancel_callback,))?;
 
-    let py_future_obj: Py<PyAny> = python_future.unbind();
-    let ret_future = py_future_obj.clone_ref(py).into_bound(py);
-
-    let locals_for_scope = locals.clone();
-    let locals_for_schedule = locals.clone();
-    let py_future_for_schedule = py_future_obj.clone_ref(py);
-    let handle_for_schedule = handle.clone();
-    let error_context_owned = error_context.to_string();
+    let py_future: Py<PyAny> = python_future.clone().unbind();
 
     pyo3_tokio::get_runtime().spawn(async move {
-        let scoped_future = pyo3_tokio::scope(locals_for_scope.clone(), future);
+        let scoped_future = pyo3_tokio::scope(locals.clone(), future);
         tokio::pin!(scoped_future);
 
-        let outcome = tokio::select! {
-            res = &mut scoped_future => Some(res),
-            _ = &mut cancel_rx => None,
+        let result = tokio::select! {
+            res = &mut scoped_future => res,
+            _ = &mut cancel_rx => return,
         };
 
-        if let Some(result) = outcome {
-            Python::attach(|py| {
-                if let Err(err) = schedule_js_future_result(
-                    py,
-                    &locals_for_schedule,
-                    &py_future_for_schedule,
-                    result,
-                    handle_for_schedule.clone(),
-                    &error_context_owned,
-                ) {
-                    if let Err(set_err) =
-                        set_future_exception_immediate(py, &py_future_for_schedule, err)
-                    {
-                        log::error!(
-                            "Failed to propagate async error to Python future: {}",
-                            set_err
-                        );
-                    }
+        Python::attach(|py| {
+            if let Err(err) =
+                schedule_js_future_result(py, &locals, &py_future, result, handle, error_context)
+            {
+                if let Err(set_err) = set_future_exception_immediate(py, &py_future, err) {
+                    log::error!(
+                        "Failed to propagate async error to Python future: {}",
+                        set_err
+                    );
                 }
-            });
-        }
+            }
+        });
     });
 
-    as_coroutine(py, ret_future)
+    as_coroutine(py, python_future)
+}
+
+/// Run `make(handle, task_locals)` for the current asyncio task and bridge
+/// its result back as a Python coroutine.
+pub(crate) fn bridge_handle_call<'py, Fut>(
+    py: Python<'py>,
+    handle: RuntimeHandle,
+    error_context: &'static str,
+    make: impl FnOnce(RuntimeHandle, Option<TaskLocals>) -> Fut,
+) -> PyResult<Bound<'py, PyAny>>
+where
+    Fut: Future<Output = RuntimeResult<JSValue>> + Send + 'static,
+{
+    let task_locals = pyo3_tokio::get_current_locals(py)?;
+    let future = make(handle.clone(), Some(task_locals.clone()));
+    bridge_js_future(py, task_locals, future, handle, error_context)
 }

@@ -18,9 +18,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as async_mpsc;
 use tokio::sync::oneshot;
+
+type IdSet = Arc<Mutex<HashSet<u32>>>;
 
 /// Thread-safe handle for communicating with a JavaScript runtime thread.
 ///
@@ -36,19 +38,13 @@ pub struct RuntimeHandle {
     tx: Option<async_mpsc::UnboundedSender<RuntimeCommand>>,
     /// Shutdown state shared across clones.
     shutdown: Arc<Mutex<bool>>,
-    /// Controller for V8 execution termination.
     termination: TerminationController,
-    /// Tracked JavaScript function handles (for cleanup).
-    tracked_functions: Arc<Mutex<HashSet<u32>>>,
-    /// Tracked JavaScript stream IDs (for cleanup).
-    tracked_js_streams: Arc<Mutex<HashSet<u32>>>,
-    /// Tracked Python stream IDs (for cleanup).
-    tracked_py_streams: Arc<Mutex<HashSet<u32>>>,
-    /// Inspector metadata (address, endpoints) if inspector is enabled.
+    /// Tracked JS function handles / JS stream IDs / Python stream IDs (for cleanup).
+    tracked_functions: IdSet,
+    tracked_js_streams: IdSet,
+    tracked_py_streams: IdSet,
     inspector_metadata: Arc<Mutex<Option<InspectorMetadata>>>,
-    /// Inspector connection state for DevTools protocol.
     inspector_connection: Option<InspectorConnectionState>,
-    /// Serialization limits for Python<->JS value transfers.
     serialization_limits: SerializationLimits,
     /// Registry for Python async iterables exposed as JS streams.
     py_stream_registry: PyStreamRegistry,
@@ -57,13 +53,8 @@ pub struct RuntimeHandle {
     force_kill_grace: Option<Duration>,
 }
 
-/// How often a blocked caller re-checks whether a termination has been
-/// requested while it waits for a result.
-///
-/// This is a *timed block* (`Receiver::recv_timeout`), not a spin: the thread
-/// sleeps between checks and costs nothing measurable, so this only bounds how
-/// promptly the escalation clock starts, not how much CPU waiting burns.
-/// It is deliberately much smaller than the grace period.
+/// How often a blocked caller re-checks for a requested termination. A timed
+/// park (`recv_timeout`), not a spin; deliberately much smaller than the grace.
 const FORCE_KILL_POLL_SLICE: Duration = Duration::from_millis(5);
 
 /// Represents a property assignment when binding Python objects into the JS global namespace.
@@ -83,36 +74,26 @@ pub(crate) enum BoundObjectProperty {
 impl RuntimeHandle {
     /// Spawn a new runtime thread with the given configuration.
     ///
-    /// This starts a dedicated OS thread running a V8 isolate and Tokio event loop.
-    /// Returns a handle for sending commands to the runtime.
-    ///
     /// # Errors
     /// Returns an error if the runtime thread fails to start or initialize.
     pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
         let serialization_limits = config.serialization_limits();
         let force_kill_grace = config.force_kill_grace;
         let (tx, termination, inspector_info, py_stream_registry) = spawn_runtime_thread(config)?;
-        let (metadata, connection) = inspector_info
-            .map(|(meta, state)| (Some(meta), Some(state)))
-            .unwrap_or((None, None));
-        let tracked_functions = Arc::new(Mutex::new(HashSet::new()));
-        let tracked_js_streams = Arc::new(Mutex::new(HashSet::new()));
-        let tracked_py_streams = Arc::new(Mutex::new(HashSet::new()));
-        {
-            let tracked = Arc::downgrade(&tracked_py_streams);
-            py_stream_registry.add_release_listener(move |stream_id| {
-                if let Some(set) = tracked.upgrade() {
-                    let mut guard = set.lock().unwrap();
-                    guard.remove(&stream_id);
-                }
-            });
-        }
+        let (metadata, connection) = inspector_info.unzip();
+        let tracked_py_streams: IdSet = Arc::default();
+        let tracked = Arc::downgrade(&tracked_py_streams);
+        py_stream_registry.add_release_listener(move |stream_id| {
+            if let Some(set) = tracked.upgrade() {
+                set.lock().unwrap().remove(&stream_id);
+            }
+        });
         Ok(Self {
             tx: Some(tx),
             shutdown: Arc::new(Mutex::new(false)),
             termination,
-            tracked_functions,
-            tracked_js_streams,
+            tracked_functions: Arc::default(),
+            tracked_js_streams: Arc::default(),
             tracked_py_streams,
             inspector_metadata: Arc::new(Mutex::new(metadata)),
             inspector_connection: connection,
@@ -122,10 +103,7 @@ impl RuntimeHandle {
         })
     }
 
-    /// Get a reference to the command sender, checking shutdown state first.
-    ///
-    /// # Errors
-    /// Returns an error if runtime is terminated or shut down.
+    /// The command sender, or an error if the runtime is terminated or shut down.
     fn sender(&self) -> RuntimeResult<&async_mpsc::UnboundedSender<RuntimeCommand>> {
         if self.termination.is_requested() || self.termination.is_terminated() {
             return Err(self.termination.terminated_error());
@@ -138,115 +116,84 @@ impl RuntimeHandle {
             .ok_or_else(|| RuntimeError::internal("Runtime has been shut down"))
     }
 
+    fn send(&self, command: RuntimeCommand, what: &str) -> RuntimeResult<()> {
+        self.sender()?
+            .send(command)
+            .map_err(|_| RuntimeError::internal(format!("Failed to send {what} command")))
+    }
+
+    /// Send a command with a std responder and block on it via [`Self::recv_result`].
+    fn request<T>(
+        &self,
+        what: &str,
+        recv_what: &str,
+        command: impl FnOnce(mpsc::Sender<RuntimeResult<T>>) -> RuntimeCommand,
+    ) -> RuntimeResult<T> {
+        let (tx, rx) = mpsc::channel();
+        self.send(command(tx), what)?;
+        self.recv_result(&rx, recv_what)?
+    }
+
+    /// Send a command with a oneshot responder and await its reply.
+    async fn request_async<T>(
+        &self,
+        what: &str,
+        recv_error: &'static str,
+        command: impl FnOnce(oneshot::Sender<RuntimeResult<T>>) -> RuntimeCommand,
+    ) -> RuntimeResult<T> {
+        let (tx, rx) = oneshot::channel();
+        self.send(command(tx), what)?;
+        rx.await.map_err(|_| RuntimeError::internal(recv_error))?
+    }
+
+    /// Mark this handle terminated and shut down, abandoning the runtime thread.
+    fn force_kill(&self, message: String) -> RuntimeError {
+        self.termination.force_mark_terminated();
+        *self.shutdown.lock().unwrap() = true;
+        RuntimeError::force_killed(message)
+    }
+
     /// Block for a command's result, escalating to a force-kill if the runtime
     /// stops answering after a termination has been requested.
     ///
-    /// # Why this is not a plain `recv()`
-    ///
-    /// The polite kill path has two tiers, and both need the runtime *thread*
-    /// to be able to run:
-    ///
-    /// 1. V8's `terminate_execution()` unwinds JavaScript the moment the
-    ///    isolate next enters it -- this is what kills `while(true){}`
-    ///    (measured median 0.11ms).
-    /// 2. The dispatcher observing the termination flag between polls, which is
-    ///    what kills a runtime parked on a pending promise (measured median
-    ///    ~1.4-1.8ms, worst case 4.02ms) -- see the `2b.` block in
-    ///    `RuntimeDispatcher::run`.
-    ///
-    /// Neither can fire when the runtime thread is itself wedged inside a host
-    /// call that never returns -- a synchronous `bind_function` handler that
-    /// blocks forever, say. The dispatcher is down inside `eval_sync` -> V8 ->
-    /// the Python callback, so it never reaches the flag check, and V8 never
-    /// re-enters JS to notice the termination. Before this escalation existed
-    /// the caller simply blocked on `recv()` for the life of the process.
-    ///
-    /// # What this does
-    ///
-    /// With `force_kill_grace` set, waits in [`FORCE_KILL_POLL_SLICE`] slices
-    /// instead of one unbounded block. Each slice is a timed park, not a spin,
-    /// so waiting still costs no CPU. Once a termination *has* been requested
-    /// it starts a clock and gives the runtime `force_kill_grace` to
-    /// acknowledge it; if the grace expires the caller gives up, marks the
-    /// handle terminated and shut down, and returns
+    /// Both polite kill tiers (V8 `terminate_execution()` and the dispatcher's
+    /// termination-flag check) need the runtime thread to run, so neither fires
+    /// when it is wedged in a host call that never returns (e.g. a blocking
+    /// sync `bind_function` handler). With `force_kill_grace` set this waits in
+    /// [`FORCE_KILL_POLL_SLICE`] slices, and once a termination is requested
+    /// gives the runtime `force_kill_grace` to acknowledge it before returning
     /// [`RuntimeError::ForceKilled`].
     ///
-    /// # Why it is opt-in
+    /// Opt-in because `recv_timeout` measurably slows this hot path (~10% per
+    /// bound-function call); with `None` it is a plain `rx.recv()`.
     ///
-    /// `recv_timeout` is measurably more expensive than `recv`, and this is the
-    /// hot path: every synchronous `eval`, bound-function call and op
-    /// registration waits here. Comparing the two arms in a single process
-    /// (interleaved, 7x2000 calls per arm, four repeats) slicing costs roughly
-    /// +2..6% on `eval('1+1')` and +9..13% on a bound-function call --
-    /// i.e. about 10% on the library's headline per-call number, paid by every
-    /// healthy call, to buy a bounded kill for the one case that needs it: a
-    /// runtime wedged in a host call that never returns.
-    ///
-    /// That is a bad default trade, so `force_kill_grace` defaults to `None`
-    /// and this reduces to a literal `rx.recv()` behind one `Option` branch --
-    /// the previous code path exactly, so the default cannot regress. Callers
-    /// running genuinely untrusted host callbacks can opt in and accept the
-    /// ~10%.
-    ///
-    /// Note this escalation is *only* needed for a wedged runtime **thread**.
-    /// The parked-promise gap that motivated this work is fixed by the
-    /// dispatcher's own flag check and needs nothing here, so `timeout=` and
-    /// `TerminationHandle::terminate()` are bounded on every shape either way.
-    ///
-    /// # What this does NOT do
-    ///
-    /// It does not reclaim the wedged thread, and it deliberately does not
-    /// silently swap a fresh isolate in behind the caller's handle. A V8
-    /// isolate cannot be dropped from another thread, so the wedged thread is
-    /// *abandoned*, not killed: it stays parked in its host call, holding its
-    /// isolate and heap, until that call returns -- at which point V8's latched
-    /// `terminate_execution()` unwinds the script and the thread exits on its
-    /// own. If the host call never returns, the thread leaks for the life of
-    /// the process. This is the same trade Deno's hosted sandbox makes, except
-    /// that it can reach for SIGKILL on the whole process and a library cannot.
-    ///
-    /// Recreating is therefore left to the caller: the `Runtime` that produced
-    /// a `ForceKilled` error is permanently dead, and a replacement costs a
-    /// normal runtime creation (~2.8ms cold, ~1.3ms from a snapshot). Bound
-    /// host functions, module state and accumulated globals do *not* carry
-    /// over, which is precisely why this is an explicit, observable error
-    /// rather than a transparent retry.
+    /// The wedged thread is abandoned, not reclaimed (a V8 isolate cannot be
+    /// dropped from another thread), and no replacement isolate is swapped in:
+    /// the `Runtime` is permanently dead and the caller must create a new one.
     fn recv_result<T>(&self, rx: &mpsc::Receiver<T>, what: &str) -> RuntimeResult<T> {
+        let recv_failed = || RuntimeError::internal(format!("Failed to receive {what} result"));
         let Some(grace) = self.force_kill_grace else {
-            // Default: the cheap path, byte-for-byte the previous behaviour.
-            return rx
-                .recv()
-                .map_err(|_| RuntimeError::internal(format!("Failed to receive {what} result")));
+            return rx.recv().map_err(|_| recv_failed());
         };
 
         let mut termination_seen_at = None;
-
         loop {
             match rx.recv_timeout(FORCE_KILL_POLL_SLICE) {
                 Ok(value) => return Ok(value),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(RuntimeError::internal(format!(
-                        "Failed to receive {what} result"
-                    )));
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(recv_failed()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if !self.termination.is_requested() {
-                        // Healthy runtime, still working. Just re-block.
                         continue;
                     }
-
-                    let started = *termination_seen_at.get_or_insert_with(std::time::Instant::now);
+                    let started = *termination_seen_at.get_or_insert_with(Instant::now);
                     if started.elapsed() < grace {
                         continue;
                     }
-
                     log::warn!(
                         "Runtime did not acknowledge termination within {grace:?}; abandoning \
                          the runtime thread and failing {what} with ForceKilled"
                     );
-                    self.termination.force_mark_terminated();
-                    *self.shutdown.lock().unwrap() = true;
-                    return Err(RuntimeError::force_killed(format!(
+                    return Err(self.force_kill(format!(
                         "Runtime did not acknowledge termination within {grace:?} and was \
                          force-killed during {what}; the runtime thread has been abandoned \
                          and this Runtime is no longer usable -- create a new one"
@@ -256,31 +203,19 @@ impl RuntimeHandle {
         }
     }
 
-    /// Evaluate JavaScript code synchronously and return the result.
-    ///
-    /// Blocks the calling thread until evaluation completes. The code runs in the
-    /// global scope and can access previously defined variables/functions.
+    /// Evaluate JavaScript code synchronously in the global scope.
     ///
     /// # Errors
     /// Returns an error if the code throws an exception or the runtime is shut down.
     pub fn eval_sync(&self, code: &str) -> RuntimeResult<JSValue> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::Eval {
-                code: code.to_string(),
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send eval command"))?;
-
-        self.recv_result(&result_rx, "eval")?
+        self.request("eval", "eval", |responder| RuntimeCommand::Eval {
+            code: code.to_string(),
+            responder,
+        })
     }
 
-    /// Evaluate JavaScript code asynchronously with optional timeout.
-    ///
-    /// If the code returns a promise, waits for it to resolve while polling the event loop.
-    /// The `task_locals` parameter provides the asyncio context for Python ops.
+    /// Evaluate JavaScript code asynchronously with optional timeout, awaiting
+    /// a returned promise. `task_locals` provides the asyncio context for Python ops.
     ///
     /// # Errors
     /// Returns an error if the code throws, times out, or the runtime is shut down.
@@ -290,29 +225,23 @@ impl RuntimeHandle {
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
     ) -> RuntimeResult<JSValue> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::EvalAsync {
+        self.request_async(
+            "eval_async",
+            "Failed to receive async eval result",
+            |responder| RuntimeCommand::EvalAsync {
                 code: code.to_string(),
                 timeout_ms,
                 task_locals,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send eval_async command"))?;
-
-        result_rx
-            .await
-            .map_err(|_| RuntimeError::internal("Failed to receive async eval result"))?
+                responder,
+            },
+        )
+        .await
     }
 
     /// Register a Python callable as an op and return its capability token.
     ///
-    /// The `mode` specifies whether the handler is sync or async. The op is
-    /// **not** callable from JavaScript until [`Self::set_op_exposure`] blesses
-    /// the token -- see the `ops` module docs for why exposure is a separate
-    /// step from registration.
+    /// The op is **not** callable from JavaScript until [`Self::set_op_exposure`]
+    /// blesses the token -- see the `ops` module docs.
     ///
     /// # Errors
     /// Returns an error if the runtime is shut down or registration fails.
@@ -322,47 +251,36 @@ impl RuntimeHandle {
         mode: PythonOpMode,
         handler: Py<PyAny>,
     ) -> RuntimeResult<OpToken> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::RegisterPythonOp {
+        self.request("register_op", "op registration", |responder| {
+            RuntimeCommand::RegisterPythonOp {
                 name,
                 mode,
                 handler,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send register_op command"))?;
-
-        self.recv_result(&result_rx, "op registration")?
+                responder,
+            }
+        })
     }
 
     /// Expose or revoke an op capability.
     ///
-    /// `exposed = true` makes a registered token dispatchable from guest JS;
-    /// the bind paths call it *after* the binding is installed, so a binding
-    /// that failed half-way leaves nothing callable. `exposed = false` revokes
-    /// the capability outright: the handler is dropped and any global left
-    /// behind by `bind_function` becomes inert.
-    ///
-    /// Returns `false` if the token was not registered on this runtime.
+    /// The bind paths expose *after* the binding is installed, so a half-failed
+    /// binding leaves nothing callable. Revoking drops the handler and makes any
+    /// global left by `bind_function` inert. Returns `false` if the token was
+    /// not registered on this runtime.
     ///
     /// # Errors
     /// Returns an error if the runtime is shut down or the command fails.
     pub fn set_op_exposure(&self, op_id: OpToken, exposed: bool) -> RuntimeResult<bool> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::SetPythonOpExposure {
+        let (responder, rx) = mpsc::channel();
+        self.send(
+            RuntimeCommand::SetPythonOpExposure {
                 op_id,
                 exposed,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send op exposure command"))?;
-
-        result_rx
-            .recv()
+                responder,
+            },
+            "op exposure",
+        )?;
+        rx.recv()
             .map_err(|_| RuntimeError::internal("Failed to receive op exposure result"))?
     }
 
@@ -373,17 +291,11 @@ impl RuntimeHandle {
     /// # Errors
     /// Returns an error if the runtime is shut down or the command fails.
     pub fn set_module_resolver(&self, handler: Py<PyAny>) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::SetModuleResolver {
-                handler,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send set_module_resolver command"))?;
-
-        self.recv_result(&result_rx, "set_module_resolver")?
+        let what = "set_module_resolver";
+        self.request(what, what, |responder| RuntimeCommand::SetModuleResolver {
+            handler,
+            responder,
+        })
     }
 
     /// Set a custom Python loader for fetching module source code.
@@ -393,44 +305,27 @@ impl RuntimeHandle {
     /// # Errors
     /// Returns an error if the runtime is shut down or the command fails.
     pub fn set_module_loader(&self, handler: Py<PyAny>) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::SetModuleLoader {
-                handler,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send set_module_loader command"))?;
-
-        self.recv_result(&result_rx, "set_module_loader")?
+        let what = "set_module_loader";
+        self.request(what, what, |responder| RuntimeCommand::SetModuleLoader {
+            handler,
+            responder,
+        })
     }
 
-    /// Register a static ES module with pre-defined source code.
-    ///
-    /// Static modules can be imported without a custom loader.
+    /// Register a static ES module that can be imported without a custom loader.
     ///
     /// # Errors
     /// Returns an error if the runtime is shut down or the command fails.
     pub fn add_static_module(&self, name: String, source: String) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::AddStaticModule {
-                name,
-                source,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send add_static_module command"))?;
-
-        self.recv_result(&result_rx, "add_static_module")?
+        let what = "add_static_module";
+        self.request(what, what, |responder| RuntimeCommand::AddStaticModule {
+            name,
+            source,
+            responder,
+        })
     }
 
-    /// Bind a Python object to the JavaScript global namespace.
-    ///
-    /// Creates a JavaScript object with the given name and properties (values and ops).
-    /// Internal API used by the Python bindings.
+    /// Bind a Python object (values and ops) to the JavaScript global namespace.
     ///
     /// # Errors
     /// Returns an error if the runtime is shut down or the command fails.
@@ -439,43 +334,28 @@ impl RuntimeHandle {
         name: String,
         properties: Vec<BoundObjectProperty>,
     ) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::BindObject {
-                name,
-                properties,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send bind_object command"))?;
-
-        self.recv_result(&result_rx, "bind_object")?
+        let what = "bind_object";
+        self.request(what, what, |responder| RuntimeCommand::BindObject {
+            name,
+            properties,
+            responder,
+        })
     }
 
     /// Evaluate an ES module synchronously and return its namespace object.
     ///
-    /// Loads and evaluates the module, blocking until completion.
-    ///
     /// # Errors
     /// Returns an error if the module fails to load/evaluate or the runtime is shut down.
     pub fn eval_module_sync(&self, specifier: &str) -> RuntimeResult<JSValue> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::EvalModule {
-                specifier: specifier.to_string(),
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send eval_module command"))?;
-
-        self.recv_result(&result_rx, "eval_module")?
+        let what = "eval_module";
+        self.request(what, what, |responder| RuntimeCommand::EvalModule {
+            specifier: specifier.to_string(),
+            responder,
+        })
     }
 
-    /// Evaluate an ES module asynchronously with optional timeout.
-    ///
-    /// Loads and evaluates the module, waiting for top-level await if present.
+    /// Evaluate an ES module asynchronously with optional timeout, waiting for
+    /// top-level await if present.
     ///
     /// # Errors
     /// Returns an error if the module fails, times out, or the runtime is shut down.
@@ -485,27 +365,23 @@ impl RuntimeHandle {
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
     ) -> RuntimeResult<JSValue> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::EvalModuleAsync {
+        self.request_async(
+            "eval_module_async",
+            "Failed to receive async eval_module result",
+            |responder| RuntimeCommand::EvalModuleAsync {
                 specifier: specifier.to_string(),
                 timeout_ms,
                 task_locals,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send eval_module_async command"))?;
-
-        result_rx
-            .await
-            .map_err(|_| RuntimeError::internal("Failed to receive async eval_module result"))?
+                responder,
+            },
+        )
+        .await
     }
 
     /// Call a JavaScript function synchronously with optional timeout.
     ///
-    /// If the function returns a promise, returns `FunctionCallResult::Pending` with a call ID
-    /// that can be used to resume polling. Otherwise, returns the immediate result.
+    /// If the function returns a promise, returns `FunctionCallResult::Pending`
+    /// with a call ID for [`Self::resume_function_call`].
     ///
     /// # Errors
     /// Returns an error if the function throws or the runtime is shut down.
@@ -515,24 +391,18 @@ impl RuntimeHandle {
         args: Vec<JSValue>,
         timeout_ms: Option<u64>,
     ) -> RuntimeResult<FunctionCallResult> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::CallFunctionSync {
+        self.request("call_function_sync", "function call", |responder| {
+            RuntimeCommand::CallFunctionSync {
                 fn_id,
                 args,
                 timeout_ms,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send call_function_sync command"))?;
-
-        self.recv_result(&result_rx, "function call")?
+                responder,
+            }
+        })
     }
 
-    /// Call a JavaScript function asynchronously with optional timeout.
-    ///
-    /// Waits for the function to complete (including promise resolution) before returning.
+    /// Call a JavaScript function asynchronously with optional timeout,
+    /// including promise resolution.
     ///
     /// # Errors
     /// Returns an error if the function throws, times out, or the runtime is shut down.
@@ -543,27 +413,21 @@ impl RuntimeHandle {
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
     ) -> RuntimeResult<JSValue> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::CallFunctionAsync {
+        self.request_async(
+            "call_function",
+            "Failed to receive function call result",
+            |responder| RuntimeCommand::CallFunctionAsync {
                 fn_id,
                 args,
                 timeout_ms,
                 task_locals,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send call_function command"))?;
-
-        result_rx
-            .await
-            .map_err(|_| RuntimeError::internal("Failed to receive function call result"))?
+                responder,
+            },
+        )
+        .await
     }
 
-    /// Resume polling a pending function call by its call ID.
-    ///
-    /// Used to continue waiting for a promise returned by `call_function_sync`.
+    /// Resume polling a pending function call returned by `call_function_sync`.
     ///
     /// # Errors
     /// Returns an error if the call ID is invalid or the runtime is shut down.
@@ -572,81 +436,57 @@ impl RuntimeHandle {
         call_id: u64,
         task_locals: Option<TaskLocals>,
     ) -> RuntimeResult<JSValue> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::ResumeFunctionCall {
+        self.request_async(
+            "resume_function_call",
+            "Failed to receive resumed function call result",
+            |responder| RuntimeCommand::ResumeFunctionCall {
                 call_id,
                 task_locals,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send resume_function_call command"))?;
-
-        result_rx
-            .await
-            .map_err(|_| RuntimeError::internal("Failed to receive resumed function call result"))?
+                responder,
+            },
+        )
+        .await
     }
 
     /// Release a function handle so the underlying V8 global can be dropped.
     pub fn release_function(&self, fn_id: u32) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::ReleaseFunction {
-                fn_id,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send release_function command"))?;
-
-        result_rx
-            .blocking_recv()
+        let (responder, rx) = oneshot::channel();
+        self.send(
+            RuntimeCommand::ReleaseFunction { fn_id, responder },
+            "release_function",
+        )?;
+        rx.blocking_recv()
             .map_err(|_| RuntimeError::internal("Failed to receive release result"))?
     }
 
-    /// Release a function handle asynchronously.
-    ///
-    /// Async variant of `release_function` for use in async contexts.
+    /// Async variant of [`Self::release_function`].
     ///
     /// # Errors
     /// Returns an error if the runtime is shut down.
     pub async fn release_function_async(&self, fn_id: u32) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::ReleaseFunction {
-                fn_id,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send release_function command"))?;
-
-        result_rx
-            .await
-            .map_err(|_| RuntimeError::internal("Failed to receive release result"))?
+        self.request_async(
+            "release_function",
+            "Failed to receive release result",
+            |responder| RuntimeCommand::ReleaseFunction { fn_id, responder },
+        )
+        .await
     }
 
-    /// Read the next chunk from a JavaScript ReadableStream.
-    ///
-    /// Returns a chunk with `done=true` when the stream ends.
+    /// Read the next chunk from a JavaScript ReadableStream (`done=true` at the end).
     ///
     /// # Errors
     /// Returns an error if the stream ID is invalid or reading fails.
     pub async fn stream_read(&self, stream_id: u32) -> RuntimeResult<StreamChunk> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        sender
-            .send(RuntimeCommand::StreamRead {
-                stream_id,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send stream_read command"))?;
-
-        let chunk_value = result_rx
-            .await
-            .map_err(|_| RuntimeError::internal("Failed to receive stream chunk"))??;
+        let chunk_value = self
+            .request_async(
+                "stream_read",
+                "Failed to receive stream chunk",
+                |responder| RuntimeCommand::StreamRead {
+                    stream_id,
+                    responder,
+                },
+            )
+            .await?;
         let chunk = StreamChunk::from_js_value(chunk_value)?;
         if chunk.done {
             self.untrack_js_stream_id(stream_id);
@@ -654,53 +494,35 @@ impl RuntimeHandle {
         Ok(chunk)
     }
 
-    /// Release a JavaScript stream handle.
-    ///
-    /// Drops the V8 global handle and reader, allowing garbage collection.
+    /// Release a JavaScript stream handle (drops the V8 global and reader).
     ///
     /// # Errors
     /// Returns an error if the stream ID is invalid or the runtime is shut down.
     pub fn stream_release(&self, stream_id: u32) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::StreamRelease {
-                stream_id,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send stream_release command"))?;
-
-        self.recv_result(&result_rx, "stream_release")??;
+        let what = "stream_release";
+        self.request(what, what, |responder| RuntimeCommand::StreamRelease {
+            stream_id,
+            responder,
+        })?;
         self.untrack_js_stream_id(stream_id);
         Ok(())
     }
 
-    /// Cancel a JavaScript stream.
-    ///
-    /// Calls the stream's cancel method and releases the handle.
+    /// Cancel a JavaScript stream and release its handle.
     ///
     /// # Errors
     /// Returns an error if the stream ID is invalid or the runtime is shut down.
     pub fn stream_cancel(&self, stream_id: u32) -> RuntimeResult<()> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::StreamCancel {
-                stream_id,
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send stream_cancel command"))?;
-
-        self.recv_result(&result_rx, "stream_cancel")??;
+        let what = "stream_cancel";
+        self.request(what, what, |responder| RuntimeCommand::StreamCancel {
+            stream_id,
+            responder,
+        })?;
         self.untrack_js_stream_id(stream_id);
         Ok(())
     }
 
-    /// Register a Python async iterable as a stream.
-    ///
-    /// Returns a stream ID that can be used to create a JavaScript ReadableStream.
+    /// Register a Python async iterable as a stream and return its stream ID.
     ///
     /// # Errors
     /// Returns an error if registration fails.
@@ -716,9 +538,7 @@ impl RuntimeHandle {
         Ok(stream_id)
     }
 
-    /// Cancel a Python stream asynchronously.
-    ///
-    /// Spawns a task to cancel the stream without blocking.
+    /// Cancel a Python stream on a background task without blocking.
     pub fn cancel_py_stream_async(&self, stream_id: u32) {
         let registry = self.py_stream_registry.clone();
         pyo3_tokio::get_runtime().spawn(async move {
@@ -729,9 +549,7 @@ impl RuntimeHandle {
         self.untrack_py_stream_id(stream_id);
     }
 
-    /// Release a Python stream handle.
-    ///
-    /// Removes the stream from the registry and untracks it.
+    /// Remove a Python stream from the registry and untrack it.
     pub fn release_py_stream(&self, stream_id: u32) {
         self.py_stream_registry.release(stream_id);
         self.untrack_py_stream_id(stream_id);
@@ -739,24 +557,14 @@ impl RuntimeHandle {
 
     /// Get current runtime statistics snapshot.
     ///
-    /// Returns metrics about heap usage, call counts, and stream activity.
-    ///
     /// # Errors
     /// Returns an error if the runtime is shut down.
     pub fn get_stats(&self) -> RuntimeResult<RuntimeStatsSnapshot> {
-        let sender = self.sender()?.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-
-        sender
-            .send(RuntimeCommand::GetStats {
-                responder: result_tx,
-            })
-            .map_err(|_| RuntimeError::internal("Failed to send get_stats command"))?;
-
-        self.recv_result(&result_rx, "stats")?
+        self.request("get_stats", "stats", |responder| RuntimeCommand::GetStats {
+            responder,
+        })
     }
 
-    /// Get the inspector connection state if inspector is enabled.
     pub fn inspector_connection(&self) -> Option<InspectorConnectionState> {
         self.inspector_connection.clone()
     }
@@ -768,24 +576,14 @@ impl RuntimeHandle {
             || *self.shutdown.lock().unwrap()
     }
 
-    /// Clone of the `TerminationController`, which wraps only the
-    /// `Send + Sync` `v8::IsolateHandle` (`v8::IsolateHandle::thread_safe_handle`).
-    ///
-    /// Unlike `RuntimeHandle` itself -- which is never exposed to Python
-    /// directly because the outer `#[pyclass(unsendable)] Runtime` panics on
-    /// any cross-thread method call -- `TerminationController` is genuinely
-    /// safe to hand to another thread. This is what lets `Runtime::termination_handle()`
-    /// (python/runtime.rs) return a non-`unsendable` `TerminationHandle` pyclass
-    /// a Python watchdog thread can call `.terminate()` on without triggering
-    /// PyO3's "Runtime is unsendable, but sent to another thread" panic.
+    /// Clone of the `Send + Sync` `TerminationController`. Unlike the
+    /// `unsendable` `Runtime` pyclass, this is safe to hand to another thread,
+    /// which is what lets a Python watchdog thread call `TerminationHandle.terminate()`.
     pub fn termination_controller(&self) -> TerminationController {
         self.termination.clone()
     }
 
     /// Forcefully terminate the runtime by canceling V8 execution.
-    ///
-    /// This triggers V8's execution termination mechanism, which interrupts any running
-    /// JavaScript code. The runtime thread will shut down after processing the termination.
     ///
     /// # Errors
     /// Returns an error if sending the termination command fails.
@@ -793,29 +591,20 @@ impl RuntimeHandle {
         if self.termination.is_terminated() {
             return Ok(());
         }
-
-        let tx = match self.tx.as_ref() {
-            Some(sender) => sender.clone(),
-            None => {
-                *self.shutdown.lock().unwrap() = true;
-                return Ok(());
-            }
+        let Some(tx) = self.tx.as_ref() else {
+            *self.shutdown.lock().unwrap() = true;
+            return Ok(());
         };
 
         self.termination.ensure_reason("Terminated by host request");
-        let first_request = self.termination.request();
-        if !first_request {
-            // Someone else is already terminating; wait for them to finish.
-            // Bounded by the same grace period -- an unbounded loop here would
-            // hang a second caller behind a wedged runtime thread just as
-            // surely as an unbounded `recv()` would.
-            let started = std::time::Instant::now();
+        if !self.termination.request() {
+            // Someone else is already terminating; wait for them, bounded by
+            // the same grace so a second caller cannot hang on a wedged thread.
+            let started = Instant::now();
             while !self.termination.is_terminated() {
                 if let Some(grace) = self.force_kill_grace {
                     if started.elapsed() >= grace {
-                        self.termination.force_mark_terminated();
-                        *self.shutdown.lock().unwrap() = true;
-                        return Err(RuntimeError::force_killed(format!(
+                        return Err(self.force_kill(format!(
                             "Runtime did not acknowledge an in-progress termination within \
                              {grace:?} and was force-killed; the runtime thread has been \
                              abandoned and this Runtime is no longer usable -- create a new one"
@@ -827,33 +616,20 @@ impl RuntimeHandle {
             return Ok(());
         }
 
-        let (result_tx, result_rx) = mpsc::channel();
-
-        tx.send(RuntimeCommand::Terminate {
-            responder: result_tx,
-        })
-        .map_err(|_| RuntimeError::internal("Failed to send terminate command"))?;
-
+        let (responder, rx) = mpsc::channel();
+        tx.send(RuntimeCommand::Terminate { responder })
+            .map_err(|_| RuntimeError::internal("Failed to send terminate command"))?;
         self.termination.terminate_execution();
 
-        // Bounded like every other wait: `request()` above has already flipped
-        // the flag, so `recv_result` starts its grace clock immediately and this
-        // cannot block forever against a wedged runtime thread.
-        match self.recv_result(&result_rx, "terminate confirmation") {
-            Ok(result) => {
-                if result.is_ok() {
-                    *self.shutdown.lock().unwrap() = true;
-                }
-                result
-            }
-            Err(err) => Err(err),
+        // `request()` already set the flag, so `recv_result`'s grace clock is running.
+        let result = self.recv_result(&rx, "terminate confirmation")?;
+        if result.is_ok() {
+            *self.shutdown.lock().unwrap() = true;
         }
+        result
     }
 
-    /// Gracefully shut down the runtime thread.
-    ///
-    /// Sends a shutdown command and waits for the thread to exit cleanly.
-    /// This consumes the command channel and marks the handle as shut down.
+    /// Gracefully shut down the runtime thread and wait for it to exit.
     ///
     /// # Errors
     /// Returns an error if the shutdown command fails to send or confirm.
@@ -868,7 +644,6 @@ impl RuntimeHandle {
         if *shutdown_guard {
             return Ok(());
         }
-
         if self.termination.is_requested() || self.termination.is_terminated() {
             self.tx.take();
             *shutdown_guard = true;
@@ -876,104 +651,70 @@ impl RuntimeHandle {
         }
 
         if let Some(tx) = self.tx.take() {
-            let (result_tx, result_rx) = mpsc::channel();
-            if tx
-                .send(RuntimeCommand::Shutdown {
-                    responder: result_tx,
-                })
-                .is_err()
-            {
+            let (responder, rx) = mpsc::channel();
+            if tx.send(RuntimeCommand::Shutdown { responder }).is_err() {
                 return Err(RuntimeError::internal("Failed to send shutdown command"));
             }
-
-            match result_rx.recv() {
-                Ok(_) => {
-                    *shutdown_guard = true;
-                    log::debug!("RuntimeHandle::close completed shutdown");
-                }
-                Err(_) => {
-                    log::warn!("RuntimeHandle::close failed to confirm runtime shutdown");
-                    return Err(RuntimeError::internal("Failed to confirm runtime shutdown"));
-                }
+            if rx.recv().is_err() {
+                log::warn!("RuntimeHandle::close failed to confirm runtime shutdown");
+                return Err(RuntimeError::internal("Failed to confirm runtime shutdown"));
             }
+            *shutdown_guard = true;
+            log::debug!("RuntimeHandle::close completed shutdown");
         }
 
         log::debug!("RuntimeHandle::close exit (shutdown={})", *shutdown_guard);
         Ok(())
     }
 
-    /// Track a function ID for cleanup on handle drop.
     pub fn track_function_id(&self, fn_id: u32) {
-        let mut set = self.tracked_functions.lock().unwrap();
-        set.insert(fn_id);
+        self.tracked_functions.lock().unwrap().insert(fn_id);
     }
 
-    /// Untrack a function ID.
     pub fn untrack_function_id(&self, fn_id: u32) {
-        let mut set = self.tracked_functions.lock().unwrap();
-        set.remove(&fn_id);
+        self.tracked_functions.lock().unwrap().remove(&fn_id);
     }
 
-    /// Drain all tracked function IDs for cleanup.
     pub fn drain_tracked_function_ids(&self) -> Vec<u32> {
-        let mut set = self.tracked_functions.lock().unwrap();
-        set.drain().collect()
+        self.tracked_functions.lock().unwrap().drain().collect()
     }
 
-    /// Track a JavaScript stream ID for cleanup on handle drop.
     pub fn track_js_stream_id(&self, stream_id: u32) {
-        let mut set = self.tracked_js_streams.lock().unwrap();
-        set.insert(stream_id);
+        self.tracked_js_streams.lock().unwrap().insert(stream_id);
     }
 
-    /// Untrack a JavaScript stream ID.
     pub fn untrack_js_stream_id(&self, stream_id: u32) {
-        let mut set = self.tracked_js_streams.lock().unwrap();
-        set.remove(&stream_id);
+        self.tracked_js_streams.lock().unwrap().remove(&stream_id);
     }
 
-    /// Drain all tracked JavaScript stream IDs for cleanup.
     pub fn drain_tracked_js_stream_ids(&self) -> Vec<u32> {
-        let mut set = self.tracked_js_streams.lock().unwrap();
-        set.drain().collect()
+        self.tracked_js_streams.lock().unwrap().drain().collect()
     }
 
-    /// Track a Python stream ID for cleanup on handle drop.
     pub fn track_py_stream_id(&self, stream_id: u32) {
-        let mut set = self.tracked_py_streams.lock().unwrap();
-        set.insert(stream_id);
+        self.tracked_py_streams.lock().unwrap().insert(stream_id);
     }
 
-    /// Untrack a Python stream ID.
     pub fn untrack_py_stream_id(&self, stream_id: u32) {
-        let mut set = self.tracked_py_streams.lock().unwrap();
-        set.remove(&stream_id);
+        self.tracked_py_streams.lock().unwrap().remove(&stream_id);
     }
 
-    /// Drain all tracked Python stream IDs for cleanup.
     pub fn drain_tracked_py_stream_ids(&self) -> Vec<u32> {
-        let mut set = self.tracked_py_streams.lock().unwrap();
-        set.drain().collect()
+        self.tracked_py_streams.lock().unwrap().drain().collect()
     }
 
-    /// Check if a function ID is currently tracked.
     pub fn is_function_tracked(&self, fn_id: u32) -> bool {
-        let set = self.tracked_functions.lock().unwrap();
-        set.contains(&fn_id)
+        self.tracked_functions.lock().unwrap().contains(&fn_id)
     }
 
-    /// Get the count of tracked function handles.
     pub fn tracked_function_count(&self) -> usize {
-        let set = self.tracked_functions.lock().unwrap();
-        set.len()
+        self.tracked_functions.lock().unwrap().len()
     }
 
-    /// Get inspector metadata (endpoints, display name) if inspector is enabled.
     pub fn inspector_metadata(&self) -> Option<InspectorMetadata> {
         self.inspector_metadata.lock().unwrap().clone()
     }
 
-    /// Get the serialization limits for this runtime.
     pub fn serialization_limits(&self) -> SerializationLimits {
         self.serialization_limits
     }

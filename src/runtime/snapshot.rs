@@ -22,23 +22,10 @@ impl Default for SnapshotBuilderConfig {
 
 /// Builds a V8 startup snapshot from host-supplied JavaScript.
 ///
-/// # This isolate is not sandboxed
-///
-/// [`create_runtime`] below deliberately builds a bare `JsRuntimeForSnapshot`
-/// with **no** `python_extension` (see `src/runtime/ops.rs`), so the bridge
-/// bootstrap that deletes `Deno`, `__bootstrap` and `__infra` never runs
-/// here. Every script passed to [`SnapshotBuilder::new`]'s `bootstrap_script`
-/// or to [`SnapshotBuilder::execute_script`] therefore has the raw
-/// `Deno.core.ops` table in scope -- including `op_print`, which writes
-/// straight to the host process's stdout -- with no timeout, no heap cap and
-/// no serialization limits. Snapshot input is host code at the same trust
-/// level as the embedder; it must never come from an untrusted source.
-///
-/// This is not a gap in the guest sandbox: a `Runtime` created from the
-/// resulting snapshot *does* run the bridge, which deletes those globals out
-/// of the restored heap before any guest code sees them
-/// (`tests/test_guest_globals.py` pins that under `RuntimeConfig(snapshot=)`
-/// as well as on a fresh runtime).
+/// Not sandboxed: the isolate has no `python_extension`, so scripts see the raw
+/// `Deno.core.ops` (incl. `op_print`) with no timeout, heap cap or limits.
+/// Snapshot input must be trusted host code. Runtimes restored from the
+/// snapshot still strip those globals (`tests/test_guest_globals.py`).
 pub struct SnapshotBuilder {
     runtime: Option<JsRuntimeForSnapshot>,
 }
@@ -63,34 +50,27 @@ impl SnapshotBuilder {
     }
 
     pub fn execute_script(&mut self, name: &str, source: &str) -> RuntimeResult<()> {
-        let runtime = self
-            .runtime
-            .as_mut()
-            .ok_or_else(|| RuntimeError::internal("Snapshot has already been built"))?;
-        execute_script(runtime, name, source)
+        execute_script(
+            self.runtime.as_mut().ok_or_else(already_built)?,
+            name,
+            source,
+        )
     }
 
     pub fn build(mut self) -> RuntimeResult<Vec<u8>> {
-        let runtime = self
-            .runtime
-            .take()
-            .ok_or_else(|| RuntimeError::internal("Snapshot has already been built"))?;
+        let runtime = self.runtime.take().ok_or_else(already_built)?;
         Ok(runtime.snapshot().into_vec())
     }
 }
 
+fn already_built() -> RuntimeError {
+    RuntimeError::internal("Snapshot has already been built")
+}
+
 fn create_runtime() -> Result<JsRuntimeForSnapshot, CoreError> {
-    // `JsRuntimeForSnapshot::try_new` registers its isolate with deno_core's
-    // platform via `tokio::runtime::Handle::try_current()` (see
-    // `spawn_runtime_thread` in src/runtime/runner.rs for the same fix on the
-    // long-lived runtime path). `SnapshotBuilder` is constructed directly on
-    // whatever thread calls it from Python, which normally never enters a
-    // tokio runtime, so the isolate would otherwise be registered with no
-    // handle -- one V8 delayed task away from an uncatchable
-    // `std::process::abort()`. Unlike `spawn_runtime_thread`, this is a
-    // synchronous one-shot call with no ongoing event loop to drive, so a
-    // minimal current-thread runtime that's merely *entered* (no `block_on`)
-    // for the duration of isolate creation is enough.
+    // `try_new` registers the isolate with the current tokio handle; without
+    // one (plain Python caller thread) a V8 delayed task later aborts the
+    // process. Merely entering a current-thread runtime is enough here.
     let tokio_rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("failed to build tokio runtime");

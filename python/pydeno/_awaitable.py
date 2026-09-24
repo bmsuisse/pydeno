@@ -1,20 +1,9 @@
 """Adapter that makes `pydeno`'s async entry points look like coroutines.
 
-Every async entry point (`Runtime.eval_async`, `Runtime.eval_module_async`,
-`JsFunction.call_async`, and `JsFunction.__call__` when the JS function returns
-a promise) starts its work on the runtime thread immediately and settles an
-`asyncio.Future` from that thread. A bare `Future` is awaitable, so `await
-f.call_async()` always worked -- but it is not a *coroutine*, and
-`asyncio.create_task` rejects it:
-
-    TypeError: a coroutine was expected, got <Future pending ...>
-
-`create_task` is the first thing anyone reaches for when they want two JS calls
-in flight, so the answer is to hand back something it accepts. The work is
-still started eagerly by the call itself -- this wrapper only changes the type
-of the handle, not when the work begins -- and cancelling a task that is
-awaiting one of these propagates to the underlying future's done callback
-exactly as cancelling the future directly used to.
+The async entry points start work eagerly on the runtime thread and return a
+bare `asyncio.Future`, which is awaitable but rejected by `asyncio.create_task`
+("a coroutine was expected"). Wrapping it changes only the handle's type, not
+when the work starts; cancelling the task still propagates to the future.
 """
 
 from __future__ import annotations

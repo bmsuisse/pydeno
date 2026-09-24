@@ -6,28 +6,21 @@ use pyo3::types::{PyDict, PyList};
 
 use super::{JavaScriptError, RuntimeForceKilled, RuntimeTerminated, RuntimeTimeout};
 
-fn set_optional_attr(py: Python<'_>, value: &Bound<'_, PyAny>, name: &str, attr: Option<String>) {
-    match attr {
-        Some(val) => {
-            let _ = value.setattr(name, val);
-        }
-        None => {
-            let _ = value.setattr(name, py.None());
-        }
+fn with_prefix(context: Option<&str>, message: String) -> String {
+    match context {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}: {message}"),
+        _ => message,
     }
 }
 
 fn build_js_exception(py: Python<'_>, details: JsExceptionDetails, context: Option<&str>) -> PyErr {
-    let summary = match context {
-        Some(prefix) if !prefix.is_empty() => format!("{prefix}: {}", details.summary()),
-        _ => details.summary(),
-    };
-    let py_err = PyErr::new::<JavaScriptError, _>(summary);
+    let py_err = PyErr::new::<JavaScriptError, _>(with_prefix(context, details.summary()));
     let value = py_err.value(py);
 
-    set_optional_attr(py, value, "name", details.name.clone());
-    set_optional_attr(py, value, "message", details.message.clone());
-    set_optional_attr(py, value, "stack", details.stack.clone());
+    // `None` fields become Python `None`; attribute errors are ignored.
+    let _ = value.setattr("name", details.name);
+    let _ = value.setattr("message", details.message);
+    let _ = value.setattr("stack", details.stack);
 
     let frames_list = PyList::empty(py);
     for frame in &details.frames {
@@ -56,41 +49,23 @@ fn runtime_error_to_py_with(py: Python<'_>, err: RuntimeError, context: Option<&
     match err {
         RuntimeError::JavaScript(details) => build_js_exception(py, details, context),
         RuntimeError::Timeout { context: msg } => {
-            let message = match context {
-                Some(prefix) => format!("{prefix}: {msg}"),
-                None => msg,
-            };
-            PyErr::new::<RuntimeTimeout, _>(message)
+            PyErr::new::<RuntimeTimeout, _>(with_prefix(context, msg))
         }
         RuntimeError::Internal { context: msg } => {
-            let message = match context {
-                Some(prefix) => format!("{prefix}: {msg}"),
-                None => msg,
-            };
-            PyRuntimeError::new_err(message)
+            PyRuntimeError::new_err(with_prefix(context, msg))
         }
         RuntimeError::Terminated { reason } => {
             let base = reason
-                .as_deref()
                 .filter(|msg| !msg.is_empty())
-                .unwrap_or("Runtime terminated");
-            let message = match context {
-                Some(prefix) if !prefix.is_empty() => format!("{prefix}: {base}"),
-                _ => base.to_string(),
-            };
-            PyErr::new::<RuntimeTerminated, _>(message)
+                .unwrap_or_else(|| "Runtime terminated".to_string());
+            PyErr::new::<RuntimeTerminated, _>(with_prefix(context, base))
         }
         RuntimeError::ForceKilled { context: msg } => {
-            let message = match context {
-                Some(prefix) if !prefix.is_empty() => format!("{prefix}: {msg}"),
-                _ => msg,
-            };
-            PyErr::new::<RuntimeForceKilled, _>(message)
+            PyErr::new::<RuntimeForceKilled, _>(with_prefix(context, msg))
         }
     }
 }
 
-/// Expose the crate-local variant used across the bindings.
 pub(crate) fn runtime_error_to_py(err: RuntimeError) -> PyErr {
     Python::attach(|py| runtime_error_to_py_with(py, err, None))
 }
@@ -98,4 +73,9 @@ pub(crate) fn runtime_error_to_py(err: RuntimeError) -> PyErr {
 /// Include context when converting runtime failures to Python exceptions.
 pub(crate) fn runtime_error_with_context(context: &str, err: RuntimeError) -> PyErr {
     Python::attach(|py| runtime_error_to_py_with(py, err, Some(context)))
+}
+
+/// `map_err` adapter for [`runtime_error_with_context`].
+pub(crate) fn context(context: &'static str) -> impl FnOnce(RuntimeError) -> PyErr {
+    move |err| runtime_error_with_context(context, err)
 }

@@ -1,8 +1,5 @@
-//! Tokio-based JavaScript runtime.
-//!
-//! This module implements a Rust-first, async runtime patterned after `deno_core`.
-//! Each runtime owns a single V8 isolate running on a dedicated OS thread with a
-//! Tokio event loop.
+//! Tokio-based JavaScript runtime: each runtime owns one V8 isolate on a
+//! dedicated OS thread with a Tokio event loop.
 
 pub mod config;
 pub mod conversion;
@@ -27,23 +24,22 @@ pub use handle::RuntimeHandle;
 
 #[cfg(test)]
 mod tests {
+    use super::js_value::JSValue;
     use super::*;
     use std::thread;
 
+    fn spawn(config: RuntimeConfig) -> RuntimeHandle {
+        RuntimeHandle::spawn(config).unwrap()
+    }
+
     #[test]
     fn test_runtime_lifecycle() {
-        let config = RuntimeConfig::default();
-        let mut handle = RuntimeHandle::spawn(config).unwrap();
-
+        let mut handle = spawn(RuntimeConfig::default());
         assert!(!handle.is_shutdown());
-
-        // Evaluate some code
-        let result = handle.eval_sync("40 + 2");
-        assert!(result.is_ok());
-        let js_value = result.unwrap();
-        assert!(matches!(js_value, js_value::JSValue::Int(42)));
-
-        // Shutdown
+        assert!(matches!(
+            handle.eval_sync("40 + 2").unwrap(),
+            JSValue::Int(42)
+        ));
         handle.close().unwrap();
         assert!(handle.is_shutdown());
     }
@@ -51,124 +47,78 @@ mod tests {
     #[test]
     fn test_multiple_runtimes_sequential() {
         for i in 0..3 {
-            let config = RuntimeConfig::default();
-            let mut handle = RuntimeHandle::spawn(config).unwrap();
-
-            let code = format!("{} * 2", i);
-            let result = handle.eval_sync(&code);
-            assert!(result.is_ok());
-            let js_value = result.unwrap();
-            assert!(matches!(js_value, js_value::JSValue::Int(val) if val == i * 2));
-
+            let mut handle = spawn(RuntimeConfig::default());
+            let result = handle.eval_sync(&format!("{} * 2", i)).unwrap();
+            assert!(matches!(result, JSValue::Int(val) if val == i * 2));
             handle.close().unwrap();
         }
     }
 
     #[test]
     fn test_concurrent_runtimes() {
-        let mut handles = vec![];
-
-        // Spawn multiple runtimes
-        for _ in 0..3 {
-            let config = RuntimeConfig::default();
-            let handle = RuntimeHandle::spawn(config).unwrap();
-            handles.push(handle);
-        }
-
-        // Use them concurrently
-        let mut threads = vec![];
-        for (i, handle) in handles.into_iter().enumerate() {
-            let t = thread::spawn(move || {
-                let code = format!("{} + 100", i);
-                let result = handle.eval_sync(&code);
-                assert!(result.is_ok());
-                let js_value = result.unwrap();
-                let expected = (i + 100) as i64;
-                assert!(matches!(js_value, js_value::JSValue::Int(val) if val == expected));
-            });
-            threads.push(t);
-        }
-
-        // Wait for all threads
+        let handles: Vec<_> = (0..3).map(|_| spawn(RuntimeConfig::default())).collect();
+        let threads: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(i, handle)| {
+                thread::spawn(move || {
+                    let result = handle.eval_sync(&format!("{} + 100", i)).unwrap();
+                    let expected = (i + 100) as i64;
+                    assert!(matches!(result, JSValue::Int(val) if val == expected));
+                })
+            })
+            .collect();
         for t in threads {
             t.join().unwrap();
         }
     }
 
-    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_runtime_with_heap_limits() {
-        let mut config = RuntimeConfig::default();
-        config.max_heap_size = Some(10 * 1024 * 1024); // 10 MB
-        config.initial_heap_size = Some(1024 * 1024); // 1 MB
-
-        let handle = RuntimeHandle::spawn(config).unwrap();
-
-        let result = handle.eval_sync("'hello'");
-        assert!(result.is_ok());
-        let js_value = result.unwrap();
-        assert!(matches!(js_value, js_value::JSValue::String(s) if s == "hello"));
+        let handle = spawn(RuntimeConfig {
+            max_heap_size: Some(10 * 1024 * 1024),
+            initial_heap_size: Some(1024 * 1024),
+            ..RuntimeConfig::default()
+        });
+        let result = handle.eval_sync("'hello'").unwrap();
+        assert!(matches!(result, JSValue::String(s) if s == "hello"));
     }
 
-    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_runtime_terminates_when_heap_limit_exceeded() {
-        let mut config = RuntimeConfig::default();
-        // Limits must leave headroom for deno_core's own extension bootstrap
-        // to compile without hitting a genuine V8 fatal OOM before the
-        // test's own JS even runs (the previous 1MB/5MB was too tight for
-        // the current deno_core version's bootstrap and crashed there,
-        // independent of the JS below).
-        config.max_heap_size = Some(10 * 1024 * 1024); // 10 MB
-        config.initial_heap_size = Some(4 * 1024 * 1024); // 4 MB
-
-        let mut handle = RuntimeHandle::spawn(config).unwrap();
-        // Growing many small, discrete allocations (rather than one
-        // exponentially-doubling string) lets V8 check the termination
-        // interrupt between allocations, so the near-heap-limit callback's
-        // `terminate_execution()` actually wins the race and this raises
-        // `Terminated` instead of V8 throwing its own "Invalid string
-        // length" `RangeError` from inside a single oversized allocation.
+        // Headroom for deno_core's bootstrap; many small allocations let the
+        // near-heap-limit termination win over V8's own RangeError.
+        let mut handle = spawn(RuntimeConfig {
+            max_heap_size: Some(10 * 1024 * 1024),
+            initial_heap_size: Some(4 * 1024 * 1024),
+            ..RuntimeConfig::default()
+        });
         let result = handle
             .eval_sync("let arr = []; while (true) { arr.push(new Array(100000).fill('x')); }");
-
-        assert!(matches!(
-            result,
-            Err(RuntimeError::Terminated { reason: _ })
-        ));
+        assert!(matches!(result, Err(RuntimeError::Terminated { .. })));
         handle.close().unwrap();
     }
 
-    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_runtime_with_bootstrap() {
-        let mut config = RuntimeConfig::default();
-        config.bootstrap_script = Some("globalThis.VERSION = '1.0.0';".to_string());
-
-        let handle = RuntimeHandle::spawn(config).unwrap();
-
-        let result = handle.eval_sync("globalThis.VERSION");
-        assert!(result.is_ok());
-        let js_value = result.unwrap();
-        assert!(matches!(js_value, js_value::JSValue::String(s) if s == "1.0.0"));
+        let handle = spawn(RuntimeConfig {
+            bootstrap_script: Some("globalThis.VERSION = '1.0.0';".to_string()),
+            ..RuntimeConfig::default()
+        });
+        let result = handle.eval_sync("globalThis.VERSION").unwrap();
+        assert!(matches!(result, JSValue::String(s) if s == "1.0.0"));
     }
 
     #[test]
     fn test_runtime_state_persistence() {
-        let config = RuntimeConfig::default();
-        let handle = RuntimeHandle::spawn(config).unwrap();
-
-        // Set a variable
-        let result1 = handle.eval_sync("var counter = 0; counter");
-        assert!(matches!(result1.unwrap(), js_value::JSValue::Int(0)));
-
-        // Increment it
-        let result2 = handle.eval_sync("++counter");
-        assert!(matches!(result2.unwrap(), js_value::JSValue::Int(1)));
-
-        // Verify persistence
-        let result3 = handle.eval_sync("counter");
-        assert!(matches!(result3.unwrap(), js_value::JSValue::Int(1)));
+        let handle = spawn(RuntimeConfig::default());
+        for (code, expected) in [
+            ("var counter = 0; counter", 0),
+            ("++counter", 1),
+            ("counter", 1),
+        ] {
+            assert!(matches!(handle.eval_sync(code).unwrap(), JSValue::Int(v) if v == expected));
+        }
     }
 
     #[test]
@@ -178,14 +128,13 @@ mod tests {
         builder
             .execute_script("init.js", "globalThis.answer = 42;")
             .unwrap();
-        let snapshot = builder.build().unwrap();
-
-        let handle = RuntimeHandle::spawn(RuntimeConfig {
-            snapshot: Some(snapshot),
+        let handle = spawn(RuntimeConfig {
+            snapshot: Some(builder.build().unwrap()),
             ..RuntimeConfig::default()
-        })
-        .unwrap();
-        let result = handle.eval_sync("answer").unwrap();
-        assert!(matches!(result, js_value::JSValue::Int(42)));
+        });
+        assert!(matches!(
+            handle.eval_sync("answer").unwrap(),
+            JSValue::Int(42)
+        ));
     }
 }

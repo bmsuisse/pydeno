@@ -17,59 +17,42 @@ use tokio::sync::Mutex as AsyncMutex;
 type PyStreamReleaseCallback = Arc<dyn Fn(u32) + Send + Sync + 'static>;
 type PyStreamReleaseListeners = Arc<Mutex<Vec<PyStreamReleaseCallback>>>;
 
-/// Sentinel tag embedded in JSValue objects that represent stream chunks.
 const STREAM_CHUNK_TYPE: &str = "StreamChunk";
 const STREAM_CHUNK_DONE_KEY: &str = "done";
 const STREAM_CHUNK_VALUE_KEY: &str = "value";
 
-/// Snapshot of streaming usage and health for runtime statistics.
-///
-/// Tracks active and total stream counts, plus bytes transferred in both directions
-/// (JS→Python and Python→JS).
+/// Streaming usage counters (active/total per side, bytes per direction).
 #[derive(Debug, Default, Clone)]
 pub struct StreamStatsSnapshot {
-    /// Number of currently active JavaScript streams.
     pub active_js_streams: u64,
-    /// Number of currently active Python streams.
     pub active_py_streams: u64,
-    /// Total JavaScript streams created over the runtime's lifetime.
     pub total_js_streams: u64,
-    /// Total Python streams created over the runtime's lifetime.
     pub total_py_streams: u64,
-    /// Bytes transferred from JavaScript to Python.
     pub bytes_streamed_js_to_py: u64,
-    /// Bytes transferred from Python to JavaScript.
     pub bytes_streamed_py_to_js: u64,
 }
 
 impl StreamStatsSnapshot {
     pub fn merge(&mut self, other: &StreamStatsSnapshot) {
-        self.active_js_streams = self
-            .active_js_streams
-            .saturating_add(other.active_js_streams);
-        self.active_py_streams = self
-            .active_py_streams
-            .saturating_add(other.active_py_streams);
-        self.total_js_streams = self.total_js_streams.saturating_add(other.total_js_streams);
-        self.total_py_streams = self.total_py_streams.saturating_add(other.total_py_streams);
-        self.bytes_streamed_js_to_py = self
-            .bytes_streamed_js_to_py
-            .saturating_add(other.bytes_streamed_js_to_py);
-        self.bytes_streamed_py_to_js = self
-            .bytes_streamed_py_to_js
-            .saturating_add(other.bytes_streamed_py_to_js);
+        macro_rules! add {
+            ($($f:ident),*) => { $(self.$f = self.$f.saturating_add(other.$f);)* };
+        }
+        add!(
+            active_js_streams,
+            active_py_streams,
+            total_js_streams,
+            total_py_streams,
+            bytes_streamed_js_to_py,
+            bytes_streamed_py_to_js
+        );
     }
 }
 
-/// Host-side representation of a chunk pulled from a JS or Python stream.
-///
-/// Mirrors the structure returned by `ReadableStreamDefaultReader.read()`,
-/// with a `done` flag and optional `value`.
+/// A chunk pulled from a JS or Python stream, shaped like
+/// `ReadableStreamDefaultReader.read()`'s result.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
-    /// True if the stream has ended (no more chunks available).
     pub done: bool,
-    /// Optional chunk value (None if done=true or stream was canceled).
     pub value: Option<JSValue>,
 }
 
@@ -88,51 +71,37 @@ impl StreamChunk {
     }
 
     pub fn from_js_value(payload: JSValue) -> RuntimeResult<Self> {
-        match payload {
-            JSValue::Object(mut map) => {
-                let tag = map
-                    .shift_remove("__pydeno_type")
-                    .and_then(|value| match value {
-                        JSValue::String(s) => Some(s),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                if tag == STREAM_CHUNK_TYPE {
-                    let done = match map.shift_remove(STREAM_CHUNK_DONE_KEY) {
-                        Some(JSValue::Bool(flag)) => flag,
-                        other => {
-                            return Err(RuntimeError::internal(format!(
-                                "Stream chunk missing done flag: {:?}",
-                                other
-                            )))
-                        }
-                    };
-                    let value = map.shift_remove(STREAM_CHUNK_VALUE_KEY);
-                    Ok(StreamChunk { done, value })
-                } else {
-                    let done = match map.shift_remove(STREAM_CHUNK_DONE_KEY) {
-                        Some(JSValue::Bool(flag)) => flag,
-                        Some(JSValue::String(text)) if text == "true" => true,
-                        Some(JSValue::String(text)) if text == "false" => false,
-                        Some(other) => {
-                            return Err(RuntimeError::internal(format!(
-                                "Invalid done field for stream chunk: {:?}",
-                                other
-                            )))
-                        }
-                        None => {
-                            return Err(RuntimeError::internal("Stream chunk missing done field"))
-                        }
-                    };
-                    let value = map.shift_remove(STREAM_CHUNK_VALUE_KEY);
-                    Ok(StreamChunk { done, value })
-                }
-            }
-            other => Err(RuntimeError::internal(format!(
+        let JSValue::Object(mut map) = payload else {
+            return Err(RuntimeError::internal(format!(
                 "Unexpected chunk payload: {:?}",
-                other
-            ))),
-        }
+                payload
+            )));
+        };
+        let tagged = matches!(
+            map.shift_remove("__pydeno_type"),
+            Some(JSValue::String(tag)) if tag == STREAM_CHUNK_TYPE
+        );
+        // Tagged chunks require a bool; untagged ones also accept "true"/"false".
+        let done = match (tagged, map.shift_remove(STREAM_CHUNK_DONE_KEY)) {
+            (_, Some(JSValue::Bool(flag))) => flag,
+            (true, other) => {
+                return Err(RuntimeError::internal(format!(
+                    "Stream chunk missing done flag: {:?}",
+                    other
+                )))
+            }
+            (false, Some(JSValue::String(text))) if text == "true" => true,
+            (false, Some(JSValue::String(text))) if text == "false" => false,
+            (false, Some(other)) => {
+                return Err(RuntimeError::internal(format!(
+                    "Invalid done field for stream chunk: {:?}",
+                    other
+                )))
+            }
+            (false, None) => return Err(RuntimeError::internal("Stream chunk missing done field")),
+        };
+        let value = map.shift_remove(STREAM_CHUNK_VALUE_KEY);
+        Ok(StreamChunk { done, value })
     }
 }
 
@@ -161,28 +130,30 @@ struct JsStreamEntry {
     transferred_bytes: u64,
 }
 
-impl JsStreamEntry {
-    fn new(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Self {
-        Self {
-            stream: v8::Global::new(scope, value),
-            reader: None,
-            chunks: 0,
-            transferred_bytes: 0,
-        }
-    }
+/// Call `obj[name]()` with the given error messages for each failure step
+/// (allocating the key, missing property, not callable, threw).
+fn call_js_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    obj: v8::Local<'s, v8::Object>,
+    name: &str,
+    [alloc_err, missing_err, not_fn_err, threw_err]: [&'static str; 4],
+) -> RuntimeResult<v8::Local<'s, v8::Value>> {
+    let key = v8::String::new(scope, name).ok_or_else(|| RuntimeError::internal(alloc_err))?;
+    let value = obj
+        .get(scope, key.into())
+        .ok_or_else(|| RuntimeError::internal(missing_err))?;
+    let func = v8::Local::<v8::Function>::try_from(value)
+        .map_err(|_| RuntimeError::internal(not_fn_err))?;
+    func.call(scope, obj.into(), &[])
+        .ok_or_else(|| RuntimeError::internal(threw_err))
 }
 
-/// Registry tracking live JS ReadableStream handles.
-///
-/// Manages V8 global handles for JavaScript `ReadableStream` objects and their readers,
-/// enabling Python code to consume chunks from JavaScript streams.
+/// Registry of live JS `ReadableStream` handles (and their readers) consumed
+/// from Python.
 #[derive(Default)]
 pub struct JsStreamRegistry {
-    /// Active stream entries indexed by stream ID.
     entries: RefCell<HashMap<u32, JsStreamEntry>>,
-    /// Next available stream ID.
     next_id: Cell<u32>,
-    /// Usage statistics for active/total streams and bytes transferred.
     stats: RefCell<JsStreamStats>,
 }
 
@@ -198,9 +169,13 @@ impl JsStreamRegistry {
     ) -> u32 {
         let id = self.next_id.get();
         self.next_id.set(id.wrapping_add(1));
-        self.entries
-            .borrow_mut()
-            .insert(id, JsStreamEntry::new(scope, stream_value));
+        let entry = JsStreamEntry {
+            stream: v8::Global::new(scope, stream_value),
+            reader: None,
+            chunks: 0,
+            transferred_bytes: 0,
+        };
+        self.entries.borrow_mut().insert(id, entry);
         let mut stats = self.stats.borrow_mut();
         stats.active = stats.active.saturating_add(1);
         stats.total = stats.total.saturating_add(1);
@@ -234,16 +209,17 @@ impl JsStreamRegistry {
         let stream_obj = stream_local
             .to_object(scope)
             .ok_or_else(|| RuntimeError::internal("ReadableStream is not an object"))?;
-        let key = v8::String::new(scope, "getReader")
-            .ok_or_else(|| RuntimeError::internal("Failed to allocate getReader string"))?;
-        let getter_value = stream_obj
-            .get(scope, key.into())
-            .ok_or_else(|| RuntimeError::internal("ReadableStream.getReader missing"))?;
-        let getter = v8::Local::<v8::Function>::try_from(getter_value)
-            .map_err(|_| RuntimeError::internal("getReader is not a function"))?;
-        let reader_value = getter
-            .call(scope, stream_obj.into(), &[])
-            .ok_or_else(|| RuntimeError::internal("getReader threw"))?;
+        let reader_value = call_js_method(
+            scope,
+            stream_obj,
+            "getReader",
+            [
+                "Failed to allocate getReader string",
+                "ReadableStream.getReader missing",
+                "getReader is not a function",
+                "getReader threw",
+            ],
+        )?;
         let reader_obj = reader_value
             .to_object(scope)
             .ok_or_else(|| RuntimeError::internal("getReader did not return object"))?;
@@ -257,16 +233,17 @@ impl JsStreamRegistry {
         stream_id: u32,
     ) -> RuntimeResult<v8::Global<v8::Promise>> {
         let reader = self.ensure_reader(scope, stream_id)?;
-        let read_key = v8::String::new(scope, "read")
-            .ok_or_else(|| RuntimeError::internal("Failed to allocate read key"))?;
-        let read_value = reader
-            .get(scope, read_key.into())
-            .ok_or_else(|| RuntimeError::internal("Reader.read missing"))?;
-        let read_fn = v8::Local::<v8::Function>::try_from(read_value)
-            .map_err(|_| RuntimeError::internal("Reader.read is not callable"))?;
-        let promise_value = read_fn
-            .call(scope, reader.into(), &[])
-            .ok_or_else(|| RuntimeError::internal("Reader.read threw"))?;
+        let promise_value = call_js_method(
+            scope,
+            reader,
+            "read",
+            [
+                "Failed to allocate read key",
+                "Reader.read missing",
+                "Reader.read is not callable",
+                "Reader.read threw",
+            ],
+        )?;
         let promise = v8::Local::<v8::Promise>::try_from(promise_value)
             .map_err(|_| RuntimeError::internal("Reader.read must return a promise"))?;
         Ok(v8::Global::new(scope, promise))
@@ -286,25 +263,17 @@ impl JsStreamRegistry {
     }
 }
 
-/// Async iterator registry for Python-provided streams consumed inside JavaScript.
-///
-/// Manages Python async iterables that are exposed as JavaScript `ReadableStream`s.
-/// Thread-safe and clone-able for sharing across the handle and runtime thread.
+/// Registry of Python async iterables exposed to JavaScript as
+/// `ReadableStream`s. Clones share state (handle and runtime thread).
 #[derive(Clone)]
 pub struct PyStreamRegistry {
-    /// Active stream entries indexed by stream ID.
     entries: Arc<Mutex<HashMap<u32, Arc<PyStreamEntry>>>>,
-    /// Next available stream ID.
     next_id: Arc<AtomicU32>,
-    /// Number of currently active streams.
     active: Arc<AtomicU64>,
-    /// Total streams created over the registry's lifetime.
     total: Arc<AtomicU64>,
     /// Bytes transferred from Python to JavaScript.
     bytes: Arc<AtomicU64>,
-    /// Callbacks invoked when a stream is released.
     release_listeners: PyStreamReleaseListeners,
-    /// Serialization limits for chunk values.
     serialization_limits: SerializationLimits,
 }
 
@@ -332,10 +301,8 @@ impl PyStreamRegistry {
     }
 
     fn notify_release_listeners(&self, stream_id: u32) {
-        let listeners = {
-            let guard = self.release_listeners.lock().unwrap();
-            guard.iter().cloned().collect::<Vec<_>>()
-        };
+        // Clone out so listeners run without holding the lock.
+        let listeners = self.release_listeners.lock().unwrap().clone();
         for listener in listeners {
             listener(stream_id);
         }
@@ -347,11 +314,13 @@ impl PyStreamRegistry {
         task_locals: TaskLocals,
     ) -> RuntimeResult<u32> {
         let stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(PyStreamEntry::new(
+        let entry = Arc::new(PyStreamEntry {
             iterable,
+            iterator: AsyncMutex::new(None),
             task_locals,
-            self.serialization_limits,
-        ));
+            closed: AtomicBool::new(false),
+            serialization_limits: self.serialization_limits,
+        });
         self.entries.lock().unwrap().insert(stream_id, entry);
         self.active.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
@@ -415,21 +384,11 @@ struct PyStreamEntry {
     serialization_limits: SerializationLimits,
 }
 
-impl PyStreamEntry {
-    fn new(
-        iterable: Py<PyAny>,
-        task_locals: TaskLocals,
-        serialization_limits: SerializationLimits,
-    ) -> Self {
-        Self {
-            iterable,
-            iterator: AsyncMutex::new(None),
-            task_locals,
-            closed: AtomicBool::new(false),
-            serialization_limits,
-        }
-    }
+fn is_stop_async_iteration(err: &PyErr) -> bool {
+    Python::attach(|py| err.is_instance_of::<PyStopAsyncIteration>(py))
+}
 
+impl PyStreamEntry {
     async fn ensure_iterator(&self) -> RuntimeResult<Py<PyAny>> {
         let mut guard = self.iterator.lock().await;
         if let Some(it) = guard.as_ref() {
@@ -471,19 +430,13 @@ impl PyStreamEntry {
                     value: Some(js_value),
                 })
             }
-            Err(err) => {
-                let is_stop = Python::attach(|py| err.is_instance_of::<PyStopAsyncIteration>(py));
-                if is_stop {
-                    Ok(StreamChunk {
-                        done: true,
-                        value: None,
-                    })
-                } else {
-                    Err(RuntimeError::internal(format!(
-                        "Python stream errored: {err}"
-                    )))
-                }
-            }
+            Err(err) if is_stop_async_iteration(&err) => Ok(StreamChunk {
+                done: true,
+                value: None,
+            }),
+            Err(err) => Err(RuntimeError::internal(format!(
+                "Python stream errored: {err}"
+            ))),
         }
     }
 
@@ -516,18 +469,14 @@ impl PyStreamEntry {
             }
         })?;
 
-        if let Some(fut) = future {
-            match fut.await {
-                Ok(_) => {}
-                Err(err) => {
-                    let is_stop =
-                        Python::attach(|py| err.is_instance_of::<PyStopAsyncIteration>(py));
-                    if !is_stop {
-                        return Err(RuntimeError::internal(format!("aclose() errored: {err}")));
-                    }
+        match future {
+            Some(fut) => match fut.await {
+                Err(err) if !is_stop_async_iteration(&err) => {
+                    Err(RuntimeError::internal(format!("aclose() errored: {err}")))
                 }
-            }
+                _ => Ok(()),
+            },
+            None => Ok(()),
         }
-        Ok(())
     }
 }
