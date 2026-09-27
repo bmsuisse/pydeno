@@ -7,6 +7,8 @@
 - Preserve `__proto__` dictionary keys as own data properties when sending Python objects into V8.
 - Track ToolBridge capabilities per runtime with weak references; detaching one runtime no longer loses revocation tokens for another.
 - Reject trailing newlines in tool names and timeouts that cannot fit the command format or platform clock.
+- Snapshot binding dictionary entries before releasing the GIL so concurrent mutation cannot panic.
+- Replace timing-sensitive concurrency assertions with barrier checks and repair documentation references.
 - Use the installed Linux wheel's interpreter for CI report checks and align local Ruff with CI.
 
 ## 0.4.2 — internal cleanup, no API changes

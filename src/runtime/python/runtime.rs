@@ -274,7 +274,10 @@ impl Runtime {
 
         let mut bindings = Vec::with_capacity(dict.len());
         let tokens = PyDict::new(py);
-        for (key, value) in dict.iter() {
+        // Registration releases the GIL; retain the original entries so another
+        // Python thread cannot invalidate PyDict's live iterator while we wait.
+        let entries: Vec<_> = dict.iter().collect();
+        for (key, value) in entries {
             let key: String = key.extract()?;
             if value.is_callable() {
                 let handler = value.unbind();

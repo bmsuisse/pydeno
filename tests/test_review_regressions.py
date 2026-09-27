@@ -155,3 +155,38 @@ def test_runtime_control_calls_release_gil(operation):
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=5
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_bind_object_snapshots_input_before_releasing_gil():
+    code = textwrap.dedent("""
+        import asyncio
+        import threading
+        from pydeno import Runtime
+
+        async def main():
+            with Runtime() as rt:
+                entered = threading.Event()
+                release = threading.Event()
+                def callback():
+                    entered.set()
+                    assert release.wait(2)
+                rt.bind_function("callback", callback)
+                pending = asyncio.create_task(rt.eval_async("callback()"))
+                assert entered.wait(2)
+                values = {"one": lambda: 1, "two": 2}
+                def mutate():
+                    values["three"] = 3
+                    release.set()
+                timer = threading.Timer(0.05, mutate)
+                timer.start()
+                rt.bind_object("values", values)
+                timer.join()
+                await pending
+                assert rt.eval("values.one() + values.two") == 3
+                assert rt.eval("Object.keys(values)") == ["one", "two"]
+        asyncio.run(main())
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=5
+    )
+    assert result.returncode == 0, result.stderr
