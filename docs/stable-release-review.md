@@ -32,7 +32,7 @@ Every finding carries one of three labels, because "I read it" and "I ran it
 and watched it happen" are not the same claim:
 
 - **[ran]** -- reproduced by executing code. The repro is given inline.
-- **[read]** -- established by reading the source. Cited with `file:line`.
+- **`[read]`** -- established by reading the source. Cited with `file:line`.
 - **[suspect]** -- a hypothesis from reading that I did **not** confirm. Needs
   a test before anyone acts on it.
 
@@ -57,7 +57,7 @@ first, it says so and stops.
 
 # MUST change before calling this stable
 
-## M1. Nothing runs the test suite. [ran] [read]
+## M1. Nothing runs the test suite. [ran] `[read]`
 
 `.github/workflows/` contains exactly three workflows:
 `workflow.yaml` (`name: Publish to PyPI`, `on: release`), `benchmarks.yml`
@@ -108,7 +108,7 @@ same input is refused cleanly at every depth I tried (100 → OK, 200..2000 →
 **this is optimization-level-dependent, not universal.** That is precisely why
 it must be fixed rather than shrugged at.
 
-Root cause [read]: no spawned thread sets a stack size.
+Root cause `[read]`: no spawned thread sets a stack size.
 `src/runtime/runner.rs:2033` and `src/runtime/pool.rs:124` both do
 `thread::Builder::new().name(...).spawn(...)` with no `.stack_size()`, so the
 V8 isolate *and* the recursive host-side serializer
@@ -131,7 +131,7 @@ CI run so the difference can never hide again. Deriving the depth limit from
 measured stack headroom instead of a hardcoded 100 would be the more honest
 version.
 
-## M3. The JS→Python direction enforces neither `max_serialization_bytes` nor `max_serialization_depth`. [ran] [read]
+## M3. The JS→Python direction enforces neither `max_serialization_bytes` nor `max_serialization_depth`. [ran] `[read]`
 
 This is the same bug class the project already found and fixed once -- on the
 other side of the boundary. `src/runtime/conversion.rs:165-175` documents the
@@ -228,7 +228,7 @@ to it before the API is frozen:
 
 Either is defensible. `{}` is not.
 
-## M5. Guest JS can enumerate the op registry and read op names out of error messages. [ran] [read]
+## M5. Guest JS can enumerate the op registry and read op names out of error messages. [ran] `[read]`
 
 `__host_op_sync__(id, ...)` is an ambient global that takes a raw integer op id
 (`ops.rs:453-470`), and op ids are allocated sequentially from zero
@@ -278,7 +278,7 @@ namespaces are cosmetic; (c) decide whether `revoke`/per-binding
 unguessable ids are worth adding now, because adding them later is a breaking
 change to the JS-side convention.
 
-## M6. pydeno's own internal error strings reach guest JS. [ran] [read]
+## M6. pydeno's own internal error strings reach guest JS. [ran] `[read]`
 
 The existing leak tests
 (`tests/test_known_escape_techniques.py:278-315`) check a JS-thrown error and a
@@ -291,7 +291,7 @@ TypeError: serde_v8 error: recursion limit exceeded
 ```
 
 -- a dependency crate name, handed to guest JS, observed on both builds. Same
-class, all guest-reachable [read]: `"Python op registry is missing"`
+class, all guest-reachable `[read]`: `"Python op registry is missing"`
 (`ops.rs:112`), `"GlobalTaskLocals not found in OpState"` (`ops.rs:216`),
 `"Serialization limits not configured"` (`ops.rs:177`, `:221`),
 `"PyStreamRegistry is missing"` (`ops.rs:279`).
@@ -308,7 +308,7 @@ that would have caught this.
 
 # SHOULD change before calling this stable
 
-## S1. `IsolatePool` is 21x slower than the thing it is offered as an alternative to, and the README still recommends it. [ran] [read]
+## S1. `IsolatePool` is 21x slower than the thing it is offered as an alternative to, and the README still recommends it. [ran] `[read]`
 
 Measured on the 0.1.1 release wheel, 3000 iterations each, same process:
 
@@ -375,7 +375,7 @@ asyncio.create_task(g.call_async())
 loudly in the docstring and stub -- `create_task` is the first thing a user
 reaches for when they want two tool calls in flight.
 
-## S4. `ToolNotFoundError` documents behaviour that does not exist. [read]
+## S4. `ToolNotFoundError` documents behaviour that does not exist. `[read]`
 
 `python/pydeno/_tools.py:63-64`: "Raised when JS asks for a tool the bridge does
 not expose." Nothing in the module raises it, and there is no code path that
@@ -385,7 +385,7 @@ V8. Either wire it up (an own-property-less namespace via a `Proxy` trap would
 do it) or delete the class. Exporting an exception that never fires is a
 promise to keep exporting it.
 
-## S5. Documented behaviour that does not exist: the permission model. [read]
+## S5. Documented behaviour that does not exist: the permission model. `[read]`
 
 `docs/contributing/architecture.md:273` -- "Permission-based (ops require
 specific permissions)". `CLAUDE.md` says the same twice: "Ops System
@@ -402,7 +402,7 @@ divergence in the repo, because it is a *security* claim, and it interacts
 directly with M5: a reader who believes ops are permission-gated will not
 notice that they are ambient.
 
-## S6. `CLAUDE.md` describes a layout the repo no longer has. [read]
+## S6. `CLAUDE.md` describes a layout the repo no longer has. `[read]`
 
 Beyond S5: it points at `src/runtime/python.rs` (now the `src/runtime/python/`
 package) and `docs/internals/` (does not exist; the architecture doc lives at
@@ -411,7 +411,7 @@ package) and `docs/internals/` (does not exist; the architecture doc lives at
 serialization limits. It is the file that tells an agent how this codebase
 works, and on the three subjects this review cares about most it is wrong.
 
-## S7. Two `unsafe` blocks have no SAFETY comment. [read]
+## S7. Two `unsafe` blocks have no SAFETY comment. `[read]`
 
 `src/runtime/runner.rs` gets this right twice (`:224`, `:241`). The other two
 do not:
@@ -456,11 +456,11 @@ The gaps are specific.
 
 | bug | regression test | verdict |
 | --- | --- | --- |
-| cross-thread termination panic | `test_fixed_termination_handle_kills_runaway_loop`, `test_the_process_survives_a_terminated_runtime`, plus `test_pathological_regexes_are_interruptible` (docstring names `PATCH.md`) | **covered** [read] |
-| uncatchable SIGABRT (large script / snapshot) | `tests/test_large_script_eval.py` (8 tests), `test_source_around_the_streaming_compile_threshold` | **covered** [read] |
-| GIL deadlock on a logging bootstrap | `test_constructing_a_runtime_does_not_deadlock_on_a_logging_bootstrap` | **covered** [read] |
-| prototype corruption via `__proto__` | `test_a_dunder_proto_key_round_trips_through_the_op_paths`, `test_dunder_proto_survives_from_js_back_to_python`, `test_bind_object_nested_dunder_proto_is_a_known_residual` | **covered** [read] |
-| GIL held across a blocking round trip | `TestGilIsReleasedAcrossBlockingCalls` (with a documented pre-fix 1.04x / post-fix 1.91x) | **covered** [read] |
+| cross-thread termination panic | `test_fixed_termination_handle_kills_runaway_loop`, `test_the_process_survives_a_terminated_runtime`, plus `test_pathological_regexes_are_interruptible` (docstring names `PATCH.md`) | **covered** `[read]` |
+| uncatchable SIGABRT (large script / snapshot) | `tests/test_large_script_eval.py` (8 tests), `test_source_around_the_streaming_compile_threshold` | **covered** `[read]` |
+| GIL deadlock on a logging bootstrap | `test_constructing_a_runtime_does_not_deadlock_on_a_logging_bootstrap` | **covered** `[read]` |
+| prototype corruption via `__proto__` | `test_a_dunder_proto_key_round_trips_through_the_op_paths`, `test_dunder_proto_survives_from_js_back_to_python`, `test_bind_object_nested_dunder_proto_remains_own_data` | **covered** `[read]` |
+| GIL held across a blocking round trip | `TestGilIsReleasedAcrossBlockingCalls` (with a documented pre-fix 1.04x / post-fix 1.91x) | **covered** `[read]` |
 | per-argument vs aggregate serialization budget | `TestSerializationBudgetIsAggregate` -- but **only Python→JS**. The JS→Python half of the same boundary has no equivalent test, and is still broken (M3) | **half-covered** |
 | memory leak (op-registry `Rc` in embedder slot 0) | nothing. `test_rapid_checkout_release_churn_does_not_grow_rss` (`test_stress_concurrency.py:67`) measures pool checkout churn, and `test_no_global_state_leaks_across_reused_isolate` is about state visibility, not RSS. Neither exercises create/close of a `Runtime` *with ops registered*, which is where the leak was | **not covered** |
 
@@ -735,7 +735,7 @@ Recorded so the punch list is not mistaken for the whole picture.
   (`prepare`'s object arm `:362`, `revive`'s default arm `:412`,
   `__pydeno_bind_object` `:488` and `:490`), so the fix is applied uniformly
   rather than at the one site the fuzzer happened to hit.
-- **Tag forgery is contained [read].** Guest JS *can* put `__pydeno_type` on an
+- **Tag forgery is contained `[read]`.** Guest JS *can* put `__pydeno_type` on an
   object it hands to a host op, and `JSValue`'s `Deserialize` will honour
   `Undefined` / `Date` / `Set` / `BigInt` tags -- a type-confusion primitive
   (the host sees `pydeno.undefined` or an `int` where the guest returned an
@@ -754,7 +754,7 @@ Recorded so the punch list is not mistaken for the whole picture.
   the docs, not a bug: guest JS *can* run arbitrary code (including other tool
   calls, spending their budget) from inside a getter while the host serializer
   is mid-object.
-- **Cycle detection via `get_identity_hash` is sound in practice [read].**
+- **Cycle detection via `get_identity_hash` is sound in practice `[read]`.**
   I initially read this as collision-prone, and it is not: `seen` holds only
   the current ancestor chain (`insert` before the recursive call, `remove`
   after -- `runner.rs:3368`, `:3406`), so at most `max_depth` (100) entries are

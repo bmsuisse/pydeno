@@ -421,9 +421,11 @@ impl Converter {
                         RuntimeError::internal(format!("Failed to allocate key '{key}'"))
                     })?;
                     let v8_value = self.to_v8(scope, val)?;
-                    object.set(scope, key_str.into(), v8_value).ok_or_else(|| {
-                        RuntimeError::internal(format!("Failed to set property '{key}'"))
-                    })?;
+                    object
+                        .create_data_property(scope, key_str.into(), v8_value)
+                        .ok_or_else(|| {
+                            RuntimeError::internal(format!("Failed to set property '{key}'"))
+                        })?;
                 }
                 object.into()
             }

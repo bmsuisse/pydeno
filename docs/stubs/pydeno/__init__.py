@@ -12,6 +12,8 @@ from ._pydeno import (
     RuntimeConfig,
     RuntimeStats,
     RuntimeTerminated,
+    RuntimeForceKilled,
+    RuntimeTimeout,
     SnapshotBuilder,
     undefined,
 )
@@ -33,6 +35,8 @@ __all__ = [
     "RuntimeConfig",
     "RuntimeStats",
     "RuntimeTerminated",
+    "RuntimeForceKilled",
+    "RuntimeTimeout",
     "SnapshotBuilder",
     "undefined",
 ]

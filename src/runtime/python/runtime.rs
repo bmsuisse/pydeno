@@ -171,9 +171,11 @@ impl Runtime {
         }
     }
 
-    fn terminate(&self) -> PyResult<()> {
+    fn terminate(&self, py: Python<'_>) -> PyResult<()> {
         match self.handle.borrow().clone() {
-            Some(handle) => handle.terminate().map_err(context("Termination failed")),
+            Some(handle) => py
+                .detach(|| handle.terminate())
+                .map_err(context("Termination failed")),
             None => Ok(()),
         }
     }
@@ -208,12 +210,11 @@ impl Runtime {
     ) -> PyResult<OpToken> {
         let handle = self.live_handle()?;
         let mode = Self::checked_mode(py, mode, &handler)?;
-        let op_id = handle
-            .register_op(name, mode, handler)
+        let op_id = py
+            .detach(|| handle.register_op(name, mode, handler))
             .map_err(context("Op registration failed"))?;
         // Handing the token to the caller *is* the bind step, so expose it now.
-        handle
-            .set_op_exposure(op_id, true)
+        py.detach(|| handle.set_op_exposure(op_id, true))
             .map_err(context("Op registration failed"))?;
         Ok(op_id)
     }
@@ -221,9 +222,9 @@ impl Runtime {
     /// Revoke an op capability, by the token `register_op`/`bind_function`
     /// returned.
     #[pyo3(signature = (op_id))]
-    fn revoke_op(&self, _py: Python<'_>, op_id: OpToken) -> PyResult<bool> {
-        self.live_handle()?
-            .set_op_exposure(op_id, false)
+    fn revoke_op(&self, py: Python<'_>, op_id: OpToken) -> PyResult<bool> {
+        let handle = self.live_handle()?;
+        py.detach(|| handle.set_op_exposure(op_id, false))
             .map_err(context("Op revocation failed"))
     }
 
@@ -231,8 +232,8 @@ impl Runtime {
     fn bind_function(&self, py: Python<'_>, name: String, handler: Py<PyAny>) -> PyResult<OpToken> {
         let handle = self.live_handle()?;
         let mode = Self::detect_mode(py, &handler)?;
-        let op_id = handle
-            .register_op(name.clone(), mode, handler)
+        let op_id = py
+            .detach(|| handle.register_op(name.clone(), mode, handler))
             .map_err(context("Op registration failed"))?;
         let bridge = match mode {
             PythonOpMode::Sync => "__host_op_sync__",
@@ -244,8 +245,7 @@ impl Runtime {
         // Expose only after the binding script succeeded, so a failed binding
         // leaves the handler registered but not dispatchable.
         self.eval(py, &script)?;
-        handle
-            .set_op_exposure(op_id, true)
+        py.detach(|| handle.set_op_exposure(op_id, true))
             .map_err(context("Op registration failed"))?;
         Ok(op_id)
     }
@@ -274,13 +274,16 @@ impl Runtime {
 
         let mut bindings = Vec::with_capacity(dict.len());
         let tokens = PyDict::new(py);
-        for (key, value) in dict.iter() {
+        // Registration releases the GIL; retain the original entries so another
+        // Python thread cannot invalidate PyDict's live iterator while we wait.
+        let entries: Vec<_> = dict.iter().collect();
+        for (key, value) in entries {
             let key: String = key.extract()?;
             if value.is_callable() {
                 let handler = value.unbind();
                 let mode = Self::detect_mode(py, &handler)?;
-                let op_id = handle
-                    .register_op(format!("{name}.{key}"), mode, handler)
+                let op_id = py
+                    .detach(|| handle.register_op(format!("{name}.{key}"), mode, handler))
                     .map_err(context("Op registration failed"))?;
                 tokens.set_item(&key, op_id)?;
                 bindings.push(BoundObjectProperty::Op { key, op_id, mode });
@@ -291,27 +294,26 @@ impl Runtime {
         }
 
         // The runner exposes the ops only once `__pydeno_bind_object` installed them.
-        handle
-            .bind_object(name, bindings)
+        py.detach(|| handle.bind_object(name, bindings))
             .map_err(context("Failed to bind object"))?;
         Ok(tokens.unbind())
     }
 
-    fn set_module_resolver(&self, _py: Python<'_>, resolver: Py<PyAny>) -> PyResult<()> {
-        self.live_handle()?
-            .set_module_resolver(resolver)
+    fn set_module_resolver(&self, py: Python<'_>, resolver: Py<PyAny>) -> PyResult<()> {
+        let handle = self.live_handle()?;
+        py.detach(|| handle.set_module_resolver(resolver))
             .map_err(context("Failed to set module resolver"))
     }
 
-    fn set_module_loader(&self, _py: Python<'_>, loader: Py<PyAny>) -> PyResult<()> {
-        self.live_handle()?
-            .set_module_loader(loader)
+    fn set_module_loader(&self, py: Python<'_>, loader: Py<PyAny>) -> PyResult<()> {
+        let handle = self.live_handle()?;
+        py.detach(|| handle.set_module_loader(loader))
             .map_err(context("Failed to set module loader"))
     }
 
-    fn add_static_module(&self, _py: Python<'_>, name: String, source: String) -> PyResult<()> {
-        self.live_handle()?
-            .add_static_module(name, source)
+    fn add_static_module(&self, py: Python<'_>, name: String, source: String) -> PyResult<()> {
+        let handle = self.live_handle()?;
+        py.detach(|| handle.add_static_module(name, source))
             .map_err(context("Failed to add static module"))
     }
 

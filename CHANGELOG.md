@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.3 — 2026-09-27
+
+- Propagate Python conversion errors to async eval, module and function callers instead of leaving their futures pending.
+- Release the GIL during blocking runtime control operations, object binding and stream cleanup so Python callbacks cannot deadlock the caller.
+- Preserve `__proto__` dictionary keys as own data properties when sending Python objects into V8.
+- Track ToolBridge capabilities per runtime with weak references; detaching one runtime no longer loses revocation tokens for another.
+- Reject trailing newlines in tool names and timeouts that cannot fit the command format or platform clock.
+- Snapshot binding dictionary entries before releasing the GIL so concurrent mutation cannot panic.
+- Replace timing-sensitive concurrency assertions with barrier checks and repair documentation references.
+- Use the installed Linux wheel's interpreter for CI report checks and align local Ruff with CI.
+
 ## 0.4.2 — internal cleanup, no API changes
 
 An internal refactor with no API or behaviour changes. The Python API, the

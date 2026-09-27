@@ -1,7 +1,7 @@
 //! Helpers shared by multiple bindings (timeout normalization, finalizers).
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
     if !seconds.is_finite() {
@@ -13,7 +13,13 @@ pub(crate) fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
     if seconds == 0.0 {
         return Err(PyValueError::new_err("Timeout cannot be zero"));
     }
-    if seconds > u64::MAX as f64 {
+    // Deadlines must fit both the millisecond command ABI and the platform clock.
+    if seconds >= u64::MAX as f64 / 1000.0
+        || Duration::try_from_secs_f64(seconds)
+            .ok()
+            .and_then(|duration| Instant::now().checked_add(duration))
+            .is_none()
+    {
         return Err(PyValueError::new_err("Timeout is too large"));
     }
     Ok(())
