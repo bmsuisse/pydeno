@@ -104,8 +104,8 @@ impl JsStream {
         pyo3_tokio::future_into_py(py, future)
     }
 
-    fn close(&self) -> PyResult<()> {
-        self.state.cancel();
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.state.cancel());
         Ok(())
     }
 
@@ -125,8 +125,8 @@ pub(crate) struct JsStreamFinalizer {
 
 #[pymethods]
 impl JsStreamFinalizer {
-    fn __call__(&self) {
-        self.state.cancel();
+    fn __call__(&self, py: Python<'_>) {
+        py.detach(|| self.state.cancel());
     }
 }
 

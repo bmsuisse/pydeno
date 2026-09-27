@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import weakref
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -178,14 +179,16 @@ class ToolBridge:
         self._max_calls = max_calls
         self._on_exhausted = on_exhausted
         self._calls = 0
-        self._tokens: list[int] = []
+        self._tokens: weakref.WeakKeyDictionary[Any, list[int]] = (
+            weakref.WeakKeyDictionary()
+        )
 
     @staticmethod
     def _check_name(name: object, *, what: str) -> None:
         """Fail closed on anything that isn't a plain, safe JS identifier."""
         if not isinstance(name, str):
             raise TypeError(f"{what} must be a string, got {type(name).__name__}")
-        if not _SAFE_NAME.match(name):
+        if not _SAFE_NAME.fullmatch(name):
             raise ValueError(
                 f"Invalid {what} {name!r}: must match [A-Za-z_][A-Za-z0-9_]* "
                 "so it is safe to install as a JavaScript property"
@@ -266,10 +269,12 @@ class ToolBridge:
         # Kept (host-side only) so `detach` can revoke them.
         if self._namespace is None:
             for name, shim in wrapped.items():
-                self._tokens.append(runtime.bind_function(name, shim))
+                self._tokens.setdefault(runtime, []).append(
+                    runtime.bind_function(name, shim)
+                )
         else:
             tokens = runtime.bind_object(self._namespace, wrapped)
-            self._tokens.extend(tokens.values())
+            self._tokens.setdefault(runtime, []).extend(tokens.values())
 
     def detach(self, runtime: Any) -> int:
         """Revoke every capability this bridge installed into `runtime`.
@@ -283,8 +288,12 @@ class ToolBridge:
             The number of capabilities actually revoked.
         """
         self._reject_non_runtime(runtime)
-        revoked = sum(1 for token in self._tokens if runtime.revoke_op(token))
-        self._tokens.clear()
+        tokens = self._tokens.get(runtime, [])
+        revoked = 0
+        while tokens:
+            revoked += bool(runtime.revoke_op(tokens[-1]))
+            tokens.pop()
+        self._tokens.pop(runtime, None)
         return revoked
 
     @staticmethod

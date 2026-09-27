@@ -13,79 +13,59 @@
 
 from __future__ import annotations
 
-import threading
-import time
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
 from pydeno import Runtime, RuntimeConfig
 
-# CPU-bound JS: long enough that the round trip dominates Python overhead,
-# short enough to keep the suite fast.
-_BUSY_BODY = "let s = 0; for (let i = 0; i < 20000000; i++) s += i % 7; return s;"
 
+def _assert_calls_overlap(entry: str) -> None:
+    """Both isolates must enter Python before either callback can finish.
 
-def _measure_overlap(make_call) -> tuple[float, float]:
-    """Return (solo_ms, two_thread_ms) for `make_call(runtime) -> callable`."""
-
-    def run(thread_count: int) -> float:
-        barrier = threading.Barrier(thread_count)
-
-        def worker() -> None:
-            rt = Runtime()
+    Run in a subprocess because retaining the GIL makes the regression a hard
+    deadlock. Unlike CPU-speed ratios, this also works on loaded CI runners.
+    """
+    code = textwrap.dedent(f"""
+        import threading
+        from pydeno import Runtime
+        barrier = threading.Barrier(2, timeout=5)
+        results = []
+        errors = []
+        def worker():
             try:
-                target = make_call(rt)
-                barrier.wait()
-                target()
-            finally:
-                rt.close()
-
-        threads = [threading.Thread(target=worker) for _ in range(thread_count)]
-        start = time.perf_counter()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        return (time.perf_counter() - start) * 1000
-
-    run(1)  # warm up: first isolate creation and JIT are not what we measure
-    return run(1), run(2)
+                with Runtime() as rt:
+                    rt.bind_function("meet", lambda: barrier.wait())
+                    if {entry!r} == "eval":
+                        result = rt.eval("meet(); 42")
+                    else:
+                        function = rt.eval("() => {{ meet(); return 42; }}")
+                        result = function()
+                    results.append(result)
+            except BaseException as error:
+                errors.append(str(error))
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not errors, errors
+        assert results == [42, 42], results
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=15
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class TestGilIsReleasedAcrossBlockingCalls:
-    """Two threads with separate Runtimes must genuinely run in parallel.
-
-    Thresholds are deliberately loose (1.4x rather than ~2.0x) so the test
-    reports a *serialization regression*, not machine load. Pre-fix,
-    `JsFunction.__call__` measured 1.04x here; post-fix, 1.91x.
-    """
-
-    MIN_OVERLAP = 1.4
-
     def test_runtime_eval_overlaps_across_threads(self) -> None:
-        """Control: this path already detached before v0.3."""
-        solo, duo = _measure_overlap(
-            lambda rt: lambda: rt.eval(f"(() => {{ {_BUSY_BODY} }})()")
-        )
-        overlap = (2 * solo) / duo
-        assert overlap > self.MIN_OVERLAP, (
-            f"Runtime.eval serialized across threads: solo={solo:.1f}ms "
-            f"2-thread={duo:.1f}ms overlap={overlap:.2f}x"
-        )
+        _assert_calls_overlap("eval")
 
     def test_js_function_call_overlaps_across_threads(self) -> None:
-        """The actual fix: `JsFunction.__call__` now releases the GIL."""
-
-        def make(rt: Runtime):
-            fn = rt.eval(f"(() => {{ {_BUSY_BODY} }})")
-            return lambda: fn()
-
-        solo, duo = _measure_overlap(make)
-        overlap = (2 * solo) / duo
-        assert overlap > self.MIN_OVERLAP, (
-            f"JsFunction.__call__ serialized across threads (the pre-0.3 bug): "
-            f"solo={solo:.1f}ms 2-thread={duo:.1f}ms overlap={overlap:.2f}x"
-        )
+        _assert_calls_overlap("function")
 
     def test_constructing_a_runtime_does_not_deadlock_on_a_logging_bootstrap(
         self,

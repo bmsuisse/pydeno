@@ -67,13 +67,15 @@ impl JsAsyncResultSetter {
             .result
             .take()
             .expect("JsAsyncResultSetter invoked more than once");
+        let result = result
+            .map_err(|err| runtime_error_with_context(self.error_context, err))
+            .and_then(|value| js_value_to_python(py, &value, Some(&self.handle)));
         match result {
-            Ok(value) => {
-                let py_value = js_value_to_python(py, &value, Some(&self.handle))?;
+            Ok(py_value) => {
                 future.call_method1(pyo3::intern!(py, "set_result"), (py_value.into_bound(py),))?;
             }
             Err(err) => {
-                let exception = runtime_error_with_context(self.error_context, err).into_value(py);
+                let exception = err.into_value(py);
                 future.call_method1(pyo3::intern!(py, "set_exception"), (exception,))?;
             }
         }
