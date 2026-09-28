@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.4 — 2026-09-28
+
+- Enable fat link-time optimization, a single codegen unit and symbol stripping for smaller release wheels.
+- Limit Hyper dependencies to the HTTP/1 inspector server and Tokio adapter, removing unused HTTP/2 dependencies.
+- Preserve panic unwinding and the 0.4.3 runtime fixes.
+
 ## 0.4.3 — 2026-09-27
 
 - Propagate Python conversion errors to async eval, module and function callers instead of leaving their futures pending.
