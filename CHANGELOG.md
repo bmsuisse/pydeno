@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.5 — 2026-09-29
+
+- Publish a manylinux_2_28 `aarch64` wheel, built and tested on a native ARM runner, so Linux ARM installs no longer fall back to the sdist (which needs Rust and a compiler).
+
 ## 0.4.4 — 2026-09-28
 
 - Enable fat link-time optimization, a single codegen unit and symbol stripping for smaller release wheels.
