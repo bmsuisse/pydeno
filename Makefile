@@ -37,18 +37,18 @@ build-profiling:
 
 .PHONY: format  ## Auto-format rust and python source files
 format:
-	uv tool run ruff format $(sources)
+	uv tool run ruff@0.15.10 format $(sources)
 	cargo fmt
 
 .PHONY: lint-python  ## Lint python source files
 lint-python:
-	uv tool run ruff check $(sources)
-	uv tool run ruff format --check $(sources)
+	uv tool run ruff@0.15.10 check $(sources)
+	uv tool run ruff@0.15.10 format --check $(sources)
 
 .PHONY: lint-python-fix  ## Auto-fix python linting issues
 lint-python-fix:
-	uv tool run ruff check --fix $(sources)
-	uv tool run ruff format $(sources)
+	uv tool run ruff@0.15.10 check --fix $(sources)
+	uv tool run ruff@0.15.10 format $(sources)
 
 .PHONY: lint-rust  ## Lint rust source files
 lint-rust:

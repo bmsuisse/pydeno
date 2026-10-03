@@ -78,8 +78,8 @@ Key classes:
 The core JavaScript execution engine built on `deno_core` and V8:
 
 - **RuntimeHandle** (`handle.rs`) - Thread-safe handle for communicating with runtime
-- **RuntimeDispatcher** (`runner.rs`) - Multiplexes command processing with async job execution
-- **RuntimeCoreState** (`runner.rs`) - Owns the V8 isolate and runtime state
+- **RuntimeDispatcher** (`runner/dispatcher.rs`) - Multiplexes command processing with async job execution
+- **RuntimeCoreState** (`runner/core.rs`) - Owns the V8 isolate and runtime state
 - **RuntimeConfig** (`config.rs`) - Configuration options
 - **PythonOpRegistry** (`ops.rs`) - Host function registry for the
   Python-JavaScript bridge. Handlers are addressed by unguessable capability

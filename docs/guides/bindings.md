@@ -392,7 +392,7 @@ That matters for two reasons:
   collapse into one trust level, because neither can address the other's ops.
 
 Revoke with [`revoke_op`][pydeno.Runtime.revoke_op], or
-[`ToolBridge.detach`][pydeno.ToolBridge.detach] for a whole bridge:
+`ToolBridge.detach` for a whole bridge:
 
 ```python
 token = runtime.bind_function("dangerous", do_something)

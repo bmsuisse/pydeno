@@ -91,7 +91,7 @@ def test_normal_completing_eval_baseline(benchmark, warm_runtime):
 def warm_timed_runtime():
     """Same as `warm_runtime`, but with `execution_timeout` configured, so
     every `eval` arms a deadline on the persistent per-runtime watchdog
-    thread (see `Watchdog` in `src/runtime/runner.rs`) instead of leaving one
+    thread (see `Watchdog` in `src/runtime/runner/termination.rs`) instead of leaving one
     unset."""
     runtime = pydeno.Runtime(pydeno.RuntimeConfig(timeout=5.0))
     runtime.eval("1")  # warm up the isolate before timing

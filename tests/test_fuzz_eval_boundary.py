@@ -562,27 +562,13 @@ class TestKnownConversionResiduals:
             )
         assert received[0] == {"__proto__": 7}
 
-    def test_bind_object_nested_dunder_proto_is_a_known_residual(self) -> None:
-        """`bind_object`'s *nested* values are built by serde_v8 on the Rust
-        side, before any bridge JS runs, so they still lose a "__proto__" key.
-
-        Scope of the residual, deliberately accepted rather than fixed:
-          - `bind_object` takes host-authored configuration supplied at bind
-            time, not untrusted data arriving at runtime -- the untrusted flow
-            (a tool returning parsed JSON) goes through the op paths, which
-            are fixed above.
-          - Only the one object's prototype is affected; `Object.prototype`
-            itself is never polluted (asserted below).
-          - Closing it would mean hand-rolling JSValue -> v8 conversion to use
-            `create_data_property` instead of serde_v8's `Object::set`,
-            duplicating the whole conversion table for this one key name.
-        ponytail: revisit only if untrusted data ever reaches bind_object.
-        """
+    def test_bind_object_nested_dunder_proto_remains_own_data(self) -> None:
+        """Nested Python dictionaries preserve keys without changing prototypes."""
         with Runtime() as rt:
             rt.bind_object("data", {"value": {"__proto__": {"isAdmin": True}, "ok": 1}})
-            # Known: the nested key is dropped.
-            assert rt.eval("JSON.stringify(Object.keys(data.value))") == '["ok"]'
-            # But it never escalates to global prototype pollution.
+            assert rt.eval("Object.keys(data.value)") == ["__proto__", "ok"]
+            assert rt.eval("Object.getPrototypeOf(data.value) === Object.prototype")
+            assert rt.eval("data.value.__proto__.isAdmin") is True
             assert rt.eval("({}).isAdmin") is undefined
             assert rt.eval("Object.prototype.isAdmin") is undefined
 

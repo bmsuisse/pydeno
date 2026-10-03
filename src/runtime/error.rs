@@ -40,12 +40,7 @@ pub struct JsExceptionDetails {
 
 impl JsExceptionDetails {
     pub(crate) fn from_js_error(mut error: JsError) -> Self {
-        let frames = error
-            .frames
-            .into_iter()
-            .map(JsFrameSummary::from)
-            .collect::<Vec<_>>();
-
+        let frames = error.frames.into_iter().map(Into::into).collect();
         let message = error.message.take().or_else(|| {
             (!error.exception_message.is_empty()).then(|| error.exception_message.clone())
         });
@@ -65,12 +60,9 @@ impl JsExceptionDetails {
     }
 
     pub(crate) fn from_js_error_box(error: JsErrorBox) -> Self {
-        let class = error.get_class().to_string();
-        let message = error.get_message().to_string();
-
         Self {
-            name: Some(class.clone()),
-            message: Some(message.clone()),
+            name: Some(error.get_class().to_string()),
+            message: Some(error.get_message().to_string()),
             stack: None,
             frames: vec![],
         }
@@ -99,14 +91,9 @@ pub enum RuntimeError {
     Terminated {
         reason: Option<String>,
     },
-    /// The runtime stopped answering after a termination was requested and was
-    /// abandoned once the force-kill grace period expired.
-    ///
-    /// Distinct from [`RuntimeError::Terminated`] on purpose: `Terminated`
-    /// means the isolate acknowledged the kill and shut down cleanly, while
-    /// this means it never acknowledged it. The runtime thread has been given
-    /// up on rather than reclaimed, so the `Runtime` that produced this error
-    /// is permanently unusable and the caller must create a new one.
+    /// The runtime never acknowledged a termination within the force-kill
+    /// grace period; its thread was abandoned, so the `Runtime` is unusable
+    /// (unlike [`RuntimeError::Terminated`], a clean acknowledged shutdown).
     ForceKilled {
         context: String,
     },
@@ -144,17 +131,6 @@ impl RuntimeError {
             context: context.into(),
         }
     }
-
-    /// Access the stored context message for non-JavaScript errors.
-    pub fn context(&self) -> Option<&str> {
-        match self {
-            Self::JavaScript(_) => None,
-            Self::Timeout { context }
-            | Self::Internal { context }
-            | Self::ForceKilled { context } => Some(context.as_str()),
-            Self::Terminated { reason } => reason.as_deref().or(Some("Runtime terminated")),
-        }
-    }
 }
 
 impl fmt::Display for RuntimeError {
@@ -176,15 +152,14 @@ impl std::error::Error for RuntimeError {}
 impl From<CoreError> for RuntimeError {
     fn from(error: CoreError) -> Self {
         let error_message = error.to_string();
-        let CoreError(inner) = error;
-        match *inner {
+        match *error.0 {
             CoreErrorKind::Js(js_error) => {
-                RuntimeError::javascript(JsExceptionDetails::from_js_error(*js_error))
+                Self::javascript(JsExceptionDetails::from_js_error(*js_error))
             }
             CoreErrorKind::JsBox(js_error_box) => {
-                RuntimeError::javascript(JsExceptionDetails::from_js_error_box(js_error_box))
+                Self::javascript(JsExceptionDetails::from_js_error_box(js_error_box))
             }
-            _ => RuntimeError::internal(error_message),
+            _ => Self::internal(error_message),
         }
     }
 }
@@ -197,13 +172,13 @@ impl From<Elapsed> for RuntimeError {
 
 impl From<String> for RuntimeError {
     fn from(message: String) -> Self {
-        RuntimeError::internal(message)
+        Self::internal(message)
     }
 }
 
 impl From<&str> for RuntimeError {
     fn from(message: &str) -> Self {
-        RuntimeError::internal(message.to_string())
+        Self::internal(message)
     }
 }
 

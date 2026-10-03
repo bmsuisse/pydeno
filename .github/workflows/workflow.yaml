@@ -12,10 +12,16 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    # Native runner per arch: cross-compiling V8 is fragile, so aarch64 builds
+    # (and is tested) on GitHub's ARM runner rather than under QEMU.
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        target: [x86_64]
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
       - name: Build manylinux wheels
@@ -79,9 +85,16 @@ jobs:
   # `linux` job above just built, so `publish` cannot ship a wheel that was
   # never installed anywhere.
   test-linux-wheel:
-    name: Test the linux wheel before publishing
+    name: Test the linux ${{ matrix.target }} wheel before publishing
     needs: [linux]
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -89,7 +102,7 @@ jobs:
           enable-cache: true
       - uses: actions/download-artifact@v6
         with:
-          name: wheels-linux-x86_64
+          name: wheels-linux-${{ matrix.target }}
           path: dist
       - name: Install the wheel and run the suite against it
         run: |

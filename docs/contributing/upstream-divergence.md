@@ -83,7 +83,7 @@ task away from an abort.
 `RuntimeCoreState::new` (`let _tokio_enter = tokio_rt.enter();`), which is
 exactly what `deno_core`'s abort message recommends. The guard is dropped
 before `block_on` takes over. The comment at that line in
-`src/runtime/runner.rs` is deliberately long; it is the only thing standing
+`src/runtime/runner/mod.rs` is deliberately long; it is the only thing standing
 between a future refactor and a reintroduced process abort.
 
 **What guards it now.** `tests/test_large_script_eval.py` — 200 KB to 5 MB

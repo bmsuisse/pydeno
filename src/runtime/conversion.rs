@@ -22,18 +22,10 @@ const SET_VALUES_KEY: &str = "values";
 const BIGINT_TYPE: &str = "BigInt";
 const BIGINT_VALUE_KEY: &str = "value";
 
-/// Convert a JSValue into a Python object.
-///
-/// This is the new primary conversion function that supports native JavaScript values
-/// including NaN and ±Infinity without sentinel strings.
-///
-/// For Function variants, a RuntimeHandle must be provided to create JsFunction proxies.
-///
-/// This entry point applies **no** depth or size limits, because its callers
-/// (the eval-result path) have already been metered while reading the value
-/// out of V8. Anything converting *guest-supplied* input -- i.e. op arguments
-/// -- must use [`js_value_to_python_tracked`] instead, so the configured
-/// limits actually bind inbound. See the module-level note on symmetry.
+/// Convert a JSValue into a Python object (`handle` is needed for functions and
+/// streams). Applies **no** limits: eval results were already metered when read
+/// out of V8. Guest-supplied input (op arguments) must use
+/// [`js_value_to_python_tracked`].
 pub(crate) fn js_value_to_python(
     py: Python<'_>,
     value: &JSValue,
@@ -44,20 +36,9 @@ pub(crate) fn js_value_to_python(
 }
 
 /// Convert a JSValue into a Python object against a caller-supplied
-/// [`LimitTracker`], so several conversions can share one *aggregate* budget.
-///
-/// This is the inbound (JS -> Python) mirror of
-/// [`python_to_js_value_tracked`]. Both halves of the boundary must meter, and
-/// both must meter *aggregately*:
-///
-/// - Until v0.2.0 the inbound path passed no tracker at all, so a guest could
-///   hand a host tool four 9 MB strings in one call -- 37.7 MB measured
-///   against a configured 10 MB cap -- and a 10-deep object against a
-///   configured depth of 3. The identical payload was correctly refused as an
-///   `eval` *result*, which made the limit bind only the trusted party.
-/// - A fresh tracker per argument would reintroduce the per-argument budget
-///   bug that `python_to_js_value_tracked` was written to fix, so the ops pass
-///   one tracker across the whole argument list.
+/// [`LimitTracker`]; ops share one tracker across all arguments so the limits
+/// bind the whole call, not each argument (mirror of
+/// [`python_to_js_value_tracked`]).
 pub(crate) fn js_value_to_python_tracked(
     py: Python<'_>,
     value: &JSValue,
@@ -124,11 +105,7 @@ fn js_value_to_python_inner(
         JSValue::Set(items) => {
             add_bytes(24, tracker)?;
             add_bytes(items.len().saturating_mul(size_of::<usize>()), tracker)?;
-            let py_set = PySet::empty(py)?;
-            for item in items {
-                py_set.add(js_value_to_python_tracked(py, item, handle, tracker)?)?;
-            }
-            Ok(py_set.into_any().unbind())
+            js_items_to_pyset(py, items, handle, tracker)
         }
         JSValue::Object(map) => {
             add_bytes(24, tracker)?;
@@ -149,26 +126,12 @@ fn js_value_to_python_inner(
                                     ))
                                 }
                             };
-                            let datetime = py.import("datetime")?;
-                            let datetime_cls = datetime.getattr("datetime")?;
-                            let timezone = datetime.getattr("timezone")?;
-                            let utc = timezone.getattr("utc")?;
-                            let seconds = epoch_ms as f64 / 1000.0;
-                            let py_dt = datetime_cls
-                                .call_method1("fromtimestamp", (seconds, utc))?
-                                .into_any()
-                                .unbind();
-                            return Ok(py_dt);
+                            return epoch_ms_to_datetime(py, epoch_ms);
                         }
                     }
                     SET_TYPE => {
                         if let Some(JSValue::Array(values)) = map.get(SET_VALUES_KEY) {
-                            let py_set = PySet::empty(py)?;
-                            for item in values {
-                                py_set
-                                    .add(js_value_to_python_tracked(py, item, handle, tracker)?)?;
-                            }
-                            return Ok(py_set.into_any().unbind());
+                            return js_items_to_pyset(py, values, handle, tracker);
                         }
                     }
                     BIGINT_TYPE => {
@@ -196,17 +159,10 @@ fn js_value_to_python_inner(
         }
         JSValue::Date(epoch_ms) => {
             add_bytes(16, tracker)?;
-            let datetime = py.import("datetime")?;
-            let datetime_cls = datetime.getattr("datetime")?;
-            let timezone = datetime.getattr("timezone")?;
-            let utc = timezone.getattr("utc")?;
-            let seconds = *epoch_ms as f64 / 1000.0;
-            let py_dt = datetime_cls.call_method1("fromtimestamp", (seconds, utc))?;
-            Ok(py_dt.into_any().unbind())
+            epoch_ms_to_datetime(py, *epoch_ms)
         }
         JSValue::Function { id } => {
             add_bytes(8, tracker)?;
-            // Create JsFunction proxy
             let handle = handle.ok_or_else(|| {
                 PyRuntimeError::new_err("RuntimeHandle required to convert JSValue::Function")
             })?;
@@ -233,9 +189,30 @@ fn js_value_to_python_inner(
     }
 }
 
-/// Convert a Python object into a JSValue.
-///
-/// This is used by the ops system to convert Python handler arguments to JSValue.
+fn epoch_ms_to_datetime(py: Python<'_>, epoch_ms: i64) -> PyResult<Py<PyAny>> {
+    let datetime = py.import("datetime")?;
+    let utc = datetime.getattr("timezone")?.getattr("utc")?;
+    let seconds = epoch_ms as f64 / 1000.0;
+    Ok(datetime
+        .getattr("datetime")?
+        .call_method1("fromtimestamp", (seconds, utc))?
+        .unbind())
+}
+
+fn js_items_to_pyset(
+    py: Python<'_>,
+    items: &[JSValue],
+    handle: Option<&super::handle::RuntimeHandle>,
+    tracker: &mut LimitTracker,
+) -> PyResult<Py<PyAny>> {
+    let py_set = PySet::empty(py)?;
+    for item in items {
+        py_set.add(js_value_to_python_tracked(py, item, handle, tracker)?)?;
+    }
+    Ok(py_set.into_any().unbind())
+}
+
+/// Convert a Python object into a JSValue under `limits`.
 pub(crate) fn python_to_js_value(
     obj: Bound<'_, PyAny>,
     limits: &SerializationLimits,
@@ -245,16 +222,8 @@ pub(crate) fn python_to_js_value(
 }
 
 /// Convert a Python object into a JSValue against a caller-supplied
-/// [`LimitTracker`], so several conversions can share one *aggregate* budget.
-///
-/// Needed because `max_serialization_bytes` is meant to cap what a single call
-/// transfers, not what each of its arguments transfers independently: a fresh
-/// tracker per argument lets N arguments each just under the limit through, for
-/// N times the intended budget.
-///
-/// Cycle detection (`seen`) stays per-object on purpose -- it is scoped to one
-/// value's own traversal, and sharing it across arguments would misreport the
-/// same object legitimately passed twice as a cycle.
+/// [`LimitTracker`], so all arguments of one call share one byte budget. Cycle
+/// detection stays per value: the same object passed twice is not a cycle.
 pub(crate) fn python_to_js_value_tracked(
     obj: Bound<'_, PyAny>,
     tracker: &mut LimitTracker,
@@ -268,12 +237,6 @@ fn python_to_js_value_internal(
     seen: &mut HashSet<usize>,
     tracker: &mut LimitTracker,
 ) -> PyResult<JSValue> {
-    // Depth is the tracker's job and only the tracker's job. This function
-    // used to also thread an explicit `depth` parameter and check it against
-    // `limits.max_depth` -- two counters for one limit, through six recursive
-    // call sites. The tracker increments *before* comparing, so it always
-    // rejected one level earlier than the parameter did and the parameter's
-    // check was unreachable.
     tracker.enter().map_err(runtime_error_to_py)?;
 
     let add_bytes = |bytes: usize, tracker: &mut LimitTracker| {
@@ -306,30 +269,9 @@ fn python_to_js_value_internal(
         add_bytes(data.len(), tracker)?;
         Ok(JSValue::Bytes(data))
     } else if let Ok(list) = obj.cast::<PyList>() {
-        let ptr = list.as_ptr() as usize;
-        if !seen.insert(ptr) {
-            return Err(PyRuntimeError::new_err(
-                "Circular reference detected while converting Python list",
-            ));
-        }
-
-        add_bytes(16, tracker)?;
-        add_bytes(list.len().saturating_mul(size_of::<usize>()), tracker)?;
-
-        let mut items = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            items.push(python_to_js_value_internal(item, seen, tracker)?);
-        }
-        seen.remove(&ptr);
-        Ok(JSValue::Array(items))
+        py_items_to_js(&obj, "list", 16, list.len(), list.iter(), seen, tracker).map(JSValue::Array)
     } else if let Ok(dict) = obj.cast::<PyDict>() {
-        let ptr = dict.as_ptr() as usize;
-        if !seen.insert(ptr) {
-            return Err(PyRuntimeError::new_err(
-                "Circular reference detected while converting Python dict",
-            ));
-        }
-
+        let ptr = enter_container(&obj, "dict", seen)?;
         add_bytes(24, tracker)?;
         add_bytes(dict.len().saturating_mul(size_of::<usize>() * 2), tracker)?;
 
@@ -342,43 +284,11 @@ fn python_to_js_value_internal(
         }
         seen.remove(&ptr);
         Ok(JSValue::Object(map))
-    } else if let Ok(py_set) = obj.cast::<PySet>() {
-        let ptr = py_set.as_ptr() as usize;
-        if !seen.insert(ptr) {
-            return Err(PyRuntimeError::new_err(
-                "Circular reference detected while converting Python set",
-            ));
-        }
-
-        add_bytes(24, tracker)?;
-        add_bytes(py_set.len().saturating_mul(size_of::<usize>()), tracker)?;
-
-        let mut items = Vec::with_capacity(py_set.len());
-        for item in py_set.iter() {
-            items.push(python_to_js_value_internal(item, seen, tracker)?);
-        }
-        seen.remove(&ptr);
-        Ok(JSValue::Set(items))
-    } else if let Ok(py_frozenset) = obj.cast::<PyFrozenSet>() {
-        let ptr = py_frozenset.as_ptr() as usize;
-        if !seen.insert(ptr) {
-            return Err(PyRuntimeError::new_err(
-                "Circular reference detected while converting Python frozenset",
-            ));
-        }
-
-        add_bytes(24, tracker)?;
-        add_bytes(
-            py_frozenset.len().saturating_mul(size_of::<usize>()),
-            tracker,
-        )?;
-
-        let mut items = Vec::with_capacity(py_frozenset.len());
-        for item in py_frozenset.iter() {
-            items.push(python_to_js_value_internal(item, seen, tracker)?);
-        }
-        seen.remove(&ptr);
-        Ok(JSValue::Set(items))
+    } else if let Ok(set) = obj.cast::<PySet>() {
+        py_items_to_js(&obj, "set", 24, set.len(), set.iter(), seen, tracker).map(JSValue::Set)
+    } else if let Ok(set) = obj.cast::<PyFrozenSet>() {
+        py_items_to_js(&obj, "frozenset", 24, set.len(), set.iter(), seen, tracker)
+            .map(JSValue::Set)
     } else if let Ok(py_datetime) = obj.cast::<PyDateTime>() {
         add_bytes(16, tracker)?;
         let datetime_mod = py.import(pyo3::intern!(py, "datetime"))?;
@@ -434,8 +344,7 @@ fn python_to_js_value_internal(
         add_bytes(16, tracker)?;
         Ok(JSValue::String(s))
     } else if let Ok(js_fn) = obj.extract::<PyRef<super::python::JsFunction>>() {
-        // JsFunction proxy - extract the function ID for round-trip
-        // This validates that the function is not closed and runtime is alive
+        // Validates the function is open and its runtime alive.
         let id = js_fn.function_id_for_transfer()?;
         add_bytes(8, tracker)?;
         Ok(JSValue::Function { id })
@@ -447,4 +356,43 @@ fn python_to_js_value_internal(
 
     tracker.exit();
     result
+}
+
+/// Mark a container as being visited; errors if it is already on the path.
+fn enter_container(
+    obj: &Bound<'_, PyAny>,
+    kind: &str,
+    seen: &mut HashSet<usize>,
+) -> PyResult<usize> {
+    let ptr = obj.as_ptr() as usize;
+    if !seen.insert(ptr) {
+        return Err(PyRuntimeError::new_err(format!(
+            "Circular reference detected while converting Python {kind}"
+        )));
+    }
+    Ok(ptr)
+}
+
+/// Convert the items of a list/set/frozenset, metering `header` bytes plus one
+/// pointer per item.
+fn py_items_to_js<'py>(
+    obj: &Bound<'py, PyAny>,
+    kind: &str,
+    header: usize,
+    len: usize,
+    iter: impl Iterator<Item = Bound<'py, PyAny>>,
+    seen: &mut HashSet<usize>,
+    tracker: &mut LimitTracker,
+) -> PyResult<Vec<JSValue>> {
+    let ptr = enter_container(obj, kind, seen)?;
+    let meter =
+        |tracker: &mut LimitTracker, bytes| tracker.add_bytes(bytes).map_err(runtime_error_to_py);
+    meter(tracker, header)?;
+    meter(tracker, len.saturating_mul(size_of::<usize>()))?;
+    let mut items = Vec::with_capacity(len);
+    for item in iter {
+        items.push(python_to_js_value_internal(item, seen, tracker)?);
+    }
+    seen.remove(&ptr);
+    Ok(items)
 }

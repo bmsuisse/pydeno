@@ -7,8 +7,8 @@ No breaking changes: every new limit is opt-in and `Runtime` is unchanged.
 ### Changed
 
 - **`deno_core` 0.409 -> 0.412** (still V8 150.4, the newest V8 any `deno_core` supports; see
-  `scripts/check_engine.py`). The debug-build overflow workaround in `Cargo.toml` is gone: the
-  upstream `source_map` bug it covered is fixed in this release.
+  `scripts/check_engine.py`). The debug-build overflow workaround in `Cargo.toml` stays: 0.412 still has
+  the `source_map` subtraction bug (now at line 221), pinned by a test.
 - **Lighter**: the release extension is stripped and link-time optimised (macOS: 60 MB -> 43 MB;
   nearly all of the rest is V8 and its built-in Intl data). `import pydeno` no longer loads the
   parent-side machinery (`asyncio`, `subprocess`, `tempfile`, the tool bridge, snapshot auth):
@@ -123,6 +123,64 @@ No breaking changes: every new limit is opt-in and `Runtime` is unchanged.
   Monty's security suite. Its strict-`xfail` cases are the sinks an in-process
   `Runtime` cannot contain; `tests/test_isolated_runtime.py` shows each is
   contained by `IsolatedRuntime`.
+
+## 0.4.5 — 2026-09-29
+
+- Publish a manylinux_2_28 `aarch64` wheel, built and tested on a native ARM runner, so Linux ARM installs no longer fall back to the sdist (which needs Rust and a compiler).
+
+## 0.4.4 — 2026-09-28
+
+- Enable fat link-time optimization, a single codegen unit and symbol stripping for smaller release wheels.
+- Limit Hyper dependencies to the HTTP/1 inspector server and Tokio adapter, removing unused HTTP/2 dependencies.
+- Preserve panic unwinding and the 0.4.3 runtime fixes.
+
+## 0.4.3 — 2026-09-27
+
+- Propagate Python conversion errors to async eval, module and function callers instead of leaving their futures pending.
+- Release the GIL during blocking runtime control operations, object binding and stream cleanup so Python callbacks cannot deadlock the caller.
+- Preserve `__proto__` dictionary keys as own data properties when sending Python objects into V8.
+- Track ToolBridge capabilities per runtime with weak references; detaching one runtime no longer loses revocation tokens for another.
+- Reject trailing newlines in tool names and timeouts that cannot fit the command format or platform clock.
+- Snapshot binding dictionary entries before releasing the GIL so concurrent mutation cannot panic.
+- Replace timing-sensitive concurrency assertions with barrier checks and repair documentation references.
+- Use the installed Linux wheel's interpreter for CI report checks and align local Ruff with CI.
+
+## 0.4.2 — internal cleanup, no API changes
+
+An internal refactor with no API or behaviour changes. The Python API, the
+`_pydeno` stubs, error messages, and runtime semantics are all unchanged, and
+the full test suite (589 tests) passes as it did on 0.4.1. Rust source is down
+from 11,749 to 9,210 lines, and the Python package from 713 to 645.
+
+### Changed (internal)
+
+- **`src/runtime/runner.rs` (3,904 lines) is now a `runner/` module** split by
+  responsibility: `termination.rs` (`TerminationController`, the deadline
+  watchdog), `dispatcher.rs` (event loop, command handling), `jobs.rs` (async
+  job state machines), `core.rs` (`RuntimeCoreState`, sync entry points),
+  `convert.rs` (V8 ↔ `JSValue`), and `mod.rs` (commands, thread spawn).
+  - Command handling shares one set of admission helpers instead of ~20
+    copies of the terminated/inspector checks.
+  - Sync and async function calls share one call path and error type.
+  - A single `Converter` replaces the 4–6 arguments that were threaded
+    through every value conversion.
+  - Sync and async module evaluation share specifier parsing, loading and
+    namespace extraction.
+- **`src/runtime/python/runtime.rs`** is split into `runtime.rs`,
+  `function.rs` and `stream.rs`. The stats pyclasses are generated from their
+  source structs.
+- **`handle.rs`** sends every command through generic request/response
+  helpers.
+- **`ops.rs`, `config.rs`, `loader.rs`, `error.rs`** share their OpState
+  lookup, handler call, validation, and loader-call helpers.
+- **`js_value.rs`, `stream.rs`, `inspector.rs`, `conversion.rs`, `stats.rs`**:
+  repeated match arms and helpers are deduplicated, and call counters are
+  indexed by call kind.
+- **`python/pydeno`**: `ToolBridge` internals, default-runtime helpers, the
+  CLI, and the awaitable adapter are simplified.
+- Over-long internal comments are condensed to the reasoning that isn't
+  obvious from the code. Python-visible docstrings and `SAFETY` comments are
+  kept verbatim.
 
 ## 0.4.1
 

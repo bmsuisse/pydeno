@@ -10,8 +10,7 @@ from pydeno import JavaScriptError, Runtime, undefined
 def main() -> None:
     """Main entry point for the pydeno CLI."""
     parser = argparse.ArgumentParser(
-        description="Execute JavaScript code using pydeno",
-        prog="python -m pydeno",
+        description="Execute JavaScript code using pydeno", prog="python -m pydeno"
     )
     parser.add_argument(
         "-c",
@@ -19,15 +18,9 @@ def main() -> None:
         dest="command",
         help="Execute JavaScript code from command line",
     )
-    parser.add_argument(
-        "file",
-        nargs="?",
-        help="JavaScript file to execute",
-    )
-
+    parser.add_argument("file", nargs="?", help="JavaScript file to execute")
     args = parser.parse_args()
 
-    # Validate arguments
     if args.command and args.file:
         parser.error("Cannot specify both -c and a file argument")
     if not args.command and not args.file:
@@ -36,21 +29,16 @@ def main() -> None:
     try:
         with Runtime() as rt:
             if args.command:
-                # Execute code from command line
-                result = rt.eval(args.command)
-                if result is not undefined:
-                    print(result)
+                code = args.command
             else:
-                # Execute file
                 file_path = Path(args.file)
                 if not file_path.exists():
                     print(f"Error: File '{file_path}' not found", file=sys.stderr)
                     sys.exit(1)
-
                 code = file_path.read_text(encoding="utf-8")
-                result = rt.eval(code)
-                if result is not undefined:
-                    print(result)
+            result = rt.eval(code)
+            if result is not undefined:
+                print(result)
     except JavaScriptError as e:
         print(f"JavaScript Error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -37,8 +37,8 @@ impl PythonModuleLoader {
     /// Create a new Python module loader.
     pub fn new() -> Self {
         Self {
-            inner: RefCell::new(LoaderInner::default()),
-            task_locals: RefCell::new(None),
+            inner: RefCell::default(),
+            task_locals: RefCell::default(),
         }
     }
 
@@ -77,25 +77,15 @@ impl PythonModuleLoader {
         *self.task_locals.borrow_mut() = None;
     }
 
-    /// Resolve a static module specifier to a pydeno:// URL.
-    ///
-    /// Returns `None` if the module is not registered as a static module.
-    fn resolve_static(&self, specifier: &str) -> Option<String> {
-        // Strip "static:" prefix if present
-        let bare_specifier = specifier.strip_prefix("static:").unwrap_or(specifier);
-
-        // Check if this is a static module (bare specifier in our registry)
-        if self
-            .inner
+    /// Resolve a registered static module (optionally `static:`-prefixed) to
+    /// its `pydeno://static/<name>` URL; `None` if not registered.
+    fn resolve_static(&self, specifier: &str) -> Option<Result<ModuleSpecifier, JsErrorBox>> {
+        let bare = specifier.strip_prefix("static:").unwrap_or(specifier);
+        self.inner
             .borrow()
             .static_modules
-            .contains_key(bare_specifier)
-        {
-            // Return a synthetic URL using pydeno: scheme to make it valid
-            Some(format!("pydeno://static/{}", bare_specifier))
-        } else {
-            None
-        }
+            .contains_key(bare)
+            .then(|| parse_url(&format!("pydeno://static/{bare}")))
     }
 
     fn module_type_from_request(requested: &RequestedModuleType) -> ModuleType {
@@ -109,111 +99,80 @@ impl PythonModuleLoader {
     }
 }
 
+fn parse_url(url: &str) -> Result<ModuleSpecifier, JsErrorBox> {
+    ModuleSpecifier::parse(url).map_err(|e| JsErrorBox::new("URIError", e.to_string()))
+}
+
+/// Call the Python loader; returns its result and whether it is a coroutine.
+fn call_loader(loader: &Py<PyAny>, specifier: &str) -> Result<(Py<PyAny>, bool), JsErrorBox> {
+    Python::attach(|py| {
+        let result = loader
+            .bind(py)
+            .call1((specifier,))
+            .map_err(|e| JsErrorBox::generic(format!("Failed to call module loader: {e}")))?;
+        let inspect = py
+            .import("inspect")
+            .map_err(|e| JsErrorBox::generic(format!("Failed to import inspect module: {e}")))?;
+        let is_coroutine = inspect
+            .call_method1("iscoroutine", (&result,))
+            .map_err(|e| {
+                JsErrorBox::generic(format!("Failed to check if result is coroutine: {e}"))
+            })?
+            .extract::<bool>()
+            .map_err(|e| {
+                JsErrorBox::generic(format!(
+                    "Failed to extract boolean from iscoroutine check: {e}"
+                ))
+            })?;
+        Ok((result.unbind(), is_coroutine))
+    })
+}
+
 impl ModuleLoader for PythonModuleLoader {
-    /// Resolve a module specifier to a URL.
-    ///
-    /// Resolution order:
-    /// 1. Custom Python resolver (if set) - returns URL or None
-    /// 2. Static modules - checks registry for pre-registered modules
-    /// 3. Error if no resolution method succeeds
-    ///
-    /// # Errors
-    /// Returns an error if resolution fails or the resolver throws.
+    /// Resolve via the Python resolver if set (`None`/`""` falls back to static
+    /// modules), otherwise only static modules are allowed.
     fn resolve(
         &self,
         specifier: &str,
         referrer: &str,
         _kind: deno_core::ResolutionKind,
     ) -> Result<deno_core::url::Url, JsErrorBox> {
-        // Handle pydeno://runtime/module_name - strip the base and treat as bare specifier
-        let actual_specifier = if let Some(bare) = specifier.strip_prefix("pydeno://runtime/") {
-            bare
-        } else {
-            specifier
+        let specifier = specifier
+            .strip_prefix("pydeno://runtime/")
+            .unwrap_or(specifier);
+        let static_or_deny = |why: &str| {
+            self.resolve_static(specifier).unwrap_or_else(|| {
+                Err(JsErrorBox::generic(format!(
+                    "Module resolution denied for {specifier}. {why}"
+                )))
+            })
         };
 
         let inner = self.inner.borrow();
-
-        // If we have a custom resolver, use it
-        if let Some(ref resolver) = inner.resolver {
-            return Python::attach(|py| {
-                let result = resolver
-                    .call1(py, (actual_specifier, referrer))
-                    .map_err(|e| {
-                        JsErrorBox::new(
-                            "Error",
-                            format!("Module resolution failed for {}: {}", actual_specifier, e),
-                        )
-                    })?;
-
-                // Check if the result is None
-                if result.is_none(py) {
-                    // Python returned None, fall back to static resolution
-                    return if let Some(static_spec) = self.resolve_static(actual_specifier) {
-                        ModuleSpecifier::parse(&static_spec)
-                            .map_err(|e| JsErrorBox::new("URIError", e.to_string()))
-                    } else {
-                        // Fallback failed, deny
-                        Err(JsErrorBox::new(
-                            "Error",
-                            format!("Module resolution denied for {}. Resolver returned None and no static module was found.", actual_specifier)
-                        ))
-                    };
-                }
-
-                // Python returned a string
-                let resolved_str = result.extract::<String>(py).map_err(|e| {
-                    JsErrorBox::new(
-                        "TypeError",
-                        format!("Module resolver must return a string or None: {}", e),
-                    )
-                })?;
-
-                // Empty string also means fall back to static resolution
-                if resolved_str.is_empty() {
-                    return if let Some(static_spec) = self.resolve_static(actual_specifier) {
-                        ModuleSpecifier::parse(&static_spec)
-                            .map_err(|e| JsErrorBox::new("URIError", e.to_string()))
-                    } else {
-                        // Fallback failed, deny
-                        Err(JsErrorBox::new(
-                            "Error",
-                            format!("Module resolution denied for {}. Resolver returned empty string and no static module was found.", actual_specifier)
-                        ))
-                    };
-                }
-
-                ModuleSpecifier::parse(&resolved_str)
-                    .map_err(|e| JsErrorBox::new("URIError", e.to_string()))
-            });
-        }
-
-        // No custom resolver, only allow static modules
-        if let Some(static_spec) = self.resolve_static(actual_specifier) {
-            ModuleSpecifier::parse(&static_spec)
-                .map_err(|e| JsErrorBox::new("URIError", e.to_string()))
-        } else {
-            Err(JsErrorBox::new(
-                "Error",
-                format!(
-                    "Module resolution denied for {}. Did you call add_static_module()?",
-                    actual_specifier
-                ),
-            ))
-        }
+        let Some(resolver) = &inner.resolver else {
+            return static_or_deny("Did you call add_static_module()?");
+        };
+        Python::attach(|py| {
+            let result = resolver.call1(py, (specifier, referrer)).map_err(|e| {
+                JsErrorBox::generic(format!("Module resolution failed for {specifier}: {e}"))
+            })?;
+            if result.is_none(py) {
+                return static_or_deny("Resolver returned None and no static module was found.");
+            }
+            let resolved = result.extract::<String>(py).map_err(|e| {
+                JsErrorBox::type_error(format!("Module resolver must return a string or None: {e}"))
+            })?;
+            if resolved.is_empty() {
+                return static_or_deny(
+                    "Resolver returned empty string and no static module was found.",
+                );
+            }
+            parse_url(&resolved)
+        })
     }
 
-    /// Load module source code for a resolved URL.
-    ///
-    /// Loading order:
-    /// 1. Static modules (pydeno://static/...) - returns immediately from registry
-    /// 2. Custom Python loader (if set) - calls loader with specifier
-    ///    - Supports both sync and async loaders
-    ///    - Async loaders require task_locals to be set
-    /// 3. Error if no loader is available
-    ///
-    /// # Errors
-    /// Returns an error if loading fails or loader throws.
+    /// Load static modules from the registry, else via the Python loader (sync
+    /// or, when task locals are set, async); error if no loader is set.
     fn load(
         &self,
         module_specifier: &ModuleSpecifier,
@@ -224,176 +183,70 @@ impl ModuleLoader for PythonModuleLoader {
         let module_type = Self::module_type_from_request(&options.requested_module_type);
         let inner = self.inner.borrow();
 
-        // Handle static modules (pydeno://static/module_name)
-        if specifier.starts_with("pydeno://static/") {
-            let name = specifier.strip_prefix("pydeno://static/").unwrap();
-            if let Some(source) = inner.static_modules.get(name) {
-                let module = ModuleSource::new(
-                    module_type.clone(),
-                    ModuleSourceCode::String(source.clone().into()),
-                    module_specifier,
-                    None,
-                );
-                return deno_core::ModuleLoadResponse::Async(
-                    async move { Ok(module) }.boxed_local(),
-                );
-            }
+        if let Some(source) = specifier
+            .strip_prefix("pydeno://static/")
+            .and_then(|name| inner.static_modules.get(name))
+        {
+            let module = ModuleSource::new(
+                module_type,
+                ModuleSourceCode::String(source.clone().into()),
+                module_specifier,
+                None,
+            );
+            return deno_core::ModuleLoadResponse::Async(async move { Ok(module) }.boxed_local());
         }
 
-        // If we have a custom loader, use it - clone before entering async block
-        let loader_opt = inner
+        let loader = inner
             .loader
             .as_ref()
             .map(|l| Python::attach(|py| l.clone_ref(py)));
-        drop(inner); // Drop the borrow before the async block
+        drop(inner);
 
-        if let Some(loader_clone) = loader_opt {
-            let task_locals = self.task_locals.borrow().clone();
-            let specifier_string = specifier.to_string();
-            let module_specifier_owned = module_specifier.clone();
-            let requested_module_type = module_type.clone();
+        let Some(loader) = loader else {
+            return deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
+                "Module loading denied for {specifier}. Did you call set_module_loader()?"
+            ))));
+        };
+        let task_locals = self.task_locals.borrow().clone();
+        let specifier = specifier.to_string();
+        let module_specifier = module_specifier.clone();
 
-            return deno_core::ModuleLoadResponse::Async(Box::pin(async move {
-                let source_obj = if let Some(ref locals) = task_locals {
-                    // Call the loader with task locals for async support
-                    let result_and_is_coro = Python::attach(|py| {
-                        let result = loader_clone
-                            .bind(py)
-                            .call1((specifier_string.clone(),))
+        deno_core::ModuleLoadResponse::Async(Box::pin(async move {
+            let (result, is_coroutine) = call_loader(&loader, &specifier)?;
+            let source_obj = match (&task_locals, is_coroutine) {
+                (_, false) => result,
+                (Some(locals), true) => {
+                    let py_future = Python::attach(|py| {
+                        pyo3_async_runtimes::into_future_with_locals(locals, result.into_bound(py))
                             .map_err(|e| {
-                                JsErrorBox::new(
-                                    "Error",
-                                    format!("Failed to call module loader: {}", e),
-                                )
-                            })?;
-
-                        // Check if the result is a coroutine
-                        let inspect = py.import("inspect").map_err(|e| {
-                            JsErrorBox::new(
-                                "Error",
-                                format!("Failed to import inspect module: {}", e),
-                            )
-                        })?;
-                        let is_coroutine = inspect
-                            .call_method1("iscoroutine", (&result,))
-                            .map_err(|e| {
-                                JsErrorBox::new(
-                                    "Error",
-                                    format!("Failed to check if result is coroutine: {}", e),
-                                )
-                            })?
-                            .extract::<bool>()
-                            .map_err(|e| {
-                                JsErrorBox::new(
-                                    "Error",
-                                    format!(
-                                        "Failed to extract boolean from iscoroutine check: {}",
-                                        e
-                                    ),
-                                )
-                            })?;
-
-                        Ok::<_, JsErrorBox>((result.unbind(), is_coroutine))
+                                JsErrorBox::generic(format!("Failed to create async future: {e}"))
+                            })
                     })?;
-
-                    if result_and_is_coro.1 {
-                        // Result is a coroutine, convert to future and await
-                        let py_future = Python::attach(|py| {
-                            let bound_result = result_and_is_coro.0.clone_ref(py).into_bound(py);
-                            pyo3_async_runtimes::into_future_with_locals(locals, bound_result)
-                                .map_err(|e| {
-                                    JsErrorBox::new(
-                                        "Error",
-                                        format!("Failed to create async future: {}", e),
-                                    )
-                                })
-                        })?;
-
-                        py_future.await.map_err(|e| {
-                            JsErrorBox::new("Error", format!("Module loader failed: {}", e))
-                        })?
-                    } else {
-                        // Result is synchronous (plain string), use it directly
-                        result_and_is_coro.0
-                    }
-                } else {
-                    // Synchronous call - call directly
+                    py_future
+                        .await
+                        .map_err(|e| JsErrorBox::generic(format!("Module loader failed: {e}")))?
+                }
+                (None, true) => {
+                    // Close the coroutine to prevent a "never awaited" warning.
                     Python::attach(|py| {
-                        let result = loader_clone
-                            .bind(py)
-                            .call1((specifier_string.clone(),))
-                            .map_err(|e| {
-                                JsErrorBox::new(
-                                    "Error",
-                                    format!("Failed to call module loader: {}", e),
-                                )
-                            })?;
-
-                        // Check if the result is a coroutine
-                        let inspect = py.import("inspect").map_err(|e| {
-                            JsErrorBox::new(
-                                "Error",
-                                format!("Failed to import inspect module: {}", e),
-                            )
-                        })?;
-                        let is_coroutine = inspect
-                            .call_method1("iscoroutine", (&result,))
-                            .map_err(|e| {
-                                JsErrorBox::new(
-                                    "Error",
-                                    format!("Failed to check if result is coroutine: {}", e),
-                                )
-                            })?
-                            .extract::<bool>()
-                            .map_err(|e| {
-                                JsErrorBox::new(
-                                    "Error",
-                                    format!(
-                                        "Failed to extract boolean from iscoroutine check: {}",
-                                        e
-                                    ),
-                                )
-                            })?;
-
-                        if is_coroutine {
-                            // Close the coroutine to prevent "never awaited" warning
-                            let _ = result.call_method0("close");
-                            return Err(JsErrorBox::new(
-                                "TypeError",
-                                "An async module loader cannot be used with a synchronous evaluation (eval_module). Use eval_module_async() instead."
-                            ));
-                        }
-
-                        Ok::<_, JsErrorBox>(result.unbind())
-                    })?
-                };
-
-                let source: String = Python::attach(|py| {
-                    source_obj.extract(py).map_err(|e| {
-                        JsErrorBox::new(
-                            "TypeError",
-                            format!("Module loader must return a string: {}", e),
-                        )
-                    })
-                })?;
-
-                let module = ModuleSource::new(
-                    requested_module_type,
-                    ModuleSourceCode::String(source.into()),
-                    &module_specifier_owned,
-                    None,
-                );
-                Ok(module)
-            }));
-        }
-
-        // No loader available
-        deno_core::ModuleLoadResponse::Sync(Err(JsErrorBox::new(
-            "Error",
-            format!(
-                "Module loading denied for {}. Did you call set_module_loader()?",
-                specifier
-            ),
-        )))
+                        let _ = result.call_method0(py, "close");
+                    });
+                    return Err(JsErrorBox::type_error(
+                        "An async module loader cannot be used with a synchronous evaluation (eval_module). Use eval_module_async() instead.",
+                    ));
+                }
+            };
+            let source: String = Python::attach(|py| {
+                source_obj.extract(py).map_err(|e| {
+                    JsErrorBox::type_error(format!("Module loader must return a string: {e}"))
+                })
+            })?;
+            Ok(ModuleSource::new(
+                module_type,
+                ModuleSourceCode::String(source.into()),
+                &module_specifier,
+                None,
+            ))
+        }))
     }
 }

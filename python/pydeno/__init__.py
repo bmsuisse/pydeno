@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import contextvars
 import sys
 import threading
@@ -102,10 +103,8 @@ def _runtime_bind(
 
     if func is None:
         return _register
-
     if not callable(func):
         raise TypeError("runtime.bind expects a callable or to be used as a decorator")
-
     return _register(cast(F, func))
 
 
@@ -229,14 +228,10 @@ def close_default_runtime() -> None:
     _default_runtime_var.set(None)
 
 
+@atexit.register
 def _close_default_runtime_on_exit() -> None:
-    try:
+    with contextlib.suppress(RuntimeError):
         close_default_runtime()
-    except RuntimeError:
-        pass
-
-
-atexit.register(_close_default_runtime_on_exit)
 
 
 def eval(code: str) -> Any:
@@ -266,7 +261,7 @@ def eval(code: str) -> Any:
     return get_default_runtime().eval(code)
 
 
-async def eval_async(code: str, **kwargs) -> Any:
+async def eval_async(code: str, **kwargs: Any) -> Any:
     """Evaluate JavaScript code asynchronously using the default context-local runtime.
 
     This is a convenience function for simple async use cases. Each asyncio task or

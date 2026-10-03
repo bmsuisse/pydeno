@@ -27,14 +27,12 @@ impl SnapshotBuilderPy {
     }
 
     fn execute_script(&self, name: &str, source: &str) -> PyResult<()> {
-        let mut guard = self.builder.borrow_mut();
-        let builder = guard
+        self.builder
+            .borrow_mut()
             .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("Snapshot already built"))?;
-        builder
+            .ok_or_else(|| PyRuntimeError::new_err("Snapshot already built"))?
             .execute_script(name, source)
-            .map_err(runtime_error_to_py)?;
-        Ok(())
+            .map_err(runtime_error_to_py)
     }
 
     fn build(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
