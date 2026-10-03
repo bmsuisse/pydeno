@@ -23,6 +23,14 @@ suite can silently deflate:
 4. `skipped <= --max-skipped`, and `failures == errors == 0`. Skips are
    printed with their reasons either way, so a new one is visible in the log
    before it is ever tolerated.
+
+`xfail` is reported by pytest's JUnit writer as a *skip*, but it is a different
+thing: a deliberate, documented expectation that something fails (for example
+the in-process crashes pinned in `tests/test_monty_parity_security.py`). Counting
+it as a skip would force the skip budget above zero and hide real skips behind
+it, so xfails are counted separately against their own budget,
+`--max-xfailed`, and listed too. A strict xfail that starts passing is a
+failure in pytest itself, which is what tells us to move it out of the list.
 """
 
 from __future__ import annotations
@@ -67,6 +75,13 @@ def main() -> int:
         "needs a bump, only removing them does",
     )
     parser.add_argument("--max-skipped", type=int, default=0)
+    parser.add_argument(
+        "--max-xfailed",
+        type=int,
+        default=0,
+        help="budget for deliberate expected failures (pytest.xfail), kept apart "
+        "from skips so one cannot hide the other",
+    )
     parser.add_argument("--label", default="pytest")
     args = parser.parse_args()
 
@@ -92,21 +107,30 @@ def main() -> int:
         return 1
 
     suites = ET.parse(args.junit).getroot()
-    total = skipped = failures = errors = 0
+    total = failures = errors = 0
     skips: list[tuple[str, str]] = []
+    xfails: list[tuple[str, str]] = []
     for suite in suites.iter("testsuite"):
         total += int(suite.get("tests", 0))
-        skipped += int(suite.get("skipped", 0))
         failures += int(suite.get("failures", 0))
         errors += int(suite.get("errors", 0))
     for case in suites.iter("testcase"):
         for skip in case.iter("skipped"):
             name = f"{case.get('classname', '')}::{case.get('name', '')}"
-            skips.append((name, skip.get("message", "")))
+            # The suite-level `skipped` attribute lumps xfail in with real skips,
+            # so classify per test case.
+            bucket = xfails if skip.get("type") == "pytest.xfail" else skips
+            bucket.append((name, skip.get("message", "")))
+    skipped = len(skips)
+    xfailed = len(xfails)
 
     if skips:
-        print(f"{args.label}: {len(skips)} skipped test(s):")
+        print(f"{args.label}: {skipped} skipped test(s):")
         for name, reason in skips:
+            print(f"  - {name}: {reason}")
+    if xfails:
+        print(f"{args.label}: {xfailed} expected failure(s) (xfail):")
+        for name, reason in xfails:
             print(f"  - {name}: {reason}")
 
     if total != collected:
@@ -121,6 +145,13 @@ def main() -> int:
             f"Listed above. A skipped test is an unverified test; either fix "
             f"the condition or raise the budget deliberately."
         )
+    if xfailed > args.max_xfailed:
+        problems.append(
+            f"{xfailed} expected failure(s) (xfail), budget is "
+            f"{args.max_xfailed}. Listed above. An xfail documents a known gap; "
+            f"adding one is a decision, so raise MAX_XFAILED deliberately in "
+            f"the same commit."
+        )
     if failures or errors:
         problems.append(f"{failures} failure(s) and {errors} error(s).")
 
@@ -130,8 +161,9 @@ def main() -> int:
         return 1
 
     print(
-        f"{args.label}: {total} tests ran, {total - skipped} passed, "
-        f"{skipped} skipped, floor {args.min_tests}. OK."
+        f"{args.label}: {total} tests ran, {total - skipped - xfailed} passed, "
+        f"{skipped} skipped, {xfailed} expected failure(s), "
+        f"floor {args.min_tests}. OK."
     )
     return 0
 

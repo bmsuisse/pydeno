@@ -1,12 +1,13 @@
 """High-level Python bindings for the pydeno runtime."""
 
-import contextvars
-import asyncio
+from __future__ import annotations
+
 import atexit
+import contextvars
+import sys
 import threading
-from dataclasses import dataclass
 from collections.abc import Callable
-from typing import Any, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from ._pydeno import (
     InspectorConfig,
@@ -26,7 +27,48 @@ from ._pydeno import (
     SUGGESTED_FORCE_KILL_GRACE,
     undefined,
 )
-from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
+
+if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
+    from ._isolated import IsolatedRuntime, WorkerCrashed
+    from ._polyfills import WEB_POLYFILLS
+    from ._snapshot_auth import (
+        SnapshotAuthenticationError,
+        sign_snapshot,
+        verify_snapshot,
+    )
+    from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
+
+# Everything below is imported on first use. `import pydeno` is then just the native module, which
+# keeps start-up small for plain `Runtime` users and for the isolation worker (which has no use for
+# the parent-side machinery: subprocess, tempfile, asyncio, ...).
+_LAZY = {
+    "IsolatedRuntime": "_isolated",
+    "WorkerCrashed": "_isolated",
+    "WEB_POLYFILLS": "_polyfills",
+    "SnapshotAuthenticationError": "_snapshot_auth",
+    "sign_snapshot": "_snapshot_auth",
+    "verify_snapshot": "_snapshot_auth",
+    "ToolBridge": "_tools",
+    "ToolBudgetError": "_tools",
+    "ToolError": "_tools",
+    "ToolNotFoundError": "_tools",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module = _LAZY.get(name)
+    if module is None:
+        raise AttributeError(f"module 'pydeno' has no attribute {name!r}")
+    from importlib import import_module
+
+    value = getattr(import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY))
+
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -67,11 +109,13 @@ def _runtime_bind(
     return _register(cast(F, func))
 
 
-@dataclass(slots=True)
 class _RuntimeSlot:
-    runtime: Runtime
-    owner: object
-    closed: bool = False
+    __slots__ = ("runtime", "owner", "closed")
+
+    def __init__(self, runtime: Runtime | IsolatedRuntime, owner: object) -> None:
+        self.runtime = runtime
+        self.owner = owner
+        self.closed = False
 
     def close(self) -> None:
         if self.closed:
@@ -82,18 +126,23 @@ class _RuntimeSlot:
 
 
 def _current_runtime_owner() -> object:
-    try:
-        task = asyncio.current_task()
-    except RuntimeError:
-        task = None
-    if task is not None:
-        return task
+    # A running task can only exist if asyncio has been imported, so a plain script never pays
+    # for importing it here.
+    asyncio = sys.modules.get("asyncio")
+    if asyncio is not None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        if task is not None:
+            return task
     return threading.current_thread()
 
 
 def _schedule_owner_cleanup(slot: _RuntimeSlot) -> None:
+    asyncio = sys.modules.get("asyncio")
     owner = slot.owner
-    if isinstance(owner, asyncio.Task):
+    if asyncio is not None and isinstance(owner, asyncio.Task):
         owner.add_done_callback(lambda _: slot.close())
 
 
@@ -105,22 +154,64 @@ _default_runtime_var: contextvars.ContextVar[_RuntimeSlot | None] = (
 )
 
 
-def get_default_runtime() -> Runtime:
+_default_factory: Callable[[], Any] = Runtime
+
+
+def configure_default_runtime(
+    config: RuntimeConfig | None = None,
+    *,
+    isolated: bool = False,
+    **isolated_options: Any,
+) -> None:
+    """Choose what `pydeno.eval()` and the other module-level functions run on.
+
+    By default each task or thread gets an in-process `Runtime`, which is fast but can be
+    crashed or hung by hostile JavaScript. For code you do not trust, make the *easy* path the
+    safe one:
+
+        pydeno.configure_default_runtime(isolated=True, sandbox="require")
+        pydeno.eval("1 + 1")        # now runs in a sandboxed worker process
+
+    With ``isolated=True`` every default runtime is an :class:`IsolatedRuntime` and
+    ``isolated_options`` are its keyword arguments (``sandbox``, ``max_memory``, ``clock``, ...).
+    With ``isolated=False`` (the default) it is a plain `Runtime`, optionally built from `config`.
+
+    Only runtimes created after this call are affected; one that already exists keeps running
+    until it is closed (``close_default_runtime()``).
+    """
+    global _default_factory  # noqa: PLW0603
+    if isolated:
+        if config is not None:
+            isolated_options["config"] = config
+        from ._isolated import IsolatedRuntime
+
+        _default_factory = lambda: IsolatedRuntime(**isolated_options)  # noqa: E731
+    else:
+        if isolated_options:
+            raise TypeError(
+                "options such as "
+                f"{sorted(isolated_options)} apply to isolated=True; pass them with it"
+            )
+        _default_factory = (lambda: Runtime(config)) if config is not None else Runtime
+
+
+def get_default_runtime() -> Runtime | IsolatedRuntime:
     """Get or create a runtime isolated to the current context.
 
     In an asyncio app, this is per-task (e.g., per-request).
     In a sync app, this is per-thread.
 
-    The runtime is created with default configuration. For custom configuration
+    The runtime is a plain `Runtime` with default configuration unless
+    :func:`configure_default_runtime` chose otherwise. For custom configuration
     (heap limits, bootstrap code, etc.), use the Runtime class directly.
 
     Returns:
-        Runtime: The context-local runtime instance.
+        The context-local runtime instance.
     """
     slot = _default_runtime_var.get()
     owner = _current_runtime_owner()
     if slot is None or slot.runtime.is_closed() or slot.owner is not owner:
-        slot = _RuntimeSlot(runtime=Runtime(), owner=owner)
+        slot = _RuntimeSlot(runtime=_default_factory(), owner=owner)
         _default_runtime_var.set(slot)
         _schedule_owner_cleanup(slot)
     return slot.runtime
@@ -249,10 +340,17 @@ __all__ = [
     "eval",
     "eval_async",
     "get_default_runtime",
+    "configure_default_runtime",
     "close_default_runtime",
     "bind_function",
     "bind_object",
     "Runtime",
+    "IsolatedRuntime",
+    "WEB_POLYFILLS",
+    "WorkerCrashed",
+    "SnapshotAuthenticationError",
+    "sign_snapshot",
+    "verify_snapshot",
     "RuntimeConfig",
     "InspectorConfig",
     "InspectorEndpoints",
