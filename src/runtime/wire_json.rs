@@ -605,10 +605,9 @@ impl<'py> Writer<'py> {
                 )?;
                 let raw = raw.cast::<PyBytes>()?;
                 self.buf.push(b'"');
-                let mut units = raw
-                    .as_bytes()
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                let bytes = raw.as_bytes();
+                let mut units = (0..bytes.len() / 2)
+                    .map(|i| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))
                     .peekable();
                 while let Some(u) = units.next() {
                     let decoded = if (0xD800..0xDC00).contains(&u) {
