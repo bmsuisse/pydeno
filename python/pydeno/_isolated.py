@@ -466,6 +466,9 @@ class IsolatedRuntime:
         self._guard = threading.local()
         self._closed = False
         self._last_rss_check = 0.0
+        # Why the idle watchdog killed the worker, for the pump to report: the watchdog thread
+        # cannot raise into the caller, so without this the caller sees only "killed by SIGKILL".
+        self._kill_reason: str | None = None
         if config.on_console is not None:
             # `console.*` in the guest calls this in the parent, like any host function.
             console_hid = next(self._hids)
@@ -606,6 +609,8 @@ class IsolatedRuntime:
             raise
 
     def _describe_death(self, prefix: str) -> str:
+        if self._kill_reason is not None:  # the watchdog killed it and kept the reason for us
+            return self._kill_reason
         code = self._proc.poll()
         if code is None:
             try:
@@ -910,18 +915,20 @@ class IsolatedRuntime:
         self._last_rss_check = now
         threads = _sandbox.thread_count(self._proc.pid)
         if threads is not None and threads > _MAX_WORKER_THREADS:
-            self._kill()
-            raise WorkerCrashed(
+            self._kill_reason = (
                 f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
             )
+            self._kill()
+            raise WorkerCrashed(self._kill_reason)
         if self._max_memory is None:
             return
         rss = _sandbox.rss_bytes(self._proc.pid)
         if rss is not None and rss > self._max_memory:
-            self._kill()
-            raise WorkerCrashed(
+            self._kill_reason = (
                 f"worker used {rss} bytes, over max_memory={self._max_memory}; killed"
             )
+            self._kill()
+            raise WorkerCrashed(self._kill_reason)
 
     @staticmethod
     def _remote_error(message: dict[str, Any]) -> Exception:
