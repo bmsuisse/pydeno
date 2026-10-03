@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.6.0 — unreleased
+
+Sandbox hardening round 2 (independent review by three models and Copilot, plus prior-art research),
+agent sessions, and a pydantic-ai integration. See [`docs/security-report.md`](docs/security-report.md)
+for every finding and its status.
+
+### Changed (behaviour you may notice)
+
+- **`redact_host_errors` now defaults to `True`.** A host function's exception text no longer reaches
+  the guest unless you opt out (`redact_host_errors=False`).
+- **`max_buffer_bytes` defaults to `max_memory // 4`** when you do not set it, so a typed-array bomb is a
+  catchable `RangeError` instead of killing the worker.
+- **Signed snapshots are bound to the pydeno release** that made them (format `pydeno-snap2`). A snapshot
+  signed by another release is refused before V8 sees it; sign it again with the release you run.
+- **`RuntimeConfig(snapshot=...)` is refused by `IsolatedRuntime`** instead of being silently dropped
+  (which also dropped its bootstrap).
+- Workers get two more V8 flags: a linear-time regex fallback and `--freeze-flags-after-init`.
+- `sandbox="auto"` emits a `RuntimeWarning` when the platform's full set of layers did not apply.
+- Bind names must be plain identifiers; `IsolatedRuntime` checks them.
+
+### Security
+
+- **macOS:** a sandboxed worker could read its parent's argv **and environment** (and the machine's hardware
+  ID, other processes' details and host statistics). The profile no longer allows `sysctl-read` and denies
+  the process-info, IOKit, hardware-ID, host-statistics and `F_GETPATH` routes.
+- **Startup self-test:** the worker tries the forbidden operations before any guest code exists and
+  refuses to start if one works.
+- **Bridge:** a guest that replaced `Date.prototype.valueOf`, `Array.prototype.map`, `Object.entries`
+  and similar could make the bridge hand a Symbol to the Rust converter, which aborts: a lost worker, or
+  a dead host process in a plain `Runtime`. Intrinsics are captured before guest code runs, the bridge is
+  strict mode, and host-call arguments are capped (1M values, depth 128) before they are copied.
+- **Linux seccomp:** stream-only `socketpair`; `prctl` allow-list; no executable mappings when jitless;
+  no `sysinfo`/`getpriority`/`ioprio_get`; the socket ioctl block and `F_SETPIPE_SZ` denied;
+  `get_robust_list`/`getpgid`/`getsid` only on ourselves; not dumpable; `RLIMIT_RTPRIO`/`NICE` 0. `uname`
+  deliberately stays allowed: V8's x86_64 build calls it while starting.
+- A worker with more than 64 threads is killed; memory and threads are supervised while a host function
+  is running; the in-flight call cap is runtime-wide.
+- A reused or mismatched capability token from the worker ends the session; revoking drops the host
+  handler first; resolver, loader and console handlers validate what the worker sends them.
+- Forked children forget the parent's workers and never touch them; a command waits for the runtime
+  at most its own deadline; `eval_async` uses a thread of its own.
+- A `BigInt` result past 4300 digits no longer ends the session; `Temporal.Now` follows the frozen
+  clock; a guest can no longer kill the worker's reply-reading thread by not awaiting an async host call.
+
+### Added
+
+- **`AgentSandbox`** (`pydeno.AgentSandbox`): an AI-agent layer on `IsolatedRuntime`. State persists across
+  runs; `start()`/`resume()` pause at every tool call (approval flows); a signed deterministic-replay
+  journal (`dump()`/`load()`); `describe_tools()` and `typescript_stubs()` generate the prompt and `.d.ts`.
+  See `docs/guides/agent-sessions.md`.
+- **pydantic-ai integration** (`pydeno.integrations.pydantic_ai`): `JSCodeMode`, the JavaScript
+  counterpart of the Monty-based code mode. See `docs/guides/pydantic-ai.md`.
+- **Examples:** Monty prepares data and pydeno builds the result: three.js terrain, orbits and a city
+  sun analysis; a d3 network; an ECharts dashboard; turf geospatial; a SQL question to a Vega-Lite chart;
+  a spreadsheet to a PowerPoint deck. Vendored d3, ECharts and turf bundles (SHA-256 pinned).
+- `docs/security-report.md`, `docs/hack-pydeno.md` and the `challenge/` kit; `security.yml` (cargo-deny,
+  cargo-audit, pip-audit, OSV).
+
 ## 0.5.0 — 2026-10-03
 
 No breaking changes: every new limit is opt-in and `Runtime` is unchanged.

@@ -230,6 +230,37 @@ Monty.
 A worker CPU-time cap of twice the hard deadline also applies, because wall-clock pauses
 during host calls cannot pause CPU.
 
+Also in force without any setting:
+
+- **A buffer cap.** With `max_memory` set (the default), `max_buffer_bytes` defaults to a quarter of
+  it, so `new Uint8Array(2 ** 31)` is a catchable `RangeError` instead of the memory poll killing the
+  whole worker. Set `RuntimeConfig(max_buffer_bytes=...)` to change it.
+- **A thread cap.** A worker has about 13 threads (17 on macOS); the parent kills one with more than
+  64, because a thread bomb stays under a memory ceiling.
+- **Supervision while a host function runs.** Memory and thread limits keep being enforced while the
+  runtime waits on a slow host function.
+- **A runtime-wide call cap.** `max_inflight_host_calls` counts calls still running across commands,
+  not just within one.
+- **V8 flags.** Besides `--jitless`: a linear-time regex fallback after excessive backtracking (a
+  catastrophic regular expression returns instead of running to the deadline) and
+  `--freeze-flags-after-init`.
+
+## The worker checks its own sandbox
+
+Before any guest code exists, the worker *tries* the things the sandbox exists to stop: reading a
+file, writing one, spawning a process, connecting out, signalling its parent, and on macOS reading the
+parent's argv/environment and the machine's hardware ID. If a complete sandbox lets one through, the
+worker refuses to start and `IsolatedRuntime` raises `WorkerCrashed("... sandbox self-test failed ...")`.
+
+This is why a gap in a deny-list (which is only as good as its last review) becomes a failed start
+rather than a finding. It costs a handful of syscalls. A *degraded* sandbox (a kernel without Landlock,
+say) is expected to leak and is not tested this way; `sandbox="require"` refuses to start there, and
+`sandbox="auto"` emits a `RuntimeWarning` saying which layers are missing.
+
+The same fail-closed rule applies to limits: if the worker's memory or CPU cannot be read on this
+system, `max_memory` and the CPU cap could never fire, so the runtime warns (`auto`) or refuses to
+start (`require`).
+
 ## Running real libraries
 
 Security that breaks the code people run gets switched off, so the sandbox is tested against real
