@@ -92,15 +92,6 @@ _CPU_CAP_FACTOR = 2.0
 # silently has no limits until you remember to set them is not much of a sandbox.
 DEFAULT_MAX_MEMORY = 1024 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 60.0
-# Globals a guest has no use for and that only widen the attack surface: shared memory and
-# atomics are what a high-resolution timer is built from, and weak references and finalizers make
-# garbage collection observable. Pass `strip_globals=()` to keep them.
-DEFAULT_STRIP_GLOBALS = (
-    "SharedArrayBuffer",
-    "Atomics",
-    "WeakRef",
-    "FinalizationRegistry",
-)
 DEFAULT_MAX_HOST_WAIT = 600.0
 DEFAULT_MAX_INFLIGHT_HOST_CALLS = 64
 DEFAULT_WRITE_STALL_TIMEOUT = 10.0
@@ -311,7 +302,6 @@ class IsolatedRuntime:
         random_seed: int | None = None,
         python: str | None = None,
         prewarm: bool = True,
-        strip_globals: Sequence[str] = DEFAULT_STRIP_GLOBALS,
     ) -> None:
         clock_ms = _clock_ms(clock)
         if random_seed is not None and (
@@ -368,14 +358,7 @@ class IsolatedRuntime:
         self._grace = float(timeout_grace)
         self._python = python or sys.executable
         seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
-        if isinstance(strip_globals, str) or not all(
-            isinstance(n, str) and _wire.GLOBAL_NAME.fullmatch(n) for n in strip_globals
-        ):
-            raise ValueError(
-                "strip_globals must be a sequence of global variable names"
-            )
         self._options: dict[str, Any] = {
-            "strip_globals": list(strip_globals),
             "sandbox": sandbox,
             "empty_root": empty_root,
             "v8_flags": (["--jitless"] if jitless else [])
@@ -448,7 +431,7 @@ class IsolatedRuntime:
             self._writer.send(
                 {
                     "t": "init",
-                    "config": _wire.encode_value(self._config),
+                    "config": _wire.Enc(self._config),
                     "options": self._options,
                 }
             )
@@ -914,7 +897,7 @@ class IsolatedRuntime:
                 hids[key] = hid
                 entries[key] = {"hid": hid, "async": is_async}
             else:
-                entries[key] = {"v": _wire.encode_value(value)}
+                entries[key] = {"v": _wire.Enc(value)}
         try:
             tokens = self._request(
                 {"t": "bind_object", "name": name, "entries": entries}

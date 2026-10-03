@@ -21,15 +21,6 @@ _EXPECTED_SANDBOX = os.environ.get("PYDENO_EXPECT_SANDBOX")
 _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 
 
-def _has_native_wire() -> bool:
-    try:
-        from pydeno import _wire
-
-        return _wire._native_decode is not None  # noqa: SLF001
-    except ImportError:
-        return False
-
-
 _PLATFORM_MARKERS = {
     "linux_only": sys.platform.startswith("linux"),
     "darwin_only": sys.platform == "darwin",
@@ -45,9 +36,6 @@ _PLATFORM_MARKERS = {
     ),
     # Needs to start as root to mean anything (a container; CI runners are not root).
     "as_root": hasattr(os, "geteuid") and os.geteuid() == 0,
-    # Compares the native wire codec with the Python reference; meaningless against a stale
-    # extension that predates it.
-    "native_wire": _has_native_wire(),
 }
 
 

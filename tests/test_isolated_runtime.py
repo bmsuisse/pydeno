@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from wire_reference import native_encode
 from pydeno import (
     IsolatedRuntime,
     JavaScriptError,
@@ -71,20 +72,20 @@ class TestWireCodec:
         ],
     )
     def test_round_trip(self, value: object) -> None:
-        back = _wire.decode_value(_wire.encode_value(value))
+        back = _wire.decode_value(native_encode(value))
         assert back == value
         assert type(back) is type(value)
 
     def test_nan_round_trips(self) -> None:
-        back = _wire.decode_value(_wire.encode_value(float("nan")))
+        back = _wire.decode_value(native_encode(float("nan")))
         assert back != back
 
     def test_negative_zero_keeps_its_sign(self) -> None:
-        assert str(_wire.decode_value(_wire.encode_value(-0.0))) == "-0.0"
+        assert str(_wire.decode_value(native_encode(-0.0))) == "-0.0"
 
     def test_unsupported_type_is_refused_not_pickled(self) -> None:
         with pytest.raises(_wire.WireError):
-            _wire.encode_value(object())
+            native_encode(object())
 
     @pytest.mark.parametrize(
         "hostile",
@@ -1147,13 +1148,13 @@ class TestWireFuzz:
             undefined,
             {1: 2},
         ]
-        msgs = [{"t": "result", "id": 1, "v": _wire.encode_value(v)} for v in values]
+        msgs = [{"t": "result", "id": 1, "v": native_encode(v)} for v in values]
         msgs.append(
             {
                 "t": "call",
                 "cid": 1,
                 "hid": 1,
-                "args": [_wire.encode_value(v) for v in values],
+                "args": [native_encode(v) for v in values],
             }
         )
         return [_wire.dumps(m) for m in msgs]

@@ -97,6 +97,14 @@ def _remote_exception(name: object, message: str) -> Exception:
 # repointed, the replacement's own prototype is `Function.prototype` (not the original, whose
 # `now` would still tick), and the one other thing in V8 that reads "now" implicitly,
 # `Intl.DateTimeFormat#format()` with no argument, is wrapped too.
+# Globals a guest has no use for and that only widen the attack surface: shared memory and atomics
+# are what a high-resolution timer is built from, and weak references and finalizers make garbage
+# collection observable.
+_STRIP_GLOBALS_JS = (
+    "for (const n of ['SharedArrayBuffer', 'Atomics', 'WeakRef', 'FinalizationRegistry'])"
+    " { try { delete globalThis[n]; } catch (_) {} }\n"
+)
+
 _FROZEN_CLOCK_JS = """
 (() => {
   const Native = Date;
@@ -385,20 +393,9 @@ class _Worker:
         console_hid = options.get("console_hid")
         if isinstance(console_hid, int):
             kwargs["on_console"] = self._console_stub(console_hid)
-        strip = options.get("strip_globals")
-        if isinstance(strip, list):
-            names = [
-                n
-                for n in strip
-                if isinstance(n, str) and _wire.GLOBAL_NAME.fullmatch(n)
-            ]
-            if names:
-                # First of all, so everything after it (clock, the caller's bootstrap) sees the
-                # reduced global scope.
-                kwargs["bootstrap"] = (
-                    f"for (const n of {json.dumps(names)})"
-                    " { try { delete globalThis[n]; } catch (_) {} }\n"
-                ) + str(kwargs.get("bootstrap") or "")
+        # First of all, so everything after it (clock, the caller's bootstrap) sees the reduced
+        # global scope.
+        kwargs["bootstrap"] = _STRIP_GLOBALS_JS + str(kwargs.get("bootstrap") or "")
         clock_ms = options.get("clock_ms")
         if isinstance(clock_ms, int) and not isinstance(clock_ms, bool):
             # Runs before the caller's own bootstrap, which therefore sees the frozen clock.

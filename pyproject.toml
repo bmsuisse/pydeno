@@ -72,5 +72,4 @@ markers = [
     "full_sandbox: asserts every dangerous operation is denied; deselected where PYDENO_EXPECT_SANDBOX names a degraded set of layers",
     "redteam: fires real privileged syscalls from a sandboxed process; deselected unless PYDENO_REDTEAM_CONTAINER=1 and seccomp is expected",
     "as_root: only meaningful when the tests run as root (a container); deselected otherwise",
-    "native_wire: compares the Rust wire codec with the Python one; deselected against an extension that lacks it",
 ]

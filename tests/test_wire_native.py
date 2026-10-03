@@ -18,9 +18,9 @@ import pytest
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
+import wire_reference as ref
+from wire_reference import native_encode
 from pydeno import _wire, undefined
-
-pytestmark = pytest.mark.native_wire
 
 NODES = _wire.MAX_NODES
 DEPTH = _wire.MAX_DEPTH
@@ -49,7 +49,7 @@ def _same(a: Any, b: Any) -> bool:
 
 
 def _decode_both(nodes: list[Any]) -> None:
-    py = _outcome(_wire.py_decode_values, nodes)
+    py = _outcome(ref.py_decode_values, nodes)
     native = _outcome(_wire.decode_values, nodes)
     assert py[0] == native[0], (nodes, py, native)
     if py[0] == "error":
@@ -59,8 +59,8 @@ def _decode_both(nodes: list[Any]) -> None:
 
 
 def _encode_both(value: Any) -> None:
-    py = _outcome(_wire.py_encode_value, value)
-    native = _outcome(_wire.encode_value, value)
+    py = _outcome(ref.py_encode_value, value)
+    native = _outcome(native_encode, value)
     assert py[0] == native[0], (value, py, native)
     if py[0] == "error":
         assert py[1] == native[1]
@@ -116,9 +116,9 @@ def test_every_kind_of_leaf_encodes_the_same(leaf: Any) -> None:
 
 @pytest.mark.parametrize("leaf", LEAVES, ids=repr)
 def test_every_kind_of_leaf_round_trips_the_same(leaf: Any) -> None:
-    encoded = _wire.py_encode_value(leaf)
+    encoded = ref.py_encode_value(leaf)
     _decode_both([encoded])
-    out = _wire.decode_values([_wire.encode_value(leaf)])[0]
+    out = _wire.decode_values([native_encode(leaf)])[0]
     if isinstance(leaf, (bytearray, memoryview)):
         assert out == bytes(leaf)
     else:
@@ -332,16 +332,8 @@ _py_values = st.recursive(
 @given(_py_values)
 def test_arbitrary_python_values_encode_and_round_trip_the_same(value: Any) -> None:
     _encode_both(value)
-    decoded = _wire.decode_values([_wire.encode_value(value)])[0]
-    assert _same(decoded, _wire.py_decode_values([_wire.py_encode_value(value)])[0])
-
-
-# --- it is the native path ----------------------------------------------------------------------
-
-
-def test_the_public_functions_use_the_native_codec() -> None:
-    assert _wire._native_encode is not None and _wire._native_decode is not None  # noqa: SLF001
-    assert _wire._native_dumps is not None and _wire._native_loads is not None  # noqa: SLF001
+    decoded = _wire.decode_values([native_encode(value)])[0]
+    assert _same(decoded, ref.py_decode_values([ref.py_encode_value(value)])[0])
 
 
 # --- the fused JSON layer: parse + decode, encode + write ---------------------------------------
@@ -362,9 +354,9 @@ def _semantic(data: bytes) -> Any:
 @pytest.mark.parametrize("leaf", LEAVES, ids=repr)
 def test_native_dumps_means_the_same_as_the_reference(leaf: Any) -> None:
     msg = _message("result", id=7, v=_wire.Enc(leaf))
-    assert _same(_semantic(_wire.dumps(msg)), _semantic(_wire.py_dumps(msg)))
+    assert _same(_semantic(_wire.dumps(msg)), _semantic(ref.py_dumps(msg)))
     call = _message("call", cid=1, hid=2, args=[_wire.Enc(leaf), _wire.Enc([leaf])])
-    assert _same(_semantic(_wire.dumps(call)), _semantic(_wire.py_dumps(call)))
+    assert _same(_semantic(_wire.dumps(call)), _semantic(ref.py_dumps(call)))
 
 
 @pytest.mark.parametrize("leaf", LEAVES, ids=repr)
@@ -395,7 +387,7 @@ def test_dumps_handles_the_plain_parts_of_a_message() -> None:
         "ctrl": 'a\x00b\x1fc\td\ne"f\\g',
         "nested": {"a": [1, [2, {"b": None}]], "t": (1, 2)},
     }
-    assert _semantic(_wire.dumps(msg)) == _semantic(_wire.py_dumps(msg))
+    assert _semantic(_wire.dumps(msg)) == _semantic(ref.py_dumps(msg))
 
 
 def test_lone_surrogates_survive_both_ways() -> None:
@@ -404,11 +396,11 @@ def test_lone_surrogates_survive_both_ways() -> None:
         sent = _message("result", id=1, v=_wire.Enc(text))
         out = _wire.loads_decoded(_wire.dumps(sent))["v"]
         assert out == text, (text, out)
-        assert out == _wire.py_loads_decoded(_wire.py_dumps(sent))["v"]
+        assert out == ref.py_loads_decoded(ref.py_dumps(sent))["v"]
         # and in a plain (non-Enc) field and as a dict key
         msg = {"t": "result", "id": 1, "v": _wire.Enc({text: [text]}), "extra": text}
-        assert _wire.loads_decoded(_wire.dumps(msg)) == _wire.py_loads_decoded(
-            _wire.py_dumps(msg)
+        assert _wire.loads_decoded(_wire.dumps(msg)) == ref.py_loads_decoded(
+            ref.py_dumps(msg)
         )
 
 
@@ -417,7 +409,7 @@ def test_unencodable_values_fail_as_wire_errors_with_the_same_text() -> None:
 
     for bad in (Custom(), object(), lambda: 1, 1j, range(2)):
         n = _outcome(_wire.dumps, _message("result", id=1, v=_wire.Enc(bad)))
-        p = _outcome(_wire.py_dumps, _message("result", id=1, v=_wire.Enc(bad)))
+        p = _outcome(ref.py_dumps, _message("result", id=1, v=_wire.Enc(bad)))
         assert n[0] == p[0] == "error"
         assert n[1] == p[1]
 
@@ -432,7 +424,7 @@ def test_dumps_refuses_oversized_messages_and_nan_in_plain_fields() -> None:
 
 
 def _frame_both(raw: bytes) -> None:
-    py = _outcome(_wire.py_loads_decoded, raw)
+    py = _outcome(ref.py_loads_decoded, raw)
     native = _outcome(_wire.loads_decoded, raw)
     assert py[0] == native[0], (raw[:200], py, native)
     if py[0] == "ok":
@@ -581,7 +573,7 @@ def test_the_native_parser_is_stricter_about_encodings_than_json_loads() -> None
         '{"t":"result","v":"é"}'.encode("utf-16"),
         '{"t":"result","v":"é"}'.encode("utf-32"),
     ):
-        assert _outcome(_wire.py_loads_decoded, raw)[0] == "ok"
+        assert _outcome(ref.py_loads_decoded, raw)[0] == "ok"
         assert _outcome(_wire.loads_decoded, raw)[0] == "error"
 
 
@@ -589,7 +581,7 @@ def test_only_the_specified_frame_types_have_their_values_decoded() -> None:
     # an `error` frame's fields are plain data: a tagged-looking value there is just a dict
     raw = b'{"t":"error","id":1,"v":{"$":"zz","v":1},"args":[{"$":"zz"}]}'
     assert _wire.loads_decoded(raw)["v"] == {"$": "zz", "v": 1}
-    assert _wire.loads_decoded(raw) == _wire.py_loads_decoded(raw)
+    assert _wire.loads_decoded(raw) == ref.py_loads_decoded(raw)
 
 
 def test_frame_limits_agree_at_the_boundaries() -> None:
@@ -619,9 +611,9 @@ def test_a_flood_frame_is_refused_before_it_is_built() -> None:
 def test_duplicate_keys_resolve_like_json_loads() -> None:
     for value in ('{"a":1,"a":2}', '{"a":1,"b":2,"a":3}', '{"t":"x","t":"y"}'):
         raw = f'{{"t":"result","id":1,"v":{value}}}'.encode()
-        assert _wire.loads_decoded(raw) == _wire.py_loads_decoded(raw)
+        assert _wire.loads_decoded(raw) == ref.py_loads_decoded(raw)
     raw = b'{"t":"result","t":"error","id":1,"v":{"$":"zz"}}'
-    assert _wire.loads_decoded(raw) == _wire.py_loads_decoded(raw)
+    assert _wire.loads_decoded(raw) == ref.py_loads_decoded(raw)
 
 
 _json_leaf = st.one_of(
@@ -670,8 +662,8 @@ def test_arbitrary_frames_get_the_same_verdict_and_value(
 def test_arbitrary_python_values_round_trip_through_the_fused_layer(value: Any) -> None:
     sent = _message("result", id=1, v=_wire.Enc(value))
     native = _wire.loads_decoded(_wire.dumps(sent))["v"]
-    reference = _wire.py_loads_decoded(_wire.py_dumps(sent))["v"]
+    reference = ref.py_loads_decoded(ref.py_dumps(sent))["v"]
     assert _same(native, reference)
     # and each side can read what the other wrote
-    assert _same(_wire.py_loads_decoded(_wire.dumps(sent))["v"], reference)
-    assert _same(_wire.loads_decoded(_wire.py_dumps(sent))["v"], reference)
+    assert _same(ref.py_loads_decoded(_wire.dumps(sent))["v"], reference)
+    assert _same(_wire.loads_decoded(ref.py_dumps(sent))["v"], reference)

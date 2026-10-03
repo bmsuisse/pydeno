@@ -11,9 +11,6 @@ seccomp + Landlock/Seatbelt). Hermetic by design: no network, nothing is fetched
 | `vega-lite-6.4.3.min.js` | `vega-lite` | 6.4.3 | BSD-3-Clause | `build/vega-lite.min.js`, **unmodified** |
 | `three-0.180.0-gltf.bundle.js` | `three` + `GLTFExporter` | 0.180.0 | MIT | esbuild IIFE (see below) |
 | `dagre.bundle.js` | `@dagrejs/dagre` | 3.1.1 | MIT | esbuild IIFE (see below) |
-| `marked.bundle.js` | `marked` | 18.0.14 | MIT | esbuild IIFE (see below) |
-| `dayjs.bundle.js` | `dayjs` | 1.11.23 | MIT | esbuild IIFE (see below) |
-| `papaparse.bundle.js` | `papaparse` | 5.7.0 | MIT | esbuild IIFE (see below) |
 
 The pptxgenjs bundle lives in `../pptxgenjs/` (see its README).
 
@@ -22,9 +19,6 @@ Entry sources (each bundle is a one-line import that sets a global):
     three:      import * as THREE from "three"; import {GLTFExporter} from "three/examples/jsm/exporters/GLTFExporter.js";
                 globalThis.THREE = THREE; globalThis.GLTFExporter = GLTFExporter;
     dagre:      import * as d from "@dagrejs/dagre"; globalThis.dagre = d;
-    marked:     import {marked} from "marked"; globalThis.marked = marked;
-    dayjs:      import d from "dayjs"; globalThis.dayjs = d;
-    papaparse:  import P from "papaparse"; globalThis.Papa = P;
 
 Rebuild an esbuild bundle:
 

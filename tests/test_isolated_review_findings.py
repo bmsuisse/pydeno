@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from wire_reference import native_encode
 from pydeno import (
     IsolatedRuntime,
     JavaScriptError,
@@ -376,22 +377,22 @@ class TestH4HashCollisionDecode:
 
     def test_honest_large_integers_use_the_tagged_form_and_round_trip(self) -> None:
         for n in (2**53 + 1, 2**200, -(2**200)):
-            assert _wire.decode_value(_wire.encode_value(n)) == n
+            assert _wire.decode_value(native_encode(n)) == n
 
     def test_honest_sets_and_dicts_are_unaffected(self) -> None:
-        assert _wire.decode_value(_wire.encode_value(set(range(50_000)))) == set(
+        assert _wire.decode_value(native_encode(set(range(50_000)))) == set(
             range(50_000)
         )
         d = {i: str(i) for i in range(5_000)}
-        assert _wire.decode_value(_wire.encode_value(d)) == d
+        assert _wire.decode_value(native_encode(d)) == d
 
     def test_the_two_values_that_legitimately_collide_in_python_are_fine(self) -> None:
         assert hash(-1) == hash(-2)
-        assert _wire.decode_value(_wire.encode_value({-1, -2})) == {-1, -2}
+        assert _wire.decode_value(native_encode({-1, -2})) == {-1, -2}
 
     def test_a_few_collisions_are_tolerated_a_flood_is_not(self) -> None:
         few = [(2**61 - 1) * k for k in range(1, 10)]
-        assert _wire.decode_value(_wire.encode_value(set(few))) == set(few)
+        assert _wire.decode_value(native_encode(set(few))) == set(few)
 
     def test_the_parent_rejects_the_flood_from_a_compromised_worker(
         self, tmp_path: Path
@@ -1094,14 +1095,6 @@ class TestStripGlobals:
         probe = self.PROBE % ", ".join(repr(n) for n in self.NAMES)
         with IsolatedRuntime(RuntimeConfig(timeout=10.0)) as rt:
             assert rt.eval(probe) == ["undefined"] * 4
-
-    def test_they_can_be_kept_and_the_list_is_validated(self) -> None:
-        probe = self.PROBE % ", ".join(repr(n) for n in self.NAMES)
-        with IsolatedRuntime(RuntimeConfig(timeout=10.0), strip_globals=()) as rt:
-            assert rt.eval(probe) == ["function", "object", "function", "function"]
-        for bad in ("Atomics", "x; evil()", ["a b"], [1]):
-            with pytest.raises(ValueError, match="strip_globals"):
-                IsolatedRuntime(RuntimeConfig(), strip_globals=bad)
 
     def test_the_caller_bootstrap_still_runs_after_the_strip(self) -> None:
         cfg = RuntimeConfig(bootstrap="globalThis.seen = typeof Atomics;", timeout=10.0)

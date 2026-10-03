@@ -234,7 +234,7 @@ during host calls cannot pause CPU.
 
 Security that breaks the code people run gets switched off, so the sandbox is tested against real
 libraries (`tests/test_isolated_libraries.py`, bytes pinned under `vendor/libs/`): pptxgenjs, three.js
-with `GLTFExporter`, Vega-Lite, dagre, marked, dayjs and PapaParse, with the same results as the plain
+with `GLTFExporter`, Vega-Lite, dagre, with the same results as the plain
 `Runtime`. A wider hand check (not vendored) also passed for lodash, date-fns, d3, ECharts (server-side
 SVG), mathjs, KaTeX, Handlebars, zod, Ajv, yaml, jsPDF, pdf-lib, docx, JSZip, fflate, crypto-js,
 decimal.js, luxon, Prettier, Terser, Cytoscape, Tailwind CSS v4's `compile`, and more. Libraries that
@@ -269,5 +269,5 @@ Pass `prewarm=False` to turn it off. Jitless V8 (the default) makes compute-heav
 ## Smaller global scope
 
 `SharedArrayBuffer`, `Atomics`, `WeakRef` and `FinalizationRegistry` are removed from the guest by
-default (`strip_globals=()` keeps them): shared memory and atomics are what high-resolution timers
+default: shared memory and atomics are what high-resolution timers
 are built from, and weak references make garbage collection observable.

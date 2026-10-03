@@ -71,15 +71,16 @@ No breaking changes: every new limit is opt-in and `Runtime` is unchanged.
   - **Smaller syscall surface** (second pass): NUMA policy (`mbind`, `set_mempolicy`),
     filesystem mutation (`mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`, `mknodat`),
     file-to-file copies (`splice`, `tee`, `sendfile`, `copy_file_range`), POSIX timers, protection
-    keys and re-entering Landlock/seccomp are denied. Checked against pptxgenjs, three.js,
-    vega-lite and dagre bundles under the full Linux sandbox.
+    keys and re-entering Landlock/seccomp are denied, including x86_64's older path-based spellings
+    (`mkdir`, `unlink`, `rename`, ...) that aarch64 never had. Checked against pptxgenjs, three.js,
+    Vega-Lite and dagre bundles under the full Linux sandbox.
   - **`prewarm`** (default on): one ready spare worker is kept so the next runtime starts in
     about 15-45 ms instead of about 100 ms (macOS; the low end when the spare is used soon after
-    it started). **`strip_globals`** removes `SharedArrayBuffer`, `Atomics`,
-    `WeakRef` and `FinalizationRegistry` from the guest by default.
+    it started). The guest also loses `SharedArrayBuffer`, `Atomics`,
+    `WeakRef` and `FinalizationRegistry` (shared-memory timers, observable GC).
   - **`pydeno.WEB_POLYFILLS`**: opt-in, pure-JS browser basics (virtual-time timers, `TextEncoder`,
     `btoa`, `Blob`, `EventTarget`) so real libraries run in the sandbox. Tested with pptxgenjs,
-    three.js, Vega-Lite, dagre, marked, dayjs and PapaParse (`vendor/libs/`), identical to `Runtime`.
+    three.js, Vega-Lite, dagre (`vendor/libs/`), identical to `Runtime`.
   - **Hostile-peer hardening** (from an independent review): the host waits
     on a worker with bounded writes (`write_stall_timeout`, default 10 s), so a
     worker that stops reading cannot freeze the caller; host-callback time no

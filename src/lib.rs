@@ -50,10 +50,6 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::v8_flags::_set_v8_flags, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
-        runtime::wire::_wire_encode_value,
-        m
-    )?)?;
-    m.add_function(pyo3::wrap_pyfunction!(
         runtime::wire::_wire_decode_values,
         m
     )?)?;

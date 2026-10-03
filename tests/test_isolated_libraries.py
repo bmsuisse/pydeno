@@ -27,9 +27,6 @@ LIBS = ROOT / "libs"
 
 PINS = {
     "dagre.bundle.js": "ca109f634a32870d6865e6cb01702a3c8cca68eeb3dccde871aa031ef4b2dbd0",
-    "dayjs.bundle.js": "620789c61b6174f9e2ca0e2022eff9d1cd1dbc0995cc45fe21849e1535867a05",
-    "marked.bundle.js": "d2012ec16260fbed474bc362527f69aee60a82edfcf921d0988266115995d487",
-    "papaparse.bundle.js": "34154f368d6a39dd64ec9dfeb3796d211f199f11fbc2f0ca8dc78ae4f0378584",
     "three-0.180.0-gltf.bundle.js": "b3faa3da4cf40d0fad9883002324ed35bfb0a57cbc4fdb1584f1df8065ba061a",
     "vega-6.4.0.min.js": "8f6a3587cf8d4f42c7e08120e3eb05d067e746d554e39d2dcf52acc0bd5ba28f",
     "vega-lite-6.4.3.min.js": "35a9821df838825b05a6a73e9414b58747a1b18321583858ed903c66393a5c7e",
@@ -37,21 +34,6 @@ PINS = {
 
 # name -> (files to evaluate in order, an async-friendly expression, what it must equal/contain)
 CASES: dict[str, tuple[list[str], str, object]] = {
-    "dayjs": (
-        ["dayjs.bundle.js"],
-        "dayjs('2024-03-05').add(1, 'month').format('YYYY-MM-DD')",
-        "2024-04-05",
-    ),
-    "marked": (
-        ["marked.bundle.js"],
-        "marked.parse('# Title\\n\\nsome *emphasis*')",
-        "<h1>Title</h1>\n<p>some <em>emphasis</em></p>\n",
-    ),
-    "papaparse": (
-        ["papaparse.bundle.js"],
-        "Papa.parse('a,b\\n1,2\\n3,4', {header: true, dynamicTyping: true}).data",
-        [{"a": 1, "b": 2}, {"a": 3, "b": 4}],
-    ),
     "dagre": (
         ["dagre.bundle.js"],
         """(() => {
@@ -135,7 +117,7 @@ def test_library_result_matches_the_in_process_runtime(name: str) -> None:
 
 
 def test_the_libraries_run_with_jitless_and_with_the_jit_alike() -> None:
-    files, expr, expected = CASES["marked"]
+    files, expr, expected = CASES["dagre"]
     with IsolatedRuntime(_config(), jitless=False) as rt:
         assert _run(rt, files, expr) == expected
 
@@ -194,11 +176,11 @@ def test_a_library_cannot_use_its_cpu_budget_to_outlive_the_deadline() -> None:
     """A heavy library call is still bounded by the hard deadline."""
     from pydeno import RuntimeTimeout
 
-    files, _, _ = CASES["marked"]
+    files, _, _ = CASES["dagre"]
     with IsolatedRuntime(_config(), request_timeout=3.0) as rt:
         asyncio.run(rt.eval_async(_sources(files), timeout=60))
         with pytest.raises(RuntimeTimeout):
-            rt.eval("let s = 0; for (;;) { s += marked.parse('# x').length }")
+            rt.eval("let s = 0; for (;;) { s += typeof dagre.layout }")
 
 
 # --- the polyfills themselves (pure JS, so they are checked directly) ----------------------

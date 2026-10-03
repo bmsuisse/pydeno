@@ -1,12 +1,12 @@
 //! The value codec of the `IsolatedRuntime` wire protocol, in Rust.
 //!
-//! This is a line-for-line port of `encode_value` / `decode_value` in `python/pydeno/_wire.py`,
-//! which stays as the reference implementation and the fallback for an older extension. The
-//! Python versions walk every node twice (once to tag it, once for `json`), which is most of the
-//! cost of moving a structured result across the boundary; here the walk is native.
+//! The decoding half of the value codec: tag rules, budgets and the hash-flood check. Encoding
+//! lives in `wire_json.rs`, fused with writing the bytes. The readable specification of both is
+//! `tests/wire_reference.py`; moving a structured result across the boundary walks every node
+//! once here instead of twice in Python.
 //!
-//! The two must agree exactly, errors included: `tests/test_wire_native.py` runs them against each
-//! other. Typed values (`int`, bytes, datetimes) call back into Python's own `int`, `base64` and
+//! The reference and this must agree exactly, errors included: `tests/test_wire_native.py` runs
+//! them against each other. Typed values (`int`, bytes, datetimes) call back into Python's own `int`, `base64` and
 //! `datetime`, so their edge cases (underscores in digits, ISO formats, base64 padding) cannot
 //! drift from the reference.
 //!
@@ -18,10 +18,7 @@ use std::collections::HashMap;
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::{
-    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyMemoryView, PySet,
-    PySlice, PyString, PyTuple,
-};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PySlice, PyString};
 
 pyo3::create_exception!(_pydeno, WireNativeError, PyException);
 
@@ -30,138 +27,6 @@ const MAX_HASH_REPEATS: usize = 16;
 
 pub(crate) fn fail<T>(message: impl Into<String>) -> PyResult<T> {
     Err(WireNativeError::new_err(message.into()))
-}
-
-fn tagged<'py>(
-    py: Python<'py>,
-    tag: &str,
-    value: Bound<'py, PyAny>,
-) -> PyResult<Bound<'py, PyAny>> {
-    let d = PyDict::new(py);
-    d.set_item("$", tag)?;
-    d.set_item("v", value)?;
-    Ok(d.into_any())
-}
-
-// ---------------------------------------------------------------------------------------------
-// encode
-// ---------------------------------------------------------------------------------------------
-
-struct Encoder<'py> {
-    py: Python<'py>,
-    max_depth: usize,
-    datetime: Bound<'py, PyAny>,
-    base64: Bound<'py, PyModule>,
-}
-
-impl<'py> Encoder<'py> {
-    fn encode(&self, v: &Bound<'py, PyAny>, depth: usize) -> PyResult<Bound<'py, PyAny>> {
-        let py = self.py;
-        if depth > self.max_depth {
-            return fail("value nested too deeply to cross the isolation boundary");
-        }
-        if v.is_none() || v.is_instance_of::<PyBool>() || v.is_instance_of::<PyString>() {
-            return Ok(v.clone());
-        }
-        if v.is_instance_of::<PyInt>() {
-            if let Ok(n) = v.extract::<i64>() {
-                if (-SAFE_INT..=SAFE_INT).contains(&n) {
-                    return Ok(v.clone());
-                }
-            }
-            return tagged(py, "int", v.str()?.into_any());
-        }
-        if v.is_instance_of::<PyFloat>() {
-            let f: f64 = v.extract()?;
-            if f.is_nan() {
-                return tagged(py, "f", "nan".into_pyobject(py)?.into_any());
-            }
-            if f.is_infinite() {
-                let name = if f > 0.0 { "inf" } else { "-inf" };
-                return tagged(py, "f", name.into_pyobject(py)?.into_any());
-            }
-            if f == 0.0 && f.is_sign_negative() {
-                return tagged(py, "f", "-0".into_pyobject(py)?.into_any());
-            }
-            return Ok(v.clone());
-        }
-        if v.is_instance_of::<PyBytes>()
-            || v.is_instance_of::<PyByteArray>()
-            || v.is_instance_of::<PyMemoryView>()
-        {
-            let raw = py.get_type::<PyBytes>().call1((v,))?;
-            let text = self
-                .base64
-                .call_method1("b64encode", (raw,))?
-                .call_method1("decode", ("ascii",))?;
-            return tagged(py, "b", text);
-        }
-        if v.is_instance_of::<super::python::JsUndefined>() {
-            let d = PyDict::new(py);
-            d.set_item("$", "u")?;
-            return Ok(d.into_any());
-        }
-        if v.is_instance(&self.datetime)? {
-            return tagged(py, "dt", v.call_method0("isoformat")?);
-        }
-        if v.is_instance_of::<PyList>() || v.is_instance_of::<PyTuple>() {
-            return Ok(self.encode_items(v, depth)?.into_any());
-        }
-        if v.is_instance_of::<PySet>() || v.is_instance_of::<PyFrozenSet>() {
-            return tagged(py, "set", self.encode_items(v, depth)?.into_any());
-        }
-        if let Ok(dict) = v.cast::<PyDict>() {
-            let mut plain = true;
-            for (k, _) in dict.iter() {
-                if !k.is_instance_of::<PyString>() || k.eq("$")? {
-                    plain = false;
-                    break;
-                }
-            }
-            if plain {
-                let out = PyDict::new(py);
-                for (k, val) in dict.iter() {
-                    out.set_item(k, self.encode(&val, depth + 1)?)?;
-                }
-                return Ok(out.into_any());
-            }
-            let pairs = PyList::empty(py);
-            for (k, val) in dict.iter() {
-                let pair = PyList::new(
-                    py,
-                    [self.encode(&k, depth + 1)?, self.encode(&val, depth + 1)?],
-                )?;
-                pairs.append(pair)?;
-            }
-            return tagged(py, "d", pairs.into_any());
-        }
-        let name = v.get_type().name()?;
-        fail(format!("{name} cannot cross the isolation boundary"))
-    }
-
-    fn encode_items(&self, v: &Bound<'py, PyAny>, depth: usize) -> PyResult<Bound<'py, PyList>> {
-        let out = PyList::empty(self.py);
-        for item in v.try_iter()? {
-            out.append(self.encode(&item?, depth + 1)?)?;
-        }
-        Ok(out)
-    }
-}
-
-/// Python value -> JSON-able structure (the same one `_wire.encode_value` builds).
-#[pyfunction]
-pub fn _wire_encode_value<'py>(
-    value: &Bound<'py, PyAny>,
-    max_depth: usize,
-) -> PyResult<Bound<'py, PyAny>> {
-    let py = value.py();
-    let encoder = Encoder {
-        py,
-        max_depth,
-        datetime: py.import("datetime")?.getattr("datetime")?,
-        base64: py.import("base64")?,
-    };
-    encoder.encode(value, 0)
 }
 
 // ---------------------------------------------------------------------------------------------

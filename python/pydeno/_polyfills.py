@@ -186,26 +186,6 @@ WEB_POLYFILLS = r"""
     }
   }
   define('FileReader', FileReader);
-  // three.js (its loaders) reaches for AbortController at load time.
-  class AbortSignal {
-    constructor() { this.aborted = false; this.reason = undefined; this._l = []; this.onabort = null; }
-    addEventListener(type, fn) { if (type === 'abort') this._l.push(fn); }
-    removeEventListener(type, fn) { this._l = this._l.filter((x) => x !== fn); }
-    throwIfAborted() { if (this.aborted) throw this.reason; }
-  }
-  class AbortController {
-    constructor() { this.signal = new AbortSignal(); }
-    abort(reason) {
-      const s = this.signal;
-      if (s.aborted) return;
-      s.aborted = true;
-      s.reason = reason === undefined ? new Error('AbortError') : reason;
-      for (const fn of s._l) fn({ type: 'abort', target: s });
-      if (s.onabort) s.onabort({ type: 'abort', target: s });
-    }
-  }
-  define('AbortSignal', AbortSignal);
-  define('AbortController', AbortController);
   class Event {
     constructor(type, init = {}) {
       this.type = String(type); this.defaultPrevented = false; this.target = null;
@@ -236,6 +216,23 @@ WEB_POLYFILLS = r"""
   }
   define('Event', Event);
   define('EventTarget', EventTarget);
+  // three.js (its loaders) reaches for AbortController at load time.
+  class AbortSignal extends EventTarget {
+    constructor() { super(); this.aborted = false; this.reason = undefined; }
+    throwIfAborted() { if (this.aborted) throw this.reason; }
+  }
+  class AbortController {
+    constructor() { this.signal = new AbortSignal(); }
+    abort(reason) {
+      const s = this.signal;
+      if (s.aborted) return;
+      s.aborted = true;
+      s.reason = reason === undefined ? new Error('AbortError') : reason;
+      s.dispatchEvent(new Event('abort'));
+    }
+  }
+  define('AbortSignal', AbortSignal);
+  define('AbortController', AbortController);
   // dagre (graphlib) clones with it. Plain data, Maps/Sets, dates and typed arrays; no cycles
   // beyond what `seen` handles, and no functions (a real structuredClone throws on those too).
   const clone = (v, seen) => {
