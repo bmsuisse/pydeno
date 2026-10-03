@@ -167,6 +167,7 @@ class TestWhatTheWorkerNeeds:
         "pread64",
         "getrlimit",
         "sched_getaffinity",
+        "uname",
         "set_tid_address",
         "mremap",
         "getcwd",
@@ -446,10 +447,10 @@ class TestShape:
 
 
 class TestWhatAWorkerMayAskTheKernelAbout:
-    """The worker never asks for these, and an attacker wants each: the kernel version, the host's
-    uptime/RAM/process count, and other processes' priorities (which enumerate every pid)."""
+    """The worker never asks for these, and an attacker wants each: the host's uptime/RAM/process
+    count, and other processes' priorities (which enumerate every pid)."""
 
-    @pytest.mark.parametrize("name", ["uname", "sysinfo", "getpriority", "ioprio_get"])
+    @pytest.mark.parametrize("name", ["sysinfo", "getpriority", "ioprio_get"])
     def test_denied(self, arch: str, prog: list, name: str) -> None:
         nr = _by_name(arch)[name]
         assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ERRNO | EPERM
@@ -516,3 +517,9 @@ class TestExecutableMemory:
 def test_pkey_mprotect_is_denied_outright(arch: str, prog: list) -> None:
     nr = _by_name(arch)["pkey_mprotect"]
     assert run(prog, arch, nr, (0, 4096, 1)) == ERRNO | EPERM
+
+
+def test_uname_stays_open_because_v8_on_x86_64_needs_it(arch: str, prog: list) -> None:
+    # V8's x86_64 build aborts at startup (`Check failed: 0 == uname(...)`) if this is refused.
+    nr = _by_name(arch)["uname"]
+    assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ALLOW

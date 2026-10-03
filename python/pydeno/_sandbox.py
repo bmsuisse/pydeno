@@ -139,12 +139,13 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     # on Linux 6.12+, Landlock's abstract-socket scope. An AF_UNIX `socket()` would add nothing
     # to what socketpair already allows, so it is simply closed with the rest.
     "socket": (41, 198),
-    # What a worker never asks and an attacker wants: the kernel version (to pick an exploit),
-    # uptime / process count / RAM (`sysinfo`), and other processes' priorities (`getpriority` and
-    # `ioprio_get` walk every pid). glibc's thread set-up calls `sched_get*` with a *thread* id, which
-    # is why those stay open.
+    # What a worker never asks and an attacker wants: uptime / process count / RAM (`sysinfo`), and
+    # other processes' priorities (`getpriority` and `ioprio_get` walk every pid). glibc's thread
+    # set-up calls `sched_get*` with a *thread* id, which is why those stay open. NOT `uname`: the
+    # kernel version would help pick an exploit, but V8's x86_64 build calls it while starting and
+    # aborts (`Check failed: 0 == uname(&uname_buffer)`) if it is refused. The aarch64 build does not,
+    # which is why this was found on an x86_64 CI runner and not in an aarch64 container.
     "sysinfo": (99, 179),
-    "uname": (63, 160),
     "getpriority": (140, 141),
     "ioprio_get": (252, 31),
     # Taking over or signalling other processes of the same user.
