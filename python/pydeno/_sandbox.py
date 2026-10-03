@@ -44,11 +44,19 @@ MEMORY_EXIT_CODE = 78
 _SEATBELT_PROFILE = """
 (version 1)
 (deny default)
-(allow sysctl-read)
+(allow sysctl-read
+  (sysctl-name-prefix "hw.")
+  (sysctl-name-prefix "kern.os")
+  (sysctl-name "kern.version" "kern.maxproc" "kern.argmax" "kern.boottime" "vm.loadavg" "vm.swapusage"))
 (allow mach-lookup (global-name "com.apple.system.logger"))
 (allow signal (target self))
+(deny process-info*)
 (allow process-info-pidinfo (target self))
 """
+# Both the `sysctl-read` filter and the explicit `process-info*` deny are needed. KERN_PROCARGS2
+# on the parent returns its argv and *environment* (any same-user process's, in fact), which
+# undoes `env={}`, and the read succeeds if EITHER rule lets it through: a blanket
+# `(allow sysctl-read)` leaks, and `(deny default)` alone does not cover `process-info*`.
 
 
 def _apply_seatbelt() -> bool:
