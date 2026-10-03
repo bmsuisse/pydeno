@@ -161,3 +161,13 @@ def test_a_confined_macos_worker_cannot_create_sysv_objects() -> None:
         timeout=60,
     ).stdout.strip()
     assert out == "True"  # unconfined, it can: so the probe in attest() is meaningful
+
+
+def test_a_worker_that_was_orphaned_refuses_to_run_its_self_test(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import os
+
+    from pydeno import _sandbox
+
+    monkeypatch.setattr(os, "getppid", lambda: 1)
+    with pytest.raises(RuntimeError, match="orphaned"):
+        _sandbox.attest()

@@ -38,6 +38,8 @@ TABLES = json.loads((Path(__file__).parent / "data" / "syscalls.json").read_text
 
 # What a compromised worker would reach for, grouped by what it would buy.
 MUST_BLOCK = {
+    # memory the worker's RSS never shows: 200 memfds of 1 MiB held ~208 MiB past max_memory
+    "hidden memory": ["memfd_create"],
     "new processes / other processes": [
         "execve",
         "execveat",
