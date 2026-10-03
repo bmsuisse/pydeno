@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -73,7 +74,9 @@ _CONFIG_KEYS = (
     "max_serialization_bytes",
     "force_kill_grace",
 )
-_UNSUPPORTED_CONFIG = ("inspector",)
+# `snapshot` is refused, not ignored: RuntimeConfig forbids a snapshot together with a bootstrap,
+# so dropping it would also drop the bootstrap the caller meant to be in force.
+_UNSUPPORTED_CONFIG = ("inspector", "snapshot")
 
 _MAX_REMOTE_MESSAGE = 64 * 1024
 _POLL_SECONDS = 0.1
@@ -328,6 +331,13 @@ class IsolatedRuntime:
                 )
 
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
+        if max_memory is not None and self._config["max_buffer_bytes"] is None:
+            # ArrayBuffer storage is outside the V8 heap, so `max_heap_size` cannot bound it, and
+            # without a cap a `new Uint8Array(2 ** 31)` is only caught by the RSS poll, which kills
+            # the whole worker. With a cap the guest gets a catchable RangeError and the session
+            # survives. (No default heap cap: with one, V8 turns an over-cap allocation into a
+            # fatal "heap limit exceeded" instead of that RangeError.)
+            self._config["max_buffer_bytes"] = max_memory // 4
         self._soft_timeout = _seconds(config.timeout)
         self._max_memory = max_memory
         # Three states: unset (soft timeout + grace, else a default ceiling), a number,
@@ -461,6 +471,17 @@ class IsolatedRuntime:
                 raise _wire.WireError("bad ready frame")
             self.sandbox = applied
             self.sandbox_extras = list(extras)
+            missing = (
+                _sandbox.missing_layers(applied) if applied != "off" else frozenset()
+            )
+            if missing and self._options["sandbox"] == "auto":
+                warnings.warn(
+                    f"IsolatedRuntime is running with a degraded OS sandbox ({applied!r}; "
+                    f"missing {sorted(missing)}). Untrusted code has less containment than "
+                    "intended; pass sandbox='require' to refuse instead.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
             self.v8_flags = list(self._options["v8_flags"])
         except TimeoutError:
             self._kill()

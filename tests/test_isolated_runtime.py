@@ -357,7 +357,13 @@ class TestContainment:
     def test_memory_ceiling_kills_the_worker(self) -> None:
         if sys.platform not in ("linux", "darwin"):
             pytest.skip("RSS polling is implemented for Linux and macOS")
-        rt = IsolatedRuntime(RuntimeConfig(), max_memory=300 * MIB, request_timeout=30)
+        # An explicit big buffer cap: the default one would turn this into a catchable RangeError,
+        # and this test is about the RSS ceiling behind it.
+        rt = IsolatedRuntime(
+            RuntimeConfig(max_buffer_bytes=8192 * MIB),
+            max_memory=300 * MIB,
+            request_timeout=30,
+        )
         with pytest.raises(WorkerCrashed, match="max_memory"):
             rt.eval("new Uint8Array(1500 * 1024 * 1024).fill(1).length")
         assert rt.is_closed()
@@ -393,7 +399,11 @@ class TestContainment:
         """The in-worker watchdog fires before the parent's poll, with its own exit code."""
         if sys.platform not in ("linux", "darwin"):
             pytest.skip("RSS reading is implemented for Linux and macOS")
-        rt = IsolatedRuntime(RuntimeConfig(), max_memory=200 * MIB, request_timeout=30)
+        rt = IsolatedRuntime(
+            RuntimeConfig(max_buffer_bytes=8192 * MIB),
+            max_memory=200 * MIB,
+            request_timeout=30,
+        )
         rt._max_memory = None  # noqa: SLF001 - disable the parent's check; only the worker's remains
         with pytest.raises(WorkerCrashed, match="went over max_memory"):
             rt.eval("new Uint8Array(900 * 1024 * 1024).fill(1); for (;;) {}")

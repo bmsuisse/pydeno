@@ -124,6 +124,23 @@ _FROZEN_CLOCK_JS = """
     { value: Patched, writable: true, configurable: true });
   Object.defineProperty(globalThis, 'Date', { value: Patched, writable: true, configurable: true });
 
+  // `Temporal.Now` is a second wall clock, with nanosecond resolution, that `Date` never sees.
+  if (typeof Temporal !== 'undefined' && Temporal.Now) {
+    const T = Temporal;
+    const instant = () => T.Instant.fromEpochMilliseconds(frozen);
+    const zoned = (tz = 'UTC') => instant().toZonedDateTimeISO(tz);
+    const now = {
+      instant,
+      timeZoneId: () => 'UTC',
+      zonedDateTimeISO: zoned,
+      plainDateTimeISO: (tz) => zoned(tz).toPlainDateTime(),
+      plainDateISO: (tz) => zoned(tz).toPlainDate(),
+      plainTimeISO: (tz) => zoned(tz).toPlainTime(),
+    };
+    Object.defineProperty(T, 'Now',
+      { value: Object.freeze(now), writable: false, configurable: false });
+  }
+
   if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
     const proto = Intl.DateTimeFormat.prototype;
     const format = Object.getOwnPropertyDescriptor(proto, 'format');
@@ -330,8 +347,11 @@ class _Worker:
             reply = {"t": "error", "id": cmd_id, "kind": kind, "msg": str(exc)}
         try:
             self._writer.send(reply)
-        except _wire.WireError as exc:
-            # The result itself could not be encoded (e.g. a JS function handle).
+        except (_wire.WireError, ValueError) as exc:
+            # The result itself could not be encoded: a JS function handle, or a BigInt past
+            # Python's int-to-str digit limit (a ValueError). Encoding fails before anything is
+            # written, so an error reply is safe, and the guest must not be able to end the
+            # session by returning one.
             self._writer.send(
                 {"t": "error", "id": cmd_id, "kind": "TypeError", "msg": str(exc)}
             )
