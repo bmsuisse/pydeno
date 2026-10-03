@@ -247,6 +247,20 @@ sandbox? Please report it privately, as described in [`SECURITY.md`](SECURITY.md
 
 Licensed under the [MIT License](LICENSE).
 
+## Acknowledgements
+
+pydeno began as a fork of [**jsrun**](https://github.com/imfing/jsrun) by Xin Fu, which had the
+original idea of a Python library that runs JavaScript on a Rust runtime built on `deno_core`. We took
+that idea and its foundations, then changed a great deal: the sandboxed worker process and OS
+confinement, the tool boundary, the wire codec, the resource limits, and most of the tests are new.
+Thank you to jsrun for the starting point. The [MIT licence and original copyright](LICENSE) are kept,
+and [`docs/contributing/upstream-divergence.md`](docs/contributing/upstream-divergence.md) records
+what came from where.
+
+Thanks also to [Monty](https://github.com/pydantic/monty) by Pydantic, whose design for running
+agent-written code (limits, host functions, a public challenge to break it) shaped how we think about
+this problem; the two sandboxes work well side by side.
+
 [v8]: https://v8.dev
 [deno_core]: https://crates.io/crates/deno_core
 [monty]: https://github.com/pydantic/monty
