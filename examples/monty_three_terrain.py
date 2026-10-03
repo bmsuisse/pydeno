@@ -247,6 +247,10 @@ class TerrainPipeline:
         self.monty.__exit__(None, None, None)
 
 
+SIZES = [33, 65, 129, 193]
+PIPELINE = TerrainPipeline
+
+
 def main() -> None:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 129
     pipe = TerrainPipeline()

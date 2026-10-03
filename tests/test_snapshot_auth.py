@@ -172,3 +172,42 @@ class TestWithRealSnapshots:
         blob = sign_snapshot(self._snapshot(), OTHER_KEY)
         with pytest.raises(SnapshotAuthenticationError):
             verify_snapshot(blob, KEY)
+
+
+class TestEngineVersionIsBound:
+    """An authentic snapshot from another release must be refused before V8 sees it: V8 answers a
+    snapshot from a different build by aborting the process."""
+
+    def test_a_snapshot_signed_by_another_release_is_refused(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from pydeno import _snapshot_auth as auth
+
+        key = b"k" * 32
+        monkeypatch.setattr(auth, "_engine_version", lambda: b"0.0.1-older")
+        blob = auth.sign_snapshot(b"payload", key)
+        monkeypatch.undo()
+        with pytest.raises(auth.SnapshotAuthenticationError, match="made by pydeno"):
+            auth.verify_snapshot(blob, key)
+
+    def test_the_same_release_round_trips(self) -> None:
+        from pydeno import _snapshot_auth as auth
+
+        key = b"k" * 32
+        assert (
+            auth.verify_snapshot(auth.sign_snapshot(b"payload", key), key) == b"payload"
+        )
+
+    def test_the_version_cannot_be_edited_without_the_key(self) -> None:
+        from pydeno import _snapshot_auth as auth
+
+        key = b"k" * 32
+        blob = bytearray(auth.sign_snapshot(b"payload", key))
+        # flip a byte of the recorded version: the MAC covers it, so this is tampering
+        blob[len(auth._MAGIC) + 1] ^= 1  # noqa: SLF001
+        with pytest.raises(auth.SnapshotAuthenticationError):
+            auth.verify_snapshot(bytes(blob), key)
+
+    def test_the_old_format_is_refused(self) -> None:
+        from pydeno import _snapshot_auth as auth
+
+        with pytest.raises(auth.SnapshotAuthenticationError):
+            auth.verify_snapshot(b"pydeno-snap1\x00" + b"\x00" * 64, b"k" * 32)

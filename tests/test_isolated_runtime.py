@@ -1338,6 +1338,12 @@ _FAKE = textwrap.dedent(
         # a compromised worker hammering the parent with host calls
         for i in range(1, 100000):
             send({"t": "call", "cid": i, "hid": 1, "args": []})
+    elif MODE == "alloc_during_call":
+        # a compromised worker that starts a host call, then eats memory while the parent's
+        # handler is still running (so the parent's pump is stuck inside the handler)
+        send({"t": "call", "cid": 1, "hid": 1, "args": []})
+        big = bytearray(b"x" * (300 << 20)); copy = bytes(big)
+        time.sleep(30)
     elif MODE == "dup_result":
         send({"t": "result", "id": cmd["id"], "v": 1})
         send({"t": "result", "id": cmd["id"], "v": 2}); time.sleep(30)
@@ -1538,3 +1544,43 @@ class TestWorkerCannotForgeCapabilityBookkeeping:
         text = str(excinfo.value)
         assert "\x1b" not in text and "\x07" not in text
         assert "at line 2" in text  # newlines survive: a JS stack is made of them
+
+
+class TestSupervisionWhileAHostHandlerRuns:
+    """The pump supervises memory, but it is blocked while a synchronous host handler runs, and a
+    compromised worker can allocate exactly then. The watchdog thread covers that window."""
+
+    def test_memory_is_enforced_while_the_pump_is_inside_a_slow_handler(
+        self, tmp_path: Path
+    ) -> None:
+        import threading
+
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "alloc_during_call"),
+            max_memory=150 * MIB,
+            request_timeout=60,
+        )
+        rt._handlers[1] = (lambda: time.sleep(8), False)  # noqa: SLF001 - a slow sync handler
+        outcome: list[object] = []
+
+        def run() -> None:
+            try:
+                outcome.append(rt.eval("1"))
+            except BaseException as exc:  # noqa: BLE001
+                outcome.append(exc)
+
+        t = threading.Thread(target=run, daemon=True)
+        start = time.monotonic()
+        t.start()
+        proc = rt._proc  # noqa: SLF001
+        while proc.poll() is None and time.monotonic() - start < 6:
+            time.sleep(0.05)
+        killed_after = time.monotonic() - start
+        assert proc.poll() is not None, (
+            "the worker was left running over its memory ceiling"
+        )
+        # long before the 8 s handler returned: the memory was reclaimed while the pump was stuck
+        assert killed_after < 5, killed_after
+        t.join(30)
+        assert isinstance(outcome[0], WorkerCrashed), outcome

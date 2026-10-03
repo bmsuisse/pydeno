@@ -124,6 +124,45 @@ Python crunched the numbers; JavaScript drew the chart with [Vega-Lite](https://
 each sandbox refused its own attempt to reach outside, and both drew on the same five-call tool
 budget. Full runnable example: [`examples/monty_and_pydeno.py`](examples/monty_and_pydeno.py).
 
+### More of the same: Python prepares, JavaScript builds
+
+Monty is excellent at the data half, and the JavaScript ecosystem has libraries nothing in Python
+matches. Each example below is a complete, tested program: the model's Python runs in Monty, the
+model's JavaScript runs in pydeno, neither can reach your files, network or environment, and each
+test checks the answer against an independent computation (and Monty's against CPython's).
+
+| Example | Monty (Python) does | pydeno (JavaScript) does | Produces |
+|---|---|---|---|
+| [3D terrain](examples/monty_three_terrain.py) | layered value-noise heightmap, slope analysis, tree placement | [three.js](https://threejs.org): mesh, normals, vertex colours by slope, instanced trees, raycast line-of-sight | `.glb` 3D model |
+| [Orbits](examples/monty_three_orbits.py) | symplectic N-body integrator (figure-eight choreography), energy drift | three.js: speed-coloured tube trails, closest-approach analysis | `.glb` 3D model |
+| [City sun analysis](examples/monty_three_city.py) | procedural city layout and zoning | three.js: extruded buildings, a raycast from every roof to the sun, shade ranking | `.glb` with per-building sunlight |
+| [Dependency network](examples/monty_d3_network.py) | synthetic package graph, PageRank, components | [d3](https://d3js.org): force layout run to convergence, Voronoi cells, treemap | one self-contained SVG |
+| [Dashboard](examples/monty_echarts_dashboard.py) | a year of metrics: moving average, z-score anomalies, correlations, regression | [ECharts](https://echarts.apache.org): four-panel dashboard, server-side | HTML page with inline SVG, no scripts |
+| [Geospatial](examples/monty_turf_geo.py) | fleet GPS tracks, cleaning and resampling | [turf.js](https://turfjs.org): buffer union, hulls, Voronoi service zones, nearest depot | GeoJSON and an SVG map |
+| [SQL to chart](examples/monty_sql_charts.py) | answers a business question through a read-only SQL tool | [Vega-Lite](https://vega.github.io/vega-lite/): bars, stacked bars, cohort heatmap | SVG charts |
+| [Spreadsheet to deck](examples/monty_spreadsheet_deck.py) | analyses a sheet through a read-only wrapper | [pptxgenjs](https://gitbrent.github.io/PptxGenJS/): native charts, tables, narrative | `.pptx` board deck |
+
+How fast are they together? One warm worker, median of three, on an Apple-silicon Mac, with V8 in
+its secure default (`jitless`) and with the JIT turned on:
+
+| Example | jitless (default) | V8 JIT on | JIT speed-up |
+|---|---:|---:|---:|
+| three.js terrain (129x129 grid) | 879 ms | 180 ms | 4.9x |
+| three.js N-body orbits (3000 steps) | 247 ms | 172 ms | 1.4x |
+| three.js city sun analysis (6x6 blocks) | 210 ms | 27 ms | 7.9x |
+| d3 network layout (200 packages) | 1,619 ms | 198 ms | 8.2x |
+| ECharts dashboard (365 days x 4 regions) | 64 ms | 42 ms | 1.5x |
+| turf geospatial (8 vehicles) | 1,937 ms | 347 ms | 5.6x |
+| SQL question to Vega-Lite chart (4000 orders) | 18 ms | 17 ms | 1.1x |
+| spreadsheet to PowerPoint (1000 rows) | 70 ms | 31 ms | 2.3x |
+
+Most turns finish in well under a second even in the secure mode; Monty's data half stays within
+about 1.1x of plain CPython. The JIT matters for compute-heavy JavaScript (layouts, raycasting), and
+it is exactly the part of V8 where most exploits live, which is why it is off by default. If you
+trust the code a little more, `IsolatedRuntime(jitless=False)` buys the second column and still
+runs behind the full OS sandbox. Reproduce with
+[`benches_py/monty_three_bench.py`](benches_py/monty_three_bench.py).
+
 ## How it works
 
 ```mermaid

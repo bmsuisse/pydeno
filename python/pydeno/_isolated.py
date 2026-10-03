@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
+import functools
 import contextvars
 import inspect
 import itertools
@@ -35,7 +37,8 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -491,10 +494,17 @@ class IsolatedRuntime:
             self, _terminate_process, self._proc, self._stderr
         )
         self._owner_pid = os.getpid()
+        # Asynchronous host calls still running, across commands: `max_inflight_host_calls` is a
+        # cap on these, not on one command's, or 1000 commands could each leave 64 behind.
+        self._async_inflight = 0
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_lock = threading.Lock()
+        self._async_inflight_lock = threading.Lock()
         # Recently revoked handler ids, oldest first (bounded): see `_on_call`.
         self._revoked_hids: dict[int, None] = {}
         _LIVE.add(self)
         self._handshake()
+        self._check_limits_can_be_enforced()
         if prewarm and python is None:
             _refill_spare()
         self._idle_since = time.monotonic()
@@ -507,6 +517,34 @@ class IsolatedRuntime:
         ).start()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _check_limits_can_be_enforced(self) -> None:
+        """A limit that cannot be measured is a limit that is not there.
+
+        Memory and CPU are read from outside (`/proc` on Linux, `proc_pidinfo` on macOS). On a
+        system where that read fails (a hardened /proc mount, a missing libproc) the checks would
+        quietly never fire while `sandbox` still reports success. Say so, and under
+        `sandbox="require"`, which promises a complete sandbox, refuse to start."""
+        missing = []
+        if self._max_memory is not None and _sandbox.rss_bytes(self._proc.pid) is None:
+            missing.append("max_memory")
+        if _sandbox.cpu_seconds(self._proc.pid) is None:
+            missing.append("the CPU cap")
+        if not missing:
+            return
+        what = " and ".join(missing)
+        if self._options["sandbox"] == "require":
+            self._kill()
+            raise WorkerCrashed(
+                f"{what} cannot be enforced on this system (the worker's resource usage "
+                "cannot be read) and sandbox='require' demands every protection"
+            )
+        warnings.warn(
+            f"{what} cannot be enforced on this system: the worker's resource usage cannot be "
+            "read, so those limits will never fire.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def _handshake(self) -> None:
         try:
@@ -649,6 +687,8 @@ class IsolatedRuntime:
         if os.getpid() != self._owner_pid:
             self._drop_inherited()
             return
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
         if not self._closed:
             self._closed = True
             try:
@@ -677,6 +717,28 @@ class IsolatedRuntime:
             return self._request_timeout  # a number, or None: the caller opted out
         return DEFAULT_REQUEST_TIMEOUT if soft is None else soft + self._grace
 
+    @contextlib.contextmanager
+    def _command_slot(self, soft_timeout: float | None) -> Iterator[None]:
+        """Hold the runtime for one command, but never wait for it forever.
+
+        Commands run one at a time. A host function that hands work to *another* thread which then
+        calls back into this runtime waits on the lock its own command holds: the re-entrancy guard
+        cannot see it (it is another thread), and the pump that enforces the deadline is the thread
+        stuck in that host function, so nothing would ever time it out. Bounding the wait by the
+        request's own deadline turns that deadlock into an error the guest can see."""
+        hard = self._hard_timeout(soft_timeout)
+        wait = -1 if hard is None else hard + self._grace
+        if not self._lock.acquire(timeout=wait):
+            raise RuntimeTimeout(
+                "timed out waiting for another command on this IsolatedRuntime to finish "
+                "(a host function that waits on another thread which calls back into the "
+                "same runtime would deadlock)"
+            )
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     def _request(
         self,
         message: dict[str, Any],
@@ -684,15 +746,12 @@ class IsolatedRuntime:
         soft_timeout: float | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> Any:
-        if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
-            raise RuntimeError(
-                "an IsolatedRuntime cannot be re-entered from its own host functions"
-            )
+        self._refuse_reentry()
         if os.getpid() != self._owner_pid:
             raise RuntimeError(
                 "this IsolatedRuntime belongs to the process that created it, not to a fork() of it"
             )
-        with self._lock:
+        with self._command_slot(soft_timeout):
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
             message["id"] = cmd_id = next(self._cmd_ids)
@@ -784,9 +843,16 @@ class IsolatedRuntime:
         raise remote
 
     def _idle_check(self) -> None:
-        """One pass of the idle watchdog. Skips itself while a command holds the runtime: the
-        pump supervises then."""
+        """One pass of the idle watchdog. While a command holds the runtime the pump supervises
+        (deadline, CPU, memory), except that the pump can be stuck inside a host handler for as
+        long as the handler takes, and a hostile worker can allocate then. So memory and thread
+        count are still checked here, without taking the lock."""
         if not self._lock.acquire(blocking=False):
+            if not self._closed:
+                try:
+                    self._check_memory()
+                except WorkerCrashed:
+                    pass  # killed; the pump sees the pipe close and reports it
             return
         try:
             if self._closed:
@@ -909,7 +975,10 @@ class IsolatedRuntime:
         # All the arguments under one budget: decoding each on its own would multiply the limit
         # by the argument count.
         decoded = args  # `loads_decoded` already decoded them, under one shared budget
-        if self._max_inflight is not None and pump.outstanding >= self._max_inflight:
+        if self._max_inflight is not None and (
+            pump.outstanding >= self._max_inflight
+            or self._async_inflight >= self._max_inflight
+        ):
             # Refused rather than run: the guest sees an error for this call, and nothing the
             # host owns is touched. Without a cap the number of asynchronous calls (and the
             # tasks and memory behind them) is whatever the guest asks for.
@@ -926,10 +995,14 @@ class IsolatedRuntime:
         pump.begin_call()
         if is_async and pump.loop is not None:
             coro = _call_guarded(handler, decoded)
+            with self._async_inflight_lock:
+                self._async_inflight += 1
             try:
                 future = asyncio.run_coroutine_threadsafe(coro, pump.loop)
             except Exception as exc:  # noqa: BLE001 - e.g. the caller's loop has closed
                 coro.close()
+                with self._async_inflight_lock:
+                    self._async_inflight -= 1
                 self._send_reply(self._error(cid, exc), pump)
                 return
             future.add_done_callback(
@@ -953,6 +1026,8 @@ class IsolatedRuntime:
         return _error_reply(cid, exc, redact=self._redact)
 
     def _finish_async_call(self, cid: int, pump: _Pump, future: Any) -> None:
+        with self._async_inflight_lock:
+            self._async_inflight -= 1
         try:
             reply = {"t": "reply", "cid": cid, "v": _wire.Enc(future.result())}
         except BaseException as exc:  # noqa: BLE001
@@ -995,13 +1070,44 @@ class IsolatedRuntime:
         loop = asyncio.get_running_loop()
         message = {"t": "eval_async", "code": code, "timeout": soft}
         try:
-            return await asyncio.to_thread(
-                self._request, message, soft_timeout=soft, loop=loop
-            )
+            return await self._in_own_thread(message, soft, loop)
         except asyncio.CancelledError:
             # The thread cannot be interrupted, and the worker is mid-command.
             self._kill()
             raise
+
+    def _refuse_reentry(self) -> None:
+        """A host function must not call back into the runtime that is waiting for it."""
+        if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
+            raise RuntimeError(
+                "an IsolatedRuntime cannot be re-entered from its own host functions"
+            )
+
+    def _own_executor(self) -> ThreadPoolExecutor:
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="pydeno-command"
+                )
+            return self._executor
+
+    async def _in_own_thread(
+        self,
+        message: dict[str, Any],
+        soft: float | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Any:
+        """Run a command off the caller's event loop on a thread this runtime owns.
+
+        `asyncio.to_thread` would use the loop's *default* executor, shared with everything else
+        in the application. A command can sit in a host callback for minutes, so a handful of
+        runtimes parked on slow tools would starve every other `to_thread` or
+        `run_in_executor(None)` in the process. One thread per runtime cannot."""
+        # Before queueing, not only inside `_request`: the runtime's thread is busy with the very
+        # command this call came from, so a queued re-entrant call would wait behind it forever.
+        self._refuse_reentry()
+        call = functools.partial(self._request, message, soft_timeout=soft, loop=loop)
+        return await loop.run_in_executor(self._own_executor(), call)
 
     def _register_token(self, token: int, hid: int) -> None:
         """Remember which host handler a worker-chosen token stands for.
@@ -1135,9 +1241,7 @@ class IsolatedRuntime:
         loop = asyncio.get_running_loop()
         message = {"t": "eval_module_async", "specifier": specifier, "timeout": soft}
         try:
-            return await asyncio.to_thread(
-                self._request, message, soft_timeout=soft, loop=loop
-            )
+            return await self._in_own_thread(message, soft, loop)
         except asyncio.CancelledError:
             self._kill()  # the thread cannot be interrupted, and the worker is mid-command
             raise
