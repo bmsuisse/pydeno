@@ -27,6 +27,7 @@ import ctypes.util
 import os
 import platform
 import resource
+import socket
 import struct
 import sys
 import threading
@@ -714,6 +715,74 @@ def apply(*, empty_root: bool = True) -> str:
         # seccomp last, with TSYNC, so it also covers any thread that already exists.
         attempt("seccomp", lambda: _seccomp_is_safe_here() and _apply_seccomp(), layers)
     return "+".join(layers) or "none"
+
+
+def _procargs_of_parent() -> bool:
+    """macOS: can this process read its parent's argv and environment (KERN_PROCARGS2)?"""
+    libc = _libc()
+    mib = (ctypes.c_int * 3)(1, 49, os.getppid())  # CTL_KERN, KERN_PROCARGS2, pid
+    buf = ctypes.create_string_buffer(4096)
+    size = ctypes.c_size_t(len(buf))
+    return libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0
+
+
+def attest() -> list[str]:
+    """Try, from inside the confined process, the things the sandbox exists to stop, and return
+    the ones that worked. Empty means every probe was refused.
+
+    The layers are assembled from lists of what to deny, and a list is only as good as its last
+    review: the macOS profile once let the worker read the host's environment through a sysctl
+    nobody had thought of. This does not trust the lists. It asks the kernel, once, before any
+    guest code exists, so a hole of that kind stops the worker from starting instead of waiting
+    for a reviewer. Every probe is a refusal we expect, so it costs a handful of syscalls.
+    """
+    breaches: list[str] = []
+    ppid = os.getppid()
+
+    def probe(name: str, attempt: Callable[[], object]) -> None:
+        try:
+            attempt()
+        except Exception:
+            return  # refused (or impossible), which is the answer we want
+        breaches.append(name)
+
+    def read(path: str) -> None:
+        with open(path, "rb") as fh:
+            fh.read(1)
+
+    def write() -> None:
+        path = f"/tmp/.pydeno-attest-{os.getpid()}"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        os.unlink(path)
+
+    def spawn() -> None:
+        pid = os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], {})
+        os.waitpid(pid, 0)
+
+    def network() -> None:
+        # Seatbelt lets `socket()` succeed and refuses the connect, so test the connect, and
+        # accept only the sandbox's own refusal: "connection refused" means the attempt got out.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            try:
+                s.connect(("127.0.0.1", 9))
+            except PermissionError:
+                raise
+            except OSError:
+                return  # reached the network stack and failed there: not refused by the sandbox
+
+    probe("read-file", lambda: read("/etc/hosts"))
+    probe("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
+    probe("write-file", write)
+    probe("spawn-process", spawn)
+    probe("network-socket", network)
+    probe("signal-parent", lambda: os.kill(ppid, 0))
+    if sys.platform == "darwin":
+        # `probe` treats a raised exception as "refused", and this one signals by return value.
+        if _procargs_of_parent():
+            breaches.append("read-parent-argv-environ")
+    return breaches
 
 
 # What "every layer this platform has" means, for `sandbox="require"`. Anything else is a

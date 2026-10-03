@@ -362,6 +362,16 @@ class _Worker:
             if mode == "off"
             else _sandbox.apply(empty_root=bool(options.get("empty_root", True)))
         )
+        if applied != "none" and not _sandbox.missing_layers(applied):
+            # Ask the kernel rather than trust the filter lists: if the platform's full sandbox
+            # claims to be on and a forbidden operation still works, no guest code may run in
+            # this process. (A degraded one, say a kernel without Landlock, is expected to leak.)
+            breaches = _sandbox.attest()
+            if breaches:
+                raise RuntimeError(
+                    f"sandbox self-test failed: the worker could still {breaches} "
+                    f"(applied: {applied})"
+                )
         if mode == "require":
             # "require" means every layer this platform has, not "at least one": a kernel that
             # lacks Landlock must not be allowed to pass for a fully sandboxed one.
