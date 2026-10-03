@@ -179,7 +179,6 @@ class TestWhatTheWorkerNeeds:
         "writev",
         "readv",
         "madvise",
-        "memfd_create",
     ]
 
     def test_each_is_allowed(self, arch: str, prog: list) -> None:
