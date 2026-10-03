@@ -609,7 +609,9 @@ class IsolatedRuntime:
             raise
 
     def _describe_death(self, prefix: str) -> str:
-        if self._kill_reason is not None:  # the watchdog killed it and kept the reason for us
+        if (
+            self._kill_reason is not None
+        ):  # the watchdog killed it and kept the reason for us
             return self._kill_reason
         code = self._proc.poll()
         if code is None:
@@ -915,9 +917,7 @@ class IsolatedRuntime:
         self._last_rss_check = now
         threads = _sandbox.thread_count(self._proc.pid)
         if threads is not None and threads > _MAX_WORKER_THREADS:
-            self._kill_reason = (
-                f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
-            )
+            self._kill_reason = f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
             self._kill()
             raise WorkerCrashed(self._kill_reason)
         if self._max_memory is None:
