@@ -252,8 +252,7 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   SandboxJS, isolated-vm and Monty were attacked. The result is a findings table that lists the
   misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
   let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
-  Read it in the **[security report](docs/security-report.md)**, and try to beat it in
-  **[Hack pydeno](docs/hack-pydeno.md)**.
+  Read it in the **[security report](docs/security-report.md)**.
 
 ## Performance
 

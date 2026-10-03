@@ -59,7 +59,6 @@ nav:
       - Serverless Runtime: use-cases/serverless-runtime.md
       - Workflow Orchestration: use-cases/workflow.md
   - Security report: security-report.md
-  - Hack pydeno: hack-pydeno.md
   - API Reference:
       - pydeno Module: api/pydeno.md
       - Runtime: api/runtime.md

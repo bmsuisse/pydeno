@@ -58,7 +58,8 @@ Three rounds, each with a different method:
   second-pass block of denials sitting in the wrong table, missing x86_64 legacy syscalls, two
   memory-ceiling tests that raced the deadline.
 - **Round 3 (the new code).** The same three reviewers read what round 2 added: the self-test, agent
-  sessions, the challenge server and the bridge fix, and looked for ways around the fixes.
+  sessions, a prototype public-challenge server and the bridge fix, and looked for ways around the
+  fixes.
 - **Round 2 (after 0.5.0).** Three AI reviewers were given separate slices and told to *reproduce
   before reporting*: one for the OS layer, one for the host/worker boundary and the engine, one for
   the guest surface and the tests. A second pass looked for "lockdown opportunities". Their reports
@@ -141,16 +142,14 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 
 ### Round 3: review of the new code
 
-The code added in round 2 (self-test, agent sessions, the public challenge server, the bridge fix)
-was reviewed again by three reviewers, with the same "reproduce before reporting" rule.
+The code added in round 2 (self-test, agent sessions, the bridge fix, and a prototype server for a
+public "hack pydeno" challenge) was reviewed again by three reviewers, with the same "reproduce
+before reporting" rule. The challenge server was then **dropped from the release**: it is not shipped and
+not supported, so its findings are summarised in one line below.
 
 | Finding | Status |
 |---|---|
-| **Challenge server:** slowloris took the whole server down (a thread per half-open connection) | **Fixed.** Socket timeout and a connection cap. |
-| **Challenge server:** a client that hung up before the answer was never logged, so code could run without leaving its hash | **Fixed.** The record is written *before* the response is sent. |
-| **Challenge server:** the leak alarm was plain substring matching (base64, hex, reversed, case-folded all passed) | **Mitigated.** Those forms are redacted and alarm; it remains a best-effort alarm, documented as such. |
-| **Challenge server:** a second `X-Forwarded-For` line bypassed the rate limiter; unbounded, unvalidated keys | **Fixed.** Every line counts, the last hop is used, only a real address is a key. |
-| **Challenge server:** `NaN` produced invalid JSON; malformed requests unlogged; secret and log files created with the umask | **Fixed.** |
+| A prototype challenge server had a slowloris, unlogged hang-ups, an evadable leak alarm, a rate-limit bypass and file-permission gaps | **Found and fixed in the prototype, then the prototype was removed from the release.** Not shipped. |
 | macOS: a confined worker could create SysV semaphores, shared memory and message queues that outlive it (a small system-wide table) | **Fixed.** Denied by syscall; self-test probes it. |
 | Linux: `READ_IMPLIES_EXEC` inherited from a parent personality defeats the no-executable-mapping rule | **Fixed.** Cleared before seccomp. |
 | `attest()` counted any `OSError` (even ENOENT) as a refusal | **Partly fixed.** A path-independent `execve` probe (Linux) was added; path probes remain and are weaker where a distroless image has no `/bin/sh` or `/etc/hosts`. |
@@ -163,7 +162,6 @@ was reviewed again by three reviewers, with the same "reproduce before reporting
 | macOS: path existence is observable (`stat` answers EPERM for a path that exists and ENOENT for one that does not); XNU build string and CPU/memory counts are readable | **Open, known.** Seatbelt cannot hide existence; Linux with only Landlock has the same oracle. |
 | Linux: the thread cap is sampled, not kernel-enforced | **Open.** A pids cgroup or `RLIMIT_NPROC` in the new user namespace is planned. |
 | Hosts that mount `/proc` with `hidepid` make the worker's usage unreadable | **Open.** `require` refuses to start there (fail closed); `auto` warns. |
-| Challenge: the worker and `secret.txt` share a uid inside the container (Landlock is the only barrier); no enforced egress block | **Open.** Documented for the operator. |
 
 ### Rejected after measuring
 
@@ -212,5 +210,4 @@ python benches_py/monty_three_bench.py       # the speed numbers above
 ```
 
 Found something this report missed? Please report it privately as described in
-[`SECURITY.md`](https://github.com/bmsuisse/pydeno/blob/main/SECURITY.md), or try the public
-[Hack pydeno](hack-pydeno.md) challenge.
+[`SECURITY.md`](https://github.com/bmsuisse/pydeno/blob/main/SECURITY.md).

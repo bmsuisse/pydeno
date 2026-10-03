@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 — unreleased
+## 0.6.0 — 2026-10-03
 
 Sandbox hardening round 2 (independent review by three models and Copilot, plus prior-art research),
 agent sessions, and a pydantic-ai integration. See [`docs/security-report.md`](docs/security-report.md)
@@ -55,8 +55,7 @@ for every finding and its status.
 - **Examples:** Monty prepares data and pydeno builds the result: three.js terrain, orbits and a city
   sun analysis; a d3 network; an ECharts dashboard; turf geospatial; a SQL question to a Vega-Lite chart;
   a spreadsheet to a PowerPoint deck. Vendored d3, ECharts and turf bundles (SHA-256 pinned).
-- `docs/security-report.md`, `docs/hack-pydeno.md` and the `challenge/` kit; `security.yml` (cargo-deny,
-  cargo-audit, pip-audit, OSV).
+- `docs/security-report.md`; `security.yml` (cargo-deny, cargo-audit, pip-audit, OSV).
 
 ## 0.5.0 — 2026-10-03
 
