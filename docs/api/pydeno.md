@@ -12,3 +12,4 @@ Each asyncio task or thread gets its own isolated runtime, created lazily and cl
         - bind_object
         - get_default_runtime
         - close_default_runtime
+        - configure_default_runtime

@@ -227,7 +227,7 @@ Snapshots use `deno_core::JsRuntimeForSnapshot` to capture V8 heap state:
 
 1. Create builder with optional bootstrap script
 2. Execute initialization code (libraries, polyfills, etc.)
-3. Call `create_snapshot()` to serialize heap to bytes
+3. Call `build()` to serialize heap to bytes
 4. Pass snapshot to `RuntimeConfig` when creating new runtimes
 5. New runtimes start with pre-initialized state, skipping bootstrap
 
@@ -246,6 +246,24 @@ Snapshots reduce cold-start time for frequently-used libraries or configurations
 - Use pytest fixtures and context managers
 
 When adding features, add tests at both layers.
+
+**Isolation tests** (`IsolatedRuntime`, the worker, the OS sandbox):
+- `tests/test_isolated_*.py` (behaviour, lifecycle, limits, determinism, fuzz),
+  `tests/test_redteam_syscalls.py` (assume-breach: fires dangerous syscalls from a sandboxed process,
+  Linux, container only), `tests/test_sandbox_syscall_tables.py` (every seccomp number checked against
+  `tests/data/syscalls.json`, which comes from the kernel's own tables).
+- Platform-specific tests are **deselected, never skipped** (`tests/conftest.py`; markers `linux_only`,
+  `darwin_only`, `full_sandbox`, `redteam`, `as_root`), because CI enforces a zero-skip budget.
+  Deliberate expected failures are `xfail`, budgeted separately (`MAX_XFAILED`).
+- Run Linux in containers, not on the Mac: `scripts/linux_matrix.sh WHEELS IMAGE [PROFILE]`
+  (podman or docker; profiles `default|no-landlock|no-seccomp|none` simulate kernels that lack a
+  feature). Build the wheel with `ghcr.io/pyo3/maturin build`. Containers share the host kernel, so
+  the kernel itself cannot vary.
+- Run tests with `.venv/bin/python -m pytest`, **not `uv run`**: `uv run` re-syncs the editable package
+  and can trigger a multi-GB Rust rebuild. Watch disk: a full `target/` is ~5 GB, and the podman VM
+  disk only grows.
+- `scripts/redteam_syscalls.py` fires every syscall and refuses to run outside a container
+  (`PYDENO_REDTEAM_CONTAINER=1`; use `--network none --cap-drop all`).
 
 ## Documentation Structure
 
@@ -398,7 +416,7 @@ from pydeno import SnapshotBuilder
 # Create snapshot with bootstrap code
 builder = SnapshotBuilder()
 builder.execute_script("myLib.js", "globalThis.myLib = { version: '1.0' };")
-snapshot = builder.create_snapshot()
+snapshot = builder.build()
 
 # Use snapshot when creating runtimes
 from pydeno import Runtime, RuntimeConfig
@@ -493,3 +511,5 @@ asyncio.run(main())
 6. **Context-local runtime confusion**: Each asyncio task and thread gets its own isolated runtime via `pydeno.eval()`. If you need shared state, use `Runtime()` explicitly and pass it around.
 
 7. **Inspector blocking**: Setting `wait_for_connection=True` in InspectorConfig will pause execution until DevTools connects. Use `False` for non-blocking debugging.
+
+8. **Trusting `Runtime` with hostile code**: V8 runs in the host process, so a single native builtin can abort it (`new Array(2**32-1).fill(0)`) or ignore `timeout=` (`sparse.sort()`). `tests/test_monty_parity_security.py` pins these as strict `xfail`s. For untrusted code use `pydeno.IsolatedRuntime` (`python/pydeno/_isolated.py`, worker in `_worker.py`, framing in `_wire.py`): a supervised worker process modelled on pydantic/monty's pool, with an OS sandbox (`_sandbox.py`: Seatbelt / Landlock+seccomp, applied before the isolate exists, so everything the worker imports must be imported first) and `--jitless` V8. `max_heap_size` does not bound `ArrayBuffer` storage; `max_buffer_bytes` does.

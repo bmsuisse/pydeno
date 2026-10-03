@@ -5,6 +5,28 @@ Snapshots let you pre-initialize JavaScript state and reuse it across multiple r
 !!! warning "Experimental Feature"
     Snapshot support is currently limited and experimental. Some advanced features may not work as expected.
 
+!!! danger "Never load a snapshot you have not authenticated"
+    V8 deserialises snapshot bytes **without validating them**. Bytes an attacker can influence
+    can crash the process or worse. A checksum stored next to the bytes is not authentication: the
+    attacker simply recomputes it. Sign the snapshot when you build it and verify it before you
+    load it:
+
+    ```python
+    from pydeno import RuntimeConfig, SnapshotBuilder, sign_snapshot, verify_snapshot
+
+    builder = SnapshotBuilder()
+    builder.execute_script("lib.js", "globalThis.lib = { version: '1.0' };")
+    blob = sign_snapshot(builder.build(), key)          # store or ship this
+
+    config = RuntimeConfig(snapshot=verify_snapshot(blob, key))   # raises if it was altered
+    ```
+
+    `verify_snapshot` raises `SnapshotAuthenticationError` and never returns bytes that failed the
+    check. The key must be at least 16 secret bytes that the attacker cannot read. This protects
+    integrity and provenance, not secrecy. Snapshots are not supported by `IsolatedRuntime` yet.
+
+    Always call `build()` on a `SnapshotBuilder`: an unbuilt one leaks its isolate.
+
 ## Why Use Snapshots?
 
 Starting a runtime is fast, but loading libraries takes time. This becomes a bottleneck in cold-start scenarios where you create many short-lived runtimes:

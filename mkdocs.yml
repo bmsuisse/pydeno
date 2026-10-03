@@ -44,6 +44,7 @@ nav:
           - Bindings: guides/bindings.md
           - Modules: guides/modules.md
           - Advanced:
+              - Isolated runtime: guides/advanced/isolation.md
               - WebAssembly: guides/advanced/webassembly.md
               - Snapshots: guides/advanced/snapshots.md
               - Inspector: guides/advanced/inspector.md

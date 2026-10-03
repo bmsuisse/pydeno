@@ -146,6 +146,32 @@ before the call and `.terminate()` it from a watchdog thread — see
 the exact pattern (and the bug it fixed, in
 [`docs/contributing/upstream-divergence.md`](docs/contributing/upstream-divergence.md)).
 
+### Code you really do not trust: `IsolatedRuntime`
+
+`Runtime` runs V8 in your own process. That is fast, but one hostile builtin call
+(`new Array(2 ** 32 - 1).fill(0)`) can abort the whole process, and another
+(`sparseArray.sort()`) ignores `timeout=`. For code you do not trust, run the same guest in a
+supervised **worker process** with an OS sandbox around it:
+
+```python
+from pydeno import IsolatedRuntime, RuntimeConfig
+
+with IsolatedRuntime(RuntimeConfig(timeout=2.0), sandbox="require") as rt:
+    rt.bind_function("lookup", lambda sku: {"A1": 3.5}[sku])
+    print(rt.eval("lookup('A1') * 2"))        # 7.0
+    rt.eval("new Array(2 ** 32 - 1).fill(0)") # raises WorkerCrashed; *your* process is fine
+```
+
+A crash, hang or memory blow-up kills the worker, not you. The worker runs with no filesystem,
+network, new processes or privileges (macOS Seatbelt; Linux Landlock + seccomp), a JIT-free V8, a
+memory ceiling and a hard deadline (both on by default), and every frame it sends is validated as
+untrusted input. It is modelled on [pydantic/monty](https://github.com/pydantic/monty)'s worker
+pool and tested the way an attacker would try: from inside, one syscall at a time, across many
+Linux distros (the CI matrix covers both x86_64 and aarch64). See
+[the guide](docs/guides/advanced/isolation.md) and
+[`SECURITY.md`](SECURITY.md). To make the module-level helpers use it too:
+`pydeno.configure_default_runtime(isolated=True, sandbox="require")`.
+
 ### Many tools, one budget
 
 When the model gets more than one tool, `ToolBridge` gives you the whole
