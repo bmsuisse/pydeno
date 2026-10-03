@@ -46,8 +46,11 @@ the quickest way to iterate. The source is in `challenge/`.
 ## What counts as a win
 
 **Reading `SECRET` or the contents of `secret.txt` through the sandbox**, from JavaScript you
-submitted to the server. The server watches every response and log line for the secret, redacts
-it, and raises an alarm named `SECRET_LEAK`. If that fires, someone won.
+submitted to the server. The server watches every response and log line for the secret (and
+for its obvious disguises: other case, reversed, hex, base64), redacts it, and raises an alarm
+named `SECRET_LEAK`. That alarm is **best effort**: a guest that can compute can disguise a value
+further than the server looks. So if you got the secret out some other way, **tell us**: send
+the SHA-256 of the secret you read, and how.
 
 ## Out of scope
 
@@ -62,8 +65,10 @@ it, and raises an alarm named `SECRET_LEAK`. If that fires, someone won.
 
 1. The server logs one JSON line per request: timestamp, `User` header, code length, SHA-256 of
    the code, the first 2 KB of the code, the outcome and the duration. Never the secret.
-2. A `SECRET_LEAK` event pinpoints the request. We replay your code (the log keeps its hash and
-   head; send us the full file) against a fresh copy and confirm it reproduces.
+2. A `SECRET_LEAK` event pinpoints the request, or you send us the SHA-256 of the secret you read
+   and the code that read it (the log keeps its hash and head; send us the full file). We replay
+   it against a fresh copy and confirm it reproduces. The request is logged before the answer is
+   sent, so a request cannot be run without leaving its hash, even if you hang up early.
 3. Show us your passphrase and we match its SHA-256 to the `User` header.
 4. We write up the mechanism, fix it upstream, and add you to the hall of fame.
 

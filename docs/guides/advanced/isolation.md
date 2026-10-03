@@ -218,6 +218,24 @@ Monty.
 - Start-up costs a process (about 0.1 s). Reuse one runtime for many evaluations.
 
 
+## When the worker crashes
+
+A crash is not a vulnerability; it is the containment doing its job. If the worker dies (a V8 abort, an
+out-of-memory kill, a limit tripping, a sandbox violation), the runtime is **closed and abandoned**:
+the next call raises `WorkerCrashed` (or `RuntimeTimeout`), and the host process carries on. Nothing the
+dead worker left behind is trusted again, because a runtime is never reused after a crash. The cost of a
+replacement is about 15 ms with the prewarmed spare.
+
+What to do about it in your own code:
+
+- **Make a new runtime** for the next request. Do not catch the error and retry on the same one.
+- **Make host tools idempotent where you can.** A crash can land between a tool starting and its answer
+  arriving, so the call may have happened without the guest ever hearing back. Record what a tool
+  already did, as `AgentSandbox` journals do, rather than assuming it did nothing.
+- **Count crashes per tenant.** One crash is the cost of doing business; a tenant whose runs crash over
+  and over is probing, or broken. Stop accepting its runs after a few in a window, the same way you
+  would rate-limit any other abuse.
+
 ## Limits against a hostile worker or guest
 
 | Parameter | Default | Effect |
