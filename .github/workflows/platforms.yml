@@ -74,6 +74,12 @@ jobs:
           uv pip install --python .venv maturin "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
           uv run --no-sync --python .venv maturin develop --uv --release
 
+      - name: Bisect Seatbelt rules (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        shell: bash
+        run: .venv/bin/python scripts/seatbelt_bisect.py 2>&1 | tail -20
+
       - name: Diagnose worker start (macOS)
         if: runner.os == 'macOS'
         continue-on-error: true
