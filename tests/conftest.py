@@ -22,6 +22,38 @@ _EXPECTED_SANDBOX = os.environ.get("PYDENO_EXPECT_SANDBOX")
 _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 
 
+
+# IsolatedRuntime, AgentSandbox and the sandbox are POSIX-only (they import `resource`; the OS
+# sandbox is Seatbelt / Landlock+seccomp), so these modules cannot even be imported on Windows.
+# Not collected there, which is the "deselected, never skipped" rule applied at file level.
+collect_ignore = (
+    [
+        "test_agent_sandbox.py",
+        "test_bridge_poisoning.py",
+        "test_default_runtime_isolation.py",
+        "test_idle_cpu.py",
+        "test_isolated_attack_classes.py",
+        "test_isolated_capability_denial.py",
+        "test_isolated_determinism.py",
+        "test_isolated_fuzz.py",
+        "test_isolated_hardening_round2.py",
+        "test_isolated_hardening_round3.py",
+        "test_isolated_libraries.py",
+        "test_isolated_lifecycle.py",
+        "test_isolated_limits.py",
+        "test_isolated_review_findings.py",
+        "test_isolated_runtime.py",
+        "test_isolated_tools.py",
+        "test_polyfill_timers.py",
+        "test_redteam_syscalls.py",
+        "test_sandbox_attest.py",
+        "test_sandbox_syscall_tables.py",
+        "test_seccomp_program.py",
+    ]
+    if sys.platform == "win32"
+    else []
+)
+
 _PLATFORM_MARKERS = {
     "linux_only": sys.platform.startswith("linux"),
     "darwin_only": sys.platform == "darwin",
