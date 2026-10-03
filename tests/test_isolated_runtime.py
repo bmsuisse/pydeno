@@ -337,7 +337,9 @@ class TestContainment:
         rt = IsolatedRuntime(RuntimeConfig(), request_timeout=1.0)
         start = time.monotonic()
         with pytest.raises(RuntimeTimeout, match="hard deadline"):
-            rt.eval("const a = []; a[2 ** 32 - 2] = 1; a.sort()")
+            # A spin, not the sparse-array sort: that sort allocates gigabytes, so on a fast
+            # machine the memory ceiling can win the race against a 1 s deadline.
+            rt.eval("while (true) {}")
         assert time.monotonic() - start < 6
         assert rt.is_closed()
         with pytest.raises(WorkerCrashed, match="closed"):

@@ -137,7 +137,9 @@ class TestTimeouts:
         rt = IsolatedRuntime(RuntimeConfig(timeout=30.0), request_timeout=1.0)
         start = time.monotonic()
         with pytest.raises(RuntimeTimeout, match="hard deadline"):
-            rt.eval("const a = []; a[2 ** 32 - 2] = 1; a.sort()")
+            # A spin, not the sparse-array sort: that sort allocates gigabytes, so on a fast
+            # machine the memory ceiling can win the race against a 1 s deadline.
+            rt.eval("while (true) {}")
         assert time.monotonic() - start < 8
 
     def test_grace_extends_the_hard_deadline_past_the_soft_timeout(self) -> None:

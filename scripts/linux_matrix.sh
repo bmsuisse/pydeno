@@ -125,7 +125,7 @@ echo "== $(. /etc/os-release; echo "$PRETTY_NAME") | $(/tmp/v/bin/python -V) | g
 set +e
 # shellcheck disable=SC2086
 /tmp/v/bin/python -m pytest $PYTEST_TARGETS -q --no-header -p no:randomly -p no:cacheprovider \
-  --strict-markers --strict-config -rs --junitxml=/out/junit.xml > /tmp/pytest.out 2>&1
+  --strict-markers --strict-config -rsfE --junitxml=/out/junit.xml > /tmp/pytest.out 2>&1
 CODE=$?
 tail -${TAIL_LINES:-25} /tmp/pytest.out
 exit "$CODE"
