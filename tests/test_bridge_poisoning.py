@@ -129,3 +129,42 @@ def test_the_bridge_is_strict_so_it_does_not_expose_its_own_arguments() -> None:
             "catch (e) { seen = 'blocked' } return 1 } }); String(seen)"
         )
         assert out in ("blocked", "null")
+
+
+def test_a_sparse_array_is_refused_before_it_is_iterated() -> None:
+    """`null`/`undefined` entries used to skip the node count, so a four-billion-entry sparse array
+    looped for as long as the deadline allowed."""
+    import time
+
+    with IsolatedRuntime(RuntimeConfig(timeout=20.0)) as rt:
+        rt.bind_function("ping", lambda v: 1)
+        start = time.monotonic()
+        with pytest.raises(JavaScriptError, match="too large"):
+            rt.eval("ping(new Array(2 ** 32 - 1))")
+        assert time.monotonic() - start < 5
+        with pytest.raises(JavaScriptError, match="too large"):
+            rt.eval("ping(new Array(1e8))")
+        assert rt.eval("1 + 1") == 2
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "__pydenoCallSync",
+        "__pydenoCallAsync",
+        "__host_op_sync__",
+        "__host_op_async__",
+        "__pydeno_bind_object",
+    ],
+)
+def test_the_bridge_globals_cannot_be_replaced_or_deleted(name: str) -> None:
+    with IsolatedRuntime(RuntimeConfig(timeout=20.0)) as rt:
+        rt.bind_function("echo", lambda v: v)
+        before = rt.eval(f"typeof {name}")
+        assert before == "function"
+        # an assignment in sloppy mode is silently ignored; deleting returns false
+        rt.eval(f"{name} = () => 'hijacked'; 0")
+        assert rt.eval(f"delete globalThis.{name}") is False
+        assert rt.eval(f"typeof {name}") == "function"
+        assert rt.eval("echo(5)") == 5  # and the bound host function still works
+        assert rt.eval(f"Object.keys(globalThis).includes('{name}')") is False

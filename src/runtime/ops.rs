@@ -412,11 +412,13 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
           "a string instead."
       );
     }
-    if (value === undefined || value === null) {
-      return value;
-    }
+    // Counted before the null check: `new Array(2 ** 32 - 1)` is four billion `undefined`s, and each
+    // one must cost a node, or the cap never trips.
     if (++argNodes > MAX_ARG_NODES) {
       throw new RangeErrorCtor("Host tool argument is too large (more than " + MAX_ARG_NODES + " values)");
+    }
+    if (value === undefined || value === null) {
+      return value;
     }
     if (level > MAX_ARG_DEPTH) {
       throw new RangeErrorCtor("Host tool argument is nested too deeply (at " + at + ")");
@@ -426,6 +428,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     }
     if (ArrayIsArray(value)) {
       const length = value.length;
+      if (length > MAX_ARG_NODES) {
+        throw new RangeErrorCtor("Host tool argument is too large (an array of " + length + " entries)");
+      }
       const out = [];
       for (let index = 0; index < length; index++) {
         out[index] = prepare(value[index], at + "[" + index + "]", level + 1);
@@ -618,6 +623,19 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       }
     }
   };
+
+  // Library code (or a guest) that assigns to one of these would silently reroute every bound
+  // host function, since they look the bridge up by name at call time. Fixed in place, and hidden
+  // from enumeration.
+  for (const name of [
+    "__pydenoCallSync",
+    "__pydenoCallAsync",
+    "__host_op_sync__",
+    "__host_op_async__",
+    "__pydeno_bind_object",
+  ]) {
+    DefineProperty(globalThis, name, { writable: false, configurable: false, enumerable: false });
+  }
 
   if (typeof globalThis.ReadableStream !== "function") {
     // Note: This minimal polyfill does not implement backpressure or BYOB readers.
