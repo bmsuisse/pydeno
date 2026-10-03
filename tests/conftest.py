@@ -49,6 +49,11 @@ collect_ignore = (
         "test_sandbox_attest.py",
         "test_sandbox_syscall_tables.py",
         "test_seccomp_program.py",
+        "test_tool_bridge.py",
+        "test_stress_concurrency.py",
+        "test_timeout_overhead.py",
+        "test_sandbox_attest_edges.py",
+        "test_review_regressions.py",
     ]
     if sys.platform == "win32"
     else []
