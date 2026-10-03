@@ -57,6 +57,8 @@ Three rounds, each with a different method:
 - **Round 1 (during 0.5.0).** Self-review plus CI. CI found real bugs that local runs did not: a
   second-pass block of denials sitting in the wrong table, missing x86_64 legacy syscalls, two
   memory-ceiling tests that raced the deadline.
+- **Round 3 (the new code).** The same three reviewers read what round 2 added: the self-test, agent
+  sessions, the challenge server and the bridge fix, and looked for ways around the fixes.
 - **Round 2 (after 0.5.0).** Three AI reviewers were given separate slices and told to *reproduce
   before reporting*: one for the OS layer, one for the host/worker boundary and the engine, one for
   the guest surface and the tests. A second pass looked for "lockdown opportunities". Their reports
@@ -136,6 +138,32 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Bridge frames and `ext:` paths visible in stack traces | **Partly fixed** (strict mode); path filtering open. |
 | A huge source ignores `timeout=` while V8 parses it (plain `Runtime`; bounded by the frame cap in `IsolatedRuntime`) | **Open.** |
 | Prototype pollution persists across evals in one runtime | **By design.** One runtime per trust unit. |
+
+### Round 3: review of the new code
+
+The code added in round 2 (self-test, agent sessions, the public challenge server, the bridge fix)
+was reviewed again by three reviewers, with the same "reproduce before reporting" rule.
+
+| Finding | Status |
+|---|---|
+| **Challenge server:** slowloris took the whole server down (a thread per half-open connection) | **Fixed.** Socket timeout and a connection cap. |
+| **Challenge server:** a client that hung up before the answer was never logged, so code could run without leaving its hash | **Fixed.** The record is written *before* the response is sent. |
+| **Challenge server:** the leak alarm was plain substring matching (base64, hex, reversed, case-folded all passed) | **Mitigated.** Those forms are redacted and alarm; it remains a best-effort alarm, documented as such. |
+| **Challenge server:** a second `X-Forwarded-For` line bypassed the rate limiter; unbounded, unvalidated keys | **Fixed.** Every line counts, the last hop is used, only a real address is a key. |
+| **Challenge server:** `NaN` produced invalid JSON; malformed requests unlogged; secret and log files created with the umask | **Fixed.** |
+| macOS: a confined worker could create SysV semaphores, shared memory and message queues that outlive it (a small system-wide table) | **Fixed.** Denied by syscall; self-test probes it. |
+| Linux: `READ_IMPLIES_EXEC` inherited from a parent personality defeats the no-executable-mapping rule | **Fixed.** Cleared before seccomp. |
+| `attest()` counted any `OSError` (even ENOENT) as a refusal | **Partly fixed.** A path-independent `execve` probe (Linux) was added; path probes remain and are weaker where a distroless image has no `/bin/sh` or `/etc/hosts`. |
+| Sessions: a journal could be rolled back (restoring a spent tool budget) or loaded as another tenant's under a shared key | **Fixed / documented.** Associated data in the signature; rollback needs a counter the caller keeps. |
+| Sessions: a forked child holding a session stalled 20 s at exit; `\w` matched characters JavaScript rejects; a tool could close its own session; odd-but-authentic journals raised the wrong errors | **Fixed.** |
+| Journal and snapshot signatures did not bind the platform or the redaction setting | **Fixed.** |
+| Polyfill timers: the fire budget never reset (a reused runtime's timers silently died), O(n) per fire and clear, unbounded pending timers, `Infinity` delays, `structuredClone` through the `__proto__` setter | **Fixed.** |
+| Bridge: `null` entries skipped the node count, so a four-billion-entry sparse array looped until the deadline | **Fixed in source; verified after the next build.** |
+| Bridge globals (`__host_op_sync__` and friends) were writable | **Fixed in source; verified after the next build.** |
+| macOS: path existence is observable (`stat` answers EPERM for a path that exists and ENOENT for one that does not); XNU build string and CPU/memory counts are readable | **Open, known.** Seatbelt cannot hide existence; Linux with only Landlock has the same oracle. |
+| Linux: the thread cap is sampled, not kernel-enforced | **Open.** A pids cgroup or `RLIMIT_NPROC` in the new user namespace is planned. |
+| Hosts that mount `/proc` with `hidepid` make the worker's usage unreadable | **Open.** `require` refuses to start there (fail closed); `auto` warns. |
+| Challenge: the worker and `secret.txt` share a uid inside the container (Landlock is the only barrier); no enforced egress block | **Open.** Documented for the operator. |
 
 ### Rejected after measuring
 
