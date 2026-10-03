@@ -79,7 +79,19 @@ impl SnapshotBuilder {
     }
 }
 
+impl Drop for SnapshotBuilder {
+    fn drop(&mut self) {
+        // A `JsRuntimeForSnapshot` that is dropped without `snapshot()` leaks its isolate and
+        // can abort the process at exit. Consuming it the way `build` does releases it
+        // properly; the bytes are discarded.
+        if let Some(runtime) = self.runtime.take() {
+            drop(runtime.snapshot());
+        }
+    }
+}
+
 fn create_runtime() -> Result<JsRuntimeForSnapshot, CoreError> {
+    crate::runtime::v8_flags::mark_v8_started();
     // `JsRuntimeForSnapshot::try_new` registers its isolate with deno_core's
     // platform via `tokio::runtime::Handle::try_current()` (see
     // `spawn_runtime_thread` in src/runtime/runner.rs for the same fix on the

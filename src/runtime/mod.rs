@@ -4,6 +4,7 @@
 //! Each runtime owns a single V8 isolate running on a dedicated OS thread with a
 //! Tokio event loop.
 
+pub mod capped_allocator;
 pub mod config;
 pub mod conversion;
 pub mod error;
@@ -17,6 +18,9 @@ pub mod runner;
 pub mod snapshot;
 pub mod stats;
 pub mod stream;
+pub mod v8_flags;
+pub mod wire;
+pub mod wire_json;
 
 #[allow(unused_imports)] // Re-exported for downstream crates.
 pub use config::RuntimeConfig;
