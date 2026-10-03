@@ -43,6 +43,8 @@ nav:
       - Guides:
           - Bindings: guides/bindings.md
           - Modules: guides/modules.md
+          - Agent sessions: guides/agent-sessions.md
+          - pydantic-ai code mode: guides/pydantic-ai.md
           - Advanced:
               - Isolated runtime: guides/advanced/isolation.md
               - WebAssembly: guides/advanced/webassembly.md
@@ -56,6 +58,8 @@ nav:
       - Plugin System: use-cases/plugin-system.md
       - Serverless Runtime: use-cases/serverless-runtime.md
       - Workflow Orchestration: use-cases/workflow.md
+  - Security report: security-report.md
+  - Hack pydeno: hack-pydeno.md
   - API Reference:
       - pydeno Module: api/pydeno.md
       - Runtime: api/runtime.md
@@ -65,6 +69,7 @@ nav:
       - Development: contributing/development.md
       - Architecture: contributing/architecture.md
       - Upstream provenance: contributing/upstream-divergence.md
+      - Supply-chain security: contributing/supply-chain.md
 
 plugins:
   - search

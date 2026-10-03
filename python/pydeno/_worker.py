@@ -124,6 +124,23 @@ _FROZEN_CLOCK_JS = """
     { value: Patched, writable: true, configurable: true });
   Object.defineProperty(globalThis, 'Date', { value: Patched, writable: true, configurable: true });
 
+  // `Temporal.Now` is a second wall clock, with nanosecond resolution, that `Date` never sees.
+  if (typeof Temporal !== 'undefined' && Temporal.Now) {
+    const T = Temporal;
+    const instant = () => T.Instant.fromEpochMilliseconds(frozen);
+    const zoned = (tz = 'UTC') => instant().toZonedDateTimeISO(tz);
+    const now = {
+      instant,
+      timeZoneId: () => 'UTC',
+      zonedDateTimeISO: zoned,
+      plainDateTimeISO: (tz) => zoned(tz).toPlainDateTime(),
+      plainDateISO: (tz) => zoned(tz).toPlainDate(),
+      plainTimeISO: (tz) => zoned(tz).toPlainTime(),
+    };
+    Object.defineProperty(T, 'Now',
+      { value: Object.freeze(now), writable: false, configurable: false });
+  }
+
   if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
     const proto = Intl.DateTimeFormat.prototype;
     const format = Object.getOwnPropertyDescriptor(proto, 'format');
@@ -188,7 +205,12 @@ class _Worker:
                     break
                 message = _wire.loads(payload)
                 if message["t"] == "reply":
-                    self._resolve(message)
+                    try:
+                        self._resolve(message)
+                    except Exception:  # noqa: BLE001
+                        # One bad reply must never end this thread: it is the only reader, so
+                        # every later reply, and so every later command, would wait forever.
+                        continue
                 else:
                     self._commands.put(message)
         except (_wire.WireError, OSError):
@@ -199,17 +221,22 @@ class _Worker:
     def _resolve(self, message: dict[str, Any]) -> None:
         with self._pending_lock:
             future = self._pending.pop(message.get("cid"), None)
-        if future is None:
-            return
-        if "err" in message:
-            future.set_exception(
-                _remote_exception(message.get("etype"), str(message["err"]))
-            )
+        if future is None or future.done():
+            # Cancelled: whoever was waiting (a loop that has since closed, a command that timed
+            # out) no longer wants the answer. Setting a result on it would raise.
             return
         try:
-            future.set_result(_wire.decode_value(message.get("v")))
-        except _wire.WireError as exc:
-            future.set_exception(RuntimeError(f"bad reply from host: {exc}"))
+            if "err" in message:
+                future.set_exception(
+                    _remote_exception(message.get("etype"), str(message["err"]))
+                )
+                return
+            try:
+                future.set_result(_wire.decode_value(message.get("v")))
+            except _wire.WireError as exc:
+                future.set_exception(RuntimeError(f"bad reply from host: {exc}"))
+        except concurrent.futures.InvalidStateError:
+            return  # cancelled between the check above and now
 
     # -- host calls --------------------------------------------------------
 
@@ -330,8 +357,11 @@ class _Worker:
             reply = {"t": "error", "id": cmd_id, "kind": kind, "msg": str(exc)}
         try:
             self._writer.send(reply)
-        except _wire.WireError as exc:
-            # The result itself could not be encoded (e.g. a JS function handle).
+        except (_wire.WireError, ValueError) as exc:
+            # The result itself could not be encoded: a JS function handle, or a BigInt past
+            # Python's int-to-str digit limit (a ValueError). Encoding fails before anything is
+            # written, so an error reply is safe, and the guest must not be able to end the
+            # session by returning one.
             self._writer.send(
                 {"t": "error", "id": cmd_id, "kind": "TypeError", "msg": str(exc)}
             )
@@ -360,8 +390,23 @@ class _Worker:
         applied = (
             "none"
             if mode == "off"
-            else _sandbox.apply(empty_root=bool(options.get("empty_root", True)))
+            else _sandbox.apply(
+                empty_root=bool(options.get("empty_root", True)),
+                # A jitless V8 never maps memory executable, so refuse it: an exploit then has to
+                # work without injecting code.
+                allow_exec="--jitless" not in flags,
+            )
         )
+        if applied != "none" and not _sandbox.missing_layers(applied):
+            # Ask the kernel rather than trust the filter lists: if the platform's full sandbox
+            # claims to be on and a forbidden operation still works, no guest code may run in
+            # this process. (A degraded one, say a kernel without Landlock, is expected to leak.)
+            breaches = _sandbox.attest()
+            if breaches:
+                raise RuntimeError(
+                    f"sandbox self-test failed: the worker could still {breaches} "
+                    f"(applied: {applied})"
+                )
         if mode == "require":
             # "require" means every layer this platform has, not "at least one": a kernel that
             # lacks Landlock must not be allowed to pass for a fully sandboxed one.

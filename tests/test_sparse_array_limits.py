@@ -49,7 +49,9 @@ def test_sparse_array_as_an_op_argument_is_refused_too() -> None:
     """The inbound (guest -> host tool) direction meters the same way."""
     with _runtime() as rt:
         op_id = rt.register_op("sink", lambda *args: "sunk", mode="sync")
-        with pytest.raises(Exception, match="Serialization size"):
+        # Refused by whichever limit sees it first: the bridge's own cap on a host call's arguments
+        # (a clear RangeError, before anything is copied) or the converter's size budget.
+        with pytest.raises(Exception, match="Serialization size|too large"):
             rt.eval(
                 f"(() => {{ const a = []; a[10000000] = 1;"
                 f" return __host_op_sync__({op_id}, a); }})()"

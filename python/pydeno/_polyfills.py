@@ -11,8 +11,10 @@ Design points that matter for a sandbox:
 * Timers run on *virtual time*: `setTimeout(f, 5000)` does not wait, it runs after everything due
   earlier, in order. A guest therefore cannot sleep, and `performance.now()` is that virtual
   counter, not a clock: there is no timing side channel in it.
-* Timers drain through the microtask queue, one per turn, and at most `MAX_TIMER_FIRES` run in
-  total, so a `setInterval` that never stops ends instead of spinning until the deadline.
+* Timers drain through the microtask queue, one per turn. At most `MAX_TIMER_FIRES` run before the
+  queue next empties, so a `setInterval` that never stops ends (with a message on the console)
+  instead of spinning until the deadline, and a later, well-behaved timer in the same runtime still
+  works. At most `MAX_PENDING_TIMERS` can wait at once: past that, `setTimeout` throws a RangeError.
 * No `window`, `document` or `navigator`: defining them would make libraries pick their DOM code
   paths. `self` and `global` alias `globalThis`, which is all the common UMD preambles probe.
 """
@@ -32,37 +34,75 @@ WEB_POLYFILLS = r"""
   define('global', g);
 
   // ---- timers on virtual time -------------------------------------------------------------
-  let now = 0, seq = 0, fires = 0, scheduled = false;
-  const queue = [];
+  // A binary min-heap ordered by (due time, id), plus a Map of the live timers: O(log n) per fire
+  // and O(1) clear (a cleared timer is only marked dead and skipped when it reaches the top).
+  const MAX_PENDING_TIMERS = 100000;
+  let now = 0, seq = 0, fires = 0, scheduled = false, warned = false;
+  const heap = [];
+  const live = new Map();
+  const before = (a, b) => a.t < b.t || (a.t === b.t && a.id < b.id);
+  const push = (timer) => {
+    let i = heap.push(timer) - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!before(heap[i], heap[parent])) break;
+      [heap[i], heap[parent]] = [heap[parent], heap[i]];
+      i = parent;
+    }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && before(heap[l], heap[m])) m = l;
+        if (r < heap.length && before(heap[r], heap[m])) m = r;
+        if (m === i) break;
+        [heap[i], heap[m]] = [heap[m], heap[i]];
+        i = m;
+      }
+    }
+    return top;
+  };
   const run = () => {
     scheduled = false;
-    if (!queue.length) return;
-    let best = 0;
-    for (let i = 1; i < queue.length; i++) {
-      const a = queue[i], b = queue[best];
-      if (a.t < b.t || (a.t === b.t && a.id < b.id)) best = i;
+    while (heap.length && heap[0].dead) pop();
+    if (!heap.length) { fires = 0; return; }  // the queue drained: a new burst gets a new budget
+    const timer = pop();
+    if (++fires > MAX_TIMER_FIRES) {
+      heap.length = 0; live.clear();
+      if (!warned && typeof console !== 'undefined') {
+        warned = true;
+        console.error('timers stopped: more than ' + MAX_TIMER_FIRES + ' fired without the queue emptying');
+      }
+      fires = 0;
+      return;
     }
-    const timer = queue.splice(best, 1)[0];
-    if (++fires > MAX_TIMER_FIRES) { queue.length = 0; return; }
     if (timer.t > now) now = timer.t;
-    if (timer.every !== null) { timer.t = now + timer.every; queue.push(timer); }
+    if (timer.every !== null) { timer.t = now + timer.every; push(timer); } else live.delete(timer.id);
     try { timer.fn(...timer.args); } catch (e) {
       if (typeof console !== 'undefined') console.error('Uncaught (in timer):', e && e.message || e);
     }
-    if (queue.length) pump();
+    if (live.size) pump(); else fires = 0;
   };
   const pump = () => { if (!scheduled) { scheduled = true; Promise.resolve().then(run); } };
   const add = (fn, ms, args, repeat) => {
     if (typeof fn !== 'function') return 0;
-    const delay = Math.max(0, Number(ms) || 0);
-    const timer = { id: ++seq, t: now + delay, fn, args, every: repeat ? Math.max(1, delay) : null };
-    queue.push(timer);
+    if (live.size >= MAX_PENDING_TIMERS) throw new RangeError('too many pending timers');
+    // Infinity or NaN would make virtual time Infinity or NaN; anything past 2**31-1 ms is "never".
+    const delay = Math.min(2147483647, Math.max(0, Number(ms) || 0));
+    const timer = { id: ++seq, t: now + delay, fn, args, every: repeat ? Math.max(1, delay) : null, dead: false };
+    live.set(timer.id, timer);
+    push(timer);
     pump();
     return timer.id;
   };
   const clear = (id) => {
-    const i = queue.findIndex((x) => x.id === id);
-    if (i >= 0) queue.splice(i, 1);
+    const timer = live.get(id);
+    if (timer) { timer.dead = true; live.delete(id); }
   };
   define('setTimeout', (fn, ms, ...args) => add(fn, ms, args, false));
   define('setInterval', (fn, ms, ...args) => add(fn, ms, args, true));
@@ -246,7 +286,13 @@ WEB_POLYFILLS = r"""
     else if (v instanceof Map) { out = new Map(); seen.set(v, out); v.forEach((x, k) => out.set(clone(k, seen), clone(x, seen))); return out; }
     else if (v instanceof Set) { out = new Set(); seen.set(v, out); v.forEach((x) => out.add(clone(x, seen))); return out; }
     else if (Array.isArray(v)) { out = []; seen.set(v, out); v.forEach((x, i) => { out[i] = clone(x, seen); }); return out; }
-    else { out = {}; seen.set(v, out); for (const k of Object.keys(v)) out[k] = clone(v[k], seen); return out; }
+    else {
+      out = {}; seen.set(v, out);
+      for (const k of Object.keys(v)) {
+        Object.defineProperty(out, k, { value: clone(v[k], seen), writable: true, enumerable: true, configurable: true });
+      }
+      return out;
+    }
     seen.set(v, out);
     return out;
   };

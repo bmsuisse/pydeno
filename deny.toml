@@ -1,0 +1,68 @@
+# cargo-deny policy for pydeno. Run: `cargo deny check` (see docs/contributing/supply-chain.md).
+# Checked on cargo-deny 0.20.x; the CI job uses the same series.
+
+[graph]
+# Wheels are built for Linux, macOS and Windows; check all of them, not just the host.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# Vulnerabilities and unsound crates are always errors; the only way to relax one is an
+# `ignore` entry below, with a reason.
+# Unmaintained: only gate on *direct* dependencies. Transitive unmaintained crates arrive via
+# deno_core/V8 where pydeno cannot act on them (today: `paste`, RUSTSEC-2024-0436, via the v8
+# crate); `cargo audit` still prints them as warnings.
+unmaintained = "workspace"
+# A yanked crate in Cargo.lock is a warning: fixable with `cargo update -p`, but never a
+# reason to block an unrelated PR.
+yanked = "warn"
+ignore = [
+  # pyo3 0.27.2: out-of-bounds read in `nth`/`nth_back` on PyList/PyTuple iterators.
+  # Not reachable: pydeno never calls `.nth()`/`.nth_back()` on a PyList/PyTuple iterator
+  # (grep of src/ is clean). The fix needs pyo3 >= 0.29, but pyo3-async-runtimes 0.27 pins
+  # pyo3 0.27. Remove when pyo3-async-runtimes ships a release for pyo3 >= 0.29 and
+  # Cargo.toml is bumped.
+  { id = "RUSTSEC-2026-0176", reason = "not reachable: no nth/nth_back on PyList/PyTuple iterators in src/; fix needs pyo3 >= 0.29, blocked on pyo3-async-runtimes" },
+  # pyo3 0.27.2: `PyCFunction::new_closure` lacks a `Sync` bound. pydeno does not call
+  # `new_closure` (grep of src/ is clean). Same removal condition as above.
+  { id = "RUSTSEC-2026-0177", reason = "not reachable: pydeno does not use PyCFunction::new_closure; fix needs pyo3 >= 0.29, blocked on pyo3-async-runtimes" },
+]
+
+[licenses]
+# Every licence present in the tree today, nothing speculative. A new one fails the build
+# and forces a conscious decision.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",     # cooked-waker (via deno_core); file-level copyleft, fine for unmodified use
+  "Unicode-3.0", # icu_* data crates, unicode-ident
+  "Zlib",
+  "0BSD",        # adler2
+  "Unlicense",   # memchr is "Unlicense OR MIT"; MIT would satisfy it anyway
+]
+# Surprising but satisfied: r-efi is "MIT OR Apache-2.0 OR LGPL-2.1-or-later". LGPL is NOT
+# allowed above; the build passes because the MIT alternative is. Do not add LGPL here.
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own path dependencies are not wildcards.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+# Git dependencies bypass the crates.io yank/advisory flow; none exist today, so a new one fails.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -30,6 +30,7 @@ from pydeno import (
     _wire,
     undefined,
 )
+from pydeno._isolated import _HARDENING_V8_FLAGS
 from test_monty_parity_security import _SINKS
 
 MIB = 1024 * 1024
@@ -357,7 +358,13 @@ class TestContainment:
     def test_memory_ceiling_kills_the_worker(self) -> None:
         if sys.platform not in ("linux", "darwin"):
             pytest.skip("RSS polling is implemented for Linux and macOS")
-        rt = IsolatedRuntime(RuntimeConfig(), max_memory=300 * MIB, request_timeout=30)
+        # An explicit big buffer cap: the default one would turn this into a catchable RangeError,
+        # and this test is about the RSS ceiling behind it.
+        rt = IsolatedRuntime(
+            RuntimeConfig(max_buffer_bytes=8192 * MIB),
+            max_memory=300 * MIB,
+            request_timeout=30,
+        )
         with pytest.raises(WorkerCrashed, match="max_memory"):
             rt.eval("new Uint8Array(1500 * 1024 * 1024).fill(1).length")
         assert rt.is_closed()
@@ -393,7 +400,11 @@ class TestContainment:
         """The in-worker watchdog fires before the parent's poll, with its own exit code."""
         if sys.platform not in ("linux", "darwin"):
             pytest.skip("RSS reading is implemented for Linux and macOS")
-        rt = IsolatedRuntime(RuntimeConfig(), max_memory=200 * MIB, request_timeout=30)
+        rt = IsolatedRuntime(
+            RuntimeConfig(max_buffer_bytes=8192 * MIB),
+            max_memory=200 * MIB,
+            request_timeout=30,
+        )
         rt._max_memory = None  # noqa: SLF001 - disable the parent's check; only the worker's remains
         with pytest.raises(WorkerCrashed, match="went over max_memory"):
             rt.eval("new Uint8Array(900 * 1024 * 1024).fill(1); for (;;) {}")
@@ -783,7 +794,7 @@ class TestOsSandbox:
                 assert rt.sandbox == "seatbelt"
             elif sys.platform.startswith("linux"):
                 assert "seccomp" in rt.sandbox
-            assert rt.v8_flags == ["--jitless"]
+            assert rt.v8_flags == ["--jitless", *_HARDENING_V8_FLAGS]
 
     def test_the_empty_root_can_be_turned_off_and_then_is_absent(self) -> None:
         with IsolatedRuntime(empty_root=False) as rt:
@@ -1243,7 +1254,7 @@ class TestV8Hardening:
 
     def test_jitless_can_be_turned_off_for_webassembly(self) -> None:
         with IsolatedRuntime(jitless=False) as rt:
-            assert rt.v8_flags == []
+            assert rt.v8_flags == list(_HARDENING_V8_FLAGS)
             assert rt.eval("typeof WebAssembly") == "object"
 
     def test_extra_flags_are_applied_before_the_isolate(self) -> None:
@@ -1327,9 +1338,29 @@ _FAKE = textwrap.dedent(
         # a compromised worker hammering the parent with host calls
         for i in range(1, 100000):
             send({"t": "call", "cid": i, "hid": 1, "args": []})
+    elif MODE == "alloc_during_call":
+        # a compromised worker that starts a host call, then eats memory while the parent's
+        # handler is still running (so the parent's pump is stuck inside the handler)
+        send({"t": "call", "cid": 1, "hid": 1, "args": []})
+        big = bytearray(b"x" * (300 << 20)); copy = bytes(big)
+        time.sleep(30)
     elif MODE == "dup_result":
         send({"t": "result", "id": cmd["id"], "v": 1})
         send({"t": "result", "id": cmd["id"], "v": 2}); time.sleep(30)
+    elif MODE == "escape_error":
+        send({"t": "error", "id": cmd["id"], "kind": "RuntimeError",
+              "msg": "boom\\x1b[2J\\x1b]0;pwned\\x07\\nat line 2"})
+        time.sleep(30)
+    elif MODE == "dup_token":
+        # answers every command with the same capability token
+        while True:
+            send({"t": "result", "id": cmd["id"], "v": 7})
+            cmd = read()
+    elif MODE == "wrong_object_keys":
+        # answers every command with a token map that does not match what was bound
+        while True:
+            send({"t": "result", "id": cmd["id"], "v": {"unrelated": 7}})
+            cmd = read()
     """
 )
 
@@ -1458,3 +1489,98 @@ class TestUntrustedWorker:
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
         with pytest.raises(WorkerCrashed):
             IsolatedRuntime(RuntimeConfig(), python=str(wrapper))
+
+
+class TestWorkerCannotForgeCapabilityBookkeeping:
+    """The tokens are the worker's claims. A lying worker must not be able to make a revoked (or
+    never-revoked) host handler outlive its capability."""
+
+    def test_a_reused_token_ends_the_session(self, tmp_path: Path) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "dup_token"),
+            request_timeout=20,
+        )
+        assert rt.bind_function("harmless", lambda: 1) == 7
+        with pytest.raises(WorkerCrashed, match="reused"):
+            rt.bind_function("privileged", lambda: 2)
+        assert rt.is_closed()
+
+    def test_a_token_map_that_does_not_match_what_was_bound_ends_the_session(
+        self, tmp_path: Path
+    ) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "wrong_object_keys"),
+            request_timeout=20,
+        )
+        with pytest.raises(WorkerCrashed, match="malformed"):
+            rt.bind_object("api", {"add": lambda a, b: a + b})
+        assert rt.is_closed()
+
+    def test_revoking_drops_the_host_handler_even_if_the_worker_never_answers(
+        self, tmp_path: Path
+    ) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "dup_token"),
+            request_timeout=20,
+        )
+        token = rt.bind_function("f", lambda: 1)
+        (hid,) = list(rt._handlers)  # noqa: SLF001
+        rt.revoke_op(token)
+        assert hid not in rt._handlers  # noqa: SLF001
+
+    def test_terminal_escapes_in_a_remote_error_message_are_neutralised(
+        self, tmp_path: Path
+    ) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "escape_error"),
+            request_timeout=20,
+        )
+        with pytest.raises(RuntimeError) as excinfo:
+            rt.eval("1")
+        text = str(excinfo.value)
+        assert "\x1b" not in text and "\x07" not in text
+        assert "at line 2" in text  # newlines survive: a JS stack is made of them
+
+
+class TestSupervisionWhileAHostHandlerRuns:
+    """The pump supervises memory, but it is blocked while a synchronous host handler runs, and a
+    compromised worker can allocate exactly then. The watchdog thread covers that window."""
+
+    def test_memory_is_enforced_while_the_pump_is_inside_a_slow_handler(
+        self, tmp_path: Path
+    ) -> None:
+        import threading
+
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "alloc_during_call"),
+            max_memory=150 * MIB,
+            request_timeout=60,
+        )
+        rt._handlers[1] = (lambda: time.sleep(8), False)  # noqa: SLF001 - a slow sync handler
+        outcome: list[object] = []
+
+        def run() -> None:
+            try:
+                outcome.append(rt.eval("1"))
+            except BaseException as exc:  # noqa: BLE001
+                outcome.append(exc)
+
+        t = threading.Thread(target=run, daemon=True)
+        start = time.monotonic()
+        t.start()
+        proc = rt._proc  # noqa: SLF001
+        while proc.poll() is None and time.monotonic() - start < 6:
+            time.sleep(0.05)
+        killed_after = time.monotonic() - start
+        assert proc.poll() is not None, (
+            "the worker was left running over its memory ceiling"
+        )
+        # long before the 8 s handler returned: the memory was reclaimed while the pump was stuck
+        assert killed_after < 5, killed_after
+        t.join(30)
+        assert isinstance(outcome[0], WorkerCrashed), outcome

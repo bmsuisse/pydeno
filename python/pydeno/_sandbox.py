@@ -23,10 +23,12 @@ so the caller decides whether "none" is acceptable (`sandbox="require"`).
 from __future__ import annotations
 
 import ctypes
+import errno
 import ctypes.util
 import os
 import platform
 import resource
+import socket
 import struct
 import sys
 import threading
@@ -44,11 +46,35 @@ MEMORY_EXIT_CODE = 78
 _SEATBELT_PROFILE = """
 (version 1)
 (deny default)
-(allow sysctl-read)
-(allow mach-lookup (global-name "com.apple.system.logger"))
 (allow signal (target self))
+(deny process-info*)
 (allow process-info-pidinfo (target self))
+(deny iokit-get-properties)
+(deny darwin-notification-post)
+(deny syscall-unix (syscall-number SYS_gethostuuid SYS_getfsstat SYS_getfsstat64 SYS_csops
+  SYS_csops_audittoken SYS_getpriority SYS_getpgid SYS_getsid SYS_fstatfs SYS_fstatfs64 SYS_kill
+  SYS_semget SYS_shmget SYS_msgget SYS_semsys SYS_shmsys SYS_msgsys))
+(deny syscall-mig (kernel-mig-routine host_statistics_from_user host_statistics64_from_user
+  host_processor_info))
+(deny system-fcntl (fcntl-command F_GETPATH))
+(deny process-codesigning*)
 """
+# What each line is for. The profile is a deny-by-default base plus explicit denies for the things
+# `(deny default)` does NOT cover; each was found by asking from inside the sandbox, not assumed:
+#  * `process-info*`: KERN_PROCARGS2 on the parent returns its argv and *environment* (any
+#    same-user process's, in fact), which undoes `env={}`. `(deny default)` alone does not stop it,
+#    and neither does narrowing `sysctl-read`, so there is no `sysctl-read` allowance at all: the
+#    worker runs without one.
+#  * `iokit-get-properties`, `SYS_gethostuuid`: the machine's permanent hardware identifier.
+#  * `SYS_getpriority`/`getpgid`/`getsid`/`getfsstat`/`fstatfs`, `host_statistics*`: they list every
+#    host process, the mounted volumes and free disk space, and system-wide CPU and memory
+#    counters (a side channel on what else the machine is doing).
+#  * `F_GETPATH`: turns an open descriptor back into a path on the host's disk.
+#  * SysV `semget`/`shmget`/`msgget`: objects that survive the worker (they cannot be removed from
+#    inside) and come from a small system-wide table (32 shared-memory ids), so one worker could
+#    use them all up until the next reboot. `(deny ipc-sysv*)` does not stop this; the syscalls must be denied.
+# Known gap: `notify_post()` still reaches other processes (the connection to notifyd is opened
+# before the profile is applied), and `kill(pid, 0)` still tells a running pid from an absent one.
 
 
 def _apply_seatbelt() -> bool:
@@ -117,6 +143,15 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     # on Linux 6.12+, Landlock's abstract-socket scope. An AF_UNIX `socket()` would add nothing
     # to what socketpair already allows, so it is simply closed with the rest.
     "socket": (41, 198),
+    # What a worker never asks and an attacker wants: uptime / process count / RAM (`sysinfo`), and
+    # other processes' priorities (`getpriority` and `ioprio_get` walk every pid). glibc's thread
+    # set-up calls `sched_get*` with a *thread* id, which is why those stay open. NOT `uname`: the
+    # kernel version would help pick an exploit, but V8's x86_64 build calls it while starting and
+    # aborts (`Check failed: 0 == uname(&uname_buffer)`) if it is refused. The aarch64 build does not,
+    # which is why this was found on an x86_64 CI runner and not in an aarch64 container.
+    "sysinfo": (99, 179),
+    "getpriority": (140, 141),
+    "ioprio_get": (252, 31),
     # Taking over or signalling other processes of the same user.
     "pidfd_open": (434, 434),
     "pidfd_getfd": (438, 438),
@@ -311,6 +346,14 @@ _SELF_PID_ARG0 = {
     "prlimit64": (302, 261),
     "migrate_pages": (256, 238),
     "move_pages": (279, 239),
+    # The read-only calls that leak something about another process: `get_robust_list(parent)`
+    # returns a pointer into the host process (its ASLR), and `getpgid`/`getsid` over every number
+    # enumerate the pids the user is running. (Not `sched_get*`, `getpriority` or `ioprio_get`:
+    # glibc and V8 call those with a *thread* id, which is not our pid, so a self-only rule breaks
+    # thread startup, and what they return is only a scheduling parameter.)
+    "get_robust_list": (274, 100),
+    "getpgid": (121, 155),
+    "getsid": (124, 156),
 }
 _SELF_PID_ARG1 = {  # (which, who, ...): `who` is the pid, and `which` must say "a process"
     "setpriority": (141, 140),
@@ -328,11 +371,32 @@ _WHICH_PROCESS = {"setpriority": 0, "ioprio_set": 1}
 # but only on Linux 6.12+.)
 _FCNTL = (72, 25)
 _IOCTL = (16, 29)
-_FCNTL_DENIED_CMDS = (8, 10, 15)  # F_SETOWN, F_SETSIG, F_SETOWN_EX
+_FCNTL_DENIED_CMDS = (8, 10, 15, 1031)  # F_SETOWN, F_SETSIG, F_SETOWN_EX, F_SETPIPE_SZ
 # FIOSETOWN, SIOCSPGRP (signal ownership), TIOCSTI, TIOCLINUX. The worker has no controlling terminal
 # (it is its own session), so the last two are belt and braces: bubblewrap documents TIOCSTI as the
 # one thing a session alone does not cover if a terminal ever reaches the sandbox.
 _IOCTL_DENIED_CMDS = (0x8901, 0x8902, 0x5412, 0x541C)
+# The whole socket-ioctl block, `SIOCGIFCONF`, `SIOCGIFHWADDR` and friends. A descriptor that is a
+# socket answers these from the kernel's network stack (a unix socket falls through to it), which
+# tells a confined process the host's interfaces, addresses and MACs, and with CAP_NET_ADMIN lets
+# it change them. Nothing here needs one.
+_IOCTL_SOCKET_BLOCK = 0x8900
+_PRCTL = (157, 167)
+_SOCKETPAIR = (53, 199)
+# `prctl` can change how the process is traced, scheduled and killed (`PR_SET_DUMPABLE`,
+# `PR_SET_PDEATHSIG`, `PR_SCHED_CORE` on another process, speculation controls), so only what a real
+# worker does is allowed (verified by tracing 182 workers across the isolation suite): naming its
+# threads, naming memory areas, and reading its dumpable flag.
+_PRCTL_ALLOWED = (15, 16, 0x53564D41, 3)  # SET_NAME, GET_NAME, SET_VMA, GET_DUMPABLE
+_PR_SET_DUMPABLE = 4
+# Mapping memory executable. A jitless V8 never needs it, and refusing it means an exploit must
+# work without injecting code of its own.
+_EXEC_CHECKED = (
+    (9, 222),
+    (10, 226),
+)  # mmap, mprotect (pkey_mprotect is denied outright)
+_PROT_EXEC = 4
+_AF_UNIX, _SOCK_STREAM, _SOCK_TYPE_MASK = 1, 1, 0xF
 # Every syscall number below this has been looked at (`tests/data/syscalls.json`, from the
 # kernel's own tables, and `tests/test_sandbox_syscall_tables.py` fails if the table ever grows
 # past it). Numbers from here up are syscalls that did not exist when this filter was reviewed:
@@ -360,6 +424,7 @@ _BPF_JEQ_K = 0x15
 _BPF_JGE_K = 0x35
 _BPF_JSET_K = 0x45
 _BPF_RET_K = 0x06
+_BPF_AND_K = 0x54
 _SECCOMP_RET_ALLOW = 0x7FFF0000
 _SECCOMP_RET_KILL_PROCESS = 0x80000000
 _SECCOMP_RET_ERRNO = 0x00050000
@@ -367,7 +432,7 @@ _EPERM, _ENOSYS = 1, 38
 _CLONE_THREAD = 0x10000
 
 
-def _seccomp_program(arch: str) -> bytes | None:
+def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     """Assemble the filter. Default-allow with a deny list: V8, CPython and tokio use
     far too many syscalls to allow-list safely, and the deny list targets what turns
     code execution into host access (new processes, new network endpoints, kernel
@@ -377,13 +442,28 @@ def _seccomp_program(arch: str) -> bytes | None:
 
     # (code, jt_label, jf_label, k); labels are resolved to relative offsets below.
     ins: list[tuple[int, str | None, str | None, int | str]] = []
-    labels: dict[str, int] = {}
+    # A name can be defined many times. BPF jumps only go forward and reach at most 255
+    # instructions, so each stretch of the program gets its own `allow`/`eperm`/... stubs and a
+    # jump lands on the nearest one after it.
+    labels: dict[str, list[int]] = {}
 
     def label(name: str) -> None:
-        labels[name] = len(ins)
+        labels.setdefault(name, []).append(len(ins))
+
+    def stubs(*, enosys: bool = False) -> None:
+        label("allow")
+        ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
+        label("eperm")
+        ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
+        if enosys:  # glibc falls back to clone() when clone3 reports ENOSYS
+            label("enosys")
+            ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _ENOSYS))
 
     ins.append((_BPF_LD_W_ABS, None, None, 4))  # arch
-    ins.append((_BPF_JEQ_K, None, "kill", _AUDIT_ARCH[arch]))
+    ins.append((_BPF_JEQ_K, "nr", "kill", _AUDIT_ARCH[arch]))
+    label("kill")
+    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_KILL_PROCESS))
+    label("nr")
     ins.append((_BPF_LD_W_ABS, None, None, 0))  # nr
     ins.append(
         (_BPF_JGE_K, "enosys", None, _FIRST_UNREVIEWED)
@@ -400,18 +480,26 @@ def _seccomp_program(arch: str) -> bytes | None:
         ins.append((_BPF_JEQ_K, f"selfpid1_{name}", None, pair[idx]))
     ins.append((_BPF_JEQ_K, "fcntl", None, _FCNTL[idx]))
     ins.append((_BPF_JEQ_K, "ioctl", None, _IOCTL[idx]))
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
+    ins.append((_BPF_JEQ_K, "prctl", None, _PRCTL[idx]))
+    if not allow_exec:
+        for pair in _EXEC_CHECKED:
+            ins.append((_BPF_JEQ_K, "noexec", None, pair[idx]))
+    ins.append((_BPF_JEQ_K, "socketpair", None, _SOCKETPAIR[idx]))
+    stubs(enosys=True)
 
     label("clone")  # only thread creation: flags must contain CLONE_THREAD
     ins.append((_BPF_LD_W_ABS, None, None, 16))
     ins.append((_BPF_JSET_K, "allow", "eperm", _CLONE_THREAD))
+    stubs()
     label("signal")  # only to ourselves (low 32 bits of the pid argument)
     ins.append((_BPF_LD_W_ABS, None, None, 16))
     ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
+    stubs()
     label("selfpid0")  # pid 0 means "the caller"; anything else must be our own pid
     ins.append((_BPF_LD_W_ABS, None, None, 16))
     ins.append((_BPF_JEQ_K, "allow", None, 0))
     ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
+    stubs()
     for name in _SELF_PID_ARG1:
         # `which` (arg0) must be the "a single process" selector, and `who` (arg1) ourselves.
         label(f"selfpid1_{name}")
@@ -420,29 +508,48 @@ def _seccomp_program(arch: str) -> bytes | None:
         ins.append((_BPF_LD_W_ABS, None, None, 24))
         ins.append((_BPF_JEQ_K, "allow", None, 0))
         ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
+        stubs()
     label("fcntl")  # the command is arg1; naming a signal owner is closed
     ins.append((_BPF_LD_W_ABS, None, None, 24))
     for cmd in _FCNTL_DENIED_CMDS:
         ins.append((_BPF_JEQ_K, "eperm", None, cmd))
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
+    stubs()
     label("ioctl")
     ins.append((_BPF_LD_W_ABS, None, None, 24))
     for cmd in _IOCTL_DENIED_CMDS:
         ins.append((_BPF_JEQ_K, "eperm", None, cmd))
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
-    label("allow")
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
-    label("eperm")
+    ins.append((_BPF_AND_K, None, None, 0xFF00))
+    ins.append((_BPF_JEQ_K, "eperm", "allow", _IOCTL_SOCKET_BLOCK))
+    stubs()
+    label("prctl")  # the option is arg0
+    ins.append((_BPF_LD_W_ABS, None, None, 16))
+    for option in _PRCTL_ALLOWED:
+        ins.append((_BPF_JEQ_K, "allow", None, option))
     ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
-    label("enosys")  # glibc falls back to clone() when clone3 reports ENOSYS
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _ENOSYS))
-    label("kill")
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_KILL_PROCESS))
+    stubs()
+    if not allow_exec:
+        label("noexec")  # `prot` is arg2 of both
+        ins.append((_BPF_LD_W_ABS, None, None, 32))
+        ins.append((_BPF_JSET_K, "eperm", "allow", _PROT_EXEC))
+        stubs()
+    label(
+        "socketpair"
+    )  # only a stream socketpair: a datagram one can `sendto` any path
+    ins.append((_BPF_LD_W_ABS, None, None, 16))
+    ins.append((_BPF_JEQ_K, None, "eperm", _AF_UNIX))
+    ins.append((_BPF_LD_W_ABS, None, None, 24))
+    ins.append((_BPF_AND_K, None, None, _SOCK_TYPE_MASK))
+    ins.append((_BPF_JEQ_K, "allow", "eperm", _SOCK_STREAM))
+    stubs()
+
+    def target(name: str, at: int) -> int:
+        # The nearest definition after `at`: jumps only go forward.
+        return min(pos for pos in labels[name] if pos > at) - at - 1
 
     out = b""
     for i, (code, jt, jf, k) in enumerate(ins):
-        jt_off = labels[jt] - i - 1 if jt else 0
-        jf_off = labels[jf] - i - 1 if jf else 0
+        jt_off = target(jt, i) if jt else 0
+        jf_off = target(jf, i) if jf else 0
         if not (0 <= jt_off < 256 and 0 <= jf_off < 256):
             return None
         out += struct.pack("<HBBI", code, jt_off, jf_off, k)
@@ -453,13 +560,13 @@ def _libc() -> ctypes.CDLL:
     return ctypes.CDLL(None, use_errno=True)
 
 
-def _apply_seccomp() -> bool:
+def _apply_seccomp(*, allow_exec: bool = True) -> bool:
     arch = platform.machine()
     if arch == "arm64":
         arch = "aarch64"
     if arch not in _AUDIT_ARCH:
         return False
-    program = _seccomp_program(arch)
+    program = _seccomp_program(arch, allow_exec=allow_exec)
     if program is None:
         return False
     libc = _libc()
@@ -476,7 +583,7 @@ def _apply_seccomp() -> bool:
     return libc.syscall(_SYS_SECCOMP[arch], 1, 1, ctypes.byref(prog)) == 0
 
 
-def _seccomp_is_safe_here() -> bool:
+def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
     """Fire the filter in a throwaway child first.
 
     The filter hard-codes syscall numbers per architecture and kills the process if
@@ -489,7 +596,7 @@ def _seccomp_is_safe_here() -> bool:
     if pid == 0:  # child: never returns
         code = 4
         try:
-            code = 0 if _apply_seccomp() and os.getpid() > 0 and os.uname() else 3
+            code = 0 if _apply_seccomp(allow_exec=allow_exec) and os.getpid() > 0 else 3
         finally:
             os._exit(code)
     _, status = os.waitpid(pid, 0)
@@ -671,7 +778,34 @@ def _apply_empty_root() -> bool:
         libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
-def apply(*, empty_root: bool = True) -> str:
+_READ_IMPLIES_EXEC = 0x0400000
+
+
+def _clear_read_implies_exec() -> None:
+    """Linux: drop the `READ_IMPLIES_EXEC` personality if this process inherited it.
+
+    With it set, the kernel adds PROT_EXEC to every PROT_READ mapping *after* seccomp has looked at
+    the arguments, which would silently defeat the no-executable-mapping rule. It survives exec
+    (`setarch -X`, and older x86_64 kernels for binaries without a GNU_STACK header)."""
+    libc = _libc()
+    current = libc.personality(0xFFFFFFFF)
+    if current != -1 and current & _READ_IMPLIES_EXEC:
+        libc.personality(current & ~_READ_IMPLIES_EXEC)
+
+
+def _thread_count_here() -> int:
+    """Threads in this process, including ones Python does not know about.
+
+    Landlock and the user-namespace layer only cover the calling thread, so a thread started by
+    native code (a library's pool, a runtime's worker) before `apply()` would be left unconfined
+    while the worker still reported "landlock". `threading.active_count()` cannot see those."""
+    try:
+        return len(os.listdir("/proc/self/task"))
+    except OSError:
+        return threading.active_count()
+
+
+def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
     """Confine the current process. Returns the layers applied, e.g. "landlock+seccomp",
     "seatbelt", or "none". Bonus layers land in `EXTRAS`.
 
@@ -696,16 +830,174 @@ def apply(*, empty_root: bool = True) -> str:
         # single-threaded by construction (the worker reads `init` before starting a thread); if
         # it is not, claiming "landlock" would be a lie about the threads that already exist, so
         # those two layers are skipped and `sandbox="require"` will say so.
-        single_threaded = threading.active_count() == 1
+        single_threaded = _thread_count_here() == 1
         # The empty root first: it needs the filesystem and the mount syscalls that the layers
         # below take away.
         if empty_root and single_threaded:
             attempt("emptyroot", _apply_empty_root, EXTRAS)
         if single_threaded:
             attempt("landlock", _apply_landlock, layers)
+        if not allow_exec:
+            _clear_read_implies_exec()  # before seccomp, which denies `personality`
         # seccomp last, with TSYNC, so it also covers any thread that already exists.
-        attempt("seccomp", lambda: _seccomp_is_safe_here() and _apply_seccomp(), layers)
+        attempt(
+            "seccomp",
+            lambda: (
+                _seccomp_is_safe_here(allow_exec=allow_exec)
+                and _apply_seccomp(allow_exec=allow_exec)
+            ),
+            layers,
+        )
     return "+".join(layers) or "none"
+
+
+def _procargs_of_parent() -> bool:
+    """macOS: can this process read its parent's argv and environment (KERN_PROCARGS2)?
+
+    The buffer is big enough for any realistic environment, and ENOMEM counts as "yes": it is
+    what a call that was *allowed* answers when the data does not fit, so mistaking it for a
+    refusal would hide the very capability this looks for."""
+    libc = _libc()
+    mib = (ctypes.c_int * 3)(1, 49, os.getppid())  # CTL_KERN, KERN_PROCARGS2, pid
+    buf = ctypes.create_string_buffer(1 << 20)
+    size = ctypes.c_size_t(len(buf))
+    rc = libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0)
+    return rc == 0 or ctypes.get_errno() == errno.ENOMEM
+
+
+def _hardware_uuid_readable() -> bool:
+    """macOS: can this process read the machine's permanent hardware identifier?"""
+    libc = _libc()
+    uuid = ctypes.create_string_buffer(16)
+
+    class _Timespec(ctypes.Structure):
+        _fields_ = (("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long))
+
+    wait = _Timespec(1, 0)
+    return libc.gethostuuid(uuid, ctypes.byref(wait)) == 0 and any(uuid.raw)
+
+
+def _creates_sysv_semaphore() -> bool:
+    """macOS: can this process create a SysV semaphore (an object that outlives it)? Removes it again."""
+    libc = _libc()
+    semid = libc.semget(0, 1, 0o1600)  # IPC_PRIVATE, one semaphore, IPC_CREAT | 0600
+    if semid == -1:
+        return False
+    libc.semctl(semid, 0, 0)  # IPC_RMID
+    return True
+
+
+def attest() -> list[str]:
+    """Try, from inside the confined process, the things the sandbox exists to stop, and return
+    the ones that worked. Empty means every probe was refused.
+
+    The layers are assembled from lists of what to deny, and a list is only as good as its last
+    review: the macOS profile once let the worker read the host's environment through a sysctl
+    nobody had thought of. This does not trust the lists. It asks the kernel, once, before any
+    guest code exists, so a hole of that kind stops the worker from starting instead of waiting
+    for a reviewer. Every probe is a refusal we expect, so it costs a handful of syscalls.
+
+    A probe is one security-sensitive call. If that call succeeds it is a breach, recorded at
+    once; cleanup afterwards is best effort and never changes the verdict. Only an `OSError` from
+    the sensitive call counts as a refusal: anything else (a bug in a probe) propagates, and the
+    worker refuses to start rather than report a sandbox it did not actually check.
+    """
+    breaches: list[str] = []
+    ppid = os.getppid()
+
+    def check(
+        name: str,
+        call: Callable[[], object],
+        cleanup: Callable[[], object] | None = None,
+    ) -> None:
+        try:
+            call()
+        except OSError:
+            return  # refused: the answer we want
+        breaches.append(name)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except OSError:
+                pass
+
+    def read(path: str) -> None:
+        with open(path, "rb") as fh:
+            fh.read(1)
+
+    created: list[str] = []
+
+    def write() -> None:
+        path = f"/tmp/.pydeno-attest-{os.getpid()}"
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        created.append(path)
+
+    spawned: list[int] = []
+
+    def spawn() -> None:
+        spawned.append(os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], {}))
+
+    def connect() -> None:
+        # Seatbelt lets `socket()` succeed and refuses the connect, so test the connect. Only the
+        # sandbox's own refusal (a PermissionError) counts: "connection refused" means the attempt
+        # reached the network stack, which the sandbox should have prevented.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            try:
+                s.connect(("127.0.0.1", 9))
+            except PermissionError:
+                raise
+            except OSError:
+                return
+
+    pairs: list[tuple[socket.socket, socket.socket]] = []
+
+    def unix_dgram() -> None:
+        # A datagram socketpair can `sendto` any path the process can name (journald, notify).
+        pairs.append(socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM))
+
+    def cleanup_files() -> None:
+        for path in created:
+            os.unlink(path)
+
+    def cleanup_children() -> None:
+        for pid in spawned:
+            os.waitpid(pid, 0)
+
+    def cleanup_sockets() -> None:
+        for a, b in pairs:
+            a.close()
+            b.close()
+
+    check("read-file", lambda: read("/etc/hosts"))
+    check("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
+    check("write-file", write, cleanup_files)
+    check("spawn-process", spawn, cleanup_children)
+    check("network-socket", connect)
+    check("signal-parent", lambda: os.kill(ppid, 0))
+    if sys.platform.startswith("linux"):
+        # `execve` of a path that cannot exist: seccomp refuses at syscall entry with EPERM, and if
+        # exec is allowed the answer is ENOENT. Unlike spawning /bin/sh this does not depend on the
+        # image having a shell at all. (Not on macOS: there the path is looked up first, so even a
+        # healthy sandbox answers ENOENT; the spawn probe above covers it.)
+        try:
+            os.execv("/nonexistent-pydeno-attest", ["x"])
+        except PermissionError:
+            pass  # refused
+        except OSError:
+            breaches.append("exec-allowed")
+    if sys.platform == "darwin":
+        # These signal by return value rather than by raising.
+        if _creates_sysv_semaphore():
+            breaches.append("create-sysv-object")
+        if _procargs_of_parent():
+            breaches.append("read-parent-argv-environ")
+        if _hardware_uuid_readable():
+            breaches.append("read-hardware-uuid")
+        check("inspect-other-process", lambda: os.getpgid(ppid))
+    if sys.platform.startswith("linux"):
+        check("unix-datagram-socket", unix_dgram, cleanup_sockets)
+    return breaches
 
 
 # What "every layer this platform has" means, for `sandbox="require"`. Anything else is a
@@ -768,6 +1060,14 @@ def drop_privileges() -> dict[str, object]:
             report["became"] = _NOBODY
         except OSError as exc:
             report["became_error"] = str(exc)
+    if os.geteuid() == 0:
+        # Still root (an unmapped uid in a rootless container, say): the bounding set is empty, but
+        # the capabilities already held are not, so clear them too. `sandbox="require"` refuses to
+        # run in this state; the other modes at least do not run it with capabilities.
+        try:
+            report["capabilities_cleared"] = _clear_capabilities(_libc())
+        except (OSError, AttributeError):
+            pass
     report["uid_after"] = os.geteuid()
     return report
 
@@ -788,12 +1088,20 @@ def harden_process() -> dict[str, object]:
         ("RLIMIT_NOFILE", 256),
         ("RLIMIT_MEMLOCK", 0),
         ("RLIMIT_MSGQUEUE", 0),
+        # A host user who is allowed realtime priority (an audio group, say) would otherwise let
+        # the worker run at realtime priority and starve the host.
+        ("RLIMIT_RTPRIO", 0),
+        ("RLIMIT_NICE", 0),
     ):
         try:
             res = getattr(resource, name)
             resource.setrlimit(res, (value, value))
         except (ValueError, OSError, AttributeError):
             pass
+    if sys.platform.startswith("linux"):
+        # Not dumpable: a same-user process cannot ptrace it or read its /proc/<pid>/mem, and
+        # the filter later refuses `prctl` options, so a guest cannot switch it back on.
+        _libc().prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
     return drop_privileges()
 
 
@@ -883,6 +1191,31 @@ def cpu_seconds(pid: int) -> float | None:
 
 
 _libproc: ctypes.CDLL | None = None
+
+
+def thread_count(pid: int) -> int | None:
+    """How many threads the process `pid` has, or None. A worker has about 13 on Linux and 17 on
+    macOS; a guest that gets native code can start thousands within a second, well under a
+    memory ceiling, and a handful of such workers exhausts the host's thread table."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                fields = fh.read().rsplit(b")", 1)[1].split()
+            return int(
+                fields[17]
+            )  # num_threads is field 20; the list starts at field 3
+        if sys.platform == "darwin":
+            global _libproc  # noqa: PLW0603
+            if _libproc is None:
+                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+            info = _TaskInfo()
+            n = _libproc.proc_pidinfo(
+                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
+            )
+            return int(info.threadnum) if n == ctypes.sizeof(info) else None
+    except (OSError, ValueError, IndexError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def rss_bytes(pid: int) -> int | None:

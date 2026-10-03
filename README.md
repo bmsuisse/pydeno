@@ -2,7 +2,7 @@
 
 # pydeno
 
-### Run AI-generated JavaScript from Python, without trusting it.
+### Run AI-generated JavaScript from Python, securely, in a sandbox.
 
 Real V8 · supervised worker process · OS-level sandbox · your Python functions as the only way out
 
@@ -124,6 +124,46 @@ Python crunched the numbers; JavaScript drew the chart with [Vega-Lite](https://
 each sandbox refused its own attempt to reach outside, and both drew on the same five-call tool
 budget. Full runnable example: [`examples/monty_and_pydeno.py`](examples/monty_and_pydeno.py).
 
+### More of the same: Python prepares, JavaScript builds
+
+Monty is excellent at the data half, and the JavaScript ecosystem has libraries nothing in Python
+matches. Each example below is a complete, tested program: the model's Python runs in Monty, the
+model's JavaScript runs in pydeno, neither can reach your files, network or environment, and each
+test checks the answer against an independent computation (and Monty's against CPython's).
+
+| Example | Monty (Python) does | pydeno (JavaScript) does | Produces |
+|---|---|---|---|
+| [3D terrain](examples/monty_three_terrain.py) | layered value-noise heightmap, slope analysis, tree placement | [three.js](https://threejs.org): mesh, normals, vertex colours by slope, instanced trees, raycast line-of-sight | `.glb` 3D model |
+| [Orbits](examples/monty_three_orbits.py) | symplectic N-body integrator (figure-eight choreography), energy drift | three.js: speed-coloured tube trails, closest-approach analysis | `.glb` 3D model |
+| [Julia relief](examples/monty_three_julia.py) | Monty's own `julia` example: escape-time counts for every grid point | three.js: a mountain range along the fractal's boundary, painted by escape time | `.glb` 3D model |
+| [City sun analysis](examples/monty_three_city.py) | procedural city layout and zoning | three.js: extruded buildings, a raycast from every roof to the sun, shade ranking | `.glb` with per-building sunlight |
+| [Dependency network](examples/monty_d3_network.py) | synthetic package graph, PageRank, components | [d3](https://d3js.org): force layout run to convergence, Voronoi cells, treemap | one self-contained SVG |
+| [Dashboard](examples/monty_echarts_dashboard.py) | a year of metrics: moving average, z-score anomalies, correlations, regression | [ECharts](https://echarts.apache.org): four-panel dashboard, server-side | HTML page with inline SVG, no scripts |
+| [Geospatial](examples/monty_turf_geo.py) | fleet GPS tracks, cleaning and resampling | [turf.js](https://turfjs.org): buffer union, hulls, Voronoi service zones, nearest depot | GeoJSON and an SVG map |
+| [SQL to chart](examples/monty_sql_charts.py) | answers a business question through a read-only SQL tool | [Vega-Lite](https://vega.github.io/vega-lite/): bars, stacked bars, cohort heatmap | SVG charts |
+| [Spreadsheet to deck](examples/monty_spreadsheet_deck.py) | analyses a sheet through a read-only wrapper | [pptxgenjs](https://gitbrent.github.io/PptxGenJS/): native charts, tables, narrative | `.pptx` board deck |
+
+How fast are they together? One warm worker, median of three, on an Apple-silicon Mac, with V8 in
+its secure default (`jitless`) and with the JIT turned on:
+
+| Example | jitless (default) | V8 JIT on | JIT speed-up |
+|---|---:|---:|---:|
+| three.js terrain (129x129 grid) | 879 ms | 180 ms | 4.9x |
+| three.js N-body orbits (3000 steps) | 247 ms | 172 ms | 1.4x |
+| three.js city sun analysis (6x6 blocks) | 210 ms | 27 ms | 7.9x |
+| d3 network layout (200 packages) | 1,619 ms | 198 ms | 8.2x |
+| ECharts dashboard (365 days x 4 regions) | 64 ms | 42 ms | 1.5x |
+| turf geospatial (8 vehicles) | 1,937 ms | 347 ms | 5.6x |
+| SQL question to Vega-Lite chart (4000 orders) | 18 ms | 17 ms | 1.1x |
+| spreadsheet to PowerPoint (1000 rows) | 70 ms | 31 ms | 2.3x |
+
+Most turns finish in well under a second even in the secure mode; Monty's data half stays within
+about 1.1x of plain CPython. The JIT matters for compute-heavy JavaScript (layouts, raycasting), and
+it is exactly the part of V8 where most exploits live, which is why it is off by default. If you
+trust the code a little more, `IsolatedRuntime(jitless=False)` buys the second column and still
+runs behind the full OS sandbox. Reproduce with
+[`benches_py/monty_three_bench.py`](benches_py/monty_three_bench.py).
+
 ## How it works
 
 ```mermaid
@@ -203,6 +243,17 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   fails closed. See [`.github/workflows/test.yml`](.github/workflows/test.yml).
 - **Zero skips.** Platform-specific tests are deselected, never skipped; CI enforces a skip budget
   of zero so an unrun test cannot hide.
+- **The worker proves its own confinement.** Before any guest code exists it tries to read a file,
+  write one, spawn a process, connect out, signal its parent and (on macOS) read the parent's
+  environment and the machine's hardware ID; a complete sandbox that lets one through refuses to
+  start. Each probe is also checked in reverse: it must report a breach in an unsandboxed process.
+- **Independent review, and what it found.** Three AI reviewers (each given a separate slice of the
+  sandbox and told to reproduce before reporting), GitHub Copilot, and research into how vm2,
+  SandboxJS, isolated-vm and Monty were attacked. The result is a findings table that lists the
+  misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
+  let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
+  Read it in the **[security report](docs/security-report.md)**, and try to beat it in
+  **[Hack pydeno](docs/hack-pydeno.md)**.
 
 ## Performance
 
@@ -225,7 +276,8 @@ slower than with the JIT; `jitless=False` trades that back for a larger attack s
 ## Integrations
 
 - [**FastMCP tool bridge**](examples/fastmcp_tool_bridge.py): expose FastMCP tools to sandboxed JS via `bind_function` and an in-process `fastmcp.Client`
-- [**pydantic-ai "code mode" agent**](examples/pydantic_ai_agent.py): the model submits one JS batch script instead of many separate tool calls, run safely with a timeout
+- [**pydantic-ai code mode (`JSCodeMode`)**](docs/guides/pydantic-ai.md): the JavaScript counterpart of pydantic-ai's Monty-based code mode. The agent gets one `run_javascript` tool; your other tools become typed `tools.*` functions the model's code calls with `await` and `Promise.all`, with retries, usage limits and approvals mapped onto pydantic-ai's own. Runs offline: [`examples/pydantic_ai_agent.py`](examples/pydantic_ai_agent.py). `pip install "pydeno[pydantic-ai]"`
+- [**Agent sessions (`AgentSandbox`)**](docs/guides/agent-sessions.md): state across turns, pause and resume at every tool call (approval flows), a signed replay journal you can `dump()` and `load()`, and the tool descriptions and `.d.ts` for your prompt
 - [**ToolBridge**](examples/tool_bridge.py): several Python tools with a total call budget, typed errors the model's JS can branch on, and `console.log` routed back to Python
 - [**Monty + pydeno**](examples/monty_and_pydeno.py): the model's Python runs in [Monty][monty], its JavaScript in pydeno, both sandboxed, sharing one tool and one call budget; Python computes, a Vega-Lite chart is drawn in JS
 - [**Vendored npm libraries**](examples/vendored_npm_libraries.py): run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles inside the sandbox; see the [guide](https://bmsuisse.github.io/pydeno/guides/advanced/vendored-npm-libraries/)
@@ -246,6 +298,20 @@ sandbox? Please report it privately, as described in [`SECURITY.md`](SECURITY.md
 [`docs/contributing/`](docs/contributing/).
 
 Licensed under the [MIT License](LICENSE).
+
+## Acknowledgements
+
+pydeno began as a fork of [**jsrun**](https://github.com/imfing/jsrun) by Xin Fu, which had the
+original idea of a Python library that runs JavaScript on a Rust runtime built on `deno_core`. We took
+that idea and its foundations, then changed a great deal: the sandboxed worker process and OS
+confinement, the tool boundary, the wire codec, the resource limits, and most of the tests are new.
+Thank you to jsrun for the starting point. The [MIT licence and original copyright](LICENSE) are kept,
+and [`docs/contributing/upstream-divergence.md`](docs/contributing/upstream-divergence.md) records
+what came from where.
+
+Thanks also to [Monty](https://github.com/pydantic/monty) by Pydantic, whose design for running
+agent-written code (limits, host functions, a public challenge to break it) shaped how we think about
+this problem; the two sandboxes work well side by side.
 
 [v8]: https://v8.dev
 [deno_core]: https://crates.io/crates/deno_core

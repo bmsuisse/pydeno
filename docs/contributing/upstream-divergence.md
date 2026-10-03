@@ -24,7 +24,15 @@ ended.
 | This repo | [bmsuisse/pydeno](https://github.com/bmsuisse/pydeno) — standalone, not a tracking fork |
 
 The name is `pydeno` = **py**thon + **deno**. The package was renamed on the
-fork; `jsrun` no longer appears in this codebase.
+fork, so the name `jsrun` no longer appears in the code. The code itself is
+another matter: measured against the base commit above (whitespace-normalised
+code lines, October 2026), about 70% of upstream's code lines are still present
+in this repo, roughly half of today's Rust core is upstream's, and a few
+upstream test files are untouched. Most of what has been added since is new (the
+isolation layer, the OS sandbox, the wire codec, the tool boundary, the limits,
+and most of the tests). That is why the MIT licence and the original copyright
+are kept, and why this page exists. Thank you to jsrun for the idea and the
+foundation.
 
 ## 1. Cross-thread termination (`TerminationHandle`)
 

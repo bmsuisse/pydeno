@@ -30,6 +30,16 @@ from ._pydeno import (
 )
 
 if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
+    from ._agent import (
+        AgentSandbox,
+        Done,
+        Failed,
+        JournalError,
+        ReplayDivergence,
+        ToolCall,
+        describe_tools,
+        typescript_stubs,
+    )
     from ._isolated import IsolatedRuntime, WorkerCrashed
     from ._polyfills import WEB_POLYFILLS
     from ._snapshot_auth import (
@@ -43,6 +53,14 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
 # keeps start-up small for plain `Runtime` users and for the isolation worker (which has no use for
 # the parent-side machinery: subprocess, tempfile, asyncio, ...).
 _LAZY = {
+    "AgentSandbox": "_agent",
+    "ToolCall": "_agent",
+    "Done": "_agent",
+    "Failed": "_agent",
+    "ReplayDivergence": "_agent",
+    "JournalError": "_agent",
+    "describe_tools": "_agent",
+    "typescript_stubs": "_agent",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
     "WEB_POLYFILLS": "_polyfills",
@@ -341,6 +359,14 @@ __all__ = [
     "bind_object",
     "Runtime",
     "IsolatedRuntime",
+    "AgentSandbox",
+    "ToolCall",
+    "Done",
+    "Failed",
+    "ReplayDivergence",
+    "JournalError",
+    "describe_tools",
+    "typescript_stubs",
     "WEB_POLYFILLS",
     "WorkerCrashed",
     "SnapshotAuthenticationError",

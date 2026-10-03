@@ -1,0 +1,83 @@
+name: Security
+
+# Dependency and supply-chain scanning. Policy lives in deny.toml; how to run each tool locally and
+# what to do about a finding: docs/contributing/supply-chain.md.
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "deny.toml"
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+  schedule:
+    # Advisories land without any change in this repo, so scan weekly as well.
+    - cron: "43 5 * * 1"
+  workflow_dispatch:
+
+# Reruns on the same ref cancel the older run.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, licences, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # Duplicate versions only warn (deny.toml); everything else fails the job.
+          arguments: --all-features
+
+  cargo-audit:
+    name: cargo-audit (RustSec)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write # audit-check publishes its result as a check run
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Keep in step with [advisories].ignore in deny.toml (reasons are there).
+          ignore: RUSTSEC-2026-0176,RUSTSEC-2026-0177
+
+  pip-audit:
+    name: pip-audit (uv.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - name: Export the locked requirements (read-only, does not touch uv.lock)
+        run: uv export --frozen --all-groups --no-emit-project --no-hashes -o "$RUNNER_TEMP/requirements.txt"
+      - name: Audit
+        # pydeno itself has no runtime Python dependencies; everything here is a dev, docs or
+        # example group, so a finding is a development-environment risk, not a wheel risk.
+        # --no-deps because uv already resolved the full tree; --disable-pip avoids a venv.
+        run: uvx pip-audit -r "$RUNNER_TEMP/requirements.txt" --no-deps --disable-pip
+
+  osv-scanner:
+    name: osv-scanner (Cargo.lock, uv.lock)
+    runs-on: ubuntu-latest
+    # Advisory cross-check, not a gate: OSV has no way to read deny.toml's reasoned ignores (an
+    # osv-scanner.toml would be needed), so known and accepted findings would keep it red. The
+    # gates are cargo-deny, cargo-audit and pip-audit above; read this job's log for anything
+    # they do not cover (OSV also indexes GHSA and PYSEC ids).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.6.0
+        with:
+          scan-args: |-
+            --lockfile=Cargo.lock
+            --lockfile=uv.lock

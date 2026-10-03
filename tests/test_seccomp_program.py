@@ -68,6 +68,8 @@ def run(
             pc += jt if acc == k else jf
         elif code == 0x35:  # BPF_JMP | BPF_JGE | BPF_K
             pc += jt if acc >= k else jf
+        elif code == 0x54:  # BPF_ALU | BPF_AND | BPF_K
+            acc &= k
         elif code == 0x45:  # BPF_JMP | BPF_JSET | BPF_K
             pc += jt if acc & k else jf
         elif code == 0x06:  # BPF_RET | BPF_K
@@ -163,9 +165,9 @@ class TestWhatTheWorkerNeeds:
         "lseek",
         "readlinkat",
         "pread64",
-        "uname",
         "getrlimit",
         "sched_getaffinity",
+        "uname",
         "set_tid_address",
         "mremap",
         "getcwd",
@@ -186,7 +188,12 @@ class TestWhatTheWorkerNeeds:
         for name in self.NEEDED:
             if name not in by:
                 continue  # not present on this architecture
-            if run(prog, arch, by[name], (0, 0, 0, 0, 0, 0)) != ALLOW:
+            # socketpair is allowed for what the worker uses it for (an AF_UNIX stream pair);
+            # every other call is checked with zeroed arguments.
+            # a real call, not zeros: socketpair as an AF_UNIX stream pair, prctl as PR_SET_NAME
+            special = {"socketpair": (1, 1, 0, 0, 0, 0), "prctl": (15, 0, 0, 0, 0, 0)}
+            args = special.get(name, (0, 0, 0, 0, 0, 0))
+            if run(prog, arch, by[name], args) != ALLOW:
                 missing.append(name)
         assert not missing, f"the filter blocks calls the worker relies on: {missing}"
 
@@ -291,7 +298,9 @@ class TestSignalOwnership:
     """`fcntl(fd, F_SETOWN, parent)` + `F_SETSIG` + `O_ASYNC` makes the kernel signal the owner
     whenever the descriptor is ready, without ever calling `kill`."""
 
-    @pytest.mark.parametrize("cmd", [8, 10, 15])  # F_SETOWN, F_SETSIG, F_SETOWN_EX
+    @pytest.mark.parametrize(
+        "cmd", [8, 10, 15, 1031]
+    )  # F_SETOWN, F_SETSIG, F_SETOWN_EX; and F_SETPIPE_SZ (pipe buffers are memory the RSS poll misses)
     def test_naming_a_signal_owner_is_denied(
         self, arch: str, prog: list, cmd: int
     ) -> None:
@@ -303,7 +312,7 @@ class TestSignalOwnership:
 
     @pytest.mark.parametrize(
         "cmd",
-        [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 1024, 1025, 1030, 1031, 1032, 1033],
+        [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 1024, 1025, 1030, 1032, 1033],
     )
     def test_every_other_fcntl_command_is_untouched(
         self, arch: str, prog: list, cmd: int
@@ -329,14 +338,49 @@ class TestSignalOwnership:
         assert run(prog, arch, nr, (3, cmd, os.getppid())) == ERRNO | EPERM
 
     @pytest.mark.parametrize(
-        "cmd", [0x541B, 0x5421, 0x5452, 0x8903, 0x8904, 0x5401, 0x5413]
+        "cmd", [0x541B, 0x5421, 0x5452, 0x5401, 0x5413, 0x7001, 0x89]
     )
     def test_ordinary_ioctls_are_untouched(
         self, arch: str, prog: list, cmd: int
     ) -> None:
-        # FIONREAD, FIONBIO, FIOASYNC, SIOCGPGRP, FIOGETOWN, TCGETS, TIOCGWINSZ
+        # FIONREAD, FIONBIO, FIOASYNC, TCGETS, TIOCGWINSZ, and two numbers just outside the block
         nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
         assert run(prog, arch, nr, (3, cmd, 0)) == ALLOW
+
+    @pytest.mark.parametrize(
+        "cmd", [0x8900, 0x8903, 0x8904, 0x8912, 0x8913, 0x8927, 0x8933, 0x89FF]
+    )
+    def test_the_whole_socket_ioctl_block_is_denied(
+        self, arch: str, prog: list, cmd: int
+    ) -> None:
+        # SIOCGIFFLAGS, SIOCGPGRP, SIOCGIFCONF, SIOCGIFHWADDR, ...: they answer from the host's
+        # network stack even on a unix socket.
+        nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (3, cmd, 0)) == ERRNO | EPERM
+
+    def test_prctl_may_not_set_a_core_scheduling_cookie(
+        self, arch: str, prog: list
+    ) -> None:
+        nr = sb._PRCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (62, 2, os.getppid(), 0, 0)) == ERRNO | EPERM
+        assert run(prog, arch, nr, (15, 0, 0, 0, 0)) == ALLOW  # PR_SET_NAME stays
+
+    @pytest.mark.parametrize(
+        ("domain", "kind", "allowed"),
+        [
+            (1, 1, True),  # AF_UNIX, SOCK_STREAM (asyncio's self-pipe)
+            (1, 1 | 0o2000000, True),  # ... with SOCK_CLOEXEC
+            (1, 2, False),  # SOCK_DGRAM: can `sendto` a path
+            (1, 5, False),  # SOCK_SEQPACKET
+            (2, 1, False),  # AF_INET
+        ],
+    )
+    def test_socketpair_is_a_unix_stream_pair_only(
+        self, arch: str, prog: list, domain: int, kind: int, allowed: bool
+    ) -> None:
+        nr = sb._SOCKETPAIR[_idx(arch)]  # noqa: SLF001
+        verdict = run(prog, arch, nr, (domain, kind, 0, 0))
+        assert verdict == (ALLOW if allowed else ERRNO | EPERM)
 
     def test_the_command_is_judged_on_its_low_32_bits_like_the_kernel_does(
         self, arch: str, prog: list
@@ -400,3 +444,82 @@ class TestShape:
 
     def test_building_it_twice_gives_the_same_program(self, arch: str) -> None:
         assert sb._seccomp_program(arch) == sb._seccomp_program(arch)  # noqa: SLF001
+
+
+class TestWhatAWorkerMayAskTheKernelAbout:
+    """The worker never asks for these, and an attacker wants each: the host's uptime/RAM/process
+    count, and other processes' priorities (which enumerate every pid)."""
+
+    @pytest.mark.parametrize("name", ["sysinfo", "getpriority", "ioprio_get"])
+    def test_denied(self, arch: str, prog: list, name: str) -> None:
+        nr = _by_name(arch)[name]
+        assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ERRNO | EPERM
+
+
+class TestPrctl:
+    @pytest.mark.parametrize(
+        "option", [15, 16, 0x53564D41, 3]
+    )  # SET/GET_NAME, SET_VMA, GET_DUMPABLE
+    def test_what_a_worker_does_is_allowed(
+        self, arch: str, prog: list, option: int
+    ) -> None:
+        nr = sb._PRCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (option, 0, 0, 0, 0)) == ALLOW
+
+    @pytest.mark.parametrize(
+        "option",
+        [1, 4, 22, 36, 38, 62, 0x59616D61],
+        ids=[
+            "pdeathsig",
+            "set-dumpable",
+            "seccomp",
+            "child-subreaper",
+            "no-new-privs",
+            "sched-core",
+            "ptracer",
+        ],
+    )
+    def test_everything_else_is_denied(
+        self, arch: str, prog: list, option: int
+    ) -> None:
+        nr = sb._PRCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (option, 0, 0, 0, 0)) == ERRNO | EPERM
+
+
+class TestExecutableMemory:
+    """A jitless V8 never maps memory executable: refusing it makes an exploit work without
+    injecting code. A JIT-enabled worker keeps it."""
+
+    PROT_READ, PROT_WRITE, PROT_EXEC = 1, 2, 4
+
+    @pytest.mark.parametrize("name", ["mmap", "mprotect"])
+    def test_refused_when_jitless(self, arch: str, name: str) -> None:
+        program = [
+            struct.unpack_from("<HBBI", raw, i * 8)
+            for raw in [sb._seccomp_program(arch, allow_exec=False)]  # noqa: SLF001
+            for i in range(len(raw) // 8)
+        ]
+        nr = _by_name(arch)[name]
+        rw = self.PROT_READ | self.PROT_WRITE
+        assert run(program, arch, nr, (0, 4096, rw)) == ALLOW
+        assert (
+            run(program, arch, nr, (0, 4096, self.PROT_READ | self.PROT_EXEC))
+            == ERRNO | EPERM
+        )
+        assert run(program, arch, nr, (0, 4096, rw | self.PROT_EXEC)) == ERRNO | EPERM
+
+    @pytest.mark.parametrize("name", ["mmap", "mprotect"])
+    def test_allowed_with_a_jit(self, arch: str, prog: list, name: str) -> None:
+        nr = _by_name(arch)[name]
+        assert run(prog, arch, nr, (0, 4096, self.PROT_READ | self.PROT_EXEC)) == ALLOW
+
+
+def test_pkey_mprotect_is_denied_outright(arch: str, prog: list) -> None:
+    nr = _by_name(arch)["pkey_mprotect"]
+    assert run(prog, arch, nr, (0, 4096, 1)) == ERRNO | EPERM
+
+
+def test_uname_stays_open_because_v8_on_x86_64_needs_it(arch: str, prog: list) -> None:
+    # V8's x86_64 build aborts at startup (`Check failed: 0 == uname(...)`) if this is refused.
+    nr = _by_name(arch)["uname"]
+    assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ALLOW

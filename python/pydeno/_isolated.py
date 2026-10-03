@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
+import functools
 import contextvars
 import inspect
 import itertools
@@ -33,8 +35,10 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -73,7 +77,9 @@ _CONFIG_KEYS = (
     "max_serialization_bytes",
     "force_kill_grace",
 )
-_UNSUPPORTED_CONFIG = ("inspector",)
+# `snapshot` is refused, not ignored: RuntimeConfig forbids a snapshot together with a bootstrap,
+# so dropping it would also drop the bootstrap the caller meant to be in force.
+_UNSUPPORTED_CONFIG = ("inspector", "snapshot")
 
 _MAX_REMOTE_MESSAGE = 64 * 1024
 _POLL_SECONDS = 0.1
@@ -104,6 +110,7 @@ _IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "pydeno_in_host_call", default=False
 )
 
+_NATIVE_FRAME = re.compile(r"0x[0-9a-fA-F]{4,}|\.(?:so|dylib)\b|\+\s*\d+\s*$")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
@@ -111,6 +118,73 @@ def _clean(text: str, limit: int = 500) -> str:
     """Text that came from the worker, made safe to put in an exception message and a log:
     no control or escape characters, bounded length."""
     return _CONTROL.sub("?", text)[:limit]
+
+
+_REVOKED_MEMORY = 4096
+# V8 flags every worker gets besides `--jitless` (each checked against dagre, three.js with the glTF
+# exporter and vega-lite under the sandbox, and against the benchmark suite):
+#  * regexp fallback: a catastrophic regular expression switches to a linear-time engine after
+#    50 000 backtracks and returns, instead of running until the deadline kills the worker.
+#  * freeze flags: V8 refuses further flag changes once it has started, so a V8 bug that could flip
+#    a flag at run time cannot be used to switch a protection off.
+_HARDENING_V8_FLAGS = (
+    "--enable-experimental-regexp-engine-on-excessive-backtracks",
+    "--freeze-flags-after-init",
+)
+# A worker runs about 13 threads (17 on macOS); this is far past that and far below a thread bomb.
+_MAX_WORKER_THREADS = 64
+
+
+def _revoked_handler(*_args: Any) -> Any:
+    raise PermissionError("capability revoked")
+
+
+_CONSOLE_LEVELS = frozenset({"log", "info", "warn", "error", "debug", "trace"})
+_MAX_SPECIFIER = 4096
+
+
+def _checked_specifiers(fn: Callable[..., Any], arity: int) -> Callable[..., Any]:
+    """Wrap a module resolver/loader so the worker can only call it with `arity` plain, bounded,
+    NUL-free strings. The parent made these handlers and knows their contract; a compromised
+    worker choosing other arguments (a path-traversal string is the obvious one, a non-string the
+    subtle one) should never reach the host's own code."""
+
+    def check(args: tuple[Any, ...]) -> None:
+        if len(args) != arity or not all(
+            isinstance(a, str) and len(a) <= _MAX_SPECIFIER and "\0" not in a
+            for a in args
+        ):
+            raise ValueError("invalid module specifier")
+
+    if inspect.iscoroutinefunction(fn):
+
+        async def acall(*args: Any) -> Any:
+            check(args)
+            return await fn(*args)
+
+        return acall
+
+    def call(*args: Any) -> Any:
+        check(args)
+        return fn(*args)
+
+    return call
+
+
+def _checked_console(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Only the six console methods, with a list of arguments: `getattr(logger, level)` in a
+    typical `on_console` must not be steerable to `__init__` by the worker."""
+
+    def call(*args: Any) -> Any:
+        if (
+            len(args) != 2
+            or args[0] not in _CONSOLE_LEVELS
+            or not isinstance(args[1], list)
+        ):
+            raise ValueError("invalid console call")
+        return fn(*args)
+
+    return call
 
 
 class _Default:
@@ -293,7 +367,7 @@ class IsolatedRuntime:
         max_host_wait: float | int | None = _DEFAULT,
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
-        redact_host_errors: bool = False,
+        redact_host_errors: bool = True,
         sandbox: str = "auto",
         empty_root: bool = True,
         jitless: bool = True,
@@ -328,6 +402,13 @@ class IsolatedRuntime:
                 )
 
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
+        if max_memory is not None and self._config["max_buffer_bytes"] is None:
+            # ArrayBuffer storage is outside the V8 heap, so `max_heap_size` cannot bound it, and
+            # without a cap a `new Uint8Array(2 ** 31)` is only caught by the RSS poll, which kills
+            # the whole worker. With a cap the guest gets a catchable RangeError and the session
+            # survives. (No default heap cap: with one, V8 turns an over-cap allocation into a
+            # fatal "heap limit exceeded" instead of that RangeError.)
+            self._config["max_buffer_bytes"] = max(1, max_memory // 4)
         self._soft_timeout = _seconds(config.timeout)
         self._max_memory = max_memory
         # Three states: unset (soft timeout + grace, else a default ceiling), a number,
@@ -362,6 +443,7 @@ class IsolatedRuntime:
             "sandbox": sandbox,
             "empty_root": empty_root,
             "v8_flags": (["--jitless"] if jitless else [])
+            + list(_HARDENING_V8_FLAGS)
             + seed_flags
             + list(v8_flags),
             "max_memory": max_memory,
@@ -387,7 +469,7 @@ class IsolatedRuntime:
         if config.on_console is not None:
             # `console.*` in the guest calls this in the parent, like any host function.
             console_hid = next(self._hids)
-            self._handlers[console_hid] = (config.on_console, False)
+            self._handlers[console_hid] = (_checked_console(config.on_console), False)
             self._options["console_hid"] = console_hid
 
         self._idle_cpu_base: float | None = None
@@ -411,8 +493,18 @@ class IsolatedRuntime:
         self._finalizer = weakref.finalize(
             self, _terminate_process, self._proc, self._stderr
         )
+        self._owner_pid = os.getpid()
+        # Asynchronous host calls still running, across commands: `max_inflight_host_calls` is a
+        # cap on these, not on one command's, or 1000 commands could each leave 64 behind.
+        self._async_inflight = 0
+        self._executor: ThreadPoolExecutor | None = None
+        self._executor_lock = threading.Lock()
+        self._async_inflight_lock = threading.Lock()
+        # Recently revoked handler ids, oldest first (bounded): see `_on_call`.
+        self._revoked_hids: dict[int, None] = {}
         _LIVE.add(self)
         self._handshake()
+        self._check_limits_can_be_enforced()
         if prewarm and python is None:
             _refill_spare()
         self._idle_since = time.monotonic()
@@ -425,6 +517,36 @@ class IsolatedRuntime:
         ).start()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _check_limits_can_be_enforced(self) -> None:
+        """A limit that cannot be measured is a limit that is not there.
+
+        Memory and CPU are read from outside (`/proc` on Linux, `proc_pidinfo` on macOS). On a
+        system where that read fails (a hardened /proc mount, a missing libproc) the checks would
+        quietly never fire while `sandbox` still reports success. Say so, and under
+        `sandbox="require"`, which promises a complete sandbox, refuse to start."""
+        missing = []
+        if self._max_memory is not None and _sandbox.rss_bytes(self._proc.pid) is None:
+            missing.append("max_memory")
+        if _sandbox.cpu_seconds(self._proc.pid) is None:
+            missing.append("the CPU cap")
+        if _sandbox.thread_count(self._proc.pid) is None:
+            missing.append("the thread cap")
+        if not missing:
+            return
+        what = " and ".join(missing)
+        if self._options["sandbox"] == "require":
+            self._kill()
+            raise WorkerCrashed(
+                f"{what} cannot be enforced on this system (the worker's resource usage "
+                "cannot be read) and sandbox='require' demands every protection"
+            )
+        warnings.warn(
+            f"{what} cannot be enforced on this system: the worker's resource usage cannot be "
+            "read, so those limits will never fire.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def _handshake(self) -> None:
         try:
@@ -461,6 +583,17 @@ class IsolatedRuntime:
                 raise _wire.WireError("bad ready frame")
             self.sandbox = applied
             self.sandbox_extras = list(extras)
+            missing = (
+                _sandbox.missing_layers(applied) if applied != "off" else frozenset()
+            )
+            if missing and self._options["sandbox"] == "auto":
+                warnings.warn(
+                    f"IsolatedRuntime is running with a degraded OS sandbox ({applied!r}; "
+                    f"missing {sorted(missing)}). Untrusted code has less containment than "
+                    "intended; pass sandbox='require' to refuse instead.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
             self.v8_flags = list(self._options["v8_flags"])
         except TimeoutError:
             self._kill()
@@ -499,9 +632,17 @@ class IsolatedRuntime:
             tail = ""
         # The worker wrote this, and a compromised one can write anything: it goes into an
         # exception message, so no control or escape characters.
-        return f"{prefix}: {_clean(tail.splitlines()[-1])}" if tail else prefix
+        last = tail.splitlines()[-1] if tail else ""
+        if not last or _NATIVE_FRAME.search(last):
+            # A native stack frame names libraries and load addresses (a map of the host's ASLR
+            # for anything that forwards `str(exc)` to a user), and says nothing a person can act on.
+            return prefix
+        return f"{prefix}: {_clean(last)}"
 
     def _kill(self) -> None:
+        if os.getpid() != self._owner_pid:
+            self._drop_inherited()
+            return
         self._closed = True
         _terminate_process(self._proc, None)
         self._reap()
@@ -528,8 +669,28 @@ class IsolatedRuntime:
     def is_closed(self) -> bool:
         return self._closed
 
+    def _drop_inherited(self) -> None:
+        """In a fork()ed child: let go of this process's copies of the worker's pipes and stderr
+        file, without signalling, waiting on or talking to a worker that belongs to the parent."""
+        self._closed = True
+        for stream in (self._proc.stdin, self._proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            self._stderr.close()
+        except (OSError, ValueError):
+            pass
+
     def close(self) -> None:
         """Ask the worker to exit; kill it if it does not within a second."""
+        if os.getpid() != self._owner_pid:
+            self._drop_inherited()
+            return
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
         if not self._closed:
             self._closed = True
             try:
@@ -558,6 +719,28 @@ class IsolatedRuntime:
             return self._request_timeout  # a number, or None: the caller opted out
         return DEFAULT_REQUEST_TIMEOUT if soft is None else soft + self._grace
 
+    @contextlib.contextmanager
+    def _command_slot(self, soft_timeout: float | None) -> Iterator[None]:
+        """Hold the runtime for one command, but never wait for it forever.
+
+        Commands run one at a time. A host function that hands work to *another* thread which then
+        calls back into this runtime waits on the lock its own command holds: the re-entrancy guard
+        cannot see it (it is another thread), and the pump that enforces the deadline is the thread
+        stuck in that host function, so nothing would ever time it out. Bounding the wait by the
+        request's own deadline turns that deadlock into an error the guest can see."""
+        hard = self._hard_timeout(soft_timeout)
+        wait = -1 if hard is None else hard + self._grace
+        if not self._lock.acquire(timeout=wait):
+            raise RuntimeTimeout(
+                "timed out waiting for another command on this IsolatedRuntime to finish "
+                "(a host function that waits on another thread which calls back into the "
+                "same runtime would deadlock)"
+            )
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     def _request(
         self,
         message: dict[str, Any],
@@ -565,11 +748,12 @@ class IsolatedRuntime:
         soft_timeout: float | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> Any:
-        if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
+        self._refuse_reentry()
+        if os.getpid() != self._owner_pid:
             raise RuntimeError(
-                "an IsolatedRuntime cannot be re-entered from its own host functions"
+                "this IsolatedRuntime belongs to the process that created it, not to a fork() of it"
             )
-        with self._lock:
+        with self._command_slot(soft_timeout):
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
             message["id"] = cmd_id = next(self._cmd_ids)
@@ -661,9 +845,16 @@ class IsolatedRuntime:
         raise remote
 
     def _idle_check(self) -> None:
-        """One pass of the idle watchdog. Skips itself while a command holds the runtime: the
-        pump supervises then."""
+        """One pass of the idle watchdog. While a command holds the runtime the pump supervises
+        (deadline, CPU, memory), except that the pump can be stuck inside a host handler for as
+        long as the handler takes, and a hostile worker can allocate then. So memory and thread
+        count are still checked here, without taking the lock."""
         if not self._lock.acquire(blocking=False):
+            if not self._closed:
+                try:
+                    self._check_memory()
+                except WorkerCrashed:
+                    pass  # killed; the pump sees the pipe close and reports it
             return
         try:
             if self._closed:
@@ -710,14 +901,21 @@ class IsolatedRuntime:
         self._check_memory()
 
     def _check_memory(self, *, force: bool = False) -> None:
-        """Kill the worker if its RSS is over `max_memory`. Sampled, so a spike that
-        ends between samples is only caught by the check made as each command finishes."""
-        if self._max_memory is None:
-            return
+        """Kill the worker if its RSS is over `max_memory` or it has far more threads than a
+        worker has. Sampled, so a spike that ends between samples is only caught by the check
+        made as each command finishes."""
         now = time.monotonic()
         if not force and now - self._last_rss_check < _RSS_EVERY_SECONDS:
             return
         self._last_rss_check = now
+        threads = _sandbox.thread_count(self._proc.pid)
+        if threads is not None and threads > _MAX_WORKER_THREADS:
+            self._kill()
+            raise WorkerCrashed(
+                f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
+            )
+        if self._max_memory is None:
+            return
         rss = _sandbox.rss_bytes(self._proc.pid)
         if rss is not None and rss > self._max_memory:
             self._kill()
@@ -744,7 +942,9 @@ class IsolatedRuntime:
                 text[:_MAX_REMOTE_MESSAGE]
                 + f"... [{len(text) - _MAX_REMOTE_MESSAGE} more characters]"
             )
-        return cls(text)
+        # Escape sequences in a message that lands in a terminal or a log are an injection channel.
+        # Newlines and tabs stay: a JavaScript stack trace is made of them.
+        return cls(_CONTROL.sub("?", text))
 
     # -- host callbacks ----------------------------------------------------
 
@@ -753,6 +953,11 @@ class IsolatedRuntime:
         # One lookup, not a membership test followed by a second one: another thread may revoke
         # in between.
         entry = self._handlers.get(hid) if isinstance(hid, int) else None
+        if entry is None and hid in self._revoked_hids:
+            # A call that was already in flight when the capability was revoked: the guest did
+            # nothing wrong, it lost a race with the host. Answer it with an error, do not treat
+            # it as a worker forging an id (which ends the session).
+            entry = (_revoked_handler, False)
         if (
             not isinstance(cid, int)
             or isinstance(cid, bool)
@@ -772,7 +977,10 @@ class IsolatedRuntime:
         # All the arguments under one budget: decoding each on its own would multiply the limit
         # by the argument count.
         decoded = args  # `loads_decoded` already decoded them, under one shared budget
-        if self._max_inflight is not None and pump.outstanding >= self._max_inflight:
+        if self._max_inflight is not None and (
+            pump.outstanding >= self._max_inflight
+            or self._async_inflight >= self._max_inflight
+        ):
             # Refused rather than run: the guest sees an error for this call, and nothing the
             # host owns is touched. Without a cap the number of asynchronous calls (and the
             # tasks and memory behind them) is whatever the guest asks for.
@@ -789,10 +997,14 @@ class IsolatedRuntime:
         pump.begin_call()
         if is_async and pump.loop is not None:
             coro = _call_guarded(handler, decoded)
+            with self._async_inflight_lock:
+                self._async_inflight += 1
             try:
                 future = asyncio.run_coroutine_threadsafe(coro, pump.loop)
             except Exception as exc:  # noqa: BLE001 - e.g. the caller's loop has closed
                 coro.close()
+                with self._async_inflight_lock:
+                    self._async_inflight -= 1
                 self._send_reply(self._error(cid, exc), pump)
                 return
             future.add_done_callback(
@@ -816,6 +1028,8 @@ class IsolatedRuntime:
         return _error_reply(cid, exc, redact=self._redact)
 
     def _finish_async_call(self, cid: int, pump: _Pump, future: Any) -> None:
+        with self._async_inflight_lock:
+            self._async_inflight -= 1
         try:
             reply = {"t": "reply", "cid": cid, "v": _wire.Enc(future.result())}
         except BaseException as exc:  # noqa: BLE001
@@ -858,16 +1072,68 @@ class IsolatedRuntime:
         loop = asyncio.get_running_loop()
         message = {"t": "eval_async", "code": code, "timeout": soft}
         try:
-            return await asyncio.to_thread(
-                self._request, message, soft_timeout=soft, loop=loop
-            )
+            return await self._in_own_thread(message, soft, loop)
         except asyncio.CancelledError:
             # The thread cannot be interrupted, and the worker is mid-command.
             self._kill()
             raise
 
+    def _refuse_reentry(self) -> None:
+        """A host function must not call back into the runtime that is waiting for it."""
+        if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
+            raise RuntimeError(
+                "an IsolatedRuntime cannot be re-entered from its own host functions"
+            )
+
+    def _own_executor(self) -> ThreadPoolExecutor:
+        with self._executor_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="pydeno-command"
+                )
+            return self._executor
+
+    async def _in_own_thread(
+        self,
+        message: dict[str, Any],
+        soft: float | None,
+        loop: asyncio.AbstractEventLoop,
+    ) -> Any:
+        """Run a command off the caller's event loop on a thread this runtime owns.
+
+        `asyncio.to_thread` would use the loop's *default* executor, shared with everything else
+        in the application. A command can sit in a host callback for minutes, so a handful of
+        runtimes parked on slow tools would starve every other `to_thread` or
+        `run_in_executor(None)` in the process. One thread per runtime cannot."""
+        # Before queueing, not only inside `_request`: the runtime's thread is busy with the very
+        # command this call came from, so a queued re-entrant call would wait behind it forever.
+        self._refuse_reentry()
+        # Run in a copy of the caller's context, as `asyncio.to_thread` does: host functions then see
+        # the caller's contextvars (tracing spans, request ids, ...).
+        context = contextvars.copy_context()
+        call = functools.partial(
+            context.run, self._request, message, soft_timeout=soft, loop=loop
+        )
+        return await loop.run_in_executor(self._own_executor(), call)
+
+    def _register_token(self, token: int, hid: int) -> None:
+        """Remember which host handler a worker-chosen token stands for.
+
+        The token is the worker's claim, not ours: a compromised worker that hands the same token
+        to two bindings would make revoking the harmless one also drop the privileged one's entry
+        in a map keyed by token, leaving the privileged handler callable for good. A duplicate is
+        therefore proof of a lying worker, and the session ends."""
+        if token in self._token_to_hid:
+            self._handlers.pop(hid, None)
+            self._kill()
+            raise WorkerCrashed("worker reused a capability token")
+        self._token_to_hid[token] = hid
+
     def bind_function(self, name: str, handler: Callable[..., Any]) -> int:
         """Expose a host function as a global; returns its capability token."""
+        from ._tools import ToolBridge
+
+        ToolBridge._check_name(name, what="function name")  # noqa: SLF001
         hid = next(self._hids)
         is_async = inspect.iscoroutinefunction(handler)
         self._handlers[hid] = (handler, is_async)
@@ -882,11 +1148,16 @@ class IsolatedRuntime:
             self._handlers.pop(hid, None)
             self._kill()
             raise WorkerCrashed("worker returned a malformed capability token")
-        self._token_to_hid[token] = hid
+        self._register_token(token, hid)
         return token
 
     def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
         """Expose a mapping as a global object; callables become host functions."""
+        from ._tools import ToolBridge
+
+        ToolBridge._check_name(name, what="object name")  # noqa: SLF001
+        for key in obj:
+            ToolBridge._check_name(key, what="property name")  # noqa: SLF001
         entries: dict[str, Any] = {}
         hids: dict[str, int] = {}
         for key, value in obj.items():
@@ -906,25 +1177,30 @@ class IsolatedRuntime:
             for hid in hids.values():
                 self._handlers.pop(hid, None)
             raise
-        if not isinstance(tokens, dict) or not all(
-            isinstance(k, str) and _is_token(v) for k, v in tokens.items()
+        if (
+            not isinstance(tokens, dict)
+            or set(tokens) != set(hids)
+            or not all(isinstance(k, str) and _is_token(v) for k, v in tokens.items())
         ):
             for hid in hids.values():
                 self._handlers.pop(hid, None)
             self._kill()
             raise WorkerCrashed("worker returned malformed capability tokens")
         for key, token in tokens.items():
-            if key in hids:
-                self._token_to_hid[token] = hids[key]
+            self._register_token(token, hids[key])
         return tokens
 
     def revoke_op(self, op_id: int) -> bool:
         """Revoke a capability. The host handler is dropped as well as the worker's token."""
-        revoked = self._request({"t": "revoke", "token": op_id})
+        # Drop the host handler first and unconditionally: what the worker answers (or whether it
+        # answers) must not decide whether a revoked capability can still be called.
         hid = self._token_to_hid.pop(op_id, None)
         if hid is not None:
             self._handlers.pop(hid, None)
-        return bool(revoked)
+            self._revoked_hids[hid] = None
+            if len(self._revoked_hids) > _REVOKED_MEMORY:
+                self._revoked_hids.pop(next(iter(self._revoked_hids)))
+        return bool(self._request({"t": "revoke", "token": op_id}))
 
     def add_static_module(self, name: str, source: str) -> None:
         self._request({"t": "add_module", "name": name, "source": source})
@@ -932,7 +1208,7 @@ class IsolatedRuntime:
     def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
         """Resolve import specifiers with a host function: `(specifier, referrer) -> str | None`."""
         hid = next(self._hids)
-        self._handlers[hid] = (resolver, False)
+        self._handlers[hid] = (_checked_specifiers(resolver, 2), False)
         try:
             self._request({"t": "set_module_resolver", "hid": hid})
         except BaseException:
@@ -945,7 +1221,10 @@ class IsolatedRuntime:
         The source comes back across the process boundary as plain text; the worker, which
         is the one that compiles it, never sees the loader itself."""
         hid = next(self._hids)
-        self._handlers[hid] = (loader, inspect.iscoroutinefunction(loader))
+        self._handlers[hid] = (
+            _checked_specifiers(loader, 1),
+            inspect.iscoroutinefunction(loader),
+        )
         try:
             self._request({"t": "set_module_loader", "hid": hid})
         except BaseException:
@@ -969,9 +1248,7 @@ class IsolatedRuntime:
         loop = asyncio.get_running_loop()
         message = {"t": "eval_module_async", "specifier": specifier, "timeout": soft}
         try:
-            return await asyncio.to_thread(
-                self._request, message, soft_timeout=soft, loop=loop
-            )
+            return await self._in_own_thread(message, soft, loop)
         except asyncio.CancelledError:
             self._kill()  # the thread cannot be interrupted, and the worker is mid-command
             raise
@@ -1122,4 +1399,22 @@ def _kill_all_at_exit() -> None:
 
 
 atexit.register(_kill_all_at_exit)
+
+
+def _forget_parents_workers() -> None:
+    """After `fork()`, the child holds the parent's runtimes and spare worker as inherited file
+    descriptors. They are the parent's: the child must not kill them at exit (its atexit hook and
+    finalizers would), must not hand out the parent's spare, and must not write frames into a
+    pipe the parent is also reading. So it forgets them, and `_request` refuses to run on one."""
+    global _SPARE, _SPARE_LOCK  # noqa: PLW0603
+    _SPARE = None
+    # A parent thread may have held this lock at the instant of the fork; that thread does not
+    # exist here, so the lock would never be released. A fresh one cannot deadlock the child.
+    _SPARE_LOCK = threading.Lock()
+    for runtime in list(_LIVE):
+        runtime._finalizer.detach()  # noqa: SLF001
+    _LIVE.clear()
+
+
+os.register_at_fork(after_in_child=_forget_parents_workers)
 atexit.register(_discard_spare)

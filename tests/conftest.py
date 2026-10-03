@@ -10,6 +10,7 @@ the collected set on the other platform, which the report check handles
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 
@@ -36,6 +37,10 @@ _PLATFORM_MARKERS = {
     ),
     # Needs to start as root to mean anything (a container; CI runners are not root).
     "as_root": hasattr(os, "geteuid") and os.geteuid() == 0,
+    # Pairs pydeno with pydantic-monty (an optional extra, in the `testing` group).
+    "needs_monty": importlib.util.find_spec("pydantic_monty") is not None,
+    # Exercises the pydantic-ai integration (the optional `pydantic-ai-slim` package).
+    "needs_pydantic_ai": importlib.util.find_spec("pydantic_ai") is not None,
 }
 
 

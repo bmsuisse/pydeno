@@ -115,6 +115,9 @@ basis.
 
 ## How the sandbox is tested
 
+The full account (methods, independent review rounds, every finding with its status, what is still
+open, and what security costs in speed) is in [`docs/security-report.md`](docs/security-report.md).
+
 - `tests/test_isolated_runtime.py`, `tests/test_isolated_lifecycle.py`,
   `tests/test_isolated_determinism.py`: behaviour, containment, leaks, limits.
 - `tests/test_isolated_capability_denial.py`: a checklist of what untrusted code tries first (read or
