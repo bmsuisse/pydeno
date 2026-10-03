@@ -30,6 +30,7 @@ from pydeno import (
     _wire,
     undefined,
 )
+from pydeno._isolated import _HARDENING_V8_FLAGS
 from test_monty_parity_security import _SINKS
 
 MIB = 1024 * 1024
@@ -793,7 +794,7 @@ class TestOsSandbox:
                 assert rt.sandbox == "seatbelt"
             elif sys.platform.startswith("linux"):
                 assert "seccomp" in rt.sandbox
-            assert rt.v8_flags == ["--jitless"]
+            assert rt.v8_flags == ["--jitless", *_HARDENING_V8_FLAGS]
 
     def test_the_empty_root_can_be_turned_off_and_then_is_absent(self) -> None:
         with IsolatedRuntime(empty_root=False) as rt:
@@ -1253,7 +1254,7 @@ class TestV8Hardening:
 
     def test_jitless_can_be_turned_off_for_webassembly(self) -> None:
         with IsolatedRuntime(jitless=False) as rt:
-            assert rt.v8_flags == []
+            assert rt.v8_flags == list(_HARDENING_V8_FLAGS)
             assert rt.eval("typeof WebAssembly") == "object"
 
     def test_extra_flags_are_applied_before_the_isolate(self) -> None:

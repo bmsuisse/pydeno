@@ -368,6 +368,8 @@ OTHERS = r"""
 import ctypes, fcntl, importlib.util, json, os, resource, socket, sys
 spec = importlib.util.spec_from_file_location("_sandbox", sys.argv[1])
 sb = importlib.util.module_from_spec(spec); spec.loader.exec_module(sb)
+# `uname` is denied once the sandbox is up, so ask for the architecture before it is
+IDX = 0 if os.uname().machine == "x86_64" else 1
 sb.apply()
 out = {}
 def attempt(name, fn):
@@ -379,8 +381,8 @@ def attempt(name, fn):
         out[name] = type(e).__name__
 me = os.getpid()
 attempt("setpriority_other", lambda: os.setpriority(os.PRIO_PROCESS, 1, 10))
-attempt("setpriority_self_zero", lambda: os.setpriority(os.PRIO_PROCESS, 0, os.getpriority(os.PRIO_PROCESS, 0)))
-attempt("setpriority_self_pid", lambda: os.setpriority(os.PRIO_PROCESS, me, os.getpriority(os.PRIO_PROCESS, me)))
+attempt("setpriority_self_zero", lambda: os.setpriority(os.PRIO_PROCESS, 0, 0))
+attempt("setpriority_self_pid", lambda: os.setpriority(os.PRIO_PROCESS, me, 0))
 attempt("affinity_other", lambda: os.sched_setaffinity(1, {0}))
 attempt("affinity_self", lambda: os.sched_setaffinity(0, os.sched_getaffinity(0)))
 attempt("prlimit_other", lambda: resource.prlimit(1, resource.RLIMIT_NOFILE))
@@ -411,8 +413,7 @@ ppid = os.getppid()
 attempt("getpgid_parent", lambda: os.getpgid(ppid))
 attempt("getsid_parent", lambda: os.getsid(ppid))
 attempt("getpgid_self", lambda: os.getpgid(0))
-idx = 0 if os.uname().machine == "x86_64" else 1
-nr = sb._SELF_PID_ARG0["get_robust_list"][idx]
+nr = sb._SELF_PID_ARG0["get_robust_list"][IDX]
 head, size = ctypes.c_void_p(), ctypes.c_size_t()
 libc.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
 attempt("get_robust_list_parent", lambda: libc_call(libc.syscall, nr, ppid, ctypes.byref(head), ctypes.byref(size)))

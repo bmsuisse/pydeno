@@ -118,6 +118,16 @@ def _clean(text: str, limit: int = 500) -> str:
 
 
 _REVOKED_MEMORY = 4096
+# V8 flags every worker gets besides `--jitless` (each checked against dagre, three.js with the glTF
+# exporter and vega-lite under the sandbox, and against the benchmark suite):
+#  * regexp fallback: a catastrophic regular expression switches to a linear-time engine after
+#    50 000 backtracks and returns, instead of running until the deadline kills the worker.
+#  * freeze flags: V8 refuses further flag changes once it has started, so a V8 bug that could flip
+#    a flag at run time cannot be used to switch a protection off.
+_HARDENING_V8_FLAGS = (
+    "--enable-experimental-regexp-engine-on-excessive-backtracks",
+    "--freeze-flags-after-init",
+)
 # A worker runs about 13 threads (17 on macOS); this is far past that and far below a thread bomb.
 _MAX_WORKER_THREADS = 64
 
@@ -430,6 +440,7 @@ class IsolatedRuntime:
             "sandbox": sandbox,
             "empty_root": empty_root,
             "v8_flags": (["--jitless"] if jitless else [])
+            + list(_HARDENING_V8_FLAGS)
             + seed_flags
             + list(v8_flags),
             "max_memory": max_memory,

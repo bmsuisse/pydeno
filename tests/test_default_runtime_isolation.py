@@ -8,6 +8,7 @@ import threading
 import pytest
 
 import pydeno
+from pydeno._isolated import _HARDENING_V8_FLAGS
 from pydeno import IsolatedRuntime, Runtime, RuntimeConfig, WorkerCrashed
 
 
@@ -46,7 +47,7 @@ def test_isolated_options_are_forwarded() -> None:
     pydeno.configure_default_runtime(isolated=True, sandbox="off", jitless=False)
     rt = pydeno.get_default_runtime()
     assert rt.sandbox == "none"
-    assert rt.v8_flags == []
+    assert rt.v8_flags == list(_HARDENING_V8_FLAGS)
     assert pydeno.eval("typeof WebAssembly") == "object"
 
 

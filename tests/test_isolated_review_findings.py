@@ -801,9 +801,9 @@ class TestM8RequireMeansEveryLayer:
         monkeypatch.setattr(_sandbox.threading, "active_count", lambda: 1)
         monkeypatch.setattr(_sandbox, "_apply_landlock", boom)
         monkeypatch.setattr(_sandbox, "_apply_empty_root", lambda: False)
-        monkeypatch.setattr(_sandbox, "_seccomp_is_safe_here", lambda: True)
+        monkeypatch.setattr(_sandbox, "_seccomp_is_safe_here", lambda **_: True)
         monkeypatch.setattr(
-            _sandbox, "_apply_seccomp", lambda: calls.append("seccomp") or True
+            _sandbox, "_apply_seccomp", lambda **_: calls.append("seccomp") or True
         )
         assert _sandbox.apply() == "seccomp"
         assert calls == ["landlock", "seccomp"]
@@ -817,7 +817,7 @@ class TestM8RequireMeansEveryLayer:
         monkeypatch.setattr(_sandbox, "_apply_landlock", lambda: True)
         monkeypatch.setattr(_sandbox, "_apply_empty_root", lambda: False)
 
-        def no_fork() -> bool:
+        def no_fork(**_: object) -> bool:
             raise OSError("cannot fork")
 
         monkeypatch.setattr(_sandbox, "_seccomp_is_safe_here", no_fork)
