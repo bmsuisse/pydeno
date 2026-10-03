@@ -91,6 +91,10 @@ choice, not a library feature, so build them around pydeno:
         --cap-drop all --security-opt no-new-privileges \
         --pids-limit 256 --memory 2g --cpus 2  your-image
 
+  For a PID and cgroup namespace around the worker (which pydeno does not create itself), pass a
+  wrapper as `IsolatedRuntime(python=...)`, a script that ends in `exec python "$@"` after
+  `bwrap --unshare-pid --unshare-cgroup ...` (untested here). The worker already runs in its own
+  session, so TIOCSTI is not reachable, and the seccomp filter denies it regardless.
   Add gVisor (`--runtime runsc`) or a microVM (Firecracker, Kata) when a kernel boundary is
   required. pydeno's seccomp filter and Landlock apply inside any of them.
 
@@ -113,6 +117,9 @@ basis.
 
 - `tests/test_isolated_runtime.py`, `tests/test_isolated_lifecycle.py`,
   `tests/test_isolated_determinism.py`: behaviour, containment, leaks, limits.
+- `tests/test_isolated_capability_denial.py`: a checklist of what untrusted code tries first (read or
+  write a file, network, subprocess, environment, `Deno`/Node/browser globals, the runtime's own
+  plumbing), through both `eval` and `eval_async`, plus a check that nothing reached the host.
 - `tests/test_redteam_syscalls.py`: assume-breach tests that fire every dangerous syscall from a
   sandboxed process and require `EPERM`. `scripts/redteam_syscalls.py` sweeps all ~350 syscalls.
 - `tests/test_sandbox_syscall_tables.py`: every number in the seccomp filter checked against the

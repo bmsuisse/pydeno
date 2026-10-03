@@ -400,6 +400,9 @@ attempt("fcntl_setfl", lambda: fcntl.fcntl(a, fcntl.F_SETFL, os.O_NONBLOCK))
 attempt("ioctl_fionread", lambda: fcntl.ioctl(a, 0x541B, b"\\0\\0\\0\\0"))
 attempt("ioctl_fiosetown", lambda: fcntl.ioctl(a, 0x8901, os.getppid().to_bytes(4, "little")))
 attempt("truncate_path", lambda: os.truncate("/nonexistent-pydeno-probe", 0))
+# TIOCSTI on a socket would answer ENOTTY if it reached the kernel; EPERM means the filter did it.
+attempt("ioctl_tiocsti", lambda: fcntl.ioctl(a, 0x5412, b"x"))
+attempt("ioctl_tioclinux", lambda: fcntl.ioctl(a, 0x541C, b"\\\\x0b"))
 print(json.dumps(out))
 """
 
@@ -430,6 +433,8 @@ def others() -> dict[str, str]:
         "fcntl_setown_parent",
         "fcntl_setown_self",
         "ioctl_fiosetown",
+        "ioctl_tiocsti",
+        "ioctl_tioclinux",
     ],
 )
 def test_acting_on_another_process_is_denied(

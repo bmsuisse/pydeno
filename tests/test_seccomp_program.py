@@ -313,7 +313,15 @@ class TestSignalOwnership:
         nr = sb._FCNTL[_idx(arch)]  # noqa: SLF001
         assert run(prog, arch, nr, (3, cmd, 0)) == ALLOW
 
-    @pytest.mark.parametrize("cmd", [0x8901, 0x8902])  # FIOSETOWN, SIOCSPGRP
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            0x8901,  # FIOSETOWN
+            0x8902,  # SIOCSPGRP
+            0x5412,  # TIOCSTI: push a byte into a terminal's input queue (CVE-2017-5226)
+            0x541C,  # TIOCLINUX: console-wide actions
+        ],
+    )
     def test_the_ioctl_spellings_of_the_same_thing_are_denied(
         self, arch: str, prog: list, cmd: int
     ) -> None:

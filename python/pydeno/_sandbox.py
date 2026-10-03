@@ -313,7 +313,10 @@ _WHICH_PROCESS = {"setpriority": 0, "ioprio_set": 1}
 _FCNTL = (72, 25)
 _IOCTL = (16, 29)
 _FCNTL_DENIED_CMDS = (8, 10, 15)  # F_SETOWN, F_SETSIG, F_SETOWN_EX
-_IOCTL_DENIED_CMDS = (0x8901, 0x8902)  # FIOSETOWN, SIOCSPGRP
+# FIOSETOWN, SIOCSPGRP (signal ownership), TIOCSTI, TIOCLINUX. The worker has no controlling terminal
+# (it is its own session), so the last two are belt and braces: bubblewrap documents TIOCSTI as the
+# one thing a session alone does not cover if a terminal ever reaches the sandbox.
+_IOCTL_DENIED_CMDS = (0x8901, 0x8902, 0x5412, 0x541C)
 # Every syscall number below this has been looked at (`tests/data/syscalls.json`, from the
 # kernel's own tables, and `tests/test_sandbox_syscall_tables.py` fails if the table ever grows
 # past it). Numbers from here up are syscalls that did not exist when this filter was reviewed:
