@@ -1,67 +1,121 @@
 # Benchmarks
 
 Two suites: Rust-level (Criterion, `benches/`, bypasses the Python API) and
-Python-level (pytest-benchmark, `benches_py/`, the real user-facing surface).
-Both run in CI on every push/PR (`.github/workflows/benchmarks.yml`),
-informational only -- they report numbers, they don't gate merges.
+Python-level (pytest-benchmark, `benches_py/`, the real user-facing surface), plus
+`benches_py/isolated_report.py` for `IsolatedRuntime`. The first two run in CI on every push/PR
+(`.github/workflows/benchmarks.yml`), informational only -- they report numbers, they don't gate
+merges.
 
-Numbers below are one real measured run, not simulated. They are
-environment-dependent -- re-run locally before trusting them for a regression
-decision on different hardware.
+Numbers are real measurements, not simulated, and they are environment-dependent: re-run locally
+before trusting them for a regression decision on different hardware.
+
+**How to read this file.** The first sections below are the *current* figures (re-measured for
+0.5.0 on 2026-10-03). Every section from [Retained runtimes](#retained-runtimes-idle-cost-and-scaling-v020)
+onward is a *historical record*: the numbers measured when that change landed, on the build and
+machine of that day, kept as the evidence for that change. They are not current figures and are not
+updated; where they differ from the tables here, the tables here are current.
 
 ## Measurement environment
 
 - Apple M2, 8 cores, 16 GB RAM, macOS 25.5.0 (Darwin), arm64
-- Rust 1.93.1, `cargo bench --features bench` (release/`bench` profile)
-- Python 3.14.3, `pytest-benchmark` 5.3.0, `maturin develop --release`
+- Rust 1.93.1, Python 3.14.3, `pytest-benchmark` 5.3.0, `maturin develop --release`
+- pydeno 0.5.0 (`deno_core` 0.412, V8 150.4), compared against `main` at 0.4.5 (`deno_core` 0.409)
+- **Not a quiet machine.** The runs below happened with a 1-minute load average of about 5 (a browser
+  using more than a core, on 8 cores). That inflates means and medians; the **minimum** is the most
+  load-robust column, so it is shown too. Expect a quiet machine to land at or below the minimums.
+
+## Is 0.5.0 slower than 0.4.5?
+
+No. The same `benches_py/` file was run against a release build of each, alternating, three rounds
+each, on the same machine. Every benchmark is within run-to-run noise of its twin (the spread
+between rounds of the *same* build is as large as the spread between builds):
+
+| Python benchmark | 0.4.5 (min / median) | 0.5.0 (min / median) |
+|---|---|---|
+| `test_cold_start` (new `Runtime()` + one eval) | 4.3 ms / 5.4 ms | 4.4 ms / 5.5 ms |
+| `test_normal_completing_eval_baseline` | 6.0 µs / 10.6 µs | 5.8 µs / 9.9 µs |
+| `test_timed_eval_baseline` (5 s timeout armed) | 5.0 µs / 12.9 µs | 4.4 µs / 12.8 µs |
+| `test_host_callback_round_trip` (`bind_function` + call from JS) | 14.3 µs / 17.5 µs | 12.5 µs / 17.4 µs |
+| `test_steady_state_1000_evals` (1000 sequential evals, warm) | 10.7 ms / 12.2 ms | 9.4 ms / 11.3 ms |
+| `test_watchdog_termination_overhead` | 55.4 ms / 60.4 ms | 55.4 ms / 60.3 ms |
+
+(Smallest minimum and median of the three per-round medians.) The 0.5.0 changes are in `IsolatedRuntime`, the
+wire codec and packaging; the in-process `Runtime` hot path is unchanged.
 
 ## Rust (Criterion, `cargo bench --features bench`)
 
-| Benchmark | Time |
-|---|---|
-| `isolate_creation_and_close` | 2.52 ms |
-| `simple_eval_throughput` (`1 + 41`) | 4.20 µs |
-| `host_callback_op_dispatch` (real Python callable via `register_op`) | 13.14 µs |
-| `termination_handle/is_terminated_check` | 0.92 ns |
-| `termination_handle/terminate_round_trip` (idle runtime) | 87.16 µs |
+Each benchmark run on its own (`-- <name>`), as the [flake note](#known-environment-flake-historical)
+below advises.
 
-`is_terminated()` is a single atomic load -- effectively free to poll. The
-206x-larger `terminate_round_trip` number is the cost of the full path:
-requesting termination, calling `v8::IsolateHandle::terminate_execution()`,
-and waiting for the runtime thread to acknowledge shutdown.
+| Benchmark | Time (low / estimate / high) |
+|---|---|
+| `isolate_creation_and_close` | 4.37 / **4.61** / 4.90 ms |
+| `simple_eval_throughput` (`1 + 41`) | 8.55 / **9.01** / 9.56 µs |
+| `timed_eval_throughput` (5 s timeout armed) | 9.91 / **10.5** / 11.3 µs |
+| `host_callback_op_dispatch` (real Python callable via `register_op`) | 11.6 / **12.4** / 13.3 µs |
+| `termination_handle/is_terminated_check` | 0.65 / **0.68** / 0.72 ns |
+| `termination_handle/terminate_round_trip` (idle runtime) | 14.7 / **21.9** / 33.4 µs (very noisy) |
+
+`is_terminated()` is a single atomic load -- effectively free to poll. `terminate_round_trip` is
+the full path: requesting termination, calling `v8::IsolateHandle::terminate_execution()`, and
+waiting for the runtime thread to acknowledge shutdown.
+
+`host_callback_op_dispatch` was **broken on `main`** until 0.5.0: ops became capability-gated (a
+registered op is not callable until it is exposed), and the bench called one without exposing it,
+failing with "Unknown host op". It now exposes the op first.
 
 ## Python (`pytest-benchmark`, `pytest benches_py/ --benchmark-only`)
 
-| Benchmark | Mean |
-|---|---|
-| `test_cold_start` (new `Runtime()` + one eval) | 2.82 ms |
-| `test_steady_state_100_evals` (100 sequential evals, warm runtime) | 363.25 µs total (~3.63 µs/eval) |
-| `test_steady_state_1000_evals` (1000 sequential evals, warm runtime) | 3.46 ms total (~3.46 µs/eval) |
-| `test_host_callback_round_trip` (`bind_function` + call from JS) | 13.98 µs |
-| `test_normal_completing_eval_baseline` | 3.77 µs |
-| `test_watchdog_termination_overhead` | 59.62 ms |
-
-A retained warm `Runtime` does a full host tool call
-(`bind_function` → JS → host → value) in **13.4 µs**, and a plain `eval`
-(`1+41`) in 3.77 µs — retaining one `Runtime` per session is the fast path
-for tool-calling workloads.
-
-Per-eval cost at the Python layer (~3.5-3.8 µs) matches the Rust-level
-`simple_eval_throughput` number closely -- the Python binding adds negligible
+The 0.5.0 column of the table above, in one place, plus what each measures. A retained warm
+`Runtime` does a full host tool call (`bind_function` → JS → host → value) in roughly **12-17 µs**,
+and a plain `eval` (`1+41`) in roughly **6-10 µs** (min to median), so retaining one `Runtime` per
+session is the fast path for tool-calling workloads. The Python-level and Rust-level per-eval costs
+agree (9.0 µs Criterion estimate against 5.8-10 µs here), so the Python binding adds negligible
 overhead over the raw `RuntimeHandle`.
+
+> **Correction.** Earlier revisions of this file headlined 3.77 µs for a bare `eval`, 13.4 µs for a
+> warm host call and 2.82 ms for cold start. Those do not reproduce on this machine today with
+> either `main` or this branch, so they were stale, not a regression from this release. The
+> sections below keep their historical numbers as measured at the time.
 
 ### Watchdog-termination proof, timed precisely
 
 `test_watchdog_termination_overhead` runs the exact scenario in
-`tests/test_termination_handle.py`: a runaway `while(true){}` eval, killed
-from a separate watchdog thread via `TerminationHandle.terminate()`, but with
-the watchdog's sleep shortened to 50 ms (20 rounds) so the suite stays fast.
-Measured mean: 59.62 ms. Subtracting the artificial 50 ms delay leaves
-**~9.6 ms** of real overhead for the cross-thread termination path itself
-(watchdog wakes up, calls into V8's isolate handle from a foreign thread,
-the runtime thread unwinds and returns control to Python) -- consistent with
-the Rust-level `terminate_round_trip` number once you add Python's own
-call/exception overhead on top.
+`tests/test_termination_handle.py`: a runaway `while(true){}` eval, killed from a separate watchdog
+thread via `TerminationHandle.terminate()`, but with the watchdog's sleep shortened to 50 ms (20
+rounds) so the suite stays fast. Measured median: ~60 ms (min ~55 ms). Subtracting the artificial
+50 ms delay leaves roughly **6-10 ms** of real overhead for the cross-thread termination path itself
+(watchdog wakes up, calls into V8's isolate handle from a foreign thread, the runtime thread unwinds
+and returns control to Python), consistent with the Rust-level `terminate_round_trip` number once
+you add Python's own call/exception overhead on top.
+
+## `IsolatedRuntime` (0.5.0)
+
+Reproduce with `python benches_py/isolated_report.py` against a release build. Measured on the
+machine above, also under background load; ranges are across the runs taken that day.
+
+| What | Result |
+|---|---|
+| Create an `IsolatedRuntime` and `eval`, **no spare worker** (`prewarm=False`) | ~70-105 ms |
+| Same, **with the spare worker**, used soon after it started (0.1 s idle gap) | ~13-20 ms |
+| Same, spare worker that sat idle longer (0.4 s or more) | ~30-45 ms (the OS is slow to wake an idle process) |
+| `eval('1 + 1')` on a warm `IsolatedRuntime` | ~70 µs (a round trip over a pipe to another process) |
+| `eval('1 + 1')` on the in-process `Runtime`, same session | ~5 µs |
+| Worker resident memory after one eval | ~44 MB |
+| Encode + write a 2.2 MB frame (50k small objects), native codec | ~18-20 ms |
+| Parse + decode that frame, native codec | ~18-23 ms |
+| Return 50k small objects: in-process / isolated | ~66 ms / ~115 ms |
+| Return a 1.7 MB string: in-process / isolated | ~0.3 ms / ~4.8 ms |
+| Return a 1 MB `Uint8Array`: in-process / isolated | ~0.2 ms / ~5.8 ms |
+| `python -I -c 'import pydeno'` against bare `python -I -c pass` | ~19 ms vs ~16 ms (quiet-machine measurement earlier that day) |
+| Release extension size (macOS arm64, stripped, LTO) | 43.5 MB (was 60.2 MB), nearly all of it V8 and its Intl data |
+
+What these mean: the price of isolation is a fixed cost per call (process boundary, ~70 µs) and a
+per-byte cost for results (~20 ms per MB of structured data, ~3-6 ms per MB of strings and bytes),
+plus start-up when you create runtimes often. For many small calls on one long-lived runtime it is
+cheap; for creating a runtime per request the spare worker removes most of the start-up. Jitless V8
+(the default) makes compute-heavy guest code roughly 1.5-2x slower than with the JIT (`jitless=False`
+trades that back for a larger attack surface).
 
 ## Retained runtimes: idle cost and scaling (v0.2.0)
 
@@ -210,7 +264,7 @@ thread, so the old behaviour shows up as a readable failure in seconds instead
 of hanging the suite -- and nothing in it is `skipif`-gated, since the absence
 of exactly this test is what let the gap survive two releases.
 
-## Known pre-existing environment flake (not caused by this release's work)
+## Known environment flake (historical)
 
 While re-running these benchmarks, `cargo bench --features bench` and the
 full `pytest benches_py/`/`pytest tests/` runs intermittently abort the whole
@@ -231,6 +285,11 @@ running the unaffected benches individually
 which avoids the flake and still gives a real, reproducible before/after
 comparison. Investigating/fixing the underlying flake is separate follow-up
 work, tracked as a known issue rather than silently worked around.
+
+**Status on 0.5.0 (`deno_core` 0.412), 2026-10-03.** Not reproduced: the full Python suite
+passed repeatedly, and every Criterion bench above was run on its own without an abort. That is
+absence of evidence from a handful of runs, not a proof that the underlying interaction is gone,
+so the one-bench-per-process procedure is kept.
 
 ## Arming a timeout (v0.2.1)
 
@@ -384,10 +443,11 @@ no profiler was available to attribute cost with confidence.
 ## Reproducing
 
 ```bash
-cargo bench --features bench
+cargo bench --features bench -- <benchmark name>   # one at a time
 uv sync --group all
 uv run maturin develop --uv --release
 uv run pytest benches_py/ --benchmark-only
+uv run python benches_py/isolated_report.py             # IsolatedRuntime
 ```
 
 If the full run hits the pre-existing flake above, re-run the two pooling

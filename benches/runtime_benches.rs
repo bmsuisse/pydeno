@@ -48,6 +48,9 @@ fn bench_op_dispatch(c: &mut Criterion) {
             "globalThis.hostFn = (...args) => __host_op_sync__({op_id}, ...args); void 0;"
         ))
         .unwrap();
+    // A registered op is not callable until it is exposed (the bind paths do this after the
+    // binding is installed); without this the bench fails with "Unknown host op".
+    assert!(handle.set_op_exposure(op_id, true).unwrap());
 
     c.bench_function("host_callback_op_dispatch", |b| {
         b.iter(|| black_box(handle.eval_sync("hostFn(21)").unwrap()));

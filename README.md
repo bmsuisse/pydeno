@@ -43,7 +43,7 @@ with IsolatedRuntime(RuntimeConfig(timeout=2.0), sandbox="require") as rt:
 | 🧱 **Contained** | A V8 abort, a hang or a memory blow-up kills a disposable worker process, never yours. |
 | 🔒 **No ambient authority** | No filesystem, network, processes, environment, `Deno`, `process` or `require`. Whatever the guest can do beyond computing, you bound on purpose. |
 | 🧰 **Real JavaScript** | The engine behind Chrome and Node ([`deno_core`][deno_core] + [V8][v8]), so model-written code behaves like JavaScript and real libraries run. |
-| ⚡ **Fast** | A native Rust wire codec and a pre-started spare worker: ~15 ms to create a runtime and evaluate, a 2 MB result in ~18 ms. |
+| ⚡ **Fast** | A native Rust wire codec and a pre-started spare worker: as little as ~15 ms to create a runtime and evaluate, a 2 MB result in ~18 ms. |
 | 🧪 **Tested like an attacker would** | Assume-breach syscall sweeps against the real kernel, a verified seccomp filter, fuzzing and hostile-worker fakes, on 12 Linux distros and two CPU architectures. |
 | 🔌 **Tool-calling built in** | `bind_function` and `ToolBridge` give the model's code your Python tools, with call budgets and errors it can branch on. |
 
@@ -88,6 +88,41 @@ from pydeno import IsolatedRuntime, RuntimeConfig, WEB_POLYFILLS
 
 rt = IsolatedRuntime(RuntimeConfig(bootstrap=WEB_POLYFILLS))
 ```
+
+## Showcase: Python and JavaScript, both sandboxed
+
+A model that writes code wants the best language for each half of the job: Python for wrangling
+data, JavaScript for what only the JS ecosystem does well. Pair pydeno with
+[Monty][monty] (Pydantic's Python sandbox) and run **both** without trusting either, sharing one
+set of host tools and one call budget:
+
+```python
+with Monty() as pool, pool.checkout() as py:                      # the model's Python, in Monty
+    analysis = py.feed_run(model_python, external_lookup={"fetch_sales": fetch_sales})
+
+with IsolatedRuntime(RuntimeConfig(bootstrap=WEB_POLYFILLS), sandbox="require") as js:
+    js.bind_function("getAnalysis", lambda: analysis)             # hand the result across
+    js.bind_function("fetch_sales", fetch_sales)                  # the same tool, same budget
+    svg = await js.eval_async(model_javascript)                   # the model's JS, in pydeno
+```
+
+```text
+1. Python half, in Monty
+  [python] best region: East (1750)
+  [python] refused: PermissionError: Permission denied: '/etc/passwd'
+2. JavaScript half, in pydeno
+  [js]     refused: Evaluation failed: ReferenceError: fetch is not defined
+  [js]     sandbox: seatbelt
+3. wrote sales.svg (11021 bytes); tool calls used: 2 of 5
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/bmsuisse/pydeno/main/docs/assets/monty-pydeno-chart.png" alt="A bar chart of revenue by region, rendered by Vega-Lite inside the pydeno sandbox from data computed by Python inside Monty" width="480">
+</p>
+
+Python crunched the numbers; JavaScript drew the chart with [Vega-Lite](https://vega.github.io/vega-lite/);
+each sandbox refused its own attempt to reach outside, and both drew on the same five-call tool
+budget. Full runnable example: [`examples/monty_and_pydeno.py`](examples/monty_and_pydeno.py).
 
 ## How it works
 
@@ -137,8 +172,8 @@ maintainers when a newer V8 becomes available.
 | **A hostile builtin can abort or hang your process** | No: it kills the worker | Yes (`new Array(2 ** 32 - 1).fill(0)`) |
 | **`timeout=` always enforced** | Yes (hard kill from outside) | Not for every builtin (e.g. sparse-array `sort`) |
 | **OS sandbox** | Yes | No |
-| **Start-up** | ~15 ms with the spare worker, ~100 ms without | microseconds |
-| **A host tool call** | Crosses a process boundary | ~13 µs ([`BENCHMARKS.md`](BENCHMARKS.md)) |
+| **Start-up** | ~15-45 ms with the spare worker, ~70-105 ms without | microseconds |
+| **A host tool call** | Crosses a process boundary (~70 µs per call) | ~12-17 µs ([`BENCHMARKS.md`](BENCHMARKS.md)) |
 
 ## How it was tested
 
@@ -171,16 +206,18 @@ The sandbox is tested the way an attacker would try it: from inside, and against
 
 ## Performance
 
-Measured on macOS arm64; reproduce with the scripts and Criterion benches in the repo
-([`BENCHMARKS.md`](BENCHMARKS.md)).
+Measured on macOS arm64 (Apple M2) with a release build, on a machine that was not idle, so
+ranges are shown. Reproduce with `benches_py/isolated_report.py` and the Criterion and
+pytest-benchmark suites ([`BENCHMARKS.md`](BENCHMARKS.md), which also shows 0.5.0 is no slower
+than 0.4.5).
 
 | | |
 |---|---|
-| Create an `IsolatedRuntime` and evaluate | **~15 ms** with the spare worker (~100 ms without) |
+| Create an `IsolatedRuntime` and evaluate | **~15 ms** with the spare worker used soon after it starts, ~30-45 ms after it has sat idle, ~70-105 ms without |
 | Move a 2 MB structured result across the boundary | **~18 ms** each way (native codec) |
 | `import pydeno` | **~19 ms** (the isolation stack loads on first use) |
 | Release extension size | **43 MB**, nearly all of it V8 and its built-in Intl data |
-| In-process `Runtime`: a complete host tool call | **~13 µs**; a bare `eval` ~3.8 µs |
+| In-process `Runtime`: a complete host tool call | **~12-17 µs**; a bare `eval` ~6-10 µs |
 
 Jitless V8 (the default for `IsolatedRuntime`) makes compute-heavy code roughly 1.5 to 2 times
 slower than with the JIT; `jitless=False` trades that back for a larger attack surface.
@@ -190,6 +227,7 @@ slower than with the JIT; `jitless=False` trades that back for a larger attack s
 - [**FastMCP tool bridge**](examples/fastmcp_tool_bridge.py): expose FastMCP tools to sandboxed JS via `bind_function` and an in-process `fastmcp.Client`
 - [**pydantic-ai "code mode" agent**](examples/pydantic_ai_agent.py): the model submits one JS batch script instead of many separate tool calls, run safely with a timeout
 - [**ToolBridge**](examples/tool_bridge.py): several Python tools with a total call budget, typed errors the model's JS can branch on, and `console.log` routed back to Python
+- [**Monty + pydeno**](examples/monty_and_pydeno.py): the model's Python runs in [Monty][monty], its JavaScript in pydeno, both sandboxed, sharing one tool and one call budget; Python computes, a Vega-Lite chart is drawn in JS
 - [**Vendored npm libraries**](examples/vendored_npm_libraries.py): run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles inside the sandbox; see the [guide](https://bmsuisse.github.io/pydeno/guides/advanced/vendored-npm-libraries/)
 - [**Arrow IPC dataframes**](examples/arrow_ipc_dataframes.py): move 100k+ row tables into the sandbox as Arrow IPC `bytes` instead of JSON objects (5 ms vs 253 ms); see the [guide](https://bmsuisse.github.io/pydeno/guides/advanced/arrow-ipc-dataframes/)
 
