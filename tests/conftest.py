@@ -42,6 +42,15 @@ _PLATFORM_MARKERS = {
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
+    # A parametrised value with no explicit `ids=` becomes part of the test id, and `pytest --co`
+    # prints ids verbatim. One 8 MiB id made the CI runner's log handling stall for an hour, with
+    # nothing in the log to say why, so refuse such ids here, where the message can name the test.
+    too_long = [item.nodeid[:120] for item in items if len(item.nodeid) > 400]
+    if too_long:
+        raise pytest.UsageError(
+            "test ids over 400 characters (give the parametrisation explicit `ids=`): "
+            + "; ".join(too_long[:5])
+        )
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:

@@ -24,7 +24,9 @@ class TestRoundTrip:
         assert verify_snapshot(sign_snapshot(PAYLOAD, KEY), KEY) == PAYLOAD
 
     @pytest.mark.parametrize(
-        "payload", [b"", b"x", b"\x00" * 100, bytes(range(256)), b"A" * 100_000]
+        "payload",
+        [b"", b"x", b"\x00" * 100, bytes(range(256)), b"A" * 100_000],
+        ids=["empty", "one-byte", "100-nulls", "all-256-byte-values", "100k-bytes"],
     )
     def test_any_payload_round_trips(self, payload: bytes) -> None:
         assert verify_snapshot(sign_snapshot(payload, KEY), KEY) == payload

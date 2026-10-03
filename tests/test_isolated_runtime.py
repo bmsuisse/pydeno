@@ -1117,6 +1117,19 @@ class TestHostileSource:
             "/" + "(" * 20_000 + "/",
             "\x00\x01\x02 not javascript ￾",
         ],
+        # Explicit ids: the default id is the source itself, up to 8 MiB on one line of `pytest
+        # --co` output, and the CI runner's log handling stalls on lines that long.
+        ids=[
+            "100k-nested-parens",
+            "100k-nested-brackets",
+            "200k-member-chain",
+            "500k-plus-chain",
+            "8mib-string-literal",
+            "2m-element-array-literal",
+            "50k-template-openers",
+            "20k-regex-parens",
+            "control-characters",
+        ],
     )
     def test_hostile_source_ends_in_a_catchable_error_and_the_host_survives(
         self, source: str
