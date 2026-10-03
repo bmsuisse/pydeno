@@ -43,6 +43,7 @@ jobs:
   # cannot see that class of bug at all.
   pytest:
     name: pytest (${{ matrix.profile }})
+    timeout-minutes: 45
     # macos-latest, matching `benchmarks.yml`: the Linux cdylib build currently
     # fails to link V8 (rust-lld TLS relocation vs `-shared`), a pre-existing
     # issue tracked separately. Moving these jobs to Linux is a follow-up, and
@@ -78,7 +79,7 @@ jobs:
       # before anything has had a chance to look green.
       - name: Collect tests
         run: |
-          uv run python -m pytest tests/ --co -q \
+          uv run python scripts/collect_guard.py 180 tests/ --co -q \
             -p no:randomly --strict-markers --strict-config \
             | tee collect-${{ matrix.profile }}.log
 
@@ -117,6 +118,7 @@ jobs:
   # container produced a wheel".
   pytest-linux-wheel:
     name: pytest (linux wheel)
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -158,7 +160,7 @@ jobs:
       # a collection error or a mass-skip fails this job exactly as loudly.
       - name: Collect tests
         run: |
-          .wheel-venv/bin/python -m pytest tests/ --co -q \
+          .wheel-venv/bin/python scripts/collect_guard.py 180 tests/ --co -q \
             -p no:randomly --strict-markers --strict-config \
             | tee collect-linux-wheel.log
 
