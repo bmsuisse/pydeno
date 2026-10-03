@@ -3,10 +3,16 @@ and the server's own protections (limits, redaction, logging) must hold."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import importlib.util
+import inspect
 import json
+import os
+import socket
+import stat
+import struct
 import threading
 import time
 from pathlib import Path
@@ -266,3 +272,183 @@ def test_log_one_line_per_request_with_user_and_no_plaintext(tmp_path: Path) -> 
         assert passphrase not in text and SECRET not in text
     finally:
         s.close()
+
+
+# ---- round-3 review findings -----------------------------------------------------------------------------
+
+
+def _raw(port: int, data: bytes, *, reset: bool = False) -> socket.socket:
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(data)
+    if reset:  # close with RST, as a client that hangs up mid-request does
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    return sock
+
+
+def _wait_for(predicate, seconds: float = 8.0) -> bool:  # type: ignore[no-untyped-def]
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_stalled_connections_are_closed_not_held_forever(tmp_path: Path) -> None:
+    """A slowloris (headers trickled in, never finished) used to hold one thread per connection."""
+    s = Running(tmp_path, socket_timeout=1.0, max_connections=8)
+    try:
+        socks = [_raw(s.port, b"POST /run HTTP/1.1\r\nHost: x\r\n") for _ in range(30)]
+        # while they stall, the server never has more than max_connections threads on them
+        assert threading.active_count() < 8 + 20
+        time.sleep(2.0)  # past socket_timeout: the stalled ones are closed
+        status, _ = s.request("GET", "/healthz")
+        assert status == 200
+        for sock in socks:
+            sock.close()
+    finally:
+        s.close()
+
+
+def test_a_client_that_hangs_up_is_still_logged(tmp_path: Path) -> None:
+    """The code ran, so the record must exist whether or not anyone read the answer."""
+    s = Running(tmp_path)
+    try:
+        code = "1 + 1"
+        body = json.dumps({"code": code}).encode()
+        request = (
+            b"POST /run HTTP/1.1\r\nHost: x\r\nContent-Length: "
+            + str(len(body)).encode()
+            + b"\r\n\r\n"
+            + body
+        )
+        _raw(s.port, request, reset=True).close()
+        digest = hashlib.sha256(code.encode()).hexdigest()
+        assert _wait_for(
+            lambda: any(r.get("code_sha256") == digest for r in s.log_lines())
+        )
+    finally:
+        s.close()
+
+
+def test_the_log_line_exists_before_the_client_sees_the_response(
+    tmp_path: Path,
+) -> None:
+    s = Running(tmp_path)
+    try:
+        for _ in range(10):
+            s.run("2 + 2")
+            assert s.log_lines()  # no sleep: logged before the answer was sent
+    finally:
+        s.close()
+
+
+def _two_xff_lines(port: int, first: str, last: str) -> int:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+    try:
+        body = json.dumps({"code": "1"}).encode()
+        conn.putrequest("POST", "/run")
+        conn.putheader("X-Forwarded-For", first)
+        conn.putheader("X-Forwarded-For", last)  # a second header line
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body)
+        return conn.getresponse().status
+    finally:
+        conn.close()
+
+
+def test_a_second_x_forwarded_for_line_cannot_dodge_the_rate_limit(
+    tmp_path: Path,
+) -> None:
+    s = Running(tmp_path, trust_proxy=True, rate=0.001, burst=2)
+    try:
+        # the client varies the FIRST line; the trusted proxy's hop is always the last one
+        statuses = [_two_xff_lines(s.port, f"9.9.9.{i}", "10.0.0.1") for i in range(6)]
+        assert 429 in statuses, statuses
+    finally:
+        s.close()
+
+
+def test_a_garbage_x_forwarded_for_value_does_not_become_a_table_key(
+    tmp_path: Path,
+) -> None:
+    s = Running(tmp_path, trust_proxy=True, rate=1000.0, burst=1000)
+    try:
+        for i in range(5):
+            _two_xff_lines(s.port, "1.1.1.1", "garbage-" + "x" * 50_000 + str(i))
+        assert len(s.srv.buckets._state) == 1  # noqa: SLF001 - all fell back to the socket address
+    finally:
+        s.close()
+
+
+@pytest.mark.parametrize(
+    "disguise",
+    [
+        lambda x: x.upper(),
+        lambda x: x[::-1],
+        lambda x: x.encode().hex(),
+        lambda x: base64.b64encode(x.encode()).decode(),
+        lambda x: base64.b64encode(b"ab" + x.encode()).decode(),
+        lambda x: base64.urlsafe_b64encode(b"a" + x.encode()).decode().rstrip("="),
+    ],
+    ids=["upper", "reversed", "hex", "base64", "base64-shifted", "base64url-shifted"],
+)
+def test_common_disguises_of_the_secret_are_redacted_and_alarm(
+    tmp_path: Path, disguise
+) -> None:  # type: ignore[no-untyped-def]
+    s = Running(tmp_path, test_hook=lambda _r: disguise(SECRET))
+    try:
+        _, body = s.run("1")
+        text = json.dumps(body)
+        assert disguise(SECRET) not in text
+        assert "[REDACTED]" in text
+        assert any(r.get("event") == "SECRET_LEAK" for r in s.log_lines())
+    finally:
+        s.close()
+
+
+def test_nan_and_infinity_do_not_produce_invalid_json(srv: Running) -> None:
+    status, raw = srv.request(
+        "POST",
+        "/run",
+        json.dumps({"code": "0 / 0"}).encode(),
+        {"Content-Type": "application/json"},
+    )
+
+    def refuse(constant: str) -> None:
+        raise AssertionError(f"invalid JSON constant {constant}")
+
+    json.loads(raw, parse_constant=refuse)  # strict
+    assert status == 200
+
+
+def test_files_are_private(tmp_path: Path) -> None:
+    s = Running(tmp_path)
+    try:
+        s.run("1")
+        assert stat.S_IMODE(os.stat(s.secret_file).st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(s.log).st_mode) == 0o600
+    finally:
+        s.close()
+
+
+def test_malformed_requests_are_logged_too(tmp_path: Path) -> None:
+    s = Running(tmp_path)
+    try:
+        _raw(s.port, b"GARBAGE\r\n\r\n").close()
+        assert _wait_for(
+            lambda: any(r.get("event") == "http_error" for r in s.log_lines())
+        )
+    finally:
+        s.close()
+
+
+def test_the_test_hook_cannot_be_set_from_the_command_line() -> None:
+    assert "test_hook" not in inspect.getsource(server_mod.main)
+
+
+def test_the_user_header_must_match_exactly() -> None:
+    assert server_mod.USER_RE.fullmatch("a" * 64) is not None
+    assert (
+        server_mod.USER_RE.fullmatch("a" * 64 + "\n") is None
+    )  # `$` alone would accept this

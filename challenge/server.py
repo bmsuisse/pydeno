@@ -9,7 +9,9 @@ Endpoints: POST /run {"code": "..."}, GET /healthz, GET / (the rules, plain text
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -42,11 +44,27 @@ Submit:  POST /run   {"code": "1 + 1"}     (JSON, at most 16 KiB)
 The host binds one function, ping(), so you can poke the bridge.
 The value of the last expression is returned as JSON: {ok, result|error, ms}.
 
-A win is reading SECRET or secret.txt through the sandbox. If the secret ever shows up in a
-response or a log line the server redacts it and raises an alarm, which is how we notice.
+A win is reading SECRET or secret.txt through the sandbox. The server redacts the secret (and
+its obvious encodings) from responses and logs and raises a best-effort alarm, but an alarm that
+does not fire is not proof that nobody won: tell us if you did, and how.
 Out of scope: DoS, social engineering, attacking the host provider. Be kind. Full rules:
 docs/hack-pydeno.md. Report private findings via SECURITY.md.
 """
+
+
+def _variants(secret: str) -> list[str]:
+    """The spellings of the secret a careless leak would produce: as is, JSON-escaped, reversed,
+    hex, and base64 at every alignment. Matching is case-insensitive. This is a best-effort alarm,
+    not a proof: a guest that can compute can always disguise a value further."""
+    raw = secret.encode()
+    out = {secret, json.dumps(secret)[1:-1], secret[::-1], raw.hex()}
+    for pad in range(3):
+        shifted = b"\x00" * pad + raw
+        for encoder in (base64.b64encode, base64.urlsafe_b64encode):
+            text = encoder(shifted).decode().rstrip("=")
+            # drop the characters that depend on the padding bytes around the secret
+            out.add(text[(pad * 4 + 2) // 3 : -2 if len(text) > 8 else None])
+    return sorted({v for v in out if len(v) >= 6}, key=len, reverse=True)
 
 
 class TokenBuckets:
@@ -66,8 +84,8 @@ class TokenBuckets:
             if ok:
                 tokens -= 1.0
             self._state[key] = (tokens, now)
-            if len(self._state) > 10_000:  # bounded memory: drop the oldest half
-                for k in sorted(self._state, key=lambda k: self._state[k][1])[:5000]:
+            if len(self._state) > 10_000:  # bounded memory: drop the oldest quarter
+                for k in sorted(self._state, key=lambda k: self._state[k][1])[:2500]:
                     self._state.pop(k, None)
             return ok
 
@@ -87,6 +105,8 @@ class Challenge(ThreadingHTTPServer):
         request_timeout: float = 3.0,
         max_memory: int = 256 * 1024 * 1024,
         trust_proxy: bool = False,
+        max_connections: int = 64,
+        socket_timeout: float = 10.0,
         test_hook: Callable[[Any], Any] | None = None,
     ) -> None:
         super().__init__(addr, Handler)
@@ -99,20 +119,40 @@ class Challenge(ThreadingHTTPServer):
         self.request_timeout = request_timeout
         self.max_memory = max_memory
         self.trust_proxy = trust_proxy
+        # One thread per connection, so a slowloris (headers trickled in forever) would use them all:
+        # cap the connections, and give every socket a read timeout.
+        self._connections = threading.BoundedSemaphore(max_connections)
+        self.socket_timeout = socket_timeout
+        self._variants = _variants(secret)
         # Tests only: lets a test force the secret into a result to prove redaction works.
         self.test_hook = test_hook
         self._log_lock = threading.Lock()
 
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._connections.acquire(blocking=False):
+            try:
+                request.close()  # no thread for it
+            except OSError:
+                pass
+            return
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request: Any) -> None:
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._connections.release()
+
     # -- helpers ----------------------------------------------------------
 
     def leaks(self, text: str) -> bool:
-        s = self.secret
-        return s in text or json.dumps(s)[1:-1] in text
+        folded = text.casefold()
+        return any(v.casefold() in folded for v in self._variants)
 
     def redact(self, text: str) -> str:
-        return text.replace(self.secret, "[REDACTED]").replace(
-            json.dumps(self.secret)[1:-1], "[REDACTED]"
-        )
+        for variant in self._variants:
+            text = re.sub(re.escape(variant), "[REDACTED]", text, flags=re.IGNORECASE)
+        return text
 
     def log(self, record: dict[str, Any]) -> None:
         line = json.dumps(record, ensure_ascii=True)
@@ -120,8 +160,10 @@ class Challenge(ThreadingHTTPServer):
             record = {"ts": record.get("ts"), "event": "SECRET_LEAK", "where": "log"}
             line = json.dumps(record)
             print("SECRET_LEAK: secret reached a log line", file=sys.stderr, flush=True)
-        with self._log_lock, open(self.log_path, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        with self._log_lock:
+            fd = os.open(self.log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
 
     def run_code(self, code: str) -> tuple[dict[str, Any], str]:
         """Execute `code` in a fresh sandbox. Returns (response body, outcome label)."""
@@ -172,8 +214,21 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "hackpydeno"
     sys_version = ""
 
+    def setup(self) -> None:
+        self.timeout = (
+            self.server.socket_timeout
+        )  # a read that stalls is closed, not waited for
+        super().setup()
+
     def log_message(self, *_args: Any) -> None:  # we write our own JSON log
         pass
+
+    def send_error(
+        self, code: int, message: str | None = None, explain: str | None = None
+    ) -> None:
+        # Malformed requests and unsupported methods never reach `do_POST`; they are still traffic.
+        self.server.log({"ts": time.time(), "event": "http_error", "status": code})
+        super().send_error(code, message, explain)
 
     def _send(self, status: int, body: bytes, ctype: str) -> None:
         self.send_response(status)
@@ -184,9 +239,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, status: int, obj: dict[str, Any]) -> bool:
-        """Send `obj`; returns True if the secret had to be redacted."""
-        text = json.dumps(obj, default=_default, ensure_ascii=True)
+    def _encode(self, obj: dict[str, Any]) -> tuple[str, bool]:
+        """The response text, with the secret redacted; and whether it had to be."""
+        try:
+            text = json.dumps(obj, default=_default, ensure_ascii=True, allow_nan=False)
+        except ValueError:  # NaN / Infinity are not JSON
+            text = json.dumps(
+                {"ok": False, "error": "result is not representable as JSON"}
+            )
         if len(text) > MAX_OUTPUT:
             text = json.dumps({"ok": False, "error": "response too large"})
         leaked = self.server.leaks(text)
@@ -196,6 +256,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"ts": time.time(), "event": "SECRET_LEAK", "where": "response"}
             )
             print("SECRET_LEAK: secret reached a response", file=sys.stderr, flush=True)
+        return text, leaked
+
+    def _json(self, status: int, obj: dict[str, Any]) -> bool:
+        """Send `obj`; returns True if the secret had to be redacted."""
+        text, leaked = self._encode(obj)
         self._send(status, text.encode(), "application/json")
         return leaked
 
@@ -214,20 +279,33 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.monotonic()
         srv = self.server
         user = self.headers.get("User", "")
-        user = user if USER_RE.match(user) else ("" if not user else "invalid")
+        user = user if USER_RE.fullmatch(user) else ("" if not user else "invalid")
         rec: dict[str, Any] = {"ts": time.time(), "user": user.lower(), "code_len": 0}
 
         def done(status: int, body: dict[str, Any], outcome: str) -> None:
             ms = int((time.monotonic() - t0) * 1000)
             body["ms"] = ms
             rec.update(outcome=outcome, status=status, ms=ms)
-            if self._json(status, body):
+            text, leaked = self._encode(body)
+            if leaked:
                 rec["event"] = "SECRET_LEAK"
+            # Logged BEFORE the answer is sent: the record must exist when the client sees the
+            # response, and a client that hangs up (or a crash) cannot make the request vanish.
             srv.log(rec)
+            try:
+                self._send(status, text.encode(), "application/json")
+            except OSError:
+                pass  # the client hung up; the code already ran and is already logged
 
         ip = self.client_address[0]
         if srv.trust_proxy:
-            ip = self.headers.get("X-Forwarded-For", ip).split(",")[-1].strip()
+            # Every X-Forwarded-For line (a client can send several), the last hop (the one the
+            # trusted proxy appended), and only if it is an address: the value keys a table.
+            hops = ",".join(self.headers.get_all("X-Forwarded-For") or []).split(",")
+            try:
+                ip = str(ipaddress.ip_address(hops[-1].strip()[:64]))
+            except ValueError:
+                pass
         if not srv.buckets.allow(ip):
             return done(429, {"ok": False, "error": "rate limited"}, "rate_limited")
         try:
@@ -252,8 +330,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         rec["code_len"] = len(code)
         rec["code_sha256"] = hashlib.sha256(code.encode()).hexdigest()
-        rec["code_head"] = srv.redact(
-            code.encode()[:LOG_CODE_BYTES].decode("utf-8", "replace")
+        rec["code_head"] = (
+            srv.redact(code).encode()[:LOG_CODE_BYTES].decode("utf-8", "replace")
         )
         if not srv.slots.acquire(blocking=False):
             return done(503, {"ok": False, "error": "busy, try again"}, "busy")
@@ -272,7 +350,9 @@ def _default(obj: Any) -> Any:
 
 def write_secret_file(secret: str, secret_file: Path) -> None:
     secret_file.parent.mkdir(parents=True, exist_ok=True)
-    secret_file.write_text(secret + "\n")
+    fd = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(secret + "\n")
     secret_file.chmod(0o600)
 
 

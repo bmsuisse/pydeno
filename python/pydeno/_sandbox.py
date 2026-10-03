@@ -52,7 +52,8 @@ _SEATBELT_PROFILE = """
 (deny iokit-get-properties)
 (deny darwin-notification-post)
 (deny syscall-unix (syscall-number SYS_gethostuuid SYS_getfsstat SYS_getfsstat64 SYS_csops
-  SYS_csops_audittoken SYS_getpriority SYS_getpgid SYS_getsid SYS_fstatfs SYS_fstatfs64 SYS_kill))
+  SYS_csops_audittoken SYS_getpriority SYS_getpgid SYS_getsid SYS_fstatfs SYS_fstatfs64 SYS_kill
+  SYS_semget SYS_shmget SYS_msgget SYS_semsys SYS_shmsys SYS_msgsys))
 (deny syscall-mig (kernel-mig-routine host_statistics_from_user host_statistics64_from_user
   host_processor_info))
 (deny system-fcntl (fcntl-command F_GETPATH))
@@ -69,6 +70,9 @@ _SEATBELT_PROFILE = """
 #    host process, the mounted volumes and free disk space, and system-wide CPU and memory
 #    counters (a side channel on what else the machine is doing).
 #  * `F_GETPATH`: turns an open descriptor back into a path on the host's disk.
+#  * SysV `semget`/`shmget`/`msgget`: objects that survive the worker (they cannot be removed from
+#    inside) and come from a small system-wide table (32 shared-memory ids), so one worker could
+#    use them all up until the next reboot. `(deny ipc-sysv*)` does not stop this; the syscalls must be denied.
 # Known gap: `notify_post()` still reaches other processes (the connection to notifyd is opened
 # before the profile is applied), and `kill(pid, 0)` still tells a running pid from an absent one.
 
@@ -774,6 +778,21 @@ def _apply_empty_root() -> bool:
         libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
+_READ_IMPLIES_EXEC = 0x0400000
+
+
+def _clear_read_implies_exec() -> None:
+    """Linux: drop the `READ_IMPLIES_EXEC` personality if this process inherited it.
+
+    With it set, the kernel adds PROT_EXEC to every PROT_READ mapping *after* seccomp has looked at
+    the arguments, which would silently defeat the no-executable-mapping rule. It survives exec
+    (`setarch -X`, and older x86_64 kernels for binaries without a GNU_STACK header)."""
+    libc = _libc()
+    current = libc.personality(0xFFFFFFFF)
+    if current != -1 and current & _READ_IMPLIES_EXEC:
+        libc.personality(current & ~_READ_IMPLIES_EXEC)
+
+
 def _thread_count_here() -> int:
     """Threads in this process, including ones Python does not know about.
 
@@ -818,6 +837,8 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
             attempt("emptyroot", _apply_empty_root, EXTRAS)
         if single_threaded:
             attempt("landlock", _apply_landlock, layers)
+        if not allow_exec:
+            _clear_read_implies_exec()  # before seccomp, which denies `personality`
         # seccomp last, with TSYNC, so it also covers any thread that already exists.
         attempt(
             "seccomp",
@@ -854,6 +875,16 @@ def _hardware_uuid_readable() -> bool:
 
     wait = _Timespec(1, 0)
     return libc.gethostuuid(uuid, ctypes.byref(wait)) == 0 and any(uuid.raw)
+
+
+def _creates_sysv_semaphore() -> bool:
+    """macOS: can this process create a SysV semaphore (an object that outlives it)? Removes it again."""
+    libc = _libc()
+    semid = libc.semget(0, 1, 0o1600)  # IPC_PRIVATE, one semaphore, IPC_CREAT | 0600
+    if semid == -1:
+        return False
+    libc.semctl(semid, 0, 0)  # IPC_RMID
+    return True
 
 
 def attest() -> list[str]:
@@ -944,8 +975,21 @@ def attest() -> list[str]:
     check("spawn-process", spawn, cleanup_children)
     check("network-socket", connect)
     check("signal-parent", lambda: os.kill(ppid, 0))
+    if sys.platform.startswith("linux"):
+        # `execve` of a path that cannot exist: seccomp refuses at syscall entry with EPERM, and if
+        # exec is allowed the answer is ENOENT. Unlike spawning /bin/sh this does not depend on the
+        # image having a shell at all. (Not on macOS: there the path is looked up first, so even a
+        # healthy sandbox answers ENOENT; the spawn probe above covers it.)
+        try:
+            os.execv("/nonexistent-pydeno-attest", ["x"])
+        except PermissionError:
+            pass  # refused
+        except OSError:
+            breaches.append("exec-allowed")
     if sys.platform == "darwin":
-        # These two signal by return value rather than by raising.
+        # These signal by return value rather than by raising.
+        if _creates_sysv_semaphore():
+            breaches.append("create-sysv-object")
         if _procargs_of_parent():
             breaches.append("read-parent-argv-environ")
         if _hardware_uuid_readable():

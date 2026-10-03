@@ -530,6 +530,8 @@ class IsolatedRuntime:
             missing.append("max_memory")
         if _sandbox.cpu_seconds(self._proc.pid) is None:
             missing.append("the CPU cap")
+        if _sandbox.thread_count(self._proc.pid) is None:
+            missing.append("the thread cap")
         if not missing:
             return
         what = " and ".join(missing)

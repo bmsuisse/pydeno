@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import platform
+import sys
 
 __all__ = ["SnapshotAuthenticationError", "sign_snapshot", "verify_snapshot"]
 
@@ -36,7 +38,8 @@ def _engine_version() -> bytes:
     try:
         from importlib.metadata import version
 
-        return version("pydeno").encode()[:64]
+        # the release and the machine: the same release built for another platform has another heap
+        return f"{version('pydeno')}+{sys.platform}-{platform.machine()}".encode()[:64]
     except Exception:  # noqa: BLE001 - an unknown build must not look like a known one
         return b"unknown"
 

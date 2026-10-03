@@ -1161,3 +1161,136 @@ class TestFakeLLMEndToEnd:
         )
         assert "analyze_sentiment(text: string): Promise<number>" in llm.prompts[0]
         assert 'Example: const result = await get_tweets("handle");' in llm.prompts[0]
+
+
+class TestRoundThreeFindings:
+    """Found by independent review of the sessions layer; each used to be possible."""
+
+    KEY = b"k" * 32
+
+    def _tools(self) -> dict[str, Any]:
+        return {"add": lambda a, b: a + b}
+
+    def test_a_journal_cannot_be_loaded_under_another_identity(self) -> None:
+        with AgentSandbox(self._tools()) as s:
+            s.run("return await add(1, 2)")
+            blob = s.dump(self.KEY, associated_data=b"tenant-a")
+        with pytest.raises(JournalError):
+            AgentSandbox.load(
+                blob, self.KEY, self._tools(), associated_data=b"tenant-b"
+            )
+        with pytest.raises(JournalError):
+            AgentSandbox.load(blob, self.KEY, self._tools())  # no identity at all
+        with AgentSandbox.load(
+            blob, self.KEY, self._tools(), associated_data=b"tenant-a"
+        ) as ok:
+            assert ok.run("return await add(2, 3)") == 5
+
+    def test_associated_data_is_framed_so_it_cannot_slide_into_the_payload(
+        self,
+    ) -> None:
+        # (ad="ab", payload="c...") and (ad="a", payload="bc...") must not share a signature
+        one = _seal(b"c-payload", self.KEY, b"ab")
+        other = _seal(b"bc-payload", self.KEY, b"a")
+        assert (
+            one[len(agent_module._MAGIC) :][:32]
+            != other[len(agent_module._MAGIC) :][:32]
+        )  # noqa: SLF001
+
+    def test_a_journal_from_another_release_is_refused_before_any_worker_starts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with AgentSandbox(self._tools()) as s:
+            blob = s.dump(self.KEY)
+        monkeypatch.setattr(agent_module, "_engine_version", lambda: b"0.0.1-other")
+
+        def no_worker(*a: object, **k: object) -> None:
+            raise AssertionError(
+                "a worker was started for a journal that should be refused"
+            )
+
+        monkeypatch.setattr(agent_module, "IsolatedRuntime", no_worker)
+        with pytest.raises(JournalError, match="recorded by pydeno"):
+            AgentSandbox.load(blob, self.KEY, self._tools())
+
+    def test_a_different_redaction_setting_is_refused(self) -> None:
+        with AgentSandbox(self._tools()) as s:
+            blob = s.dump(self.KEY)
+        with pytest.raises(JournalError, match="redact_host_errors"):
+            AgentSandbox.load(blob, self.KEY, self._tools(), redact_host_errors=False)
+
+    def test_a_unicode_word_character_in_a_comment_does_not_break_the_run(self) -> None:
+        with AgentSandbox({}) as s:
+            step = s.start("/*\nconst x\u00b2 = 1\n*/\nreturn 1")
+            assert isinstance(step, Done) and step.value == 1
+
+    @pytest.mark.parametrize(
+        "config_change",
+        [
+            {"max_tool_calls": True},
+            {"clock_ms": 10**30},
+            {"random_seed": -1},
+            {"release": 5},
+        ],
+        ids=["bool-budget", "clock-out-of-range", "negative-seed", "release-not-str"],
+    )
+    def test_authentic_but_odd_journals_raise_journal_error(
+        self, config_change: dict
+    ) -> None:
+        with AgentSandbox(self._tools()) as s:
+            blob = s.dump(self.KEY)
+        journal = json.loads(_open(blob, self.KEY))
+        journal["config"].update(config_change)
+        forged = _seal(json.dumps(journal).encode(), self.KEY)
+        with pytest.raises(JournalError):
+            AgentSandbox.load(forged, self.KEY, self._tools())
+
+    def test_an_authentic_journal_with_a_huge_integer_is_a_journal_error(self) -> None:
+        with AgentSandbox(self._tools()) as s:
+            s.run("return await add(1, 2)")
+            blob = s.dump(self.KEY)
+        journal = json.loads(_open(blob, self.KEY))
+        journal["records"] = [
+            ["run", "return 1"],
+            ["obs", "done", "x"],
+            ["ans", "v", {"$": "int", "v": "9" * 5000}],
+        ]
+        forged = _seal(json.dumps(journal).encode(), self.KEY)
+        with pytest.raises((JournalError, ReplayDivergence)):
+            AgentSandbox.load(forged, self.KEY, self._tools())
+
+    def test_a_forked_child_exiting_does_not_stall_for_the_drain_timeout(self) -> None:
+        code = (
+            "import os, sys, time\n"
+            "from pydeno import AgentSandbox\n"
+            "s = AgentSandbox({})\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    sys.exit(0)\n"
+            "t = time.monotonic(); os.waitpid(pid, 0)\n"
+            "took = time.monotonic() - t\n"
+            "assert s.run('return 1') == 1\n"
+            "s.close()\n"
+            "print('%.1f' % took)\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+        )
+        assert done.returncode == 0, done.stderr
+        assert float(done.stdout.strip()) < 5.0, done.stdout
+
+    def test_a_tool_cannot_close_its_own_session(self) -> None:
+        holder: dict[str, AgentSandbox] = {}
+        errors: list[BaseException] = []
+
+        async def sabotage() -> int:
+            try:
+                holder["s"].close()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            return 1
+
+        with AgentSandbox({"sabotage": sabotage}) as s:
+            holder["s"] = s
+            assert s.run("return await sabotage()") == 1
+        assert errors and isinstance(errors[0], RuntimeError), errors

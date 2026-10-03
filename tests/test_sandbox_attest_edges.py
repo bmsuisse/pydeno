@@ -106,3 +106,58 @@ def test_a_root_worker_that_cannot_become_nobody_still_loses_its_capabilities() 
     ).stdout.split()
     assert out[0] == "0", out  # still root...
     assert out[1] == "0", out  # ...but holding nothing
+
+
+@pytest.mark.linux_only
+def test_the_read_implies_exec_personality_is_cleared() -> None:
+    """With READ_IMPLIES_EXEC set the kernel adds PROT_EXEC after seccomp has judged the mapping."""
+    code = textwrap.dedent(
+        """
+        import ctypes
+        from pydeno import _sandbox
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.personality(0x0400000)
+        had = bool(libc.personality(0xFFFFFFFF) & 0x0400000)
+        _sandbox._clear_read_implies_exec()
+        print(had, bool(libc.personality(0xFFFFFFFF) & 0x0400000))
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60
+    ).stdout.split()
+    assert out == ["True", "False"], out
+
+
+@pytest.mark.linux_only
+def test_an_unconfined_process_is_reported_as_allowed_to_exec() -> None:
+    code = textwrap.dedent(
+        """
+        from pydeno import _sandbox
+        print(",".join(_sandbox.attest()))
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60
+    ).stdout.strip()
+    assert "exec-allowed" in out.split(","), out
+
+
+@pytest.mark.darwin_only
+def test_a_confined_macos_worker_cannot_create_sysv_objects() -> None:
+    from pydeno import IsolatedRuntime
+
+    # `attest()` includes the SysV probe, so a worker that started under `require` passed it.
+    with IsolatedRuntime(sandbox="require") as rt:
+        assert rt.sandbox == "seatbelt"
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "from pydeno import _sandbox; print(_sandbox._creates_sysv_semaphore())",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    ).stdout.strip()
+    assert out == "True"  # unconfined, it can: so the probe in attest() is meaningful

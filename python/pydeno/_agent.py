@@ -31,6 +31,7 @@ import inspect
 import itertools
 import json
 import math
+import os
 import re
 import secrets
 import threading
@@ -44,6 +45,7 @@ from typing import Any
 
 from ._isolated import IsolatedRuntime
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
+from ._snapshot_auth import _engine_version
 from ._snapshot_auth import _key as _checked_key
 from ._tools import ToolBridge, ToolBudgetError
 
@@ -70,14 +72,15 @@ _MAX_ABANDONED_CALLS = 64
 _JOURNAL_FORMAT = 1
 # Distinct from the snapshot magic, so a signed snapshot can never be loaded as a journal, nor the
 # other way round, even under the same key.
-_MAGIC = b"pydeno-agent1\x00"
+_MAGIC = b"pydeno-agent2\x00"
+_MAX_ASSOCIATED_DATA = 1024
 _MAC_LEN = hashlib.sha256().digest_size
 # Top-level declarations, recognised only at the start of a line (no parser: a convenience, not a
 # guarantee). Their bindings are copied to `globalThis` when a run ends; see `_wrap`.
 _DECLARATION = re.compile(
     r"^(?:(?:async[ \t]+)?function\*?[ \t]*|class[ \t]+|(?:const|let|var)[ \t]+)"
     r"([A-Za-z_$][\w$]*)",
-    re.MULTILINE,
+    re.MULTILINE | re.ASCII,  # JavaScript identifiers are narrower than Unicode "\w"
 )
 _SETTLE = "__pydeno_agent_settle"
 _PERSIST = "__pydeno_agent_persist"
@@ -567,6 +570,7 @@ class _Core:
         self.run: _Run | None = None
         self.abandoned: list[asyncio.Future[Any]] = []
         self.closed = False
+        self.pid = os.getpid()
         self.task: asyncio.Future[Any] | None = None
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(
@@ -680,6 +684,11 @@ class _Core:
                 self.cond.wait(0.1)
 
     def shutdown(self) -> None:
+        if os.getpid() != self.pid:
+            # A fork()ed child: the worker and the loop thread belong to the parent. The thread does
+            # not even exist here, so waiting on its loop would stall for the whole drain timeout.
+            self.closed = True
+            return
         with self.cond:
             if self.closed:
                 return
@@ -791,6 +800,7 @@ class AgentSandbox:
 
         self._namespace = namespace
         self._max_tool_calls = max_tool_calls
+        self._redact = bool(runtime_options.get("redact_host_errors", True))
         self._clock_ms = clock_ms
         self._random_seed = random_seed
         self._max_journal_bytes = max_journal_bytes
@@ -1052,12 +1062,17 @@ class AgentSandbox:
 
     # -- durability ----------------------------------------------------------
 
-    def dump(self, key: bytes) -> bytes:
+    def dump(self, key: bytes, *, associated_data: bytes = b"") -> bytes:
         """The session's journal, HMAC-SHA256-signed with `key` (at least 16 bytes).
 
         It holds every run's code and every tool answer (errors as their class name, and their
         message only with ``redact_host_errors=False``), plus a hash of every outcome. It is
-        signed, not encrypted. Restore with `AgentSandbox.load`."""
+        signed, not encrypted. Restore with `AgentSandbox.load`.
+
+        `associated_data` (for example a tenant or session id) is folded into the signature but not
+        stored: `load` must be given the same bytes, so a journal cannot be loaded as another tenant's.
+        A journal alone cannot stop *rollback* (loading an older dump of the same session restores
+        its spent tool budget): keep a counter in your own store and put it in `associated_data`."""
         self._enter()
         try:
             if self._dead:
@@ -1078,13 +1093,15 @@ class AgentSandbox:
                         "max_tool_calls": self._max_tool_calls,
                         "namespace": self._namespace,
                         "tools": list(self._tools),
+                        "release": _engine_version().decode(errors="replace"),
+                        "redact": self._redact,
                     },
                     "records": self._records,
                 },
                 separators=(",", ":"),
                 ensure_ascii=True,
             ).encode()
-            return _seal(payload, key)
+            return _seal(payload, key, associated_data)
         finally:
             self._lock.release()
 
@@ -1096,6 +1113,7 @@ class AgentSandbox:
         tools: Mapping[str, Callable[..., Any]],
         *,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
+        associated_data: bytes = b"",
         **options: Any,
     ) -> AgentSandbox:
         """Rebuild a session from `dump()` output by replaying it on a fresh worker.
@@ -1110,8 +1128,19 @@ class AgentSandbox:
             raise TypeError("blob must be bytes")
         if len(blob) > max_journal_bytes * 2 + len(_MAGIC) + _MAC_LEN + 4096:
             raise JournalError("journal is larger than max_journal_bytes allows")
-        journal = _parse(_open(bytes(blob), key))
+        journal = _parse(_open(bytes(blob), key, associated_data))
         config = journal["config"]
+        made_by = _engine_version().decode(errors="replace")
+        if config["release"] != made_by:
+            # Before any worker starts: replaying under another engine would only fail later, as
+            # a divergence, after running the guest's code.
+            raise JournalError(
+                f"the journal was recorded by pydeno {config['release']!r}, this is {made_by!r}"
+            )
+        if bool(options.get("redact_host_errors", True)) != config["redact"]:
+            raise JournalError(
+                "the journal was recorded with a different redact_host_errors setting"
+            )
         tools = _check_tools(tools)
         if list(tools) != config["tools"]:
             raise JournalError(
@@ -1131,6 +1160,9 @@ class AgentSandbox:
         )
         try:
             session._replay(journal["records"])
+        except (ValueError, TypeError, OverflowError) as exc:
+            session.close()
+            raise JournalError(f"malformed journal: {type(exc).__name__}") from None
         except BaseException:
             session.close()
             raise
@@ -1190,6 +1222,8 @@ class AgentSandbox:
 
     def close(self) -> None:
         """Stop the worker and the session's thread. Idempotent; safe while paused."""
+        if threading.current_thread() is self._core.thread:
+            raise RuntimeError("a tool cannot close the session that is running it")
         self._paused = None
         self._finalizer()
 
@@ -1294,21 +1328,35 @@ def _check_tools(
 # ---------------------------------------------------------------------------
 
 
-def _seal(payload: bytes, key: bytes) -> bytes:
-    mac = hmac.new(_checked_key(key), _MAGIC + payload, hashlib.sha256).digest()
+def _bound(associated_data: bytes) -> bytes:
+    if not isinstance(associated_data, (bytes, bytearray)):
+        raise TypeError("associated_data must be bytes")
+    if len(associated_data) > _MAX_ASSOCIATED_DATA:
+        raise ValueError(f"associated_data is limited to {_MAX_ASSOCIATED_DATA} bytes")
+    # The length goes in first, so no payload can be read as associated data or the reverse.
+    return len(associated_data).to_bytes(4, "big") + bytes(associated_data)
+
+
+def _seal(payload: bytes, key: bytes, associated_data: bytes = b"") -> bytes:
+    mac = hmac.new(
+        _checked_key(key), _MAGIC + _bound(associated_data) + payload, hashlib.sha256
+    ).digest()
     return _MAGIC + mac + payload
 
 
-def _open(blob: bytes, key: bytes) -> bytes:
+def _open(blob: bytes, key: bytes, associated_data: bytes = b"") -> bytes:
     secret = _checked_key(key)
     if len(blob) < len(_MAGIC) + _MAC_LEN or not blob.startswith(_MAGIC):
         raise JournalError("not a signed pydeno agent journal")
     mac = blob[len(_MAGIC) : len(_MAGIC) + _MAC_LEN]
     payload = blob[len(_MAGIC) + _MAC_LEN :]
-    expected = hmac.new(secret, _MAGIC + payload, hashlib.sha256).digest()
+    expected = hmac.new(
+        secret, _MAGIC + _bound(associated_data) + payload, hashlib.sha256
+    ).digest()
     if not hmac.compare_digest(mac, expected):
         raise JournalError(
-            "journal authentication failed (tampered, or signed with a different key)"
+            "journal authentication failed (tampered, signed with a different key, or loaded "
+            "with different associated_data)"
         )
     return payload
 
@@ -1329,13 +1377,24 @@ def _parse(payload: bytes) -> dict[str, Any]:
     config, records = journal.get("config"), journal.get("records")
     if not isinstance(config, dict) or not isinstance(records, list):
         raise bad("missing config or records")
-    if not isinstance(config.get("clock_ms"), int) or not isinstance(
-        config.get("random_seed"), int
-    ):
-        raise bad("clock or seed")
+
+    def plain_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    clock, seed = config.get("clock_ms"), config.get("random_seed")
+    if (
+        not plain_int(clock) or abs(clock) > 8_640_000_000_000_000
+    ):  # JavaScript's Date range
+        raise bad("clock")
+    if not plain_int(seed) or not 0 <= seed < 2**31:
+        raise bad("seed")
     budget = config.get("max_tool_calls")
-    if budget is not None and not isinstance(budget, int):
+    if budget is not None and (not plain_int(budget) or budget < 0):
         raise bad("max_tool_calls")
+    if not isinstance(config.get("release"), str) or not isinstance(
+        config.get("redact"), bool
+    ):
+        raise bad("release or redact")
     namespace = config.get("namespace")
     if namespace is not None and not isinstance(namespace, str):
         raise bad("namespace")

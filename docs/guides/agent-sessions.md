@@ -153,6 +153,13 @@ during replay), and compares every outcome with the recorded hash.
   and no worker is ever started for it. A signed V8 snapshot is not a journal (different header),
   even under the same key. It contains the code and tool results in clear: store it like you would
   store the conversation. Redacted error messages (the default) are not written to it.
+- **Bound to an identity.** `dump(key, associated_data=b"tenant-42")` folds the bytes into the
+  signature without storing them, and `load(..., associated_data=b"tenant-42")` must be given the same
+  bytes, so one tenant's journal cannot be loaded as another's even when they share a key. The journal
+  also records the pydeno release and the `redact_host_errors` setting and is refused, before any worker
+  starts, if either differs. **A journal alone cannot prevent rollback:** loading an older dump of the
+  same session restores the tool budget it had spent since. If that matters, keep a counter in your own
+  store and include it in `associated_data`.
 - **Bounded.** `max_journal_bytes` (default 8 MiB) caps the journal. Past it the session keeps
   working, but `dump()` raises; `load()` refuses a blob larger than its own cap before checking it.
 - **Divergence is detected, not prevented.** The clock is frozen and `Math.random` seeded for every
@@ -201,8 +208,8 @@ session.run(code) -> Any
 session.start(code) -> ToolCall | Done | Failed
 session.resume(step, value) / session.resume(step, error=exc) -> ToolCall | Done | Failed
 session.pending -> ToolCall | None
-session.dump(key) -> bytes
-AgentSandbox.load(blob, key, tools, *, max_journal_bytes=8 MiB, **isolated_runtime_options)
+session.dump(key, *, associated_data=b"") -> bytes
+AgentSandbox.load(blob, key, tools, *, max_journal_bytes=8 MiB, associated_data=b"", **isolated_runtime_options)
 session.describe_tools() -> str
 session.typescript_stubs() -> str
 session.calls_made, session.calls_remaining, session.clock, session.random_seed
