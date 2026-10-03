@@ -17,7 +17,8 @@ from typing import Any
 
 import pytest
 
-pytestmark = pytest.mark.needs_monty
+# `sandbox="require"` is what these pipelines ask for, so they need a complete sandbox.
+pytestmark = [pytest.mark.needs_monty, pytest.mark.full_sandbox]
 
 EXAMPLE = (
     pathlib.Path(__file__).resolve().parent.parent
