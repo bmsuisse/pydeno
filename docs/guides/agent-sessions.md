@@ -159,7 +159,8 @@ during replay), and compares every outcome with the recorded hash.
   also records the pydeno release and the `redact_host_errors` setting and is refused, before any worker
   starts, if either differs. **A journal alone cannot prevent rollback:** loading an older dump of the
   same session restores the tool budget it had spent since. If that matters, keep a counter in your own
-  store and include it in `associated_data`.
+  store and include it in `associated_data`, or use
+  [`SessionPool`](advanced/async-agent-sessions.md#sessionpool), which does exactly that.
 - **Bounded.** `max_journal_bytes` (default 8 MiB) caps the journal. Past it the session keeps
   working, but `dump()` raises; `load()` refuses a blob larger than its own cap before checking it.
 - **Divergence is detected, not prevented.** The clock is frozen and `Math.random` seeded for every
@@ -218,3 +219,7 @@ session.close(), session.is_closed()
 
 `namespace="tools"` installs the tools as `tools.query_rows(...)` instead of globals; the prompt
 helpers follow it.
+
+For an asyncio service, `AsyncAgentSandbox` is this class with coroutine methods and no thread per
+session, and `SessionPool` manages many of them per user: see
+[Async agent sessions and the session pool](advanced/async-agent-sessions.md).
