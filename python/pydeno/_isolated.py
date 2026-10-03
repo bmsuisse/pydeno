@@ -118,6 +118,8 @@ def _clean(text: str, limit: int = 500) -> str:
 
 
 _REVOKED_MEMORY = 4096
+# A worker runs about 13 threads (17 on macOS); this is far past that and far below a thread bomb.
+_MAX_WORKER_THREADS = 64
 
 
 def _revoked_handler(*_args: Any) -> Any:
@@ -393,7 +395,7 @@ class IsolatedRuntime:
             # the whole worker. With a cap the guest gets a catchable RangeError and the session
             # survives. (No default heap cap: with one, V8 turns an over-cap allocation into a
             # fatal "heap limit exceeded" instead of that RangeError.)
-            self._config["max_buffer_bytes"] = max_memory // 4
+            self._config["max_buffer_bytes"] = max(1, max_memory // 4)
         self._soft_timeout = _seconds(config.timeout)
         self._max_memory = max_memory
         # Three states: unset (soft timeout + grace, else a default ceiling), a number,
@@ -587,6 +589,9 @@ class IsolatedRuntime:
         return f"{prefix}: {_clean(last)}"
 
     def _kill(self) -> None:
+        if os.getpid() != self._owner_pid:
+            self._drop_inherited()
+            return
         self._closed = True
         _terminate_process(self._proc, None)
         self._reap()
@@ -613,8 +618,26 @@ class IsolatedRuntime:
     def is_closed(self) -> bool:
         return self._closed
 
+    def _drop_inherited(self) -> None:
+        """In a fork()ed child: let go of this process's copies of the worker's pipes and stderr
+        file, without signalling, waiting on or talking to a worker that belongs to the parent."""
+        self._closed = True
+        for stream in (self._proc.stdin, self._proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            self._stderr.close()
+        except (OSError, ValueError):
+            pass
+
     def close(self) -> None:
         """Ask the worker to exit; kill it if it does not within a second."""
+        if os.getpid() != self._owner_pid:
+            self._drop_inherited()
+            return
         if not self._closed:
             self._closed = True
             try:
@@ -799,14 +822,21 @@ class IsolatedRuntime:
         self._check_memory()
 
     def _check_memory(self, *, force: bool = False) -> None:
-        """Kill the worker if its RSS is over `max_memory`. Sampled, so a spike that
-        ends between samples is only caught by the check made as each command finishes."""
-        if self._max_memory is None:
-            return
+        """Kill the worker if its RSS is over `max_memory` or it has far more threads than a
+        worker has. Sampled, so a spike that ends between samples is only caught by the check
+        made as each command finishes."""
         now = time.monotonic()
         if not force and now - self._last_rss_check < _RSS_EVERY_SECONDS:
             return
         self._last_rss_check = now
+        threads = _sandbox.thread_count(self._proc.pid)
+        if threads is not None and threads > _MAX_WORKER_THREADS:
+            self._kill()
+            raise WorkerCrashed(
+                f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
+            )
+        if self._max_memory is None:
+            return
         rss = _sandbox.rss_bytes(self._proc.pid)
         if rss is not None and rss > self._max_memory:
             self._kill()
@@ -1254,8 +1284,11 @@ def _forget_parents_workers() -> None:
     descriptors. They are the parent's: the child must not kill them at exit (its atexit hook and
     finalizers would), must not hand out the parent's spare, and must not write frames into a
     pipe the parent is also reading. So it forgets them, and `_request` refuses to run on one."""
-    global _SPARE  # noqa: PLW0603
+    global _SPARE, _SPARE_LOCK  # noqa: PLW0603
     _SPARE = None
+    # A parent thread may have held this lock at the instant of the fork; that thread does not
+    # exist here, so the lock would never be released. A fresh one cannot deadlock the child.
+    _SPARE_LOCK = threading.Lock()
     for runtime in list(_LIVE):
         runtime._finalizer.detach()  # noqa: SLF001
     _LIVE.clear()

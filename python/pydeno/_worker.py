@@ -380,7 +380,12 @@ class _Worker:
         applied = (
             "none"
             if mode == "off"
-            else _sandbox.apply(empty_root=bool(options.get("empty_root", True)))
+            else _sandbox.apply(
+                empty_root=bool(options.get("empty_root", True)),
+                # A jitless V8 never maps memory executable, so refuse it: an exploit then has to
+                # work without injecting code.
+                allow_exec="--jitless" not in flags,
+            )
         )
         if applied != "none" and not _sandbox.missing_layers(applied):
             # Ask the kernel rather than trust the filter lists: if the platform's full sandbox

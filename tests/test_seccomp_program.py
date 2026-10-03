@@ -165,7 +165,6 @@ class TestWhatTheWorkerNeeds:
         "lseek",
         "readlinkat",
         "pread64",
-        "uname",
         "getrlimit",
         "sched_getaffinity",
         "set_tid_address",
@@ -190,7 +189,9 @@ class TestWhatTheWorkerNeeds:
                 continue  # not present on this architecture
             # socketpair is allowed for what the worker uses it for (an AF_UNIX stream pair);
             # every other call is checked with zeroed arguments.
-            args = (1, 1, 0, 0, 0, 0) if name == "socketpair" else (0, 0, 0, 0, 0, 0)
+            # a real call, not zeros: socketpair as an AF_UNIX stream pair, prctl as PR_SET_NAME
+            special = {"socketpair": (1, 1, 0, 0, 0, 0), "prctl": (15, 0, 0, 0, 0, 0)}
+            args = special.get(name, (0, 0, 0, 0, 0, 0))
             if run(prog, arch, by[name], args) != ALLOW:
                 missing.append(name)
         assert not missing, f"the filter blocks calls the worker relies on: {missing}"
@@ -296,7 +297,9 @@ class TestSignalOwnership:
     """`fcntl(fd, F_SETOWN, parent)` + `F_SETSIG` + `O_ASYNC` makes the kernel signal the owner
     whenever the descriptor is ready, without ever calling `kill`."""
 
-    @pytest.mark.parametrize("cmd", [8, 10, 15])  # F_SETOWN, F_SETSIG, F_SETOWN_EX
+    @pytest.mark.parametrize(
+        "cmd", [8, 10, 15, 1031]
+    )  # F_SETOWN, F_SETSIG, F_SETOWN_EX; and F_SETPIPE_SZ (pipe buffers are memory the RSS poll misses)
     def test_naming_a_signal_owner_is_denied(
         self, arch: str, prog: list, cmd: int
     ) -> None:
@@ -308,7 +311,7 @@ class TestSignalOwnership:
 
     @pytest.mark.parametrize(
         "cmd",
-        [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 1024, 1025, 1030, 1031, 1032, 1033],
+        [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 1024, 1025, 1030, 1032, 1033],
     )
     def test_every_other_fcntl_command_is_untouched(
         self, arch: str, prog: list, cmd: int
@@ -440,3 +443,76 @@ class TestShape:
 
     def test_building_it_twice_gives_the_same_program(self, arch: str) -> None:
         assert sb._seccomp_program(arch) == sb._seccomp_program(arch)  # noqa: SLF001
+
+
+class TestWhatAWorkerMayAskTheKernelAbout:
+    """The worker never asks for these, and an attacker wants each: the kernel version, the host's
+    uptime/RAM/process count, and other processes' priorities (which enumerate every pid)."""
+
+    @pytest.mark.parametrize("name", ["uname", "sysinfo", "getpriority", "ioprio_get"])
+    def test_denied(self, arch: str, prog: list, name: str) -> None:
+        nr = _by_name(arch)[name]
+        assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ERRNO | EPERM
+
+
+class TestPrctl:
+    @pytest.mark.parametrize(
+        "option", [15, 16, 0x53564D41, 3]
+    )  # SET/GET_NAME, SET_VMA, GET_DUMPABLE
+    def test_what_a_worker_does_is_allowed(
+        self, arch: str, prog: list, option: int
+    ) -> None:
+        nr = sb._PRCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (option, 0, 0, 0, 0)) == ALLOW
+
+    @pytest.mark.parametrize(
+        "option",
+        [1, 4, 22, 36, 38, 62, 0x59616D61],
+        ids=[
+            "pdeathsig",
+            "set-dumpable",
+            "seccomp",
+            "child-subreaper",
+            "no-new-privs",
+            "sched-core",
+            "ptracer",
+        ],
+    )
+    def test_everything_else_is_denied(
+        self, arch: str, prog: list, option: int
+    ) -> None:
+        nr = sb._PRCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (option, 0, 0, 0, 0)) == ERRNO | EPERM
+
+
+class TestExecutableMemory:
+    """A jitless V8 never maps memory executable: refusing it makes an exploit work without
+    injecting code. A JIT-enabled worker keeps it."""
+
+    PROT_READ, PROT_WRITE, PROT_EXEC = 1, 2, 4
+
+    @pytest.mark.parametrize("name", ["mmap", "mprotect"])
+    def test_refused_when_jitless(self, arch: str, name: str) -> None:
+        program = [
+            struct.unpack_from("<HBBI", raw, i * 8)
+            for raw in [sb._seccomp_program(arch, allow_exec=False)]  # noqa: SLF001
+            for i in range(len(raw) // 8)
+        ]
+        nr = _by_name(arch)[name]
+        rw = self.PROT_READ | self.PROT_WRITE
+        assert run(program, arch, nr, (0, 4096, rw)) == ALLOW
+        assert (
+            run(program, arch, nr, (0, 4096, self.PROT_READ | self.PROT_EXEC))
+            == ERRNO | EPERM
+        )
+        assert run(program, arch, nr, (0, 4096, rw | self.PROT_EXEC)) == ERRNO | EPERM
+
+    @pytest.mark.parametrize("name", ["mmap", "mprotect"])
+    def test_allowed_with_a_jit(self, arch: str, prog: list, name: str) -> None:
+        nr = _by_name(arch)[name]
+        assert run(prog, arch, nr, (0, 4096, self.PROT_READ | self.PROT_EXEC)) == ALLOW
+
+
+def test_pkey_mprotect_is_denied_outright(arch: str, prog: list) -> None:
+    nr = _by_name(arch)["pkey_mprotect"]
+    assert run(prog, arch, nr, (0, 4096, 1)) == ERRNO | EPERM

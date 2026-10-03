@@ -22,6 +22,7 @@ _FORK = textwrap.dedent(
             assert "fork" in str(exc), exc
         else:
             os._exit(3)
+        rt.close()  # closing the inherited runtime must not touch the parent's worker either
         sys.exit(0)  # a normal exit: atexit hooks and finalizers run
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0, status
@@ -64,3 +65,15 @@ def test_a_crash_message_does_not_carry_native_stack_frames() -> None:
     ):
         assert _NATIVE_FRAME.search(line)
     assert not _NATIVE_FRAME.search("RuntimeError: sandbox self-test failed")
+
+
+def test_the_spare_lock_is_replaced_in_a_forked_child() -> None:
+    # A parent thread may hold the lock at the instant of the fork; the child must not inherit it.
+    from pydeno import _isolated
+
+    _isolated._SPARE_LOCK.acquire()  # noqa: SLF001
+    try:
+        _isolated._forget_parents_workers()  # noqa: SLF001
+        assert not _isolated._SPARE_LOCK.locked()  # noqa: SLF001
+    finally:
+        pass  # the replaced lock is the live one; the old one is simply abandoned

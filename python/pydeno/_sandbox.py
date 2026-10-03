@@ -23,6 +23,7 @@ so the caller decides whether "none" is acceptable (`sandbox="require"`).
 from __future__ import annotations
 
 import ctypes
+import errno
 import ctypes.util
 import os
 import platform
@@ -45,19 +46,31 @@ MEMORY_EXIT_CODE = 78
 _SEATBELT_PROFILE = """
 (version 1)
 (deny default)
-(allow sysctl-read
-  (sysctl-name-prefix "hw.")
-  (sysctl-name-prefix "kern.os")
-  (sysctl-name "kern.version" "kern.maxproc" "kern.argmax" "kern.boottime" "vm.loadavg" "vm.swapusage"))
-(allow mach-lookup (global-name "com.apple.system.logger"))
 (allow signal (target self))
 (deny process-info*)
 (allow process-info-pidinfo (target self))
+(deny iokit-get-properties)
+(deny darwin-notification-post)
+(deny syscall-unix (syscall-number SYS_gethostuuid SYS_getfsstat SYS_getfsstat64 SYS_csops
+  SYS_csops_audittoken SYS_getpriority SYS_getpgid SYS_getsid SYS_fstatfs SYS_fstatfs64 SYS_kill))
+(deny syscall-mig (kernel-mig-routine host_statistics_from_user host_statistics64_from_user
+  host_processor_info))
+(deny system-fcntl (fcntl-command F_GETPATH))
+(deny process-codesigning*)
 """
-# Both the `sysctl-read` filter and the explicit `process-info*` deny are needed. KERN_PROCARGS2
-# on the parent returns its argv and *environment* (any same-user process's, in fact), which
-# undoes `env={}`, and the read succeeds if EITHER rule lets it through: a blanket
-# `(allow sysctl-read)` leaks, and `(deny default)` alone does not cover `process-info*`.
+# What each line is for. The profile is a deny-by-default base plus explicit denies for the things
+# `(deny default)` does NOT cover; each was found by asking from inside the sandbox, not assumed:
+#  * `process-info*`: KERN_PROCARGS2 on the parent returns its argv and *environment* (any
+#    same-user process's, in fact), which undoes `env={}`. `(deny default)` alone does not stop it,
+#    and neither does narrowing `sysctl-read`, so there is no `sysctl-read` allowance at all: the
+#    worker runs without one.
+#  * `iokit-get-properties`, `SYS_gethostuuid`: the machine's permanent hardware identifier.
+#  * `SYS_getpriority`/`getpgid`/`getsid`/`getfsstat`/`fstatfs`, `host_statistics*`: they list every
+#    host process, the mounted volumes and free disk space, and system-wide CPU and memory
+#    counters (a side channel on what else the machine is doing).
+#  * `F_GETPATH`: turns an open descriptor back into a path on the host's disk.
+# Known gap: `notify_post()` still reaches other processes (the connection to notifyd is opened
+# before the profile is applied), and `kill(pid, 0)` still tells a running pid from an absent one.
 
 
 def _apply_seatbelt() -> bool:
@@ -126,6 +139,14 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     # on Linux 6.12+, Landlock's abstract-socket scope. An AF_UNIX `socket()` would add nothing
     # to what socketpair already allows, so it is simply closed with the rest.
     "socket": (41, 198),
+    # What a worker never asks and an attacker wants: the kernel version (to pick an exploit),
+    # uptime / process count / RAM (`sysinfo`), and other processes' priorities (`getpriority` and
+    # `ioprio_get` walk every pid). glibc's thread set-up calls `sched_get*` with a *thread* id, which
+    # is why those stay open.
+    "sysinfo": (99, 179),
+    "uname": (63, 160),
+    "getpriority": (140, 141),
+    "ioprio_get": (252, 31),
     # Taking over or signalling other processes of the same user.
     "pidfd_open": (434, 434),
     "pidfd_getfd": (438, 438),
@@ -345,7 +366,7 @@ _WHICH_PROCESS = {"setpriority": 0, "ioprio_set": 1}
 # but only on Linux 6.12+.)
 _FCNTL = (72, 25)
 _IOCTL = (16, 29)
-_FCNTL_DENIED_CMDS = (8, 10, 15)  # F_SETOWN, F_SETSIG, F_SETOWN_EX
+_FCNTL_DENIED_CMDS = (8, 10, 15, 1031)  # F_SETOWN, F_SETSIG, F_SETOWN_EX, F_SETPIPE_SZ
 # FIOSETOWN, SIOCSPGRP (signal ownership), TIOCSTI, TIOCLINUX. The worker has no controlling terminal
 # (it is its own session), so the last two are belt and braces: bubblewrap documents TIOCSTI as the
 # one thing a session alone does not cover if a terminal ever reaches the sandbox.
@@ -357,9 +378,19 @@ _IOCTL_DENIED_CMDS = (0x8901, 0x8902, 0x5412, 0x541C)
 _IOCTL_SOCKET_BLOCK = 0x8900
 _PRCTL = (157, 167)
 _SOCKETPAIR = (53, 199)
-_PR_SCHED_CORE = (
-    62  # can set a core-scheduling cookie on another process (a side-channel setting)
-)
+# `prctl` can change how the process is traced, scheduled and killed (`PR_SET_DUMPABLE`,
+# `PR_SET_PDEATHSIG`, `PR_SCHED_CORE` on another process, speculation controls), so only what a real
+# worker does is allowed (verified by tracing 182 workers across the isolation suite): naming its
+# threads, naming memory areas, and reading its dumpable flag.
+_PRCTL_ALLOWED = (15, 16, 0x53564D41, 3)  # SET_NAME, GET_NAME, SET_VMA, GET_DUMPABLE
+_PR_SET_DUMPABLE = 4
+# Mapping memory executable. A jitless V8 never needs it, and refusing it means an exploit must
+# work without injecting code of its own.
+_EXEC_CHECKED = (
+    (9, 222),
+    (10, 226),
+)  # mmap, mprotect (pkey_mprotect is denied outright)
+_PROT_EXEC = 4
 _AF_UNIX, _SOCK_STREAM, _SOCK_TYPE_MASK = 1, 1, 0xF
 # Every syscall number below this has been looked at (`tests/data/syscalls.json`, from the
 # kernel's own tables, and `tests/test_sandbox_syscall_tables.py` fails if the table ever grows
@@ -396,7 +427,7 @@ _EPERM, _ENOSYS = 1, 38
 _CLONE_THREAD = 0x10000
 
 
-def _seccomp_program(arch: str) -> bytes | None:
+def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     """Assemble the filter. Default-allow with a deny list: V8, CPython and tokio use
     far too many syscalls to allow-list safely, and the deny list targets what turns
     code execution into host access (new processes, new network endpoints, kernel
@@ -445,6 +476,9 @@ def _seccomp_program(arch: str) -> bytes | None:
     ins.append((_BPF_JEQ_K, "fcntl", None, _FCNTL[idx]))
     ins.append((_BPF_JEQ_K, "ioctl", None, _IOCTL[idx]))
     ins.append((_BPF_JEQ_K, "prctl", None, _PRCTL[idx]))
+    if not allow_exec:
+        for pair in _EXEC_CHECKED:
+            ins.append((_BPF_JEQ_K, "noexec", None, pair[idx]))
     ins.append((_BPF_JEQ_K, "socketpair", None, _SOCKETPAIR[idx]))
     stubs(enosys=True)
 
@@ -484,8 +518,15 @@ def _seccomp_program(arch: str) -> bytes | None:
     stubs()
     label("prctl")  # the option is arg0
     ins.append((_BPF_LD_W_ABS, None, None, 16))
-    ins.append((_BPF_JEQ_K, "eperm", "allow", _PR_SCHED_CORE))
+    for option in _PRCTL_ALLOWED:
+        ins.append((_BPF_JEQ_K, "allow", None, option))
+    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
     stubs()
+    if not allow_exec:
+        label("noexec")  # `prot` is arg2 of both
+        ins.append((_BPF_LD_W_ABS, None, None, 32))
+        ins.append((_BPF_JSET_K, "eperm", "allow", _PROT_EXEC))
+        stubs()
     label(
         "socketpair"
     )  # only a stream socketpair: a datagram one can `sendto` any path
@@ -514,13 +555,13 @@ def _libc() -> ctypes.CDLL:
     return ctypes.CDLL(None, use_errno=True)
 
 
-def _apply_seccomp() -> bool:
+def _apply_seccomp(*, allow_exec: bool = True) -> bool:
     arch = platform.machine()
     if arch == "arm64":
         arch = "aarch64"
     if arch not in _AUDIT_ARCH:
         return False
-    program = _seccomp_program(arch)
+    program = _seccomp_program(arch, allow_exec=allow_exec)
     if program is None:
         return False
     libc = _libc()
@@ -537,7 +578,7 @@ def _apply_seccomp() -> bool:
     return libc.syscall(_SYS_SECCOMP[arch], 1, 1, ctypes.byref(prog)) == 0
 
 
-def _seccomp_is_safe_here() -> bool:
+def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
     """Fire the filter in a throwaway child first.
 
     The filter hard-codes syscall numbers per architecture and kills the process if
@@ -550,7 +591,7 @@ def _seccomp_is_safe_here() -> bool:
     if pid == 0:  # child: never returns
         code = 4
         try:
-            code = 0 if _apply_seccomp() and os.getpid() > 0 and os.uname() else 3
+            code = 0 if _apply_seccomp(allow_exec=allow_exec) and os.getpid() > 0 else 3
         finally:
             os._exit(code)
     _, status = os.waitpid(pid, 0)
@@ -732,7 +773,7 @@ def _apply_empty_root() -> bool:
         libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
-def apply(*, empty_root: bool = True) -> str:
+def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
     """Confine the current process. Returns the layers applied, e.g. "landlock+seccomp",
     "seatbelt", or "none". Bonus layers land in `EXTRAS`.
 
@@ -765,17 +806,41 @@ def apply(*, empty_root: bool = True) -> str:
         if single_threaded:
             attempt("landlock", _apply_landlock, layers)
         # seccomp last, with TSYNC, so it also covers any thread that already exists.
-        attempt("seccomp", lambda: _seccomp_is_safe_here() and _apply_seccomp(), layers)
+        attempt(
+            "seccomp",
+            lambda: (
+                _seccomp_is_safe_here(allow_exec=allow_exec)
+                and _apply_seccomp(allow_exec=allow_exec)
+            ),
+            layers,
+        )
     return "+".join(layers) or "none"
 
 
 def _procargs_of_parent() -> bool:
-    """macOS: can this process read its parent's argv and environment (KERN_PROCARGS2)?"""
+    """macOS: can this process read its parent's argv and environment (KERN_PROCARGS2)?
+
+    The buffer is big enough for any realistic environment, and ENOMEM counts as "yes": it is
+    what a call that was *allowed* answers when the data does not fit, so mistaking it for a
+    refusal would hide the very capability this looks for."""
     libc = _libc()
     mib = (ctypes.c_int * 3)(1, 49, os.getppid())  # CTL_KERN, KERN_PROCARGS2, pid
-    buf = ctypes.create_string_buffer(4096)
+    buf = ctypes.create_string_buffer(1 << 20)
     size = ctypes.c_size_t(len(buf))
-    return libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0
+    rc = libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0)
+    return rc == 0 or ctypes.get_errno() == errno.ENOMEM
+
+
+def _hardware_uuid_readable() -> bool:
+    """macOS: can this process read the machine's permanent hardware identifier?"""
+    libc = _libc()
+    uuid = ctypes.create_string_buffer(16)
+
+    class _Timespec(ctypes.Structure):
+        _fields_ = (("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long))
+
+    wait = _Timespec(1, 0)
+    return libc.gethostuuid(uuid, ctypes.byref(wait)) == 0 and any(uuid.raw)
 
 
 def attest() -> list[str]:
@@ -787,34 +852,51 @@ def attest() -> list[str]:
     nobody had thought of. This does not trust the lists. It asks the kernel, once, before any
     guest code exists, so a hole of that kind stops the worker from starting instead of waiting
     for a reviewer. Every probe is a refusal we expect, so it costs a handful of syscalls.
+
+    A probe is one security-sensitive call. If that call succeeds it is a breach, recorded at
+    once; cleanup afterwards is best effort and never changes the verdict. Only an `OSError` from
+    the sensitive call counts as a refusal: anything else (a bug in a probe) propagates, and the
+    worker refuses to start rather than report a sandbox it did not actually check.
     """
     breaches: list[str] = []
     ppid = os.getppid()
 
-    def probe(name: str, attempt: Callable[[], object]) -> None:
+    def check(
+        name: str,
+        call: Callable[[], object],
+        cleanup: Callable[[], object] | None = None,
+    ) -> None:
         try:
-            attempt()
-        except Exception:
-            return  # refused (or impossible), which is the answer we want
+            call()
+        except OSError:
+            return  # refused: the answer we want
         breaches.append(name)
+        if cleanup is not None:
+            try:
+                cleanup()
+            except OSError:
+                pass
 
     def read(path: str) -> None:
         with open(path, "rb") as fh:
             fh.read(1)
 
+    created: list[str] = []
+
     def write() -> None:
         path = f"/tmp/.pydeno-attest-{os.getpid()}"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(fd)
-        os.unlink(path)
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        created.append(path)
+
+    spawned: list[int] = []
 
     def spawn() -> None:
-        pid = os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], {})
-        os.waitpid(pid, 0)
+        spawned.append(os.posix_spawn("/bin/sh", ["sh", "-c", "exit 0"], {}))
 
-    def network() -> None:
-        # Seatbelt lets `socket()` succeed and refuses the connect, so test the connect, and
-        # accept only the sandbox's own refusal: "connection refused" means the attempt got out.
+    def connect() -> None:
+        # Seatbelt lets `socket()` succeed and refuses the connect, so test the connect. Only the
+        # sandbox's own refusal (a PermissionError) counts: "connection refused" means the attempt
+        # reached the network stack, which the sandbox should have prevented.
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(1)
             try:
@@ -822,26 +904,42 @@ def attest() -> list[str]:
             except PermissionError:
                 raise
             except OSError:
-                return  # reached the network stack and failed there: not refused by the sandbox
+                return
+
+    pairs: list[tuple[socket.socket, socket.socket]] = []
 
     def unix_dgram() -> None:
         # A datagram socketpair can `sendto` any path the process can name (journald, notify).
-        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
-        a.close()
-        b.close()
+        pairs.append(socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM))
 
-    probe("read-file", lambda: read("/etc/hosts"))
-    probe("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
-    probe("write-file", write)
-    probe("spawn-process", spawn)
-    probe("network-socket", network)
-    probe("signal-parent", lambda: os.kill(ppid, 0))
+    def cleanup_files() -> None:
+        for path in created:
+            os.unlink(path)
+
+    def cleanup_children() -> None:
+        for pid in spawned:
+            os.waitpid(pid, 0)
+
+    def cleanup_sockets() -> None:
+        for a, b in pairs:
+            a.close()
+            b.close()
+
+    check("read-file", lambda: read("/etc/hosts"))
+    check("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
+    check("write-file", write, cleanup_files)
+    check("spawn-process", spawn, cleanup_children)
+    check("network-socket", connect)
+    check("signal-parent", lambda: os.kill(ppid, 0))
     if sys.platform == "darwin":
-        # `probe` treats a raised exception as "refused", and this one signals by return value.
+        # These two signal by return value rather than by raising.
         if _procargs_of_parent():
             breaches.append("read-parent-argv-environ")
+        if _hardware_uuid_readable():
+            breaches.append("read-hardware-uuid")
+        check("inspect-other-process", lambda: os.getpgid(ppid))
     if sys.platform.startswith("linux"):
-        probe("unix-datagram-socket", unix_dgram)
+        check("unix-datagram-socket", unix_dgram, cleanup_sockets)
     return breaches
 
 
@@ -925,12 +1023,20 @@ def harden_process() -> dict[str, object]:
         ("RLIMIT_NOFILE", 256),
         ("RLIMIT_MEMLOCK", 0),
         ("RLIMIT_MSGQUEUE", 0),
+        # A host user who is allowed realtime priority (an audio group, say) would otherwise let
+        # the worker run at realtime priority and starve the host.
+        ("RLIMIT_RTPRIO", 0),
+        ("RLIMIT_NICE", 0),
     ):
         try:
             res = getattr(resource, name)
             resource.setrlimit(res, (value, value))
         except (ValueError, OSError, AttributeError):
             pass
+    if sys.platform.startswith("linux"):
+        # Not dumpable: a same-user process cannot ptrace it or read its /proc/<pid>/mem, and
+        # the filter later refuses `prctl` options, so a guest cannot switch it back on.
+        _libc().prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
     return drop_privileges()
 
 
@@ -1020,6 +1126,31 @@ def cpu_seconds(pid: int) -> float | None:
 
 
 _libproc: ctypes.CDLL | None = None
+
+
+def thread_count(pid: int) -> int | None:
+    """How many threads the process `pid` has, or None. A worker has about 13 on Linux and 17 on
+    macOS; a guest that gets native code can start thousands within a second, well under a
+    memory ceiling, and a handful of such workers exhausts the host's thread table."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/stat", "rb") as fh:
+                fields = fh.read().rsplit(b")", 1)[1].split()
+            return int(
+                fields[17]
+            )  # num_threads is field 20; the list starts at field 3
+        if sys.platform == "darwin":
+            global _libproc  # noqa: PLW0603
+            if _libproc is None:
+                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+            info = _TaskInfo()
+            n = _libproc.proc_pidinfo(
+                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
+            )
+            return int(info.threadnum) if n == ctypes.sizeof(info) else None
+    except (OSError, ValueError, IndexError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def rss_bytes(pid: int) -> int | None:

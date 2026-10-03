@@ -124,7 +124,6 @@ def test_the_syscalls_the_worker_needs_are_not_in_the_deny_list(arch: str) -> No
         "prlimit64",
         "getrlimit",
         "sched_getaffinity",
-        "uname",
         "openat",
         "fstat",
         "newfstatat",

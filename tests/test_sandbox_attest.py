@@ -9,6 +9,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 from pydeno import IsolatedRuntime
 
 
@@ -27,8 +29,16 @@ def test_an_unsandboxed_process_is_reported_as_breached() -> None:
     assert {"read-file", "write-file", "spawn-process", "network-socket"} <= breaches, (
         out
     )
+    if sys.platform == "darwin":
+        # The macOS-only probes must also notice, or a green self-test would prove nothing.
+        assert {
+            "read-parent-argv-environ",
+            "read-hardware-uuid",
+            "inspect-other-process",
+        } <= breaches, out
 
 
+@pytest.mark.full_sandbox  # `require` must fail by design where a layer is deliberately missing
 def test_a_sandboxed_worker_starts_so_it_passed_its_own_self_test() -> None:
     # `_init` raises if attest() finds anything, and that surfaces here as a failed start.
     with IsolatedRuntime(sandbox="require") as rt:
