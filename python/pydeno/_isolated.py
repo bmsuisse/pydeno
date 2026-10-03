@@ -1108,7 +1108,12 @@ class IsolatedRuntime:
         # Before queueing, not only inside `_request`: the runtime's thread is busy with the very
         # command this call came from, so a queued re-entrant call would wait behind it forever.
         self._refuse_reentry()
-        call = functools.partial(self._request, message, soft_timeout=soft, loop=loop)
+        # Run in a copy of the caller's context, as `asyncio.to_thread` does: host functions then see
+        # the caller's contextvars (tracing spans, request ids, ...).
+        context = contextvars.copy_context()
+        call = functools.partial(
+            context.run, self._request, message, soft_timeout=soft, loop=loop
+        )
         return await loop.run_in_executor(self._own_executor(), call)
 
     def _register_token(self, token: int, hid: int) -> None:

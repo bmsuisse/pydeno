@@ -236,3 +236,27 @@ def test_an_unawaited_async_host_call_does_not_wedge_the_next_command() -> None:
         asyncio.run(expire())
         if not rt.is_closed():
             assert rt.eval("3 + 3") == 6
+
+
+def test_async_host_functions_see_the_callers_context_variables() -> None:
+    """`eval_async` runs on a thread of its own; it must carry the caller's contextvars across, as
+    `asyncio.to_thread` does, or tracing spans and request ids vanish inside host functions."""
+    import asyncio
+    import contextvars
+
+    from pydeno import RuntimeConfig
+
+    request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+        "request_id", default="none"
+    )
+
+    async def whoami() -> str:
+        return request_id.get()
+
+    async def go() -> object:
+        with IsolatedRuntime(RuntimeConfig(timeout=20.0)) as rt:
+            rt.bind_function("whoami", whoami)
+            request_id.set("req-42")
+            return await rt.eval_async("whoami()")
+
+    assert asyncio.run(go()) == "req-42"

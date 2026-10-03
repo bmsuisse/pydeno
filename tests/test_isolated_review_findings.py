@@ -798,7 +798,7 @@ class TestM8RequireMeansEveryLayer:
             calls.append("landlock")
             raise OSError("landlock exploded")
 
-        monkeypatch.setattr(_sandbox.threading, "active_count", lambda: 1)
+        monkeypatch.setattr(_sandbox, "_thread_count_here", lambda: 1)
         monkeypatch.setattr(_sandbox, "_apply_landlock", boom)
         monkeypatch.setattr(_sandbox, "_apply_empty_root", lambda: False)
         monkeypatch.setattr(_sandbox, "_seccomp_is_safe_here", lambda **_: True)
@@ -813,7 +813,7 @@ class TestM8RequireMeansEveryLayer:
     ) -> None:
         if not sys.platform.startswith("linux"):
             return
-        monkeypatch.setattr(_sandbox.threading, "active_count", lambda: 1)
+        monkeypatch.setattr(_sandbox, "_thread_count_here", lambda: 1)
         monkeypatch.setattr(_sandbox, "_apply_landlock", lambda: True)
         monkeypatch.setattr(_sandbox, "_apply_empty_root", lambda: False)
 
