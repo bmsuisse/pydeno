@@ -1340,6 +1340,20 @@ _FAKE = textwrap.dedent(
     elif MODE == "dup_result":
         send({"t": "result", "id": cmd["id"], "v": 1})
         send({"t": "result", "id": cmd["id"], "v": 2}); time.sleep(30)
+    elif MODE == "escape_error":
+        send({"t": "error", "id": cmd["id"], "kind": "RuntimeError",
+              "msg": "boom\\x1b[2J\\x1b]0;pwned\\x07\\nat line 2"})
+        time.sleep(30)
+    elif MODE == "dup_token":
+        # answers every command with the same capability token
+        while True:
+            send({"t": "result", "id": cmd["id"], "v": 7})
+            cmd = read()
+    elif MODE == "wrong_object_keys":
+        # answers every command with a token map that does not match what was bound
+        while True:
+            send({"t": "result", "id": cmd["id"], "v": {"unrelated": 7}})
+            cmd = read()
     """
 )
 
@@ -1468,3 +1482,58 @@ class TestUntrustedWorker:
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
         with pytest.raises(WorkerCrashed):
             IsolatedRuntime(RuntimeConfig(), python=str(wrapper))
+
+
+class TestWorkerCannotForgeCapabilityBookkeeping:
+    """The tokens are the worker's claims. A lying worker must not be able to make a revoked (or
+    never-revoked) host handler outlive its capability."""
+
+    def test_a_reused_token_ends_the_session(self, tmp_path: Path) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "dup_token"),
+            request_timeout=20,
+        )
+        assert rt.bind_function("harmless", lambda: 1) == 7
+        with pytest.raises(WorkerCrashed, match="reused"):
+            rt.bind_function("privileged", lambda: 2)
+        assert rt.is_closed()
+
+    def test_a_token_map_that_does_not_match_what_was_bound_ends_the_session(
+        self, tmp_path: Path
+    ) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "wrong_object_keys"),
+            request_timeout=20,
+        )
+        with pytest.raises(WorkerCrashed, match="malformed"):
+            rt.bind_object("api", {"add": lambda a, b: a + b})
+        assert rt.is_closed()
+
+    def test_revoking_drops_the_host_handler_even_if_the_worker_never_answers(
+        self, tmp_path: Path
+    ) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "dup_token"),
+            request_timeout=20,
+        )
+        token = rt.bind_function("f", lambda: 1)
+        (hid,) = list(rt._handlers)  # noqa: SLF001
+        rt.revoke_op(token)
+        assert hid not in rt._handlers  # noqa: SLF001
+
+    def test_terminal_escapes_in_a_remote_error_message_are_neutralised(
+        self, tmp_path: Path
+    ) -> None:
+        rt = IsolatedRuntime(
+            RuntimeConfig(),
+            python=_fake_worker(tmp_path, "escape_error"),
+            request_timeout=20,
+        )
+        with pytest.raises(RuntimeError) as excinfo:
+            rt.eval("1")
+        text = str(excinfo.value)
+        assert "\x1b" not in text and "\x07" not in text
+        assert "at line 2" in text  # newlines survive: a JS stack is made of them

@@ -320,6 +320,14 @@ _SELF_PID_ARG0 = {
     "prlimit64": (302, 261),
     "migrate_pages": (256, 238),
     "move_pages": (279, 239),
+    # The read-only calls that leak something about another process: `get_robust_list(parent)`
+    # returns a pointer into the host process (its ASLR), and `getpgid`/`getsid` over every number
+    # enumerate the pids the user is running. (Not `sched_get*`, `getpriority` or `ioprio_get`:
+    # glibc and V8 call those with a *thread* id, which is not our pid, so a self-only rule breaks
+    # thread startup, and what they return is only a scheduling parameter.)
+    "get_robust_list": (274, 100),
+    "getpgid": (121, 155),
+    "getsid": (124, 156),
 }
 _SELF_PID_ARG1 = {  # (which, who, ...): `who` is the pid, and `which` must say "a process"
     "setpriority": (141, 140),
@@ -342,6 +350,17 @@ _FCNTL_DENIED_CMDS = (8, 10, 15)  # F_SETOWN, F_SETSIG, F_SETOWN_EX
 # (it is its own session), so the last two are belt and braces: bubblewrap documents TIOCSTI as the
 # one thing a session alone does not cover if a terminal ever reaches the sandbox.
 _IOCTL_DENIED_CMDS = (0x8901, 0x8902, 0x5412, 0x541C)
+# The whole socket-ioctl block, `SIOCGIFCONF`, `SIOCGIFHWADDR` and friends. A descriptor that is a
+# socket answers these from the kernel's network stack (a unix socket falls through to it), which
+# tells a confined process the host's interfaces, addresses and MACs, and with CAP_NET_ADMIN lets
+# it change them. Nothing here needs one.
+_IOCTL_SOCKET_BLOCK = 0x8900
+_PRCTL = (157, 167)
+_SOCKETPAIR = (53, 199)
+_PR_SCHED_CORE = (
+    62  # can set a core-scheduling cookie on another process (a side-channel setting)
+)
+_AF_UNIX, _SOCK_STREAM, _SOCK_TYPE_MASK = 1, 1, 0xF
 # Every syscall number below this has been looked at (`tests/data/syscalls.json`, from the
 # kernel's own tables, and `tests/test_sandbox_syscall_tables.py` fails if the table ever grows
 # past it). Numbers from here up are syscalls that did not exist when this filter was reviewed:
@@ -369,6 +388,7 @@ _BPF_JEQ_K = 0x15
 _BPF_JGE_K = 0x35
 _BPF_JSET_K = 0x45
 _BPF_RET_K = 0x06
+_BPF_AND_K = 0x54
 _SECCOMP_RET_ALLOW = 0x7FFF0000
 _SECCOMP_RET_KILL_PROCESS = 0x80000000
 _SECCOMP_RET_ERRNO = 0x00050000
@@ -386,13 +406,28 @@ def _seccomp_program(arch: str) -> bytes | None:
 
     # (code, jt_label, jf_label, k); labels are resolved to relative offsets below.
     ins: list[tuple[int, str | None, str | None, int | str]] = []
-    labels: dict[str, int] = {}
+    # A name can be defined many times. BPF jumps only go forward and reach at most 255
+    # instructions, so each stretch of the program gets its own `allow`/`eperm`/... stubs and a
+    # jump lands on the nearest one after it.
+    labels: dict[str, list[int]] = {}
 
     def label(name: str) -> None:
-        labels[name] = len(ins)
+        labels.setdefault(name, []).append(len(ins))
+
+    def stubs(*, enosys: bool = False) -> None:
+        label("allow")
+        ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
+        label("eperm")
+        ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
+        if enosys:  # glibc falls back to clone() when clone3 reports ENOSYS
+            label("enosys")
+            ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _ENOSYS))
 
     ins.append((_BPF_LD_W_ABS, None, None, 4))  # arch
-    ins.append((_BPF_JEQ_K, None, "kill", _AUDIT_ARCH[arch]))
+    ins.append((_BPF_JEQ_K, "nr", "kill", _AUDIT_ARCH[arch]))
+    label("kill")
+    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_KILL_PROCESS))
+    label("nr")
     ins.append((_BPF_LD_W_ABS, None, None, 0))  # nr
     ins.append(
         (_BPF_JGE_K, "enosys", None, _FIRST_UNREVIEWED)
@@ -409,18 +444,23 @@ def _seccomp_program(arch: str) -> bytes | None:
         ins.append((_BPF_JEQ_K, f"selfpid1_{name}", None, pair[idx]))
     ins.append((_BPF_JEQ_K, "fcntl", None, _FCNTL[idx]))
     ins.append((_BPF_JEQ_K, "ioctl", None, _IOCTL[idx]))
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
+    ins.append((_BPF_JEQ_K, "prctl", None, _PRCTL[idx]))
+    ins.append((_BPF_JEQ_K, "socketpair", None, _SOCKETPAIR[idx]))
+    stubs(enosys=True)
 
     label("clone")  # only thread creation: flags must contain CLONE_THREAD
     ins.append((_BPF_LD_W_ABS, None, None, 16))
     ins.append((_BPF_JSET_K, "allow", "eperm", _CLONE_THREAD))
+    stubs()
     label("signal")  # only to ourselves (low 32 bits of the pid argument)
     ins.append((_BPF_LD_W_ABS, None, None, 16))
     ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
+    stubs()
     label("selfpid0")  # pid 0 means "the caller"; anything else must be our own pid
     ins.append((_BPF_LD_W_ABS, None, None, 16))
     ins.append((_BPF_JEQ_K, "allow", None, 0))
     ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
+    stubs()
     for name in _SELF_PID_ARG1:
         # `which` (arg0) must be the "a single process" selector, and `who` (arg1) ourselves.
         label(f"selfpid1_{name}")
@@ -429,29 +469,41 @@ def _seccomp_program(arch: str) -> bytes | None:
         ins.append((_BPF_LD_W_ABS, None, None, 24))
         ins.append((_BPF_JEQ_K, "allow", None, 0))
         ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
+        stubs()
     label("fcntl")  # the command is arg1; naming a signal owner is closed
     ins.append((_BPF_LD_W_ABS, None, None, 24))
     for cmd in _FCNTL_DENIED_CMDS:
         ins.append((_BPF_JEQ_K, "eperm", None, cmd))
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
+    stubs()
     label("ioctl")
     ins.append((_BPF_LD_W_ABS, None, None, 24))
     for cmd in _IOCTL_DENIED_CMDS:
         ins.append((_BPF_JEQ_K, "eperm", None, cmd))
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
-    label("allow")
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
-    label("eperm")
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
-    label("enosys")  # glibc falls back to clone() when clone3 reports ENOSYS
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _ENOSYS))
-    label("kill")
-    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_KILL_PROCESS))
+    ins.append((_BPF_AND_K, None, None, 0xFF00))
+    ins.append((_BPF_JEQ_K, "eperm", "allow", _IOCTL_SOCKET_BLOCK))
+    stubs()
+    label("prctl")  # the option is arg0
+    ins.append((_BPF_LD_W_ABS, None, None, 16))
+    ins.append((_BPF_JEQ_K, "eperm", "allow", _PR_SCHED_CORE))
+    stubs()
+    label(
+        "socketpair"
+    )  # only a stream socketpair: a datagram one can `sendto` any path
+    ins.append((_BPF_LD_W_ABS, None, None, 16))
+    ins.append((_BPF_JEQ_K, None, "eperm", _AF_UNIX))
+    ins.append((_BPF_LD_W_ABS, None, None, 24))
+    ins.append((_BPF_AND_K, None, None, _SOCK_TYPE_MASK))
+    ins.append((_BPF_JEQ_K, "allow", "eperm", _SOCK_STREAM))
+    stubs()
+
+    def target(name: str, at: int) -> int:
+        # The nearest definition after `at`: jumps only go forward.
+        return min(pos for pos in labels[name] if pos > at) - at - 1
 
     out = b""
     for i, (code, jt, jf, k) in enumerate(ins):
-        jt_off = labels[jt] - i - 1 if jt else 0
-        jf_off = labels[jf] - i - 1 if jf else 0
+        jt_off = target(jt, i) if jt else 0
+        jf_off = target(jf, i) if jf else 0
         if not (0 <= jt_off < 256 and 0 <= jf_off < 256):
             return None
         out += struct.pack("<HBBI", code, jt_off, jf_off, k)
@@ -772,6 +824,12 @@ def attest() -> list[str]:
             except OSError:
                 return  # reached the network stack and failed there: not refused by the sandbox
 
+    def unix_dgram() -> None:
+        # A datagram socketpair can `sendto` any path the process can name (journald, notify).
+        a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        a.close()
+        b.close()
+
     probe("read-file", lambda: read("/etc/hosts"))
     probe("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
     probe("write-file", write)
@@ -782,6 +840,8 @@ def attest() -> list[str]:
         # `probe` treats a raised exception as "refused", and this one signals by return value.
         if _procargs_of_parent():
             breaches.append("read-parent-argv-environ")
+    if sys.platform.startswith("linux"):
+        probe("unix-datagram-socket", unix_dgram)
     return breaches
 
 

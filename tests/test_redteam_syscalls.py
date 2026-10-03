@@ -403,6 +403,25 @@ attempt("truncate_path", lambda: os.truncate("/nonexistent-pydeno-probe", 0))
 # TIOCSTI on a socket would answer ENOTTY if it reached the kernel; EPERM means the filter did it.
 attempt("ioctl_tiocsti", lambda: fcntl.ioctl(a, 0x5412, b"x"))
 attempt("ioctl_tioclinux", lambda: fcntl.ioctl(a, 0x541C, b"\\\\x0b"))
+libc = ctypes.CDLL(None, use_errno=True)
+def libc_call(fn, *args):
+    if fn(*args) == -1:
+        e = ctypes.get_errno(); raise OSError(e, os.strerror(e))
+ppid = os.getppid()
+attempt("getpgid_parent", lambda: os.getpgid(ppid))
+attempt("getsid_parent", lambda: os.getsid(ppid))
+attempt("getpgid_self", lambda: os.getpgid(0))
+idx = 0 if os.uname().machine == "x86_64" else 1
+nr = sb._SELF_PID_ARG0["get_robust_list"][idx]
+head, size = ctypes.c_void_p(), ctypes.c_size_t()
+libc.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+attempt("get_robust_list_parent", lambda: libc_call(libc.syscall, nr, ppid, ctypes.byref(head), ctypes.byref(size)))
+attempt("prctl_sched_core", lambda: libc_call(libc.prctl, 62, 2, ppid, 0, 0))
+attempt("prctl_set_name", lambda: libc_call(libc.prctl, 15, b"pydeno", 0, 0, 0))
+attempt("ioctl_siocgifconf", lambda: fcntl.ioctl(a, 0x8912, b"\x00" * 16))
+attempt("ioctl_siocgifhwaddr", lambda: fcntl.ioctl(a, 0x8927, b"\x00" * 40))
+attempt("socketpair_datagram", lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM))
+attempt("socketpair_stream", lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM))
 print(json.dumps(out))
 """
 
@@ -435,6 +454,13 @@ def others() -> dict[str, str]:
         "ioctl_fiosetown",
         "ioctl_tiocsti",
         "ioctl_tioclinux",
+        "getpgid_parent",
+        "getsid_parent",
+        "get_robust_list_parent",
+        "prctl_sched_core",
+        "ioctl_siocgifconf",
+        "ioctl_siocgifhwaddr",
+        "socketpair_datagram",
     ],
 )
 def test_acting_on_another_process_is_denied(
@@ -456,6 +482,9 @@ def test_acting_on_another_process_is_denied(
         "fcntl_getfl",
         "fcntl_setfl",
         "ioctl_fionread",
+        "getpgid_self",
+        "prctl_set_name",
+        "socketpair_stream",
     ],
 )
 def test_acting_on_itself_stays_allowed(others: dict[str, str], operation: str) -> None:

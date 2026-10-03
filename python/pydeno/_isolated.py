@@ -116,6 +116,54 @@ def _clean(text: str, limit: int = 500) -> str:
     return _CONTROL.sub("?", text)[:limit]
 
 
+_CONSOLE_LEVELS = frozenset({"log", "info", "warn", "error", "debug", "trace"})
+_MAX_SPECIFIER = 4096
+
+
+def _checked_specifiers(fn: Callable[..., Any], arity: int) -> Callable[..., Any]:
+    """Wrap a module resolver/loader so the worker can only call it with `arity` plain, bounded,
+    NUL-free strings. The parent made these handlers and knows their contract; a compromised
+    worker choosing other arguments (a path-traversal string is the obvious one, a non-string the
+    subtle one) should never reach the host's own code."""
+
+    def check(args: tuple[Any, ...]) -> None:
+        if len(args) != arity or not all(
+            isinstance(a, str) and len(a) <= _MAX_SPECIFIER and "\0" not in a
+            for a in args
+        ):
+            raise ValueError("invalid module specifier")
+
+    if inspect.iscoroutinefunction(fn):
+
+        async def acall(*args: Any) -> Any:
+            check(args)
+            return await fn(*args)
+
+        return acall
+
+    def call(*args: Any) -> Any:
+        check(args)
+        return fn(*args)
+
+    return call
+
+
+def _checked_console(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Only the six console methods, with a list of arguments: `getattr(logger, level)` in a
+    typical `on_console` must not be steerable to `__init__` by the worker."""
+
+    def call(*args: Any) -> Any:
+        if (
+            len(args) != 2
+            or args[0] not in _CONSOLE_LEVELS
+            or not isinstance(args[1], list)
+        ):
+            raise ValueError("invalid console call")
+        return fn(*args)
+
+    return call
+
+
 class _Default:
     def __repr__(self) -> str:
         return "<default>"
@@ -397,7 +445,7 @@ class IsolatedRuntime:
         if config.on_console is not None:
             # `console.*` in the guest calls this in the parent, like any host function.
             console_hid = next(self._hids)
-            self._handlers[console_hid] = (config.on_console, False)
+            self._handlers[console_hid] = (_checked_console(config.on_console), False)
             self._options["console_hid"] = console_hid
 
         self._idle_cpu_base: float | None = None
@@ -765,7 +813,9 @@ class IsolatedRuntime:
                 text[:_MAX_REMOTE_MESSAGE]
                 + f"... [{len(text) - _MAX_REMOTE_MESSAGE} more characters]"
             )
-        return cls(text)
+        # Escape sequences in a message that lands in a terminal or a log are an injection channel.
+        # Newlines and tabs stay: a JavaScript stack trace is made of them.
+        return cls(_CONTROL.sub("?", text))
 
     # -- host callbacks ----------------------------------------------------
 
@@ -887,6 +937,19 @@ class IsolatedRuntime:
             self._kill()
             raise
 
+    def _register_token(self, token: int, hid: int) -> None:
+        """Remember which host handler a worker-chosen token stands for.
+
+        The token is the worker's claim, not ours: a compromised worker that hands the same token
+        to two bindings would make revoking the harmless one also drop the privileged one's entry
+        in a map keyed by token, leaving the privileged handler callable for good. A duplicate is
+        therefore proof of a lying worker, and the session ends."""
+        if token in self._token_to_hid:
+            self._handlers.pop(hid, None)
+            self._kill()
+            raise WorkerCrashed("worker reused a capability token")
+        self._token_to_hid[token] = hid
+
     def bind_function(self, name: str, handler: Callable[..., Any]) -> int:
         """Expose a host function as a global; returns its capability token."""
         hid = next(self._hids)
@@ -903,7 +966,7 @@ class IsolatedRuntime:
             self._handlers.pop(hid, None)
             self._kill()
             raise WorkerCrashed("worker returned a malformed capability token")
-        self._token_to_hid[token] = hid
+        self._register_token(token, hid)
         return token
 
     def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
@@ -927,25 +990,27 @@ class IsolatedRuntime:
             for hid in hids.values():
                 self._handlers.pop(hid, None)
             raise
-        if not isinstance(tokens, dict) or not all(
-            isinstance(k, str) and _is_token(v) for k, v in tokens.items()
+        if (
+            not isinstance(tokens, dict)
+            or set(tokens) != set(hids)
+            or not all(isinstance(k, str) and _is_token(v) for k, v in tokens.items())
         ):
             for hid in hids.values():
                 self._handlers.pop(hid, None)
             self._kill()
             raise WorkerCrashed("worker returned malformed capability tokens")
         for key, token in tokens.items():
-            if key in hids:
-                self._token_to_hid[token] = hids[key]
+            self._register_token(token, hids[key])
         return tokens
 
     def revoke_op(self, op_id: int) -> bool:
         """Revoke a capability. The host handler is dropped as well as the worker's token."""
-        revoked = self._request({"t": "revoke", "token": op_id})
+        # Drop the host handler first and unconditionally: what the worker answers (or whether it
+        # answers) must not decide whether a revoked capability can still be called.
         hid = self._token_to_hid.pop(op_id, None)
         if hid is not None:
             self._handlers.pop(hid, None)
-        return bool(revoked)
+        return bool(self._request({"t": "revoke", "token": op_id}))
 
     def add_static_module(self, name: str, source: str) -> None:
         self._request({"t": "add_module", "name": name, "source": source})
@@ -953,7 +1018,7 @@ class IsolatedRuntime:
     def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
         """Resolve import specifiers with a host function: `(specifier, referrer) -> str | None`."""
         hid = next(self._hids)
-        self._handlers[hid] = (resolver, False)
+        self._handlers[hid] = (_checked_specifiers(resolver, 2), False)
         try:
             self._request({"t": "set_module_resolver", "hid": hid})
         except BaseException:
@@ -966,7 +1031,10 @@ class IsolatedRuntime:
         The source comes back across the process boundary as plain text; the worker, which
         is the one that compiles it, never sees the loader itself."""
         hid = next(self._hids)
-        self._handlers[hid] = (loader, inspect.iscoroutinefunction(loader))
+        self._handlers[hid] = (
+            _checked_specifiers(loader, 1),
+            inspect.iscoroutinefunction(loader),
+        )
         try:
             self._request({"t": "set_module_loader", "hid": hid})
         except BaseException:

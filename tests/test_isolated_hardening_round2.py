@@ -54,3 +54,46 @@ def test_a_buffer_bomb_is_a_catchable_error_and_the_session_survives() -> None:
             == "RangeError"
         )
         assert rt.eval("1 + 1") == 2
+
+
+class TestParentOwnedHandlersValidateWhatTheWorkerSends:
+    """The resolver, loader and console handlers are the parent's own; the worker may call them
+    with anything it likes, so they only accept what their contract says."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [(), ("a", "b"), (1,), (None,), ("x\0y",), ("x" * 5000,), (["a"],)],
+        ids=["none", "two", "int", "null", "nul-byte", "too-long", "list"],
+    )
+    def test_a_loader_only_takes_one_bounded_string(self, args: tuple) -> None:
+        from pydeno._isolated import _checked_specifiers
+
+        seen: list[tuple] = []
+        loader = _checked_specifiers(lambda *a: seen.append(a) or "src", 1)
+        with pytest.raises(ValueError, match="invalid module specifier"):
+            loader(*args)
+        assert seen == []
+
+    def test_a_resolver_takes_two_strings_and_a_good_call_passes_through(self) -> None:
+        from pydeno._isolated import _checked_specifiers
+
+        resolver = _checked_specifiers(lambda spec, ref: f"{ref}>{spec}", 2)
+        assert resolver("a", "b") == "b>a"
+        with pytest.raises(ValueError):
+            resolver("a")
+
+    @pytest.mark.parametrize(
+        "args",
+        [("__init__", []), ("log", "text"), ("log",), ("log", [], 1), (1, [])],
+        ids=["dunder-level", "string-args", "missing-args", "extra-arg", "int-level"],
+    )
+    def test_console_only_takes_a_real_level_and_a_list(self, args: tuple) -> None:
+        from pydeno._isolated import _checked_console
+
+        seen: list[tuple] = []
+        console = _checked_console(lambda *a: seen.append(a))
+        with pytest.raises(ValueError, match="invalid console call"):
+            console(*args)
+        assert seen == []
+        console("warn", ["ok"])
+        assert seen == [("warn", ["ok"])]

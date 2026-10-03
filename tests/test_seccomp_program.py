@@ -68,6 +68,8 @@ def run(
             pc += jt if acc == k else jf
         elif code == 0x35:  # BPF_JMP | BPF_JGE | BPF_K
             pc += jt if acc >= k else jf
+        elif code == 0x54:  # BPF_ALU | BPF_AND | BPF_K
+            acc &= k
         elif code == 0x45:  # BPF_JMP | BPF_JSET | BPF_K
             pc += jt if acc & k else jf
         elif code == 0x06:  # BPF_RET | BPF_K
@@ -186,7 +188,10 @@ class TestWhatTheWorkerNeeds:
         for name in self.NEEDED:
             if name not in by:
                 continue  # not present on this architecture
-            if run(prog, arch, by[name], (0, 0, 0, 0, 0, 0)) != ALLOW:
+            # socketpair is allowed for what the worker uses it for (an AF_UNIX stream pair);
+            # every other call is checked with zeroed arguments.
+            args = (1, 1, 0, 0, 0, 0) if name == "socketpair" else (0, 0, 0, 0, 0, 0)
+            if run(prog, arch, by[name], args) != ALLOW:
                 missing.append(name)
         assert not missing, f"the filter blocks calls the worker relies on: {missing}"
 
@@ -329,14 +334,49 @@ class TestSignalOwnership:
         assert run(prog, arch, nr, (3, cmd, os.getppid())) == ERRNO | EPERM
 
     @pytest.mark.parametrize(
-        "cmd", [0x541B, 0x5421, 0x5452, 0x8903, 0x8904, 0x5401, 0x5413]
+        "cmd", [0x541B, 0x5421, 0x5452, 0x5401, 0x5413, 0x7001, 0x89]
     )
     def test_ordinary_ioctls_are_untouched(
         self, arch: str, prog: list, cmd: int
     ) -> None:
-        # FIONREAD, FIONBIO, FIOASYNC, SIOCGPGRP, FIOGETOWN, TCGETS, TIOCGWINSZ
+        # FIONREAD, FIONBIO, FIOASYNC, TCGETS, TIOCGWINSZ, and two numbers just outside the block
         nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
         assert run(prog, arch, nr, (3, cmd, 0)) == ALLOW
+
+    @pytest.mark.parametrize(
+        "cmd", [0x8900, 0x8903, 0x8904, 0x8912, 0x8913, 0x8927, 0x8933, 0x89FF]
+    )
+    def test_the_whole_socket_ioctl_block_is_denied(
+        self, arch: str, prog: list, cmd: int
+    ) -> None:
+        # SIOCGIFFLAGS, SIOCGPGRP, SIOCGIFCONF, SIOCGIFHWADDR, ...: they answer from the host's
+        # network stack even on a unix socket.
+        nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (3, cmd, 0)) == ERRNO | EPERM
+
+    def test_prctl_may_not_set_a_core_scheduling_cookie(
+        self, arch: str, prog: list
+    ) -> None:
+        nr = sb._PRCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (62, 2, os.getppid(), 0, 0)) == ERRNO | EPERM
+        assert run(prog, arch, nr, (15, 0, 0, 0, 0)) == ALLOW  # PR_SET_NAME stays
+
+    @pytest.mark.parametrize(
+        ("domain", "kind", "allowed"),
+        [
+            (1, 1, True),  # AF_UNIX, SOCK_STREAM (asyncio's self-pipe)
+            (1, 1 | 0o2000000, True),  # ... with SOCK_CLOEXEC
+            (1, 2, False),  # SOCK_DGRAM: can `sendto` a path
+            (1, 5, False),  # SOCK_SEQPACKET
+            (2, 1, False),  # AF_INET
+        ],
+    )
+    def test_socketpair_is_a_unix_stream_pair_only(
+        self, arch: str, prog: list, domain: int, kind: int, allowed: bool
+    ) -> None:
+        nr = sb._SOCKETPAIR[_idx(arch)]  # noqa: SLF001
+        verdict = run(prog, arch, nr, (domain, kind, 0, 0))
+        assert verdict == (ALLOW if allowed else ERRNO | EPERM)
 
     def test_the_command_is_judged_on_its_low_32_bits_like_the_kernel_does(
         self, arch: str, prog: list
