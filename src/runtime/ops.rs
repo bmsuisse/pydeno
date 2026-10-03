@@ -344,7 +344,30 @@ fn op_pydeno_stream_cancel_py(
 pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     let bridge_code = ascii_str!(
         r#"(function (globalThis) {
+  "use strict";
   const { ops } = Deno.core;
+
+  // Everything below runs while the guest holds values it fully controls, so the bridge must not
+  // look anything up on a guest-reachable object at call time: a guest that replaces
+  // `Date.prototype.valueOf`, `Array.prototype.map` or `Array.prototype[Symbol.iterator]` could
+  // otherwise hand a Symbol (or anything else the converter does not expect) to the Rust side,
+  // which aborts the process. These are captured once, before any guest code exists, and
+  // `uncurry` binds each to the intrinsic itself (not to `.call` as the guest may have left it).
+  const uncurry = Function.prototype.call.bind.bind(Function.prototype.call);
+  const ArrayIsArray = Array.isArray;
+  const IsView = ArrayBuffer.isView;
+  const ObjectEntries = Object.entries;
+  const DefineProperty = Object.defineProperty;
+  const DateValueOf = uncurry(Date.prototype.valueOf);
+  const BigIntToString = uncurry(BigInt.prototype.toString);
+  const SetForEach = uncurry(Set.prototype.forEach);
+  const TypeErrorCtor = TypeError;
+  const RangeErrorCtor = RangeError;
+  // A host-bound function's arguments are copied before they cross: cap the work and the depth
+  // up front, so one call cannot make the copy itself the denial of service.
+  const MAX_ARG_NODES = 1000000;
+  const MAX_ARG_DEPTH = 128;
+  let argNodes = 0;
 
   // `Deno`/`__bootstrap` expose raw, unmetered `core.ops` into the host;
   // `__infra` is deleted defensively. tests/test_guest_globals.py pins this.
@@ -355,7 +378,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // Install `key` as own data: plain assignment of "__proto__" would invoke
   // the setter and swap the prototype (tests/test_fuzz_eval_boundary.py).
   function setOwn(target, key, value) {
-    Object.defineProperty(target, key, {
+    DefineProperty(target, key, {
       value,
       writable: true,
       enumerable: true,
@@ -374,14 +397,15 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     );
   }
 
-  function prepare(value, path) {
+  function prepare(value, path, depth) {
     const at = path === undefined ? "argument" : path;
+    const level = depth === undefined ? 0 : depth;
     if (typeof value === "function") {
       rejectFunction(at);
     }
     // A Symbol reaching `serde_v8` panics and aborts the host process.
     if (typeof value === "symbol") {
-      throw new TypeError(
+      throw new TypeErrorCtor(
         "Cannot pass a JavaScript Symbol to a host tool (at " +
           at +
           "). Symbols have no Python representation; pass its description as " +
@@ -391,30 +415,45 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     if (value === undefined || value === null) {
       return value;
     }
-    if (ArrayBuffer.isView(value)) {
+    if (++argNodes > MAX_ARG_NODES) {
+      throw new RangeErrorCtor("Host tool argument is too large (more than " + MAX_ARG_NODES + " values)");
+    }
+    if (level > MAX_ARG_DEPTH) {
+      throw new RangeErrorCtor("Host tool argument is nested too deeply (at " + at + ")");
+    }
+    if (IsView(value)) {
       return value;
     }
-    if (Array.isArray(value)) {
-      return value.map((entry, index) => prepare(entry, at + "[" + index + "]"));
+    if (ArrayIsArray(value)) {
+      const length = value.length;
+      const out = [];
+      for (let index = 0; index < length; index++) {
+        out[index] = prepare(value[index], at + "[" + index + "]", level + 1);
+      }
+      return out;
     }
     if (value instanceof Date) {
-      return { __pydeno_type: "Date", epoch_ms: value.valueOf() };
+      return { __pydeno_type: "Date", epoch_ms: DateValueOf(value) };
     }
     if (value instanceof Set) {
-      return {
-        __pydeno_type: "Set",
-        values: Array.from(value, (entry, index) =>
-          prepare(entry, at + ".<set item " + index + ">")
-        ),
-      };
+      const values = [];
+      SetForEach(value, (entry) => {
+        values[values.length] = prepare(entry, at + ".<set item " + values.length + ">", level + 1);
+      });
+      return { __pydeno_type: "Set", values };
     }
     if (typeof value === "bigint") {
-      return { __pydeno_type: "BigInt", value: value.toString() };
+      return { __pydeno_type: "BigInt", value: BigIntToString(value) };
     }
     if (typeof value === "object") {
       const result = {};
-      for (const [key, val] of Object.entries(value)) {
-        setOwn(result, key, prepare(val, at + "." + key));
+      // Indexed loops, not `for...of` or destructuring: those go through
+      // `Array.prototype[Symbol.iterator]`, which the guest can replace.
+      const entries = ObjectEntries(value);
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index];
+        const key = entry[0];
+        setOwn(result, key, prepare(entry[1], at + "." + key, level + 1));
       }
       return result;
     }
@@ -422,7 +461,12 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   }
 
   function prepareArgs(args) {
-    return args.map((value, index) => prepare(value, "args[" + index + "]"));
+    argNodes = 0;
+    const out = [];
+    for (let index = 0; index < args.length; index++) {
+      out[index] = prepare(args[index], "args[" + index + "]", 0);
+    }
+    return out;
   }
 
   function reviveStreamChunk(entry) {
