@@ -225,7 +225,7 @@ Monty.
 | `max_host_wait` | 600 s | Total time a run may spend waiting on host callbacks; exceeding it raises `RuntimeTimeout` and kills the worker. `None` disables it (the CPU cap still applies) |
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
-| `redact_host_errors` | `False` | Guest sees the exception class but only `"host function failed"` as message |
+| `redact_host_errors` | `True` | Guest sees the exception class but only `"host function failed"` as message |
 
 A worker CPU-time cap of twice the hard deadline also applies, because wall-clock pauses
 during host calls cannot pause CPU.

@@ -873,19 +873,31 @@ class TestLowFindings:
         assert message == "host function failed"
         assert "shadow" not in message
 
-    def test_redaction_is_off_by_default_for_parity_with_in_process(self) -> None:
+    def test_host_error_text_is_redacted_by_default_and_visible_on_request(
+        self,
+    ) -> None:
         def leak() -> None:
-            raise ValueError("visible")
+            raise ValueError("/srv/secrets/credentials")
 
+        probe = "try { leak() } catch (e) { e.message }"
         with IsolatedRuntime(RuntimeConfig(timeout=10.0)) as rt:
             rt.bind_function("leak", leak)
-            assert rt.eval("try { leak() } catch (e) { e.message }") == "visible"
+            assert rt.eval(probe) == "host function failed"
+        with IsolatedRuntime(
+            RuntimeConfig(timeout=10.0), redact_host_errors=False
+        ) as rt:
+            rt.bind_function("leak", leak)
+            assert rt.eval(probe) == "/srv/secrets/credentials"
 
     def test_a_handler_calling_back_into_its_own_runtime_fails_instead_of_deadlocking(
         self,
     ) -> None:
         async def go() -> object:
-            with IsolatedRuntime(RuntimeConfig(timeout=10.0), request_timeout=20) as rt:
+            with IsolatedRuntime(
+                RuntimeConfig(timeout=10.0),
+                request_timeout=20,
+                redact_host_errors=False,
+            ) as rt:
 
                 async def reenter() -> object:
                     return await rt.eval_async("1")
@@ -901,7 +913,9 @@ class TestLowFindings:
         assert "re-entered" in str(message)
 
     def test_a_sync_handler_calling_back_in_fails_the_same_way(self) -> None:
-        with IsolatedRuntime(RuntimeConfig(timeout=10.0)) as rt:
+        with IsolatedRuntime(
+            RuntimeConfig(timeout=10.0), redact_host_errors=False
+        ) as rt:
             rt.bind_function("reenter", lambda: rt.eval("1"))
             assert "re-entered" in rt.eval("try { reenter() } catch (e) { e.message }")
 

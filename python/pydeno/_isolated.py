@@ -107,6 +107,7 @@ _IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "pydeno_in_host_call", default=False
 )
 
+_NATIVE_FRAME = re.compile(r"0x[0-9a-fA-F]{4,}|\.(?:so|dylib)\b|\+\s*\d+\s*$")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
@@ -114,6 +115,13 @@ def _clean(text: str, limit: int = 500) -> str:
     """Text that came from the worker, made safe to put in an exception message and a log:
     no control or escape characters, bounded length."""
     return _CONTROL.sub("?", text)[:limit]
+
+
+_REVOKED_MEMORY = 4096
+
+
+def _revoked_handler(*_args: Any) -> Any:
+    raise PermissionError("capability revoked")
 
 
 _CONSOLE_LEVELS = frozenset({"log", "info", "warn", "error", "debug", "trace"})
@@ -344,7 +352,7 @@ class IsolatedRuntime:
         max_host_wait: float | int | None = _DEFAULT,
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
-        redact_host_errors: bool = False,
+        redact_host_errors: bool = True,
         sandbox: str = "auto",
         empty_root: bool = True,
         jitless: bool = True,
@@ -469,6 +477,9 @@ class IsolatedRuntime:
         self._finalizer = weakref.finalize(
             self, _terminate_process, self._proc, self._stderr
         )
+        self._owner_pid = os.getpid()
+        # Recently revoked handler ids, oldest first (bounded): see `_on_call`.
+        self._revoked_hids: dict[int, None] = {}
         _LIVE.add(self)
         self._handshake()
         if prewarm and python is None:
@@ -568,7 +579,12 @@ class IsolatedRuntime:
             tail = ""
         # The worker wrote this, and a compromised one can write anything: it goes into an
         # exception message, so no control or escape characters.
-        return f"{prefix}: {_clean(tail.splitlines()[-1])}" if tail else prefix
+        last = tail.splitlines()[-1] if tail else ""
+        if not last or _NATIVE_FRAME.search(last):
+            # A native stack frame names libraries and load addresses (a map of the host's ASLR
+            # for anything that forwards `str(exc)` to a user), and says nothing a person can act on.
+            return prefix
+        return f"{prefix}: {_clean(last)}"
 
     def _kill(self) -> None:
         self._closed = True
@@ -637,6 +653,10 @@ class IsolatedRuntime:
         if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
             raise RuntimeError(
                 "an IsolatedRuntime cannot be re-entered from its own host functions"
+            )
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError(
+                "this IsolatedRuntime belongs to the process that created it, not to a fork() of it"
             )
         with self._lock:
             if self._closed:
@@ -824,6 +844,11 @@ class IsolatedRuntime:
         # One lookup, not a membership test followed by a second one: another thread may revoke
         # in between.
         entry = self._handlers.get(hid) if isinstance(hid, int) else None
+        if entry is None and hid in self._revoked_hids:
+            # A call that was already in flight when the capability was revoked: the guest did
+            # nothing wrong, it lost a race with the host. Answer it with an error, do not treat
+            # it as a worker forging an id (which ends the session).
+            entry = (_revoked_handler, False)
         if (
             not isinstance(cid, int)
             or isinstance(cid, bool)
@@ -952,6 +977,9 @@ class IsolatedRuntime:
 
     def bind_function(self, name: str, handler: Callable[..., Any]) -> int:
         """Expose a host function as a global; returns its capability token."""
+        from ._tools import ToolBridge
+
+        ToolBridge._check_name(name, what="function name")  # noqa: SLF001
         hid = next(self._hids)
         is_async = inspect.iscoroutinefunction(handler)
         self._handlers[hid] = (handler, is_async)
@@ -971,6 +999,11 @@ class IsolatedRuntime:
 
     def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
         """Expose a mapping as a global object; callables become host functions."""
+        from ._tools import ToolBridge
+
+        ToolBridge._check_name(name, what="object name")  # noqa: SLF001
+        for key in obj:
+            ToolBridge._check_name(key, what="property name")  # noqa: SLF001
         entries: dict[str, Any] = {}
         hids: dict[str, int] = {}
         for key, value in obj.items():
@@ -1010,6 +1043,9 @@ class IsolatedRuntime:
         hid = self._token_to_hid.pop(op_id, None)
         if hid is not None:
             self._handlers.pop(hid, None)
+            self._revoked_hids[hid] = None
+            if len(self._revoked_hids) > _REVOKED_MEMORY:
+                self._revoked_hids.pop(next(iter(self._revoked_hids)))
         return bool(self._request({"t": "revoke", "token": op_id}))
 
     def add_static_module(self, name: str, source: str) -> None:
@@ -1211,4 +1247,19 @@ def _kill_all_at_exit() -> None:
 
 
 atexit.register(_kill_all_at_exit)
+
+
+def _forget_parents_workers() -> None:
+    """After `fork()`, the child holds the parent's runtimes and spare worker as inherited file
+    descriptors. They are the parent's: the child must not kill them at exit (its atexit hook and
+    finalizers would), must not hand out the parent's spare, and must not write frames into a
+    pipe the parent is also reading. So it forgets them, and `_request` refuses to run on one."""
+    global _SPARE  # noqa: PLW0603
+    _SPARE = None
+    for runtime in list(_LIVE):
+        runtime._finalizer.detach()  # noqa: SLF001
+    _LIVE.clear()
+
+
+os.register_at_fork(after_in_child=_forget_parents_workers)
 atexit.register(_discard_spare)

@@ -2,7 +2,7 @@
 
 # pydeno
 
-### Run AI-generated JavaScript from Python, without trusting it.
+### Run AI-generated JavaScript from Python, securely, in a sandbox.
 
 Real V8 · supervised worker process · OS-level sandbox · your Python functions as the only way out
 

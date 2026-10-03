@@ -17,8 +17,8 @@ from pydeno import (
 )
 
 
-def _iso() -> IsolatedRuntime:
-    return IsolatedRuntime(RuntimeConfig(timeout=10.0))
+def _iso(**kwargs: object) -> IsolatedRuntime:
+    return IsolatedRuntime(RuntimeConfig(timeout=10.0), **kwargs)  # type: ignore[arg-type]
 
 
 def _both() -> list[object]:
@@ -128,7 +128,7 @@ class TestHostExceptionsLookTheSameToTheGuest:
         plain = Runtime(RuntimeConfig(timeout=10.0))
         plain.bind_function("fn", fn)
         expected = plain.eval(probe)
-        with _iso() as rt:
+        with _iso(redact_host_errors=False) as rt:
             rt.bind_function("fn", fn)
             assert rt.eval(probe) == expected
 
@@ -142,7 +142,7 @@ class TestHostExceptionsLookTheSameToTheGuest:
             plain = Runtime(RuntimeConfig(timeout=10.0))
             plain.bind_function("fn", fn)
             expected = await plain.eval_async(probe)
-            with _iso() as rt:
+            with _iso(redact_host_errors=False) as rt:
                 rt.bind_function("fn", fn)
                 return expected, await rt.eval_async(probe)
 
@@ -160,7 +160,7 @@ class TestHostExceptionsLookTheSameToTheGuest:
         def fn() -> None:
             raise evil("boom")
 
-        with _iso() as rt:
+        with _iso(redact_host_errors=False) as rt:
             rt.bind_function("fn", fn)
             name = rt.eval("try { fn() } catch (e) { e.name }")
             assert isinstance(name, str)
@@ -176,7 +176,7 @@ class TestHostExceptionsLookTheSameToTheGuest:
             counter["n"] += 1
             raise classes[counter["n"] % len(classes)]("x")
 
-        with _iso() as rt:
+        with _iso(redact_host_errors=False) as rt:
             rt.bind_function("fn", fn)
             assert (
                 rt.eval(
