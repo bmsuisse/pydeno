@@ -246,18 +246,6 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     "llistxattr": (195, 12),
     "getxattrat": (464, 464),
     "listxattrat": (465, 465),
-}
-# Calls that act on *another process* chosen by a pid argument. Allowed only on ourselves
-# (pid 0 or our own), so a compromised worker cannot renice, re-pin, re-limit or migrate the
-# host process or anything else the same user runs.
-_SELF_PID_ARG0 = {
-    "sched_setscheduler": (144, 119),
-    "sched_setparam": (142, 118),
-    "sched_setattr": (314, 274),
-    "sched_setaffinity": (203, 122),
-    "prlimit64": (302, 261),
-    "migrate_pages": (256, 238),
-    "move_pages": (279, 239),
     # Second pass (surface a guest never needs): NUMA policy, filesystem mutation, file-to-file
     # copies, POSIX timers/queues, protection keys, and re-entering Landlock/seccomp once applied.
     "mbind": (237, 235),
@@ -295,6 +283,34 @@ _SELF_PID_ARG0 = {
     "lsm_get_self_attr": (459, 459),
     "lsm_list_modules": (461, 461),
     "seccomp": (317, 277),
+    # x86_64 also has the older path-based spellings of the filesystem-mutation calls denied above
+    # (aarch64 only ever had the `*at` forms), and glibc on x86_64 calls them directly. Without
+    # these the denial above would hold on one architecture and not the other.
+    "mkdir": (83, None),
+    "rmdir": (84, None),
+    "creat": (85, None),
+    "link": (86, None),
+    "unlink": (87, None),
+    "symlink": (88, None),
+    "rename": (82, None),
+    "mknod": (133, None),
+    # obsolete x86 interfaces nothing legitimate needs: load a shared library by path, edit the
+    # local descriptor table (a classic exploit helper), and the removed sysctl interface
+    "uselib": (134, None),
+    "modify_ldt": (154, None),
+    "_sysctl": (156, None),
+}
+# Calls that act on *another process* chosen by a pid argument. Allowed only on ourselves
+# (pid 0 or our own), so a compromised worker cannot renice, re-pin, re-limit or migrate the
+# host process or anything else the same user runs.
+_SELF_PID_ARG0 = {
+    "sched_setscheduler": (144, 119),
+    "sched_setparam": (142, 118),
+    "sched_setattr": (314, 274),
+    "sched_setaffinity": (203, 122),
+    "prlimit64": (302, 261),
+    "migrate_pages": (256, 238),
+    "move_pages": (279, 239),
 }
 _SELF_PID_ARG1 = {  # (which, who, ...): `who` is the pid, and `which` must say "a process"
     "setpriority": (141, 140),
