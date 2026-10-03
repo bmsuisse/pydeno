@@ -242,6 +242,17 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   fails closed. See [`.github/workflows/test.yml`](.github/workflows/test.yml).
 - **Zero skips.** Platform-specific tests are deselected, never skipped; CI enforces a skip budget
   of zero so an unrun test cannot hide.
+- **The worker proves its own confinement.** Before any guest code exists it tries to read a file,
+  write one, spawn a process, connect out, signal its parent and (on macOS) read the parent's
+  environment and the machine's hardware ID; a complete sandbox that lets one through refuses to
+  start. Each probe is also checked in reverse: it must report a breach in an unsandboxed process.
+- **Independent review, and what it found.** Three AI reviewers (each given a separate slice of the
+  sandbox and told to reproduce before reporting), GitHub Copilot, and research into how vm2,
+  SandboxJS, isolated-vm and Monty were attacked. The result is a findings table that lists the
+  misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
+  let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
+  Read it in the **[security report](docs/security-report.md)**, and try to beat it in
+  **[Hack pydeno](docs/hack-pydeno.md)**.
 
 ## Performance
 
