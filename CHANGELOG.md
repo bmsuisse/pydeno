@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-10-03
 
 No breaking changes: every new limit is opt-in and `Runtime` is unchanged.
 
