@@ -205,7 +205,12 @@ class _Worker:
                     break
                 message = _wire.loads(payload)
                 if message["t"] == "reply":
-                    self._resolve(message)
+                    try:
+                        self._resolve(message)
+                    except Exception:  # noqa: BLE001
+                        # One bad reply must never end this thread: it is the only reader, so
+                        # every later reply, and so every later command, would wait forever.
+                        continue
                 else:
                     self._commands.put(message)
         except (_wire.WireError, OSError):
@@ -216,17 +221,22 @@ class _Worker:
     def _resolve(self, message: dict[str, Any]) -> None:
         with self._pending_lock:
             future = self._pending.pop(message.get("cid"), None)
-        if future is None:
-            return
-        if "err" in message:
-            future.set_exception(
-                _remote_exception(message.get("etype"), str(message["err"]))
-            )
+        if future is None or future.done():
+            # Cancelled: whoever was waiting (a loop that has since closed, a command that timed
+            # out) no longer wants the answer. Setting a result on it would raise.
             return
         try:
-            future.set_result(_wire.decode_value(message.get("v")))
-        except _wire.WireError as exc:
-            future.set_exception(RuntimeError(f"bad reply from host: {exc}"))
+            if "err" in message:
+                future.set_exception(
+                    _remote_exception(message.get("etype"), str(message["err"]))
+                )
+                return
+            try:
+                future.set_result(_wire.decode_value(message.get("v")))
+            except _wire.WireError as exc:
+                future.set_exception(RuntimeError(f"bad reply from host: {exc}"))
+        except concurrent.futures.InvalidStateError:
+            return  # cancelled between the check above and now
 
     # -- host calls --------------------------------------------------------
 

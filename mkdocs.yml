@@ -43,6 +43,7 @@ nav:
       - Guides:
           - Bindings: guides/bindings.md
           - Modules: guides/modules.md
+          - Agent sessions: guides/agent-sessions.md
           - Advanced:
               - Isolated runtime: guides/advanced/isolation.md
               - WebAssembly: guides/advanced/webassembly.md

@@ -39,6 +39,8 @@ _PLATFORM_MARKERS = {
     "as_root": hasattr(os, "geteuid") and os.geteuid() == 0,
     # Pairs pydeno with pydantic-monty (an optional extra, in the `testing` group).
     "needs_monty": importlib.util.find_spec("pydantic_monty") is not None,
+    # Exercises the pydantic-ai integration (the optional `pydantic-ai-slim` package).
+    "needs_pydantic_ai": importlib.util.find_spec("pydantic_ai") is not None,
 }
 
 

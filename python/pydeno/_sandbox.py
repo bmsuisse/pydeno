@@ -774,6 +774,18 @@ def _apply_empty_root() -> bool:
         libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
+def _thread_count_here() -> int:
+    """Threads in this process, including ones Python does not know about.
+
+    Landlock and the user-namespace layer only cover the calling thread, so a thread started by
+    native code (a library's pool, a runtime's worker) before `apply()` would be left unconfined
+    while the worker still reported "landlock". `threading.active_count()` cannot see those."""
+    try:
+        return len(os.listdir("/proc/self/task"))
+    except OSError:
+        return threading.active_count()
+
+
 def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
     """Confine the current process. Returns the layers applied, e.g. "landlock+seccomp",
     "seatbelt", or "none". Bonus layers land in `EXTRAS`.
@@ -799,7 +811,7 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
         # single-threaded by construction (the worker reads `init` before starting a thread); if
         # it is not, claiming "landlock" would be a lie about the threads that already exist, so
         # those two layers are skipped and `sandbox="require"` will say so.
-        single_threaded = threading.active_count() == 1
+        single_threaded = _thread_count_here() == 1
         # The empty root first: it needs the filesystem and the mount syscalls that the layers
         # below take away.
         if empty_root and single_threaded:
@@ -1004,6 +1016,14 @@ def drop_privileges() -> dict[str, object]:
             report["became"] = _NOBODY
         except OSError as exc:
             report["became_error"] = str(exc)
+    if os.geteuid() == 0:
+        # Still root (an unmapped uid in a rootless container, say): the bounding set is empty, but
+        # the capabilities already held are not, so clear them too. `sandbox="require"` refuses to
+        # run in this state; the other modes at least do not run it with capabilities.
+        try:
+            report["capabilities_cleared"] = _clear_capabilities(_libc())
+        except (OSError, AttributeError):
+            pass
     report["uid_after"] = os.geteuid()
     return report
 

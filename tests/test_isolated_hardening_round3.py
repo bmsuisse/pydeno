@@ -198,3 +198,41 @@ class TestALimitThatCannotBeMeasuredIsNotSilent:
         with pytest.warns(RuntimeWarning, match="cannot be enforced"):
             rt = IsolatedRuntime()
         rt.close()
+
+
+def test_an_unawaited_async_host_call_does_not_wedge_the_next_command() -> None:
+    """Guest code that calls an async host function and does not await it makes the command return
+    at once; the answer then reaches a worker whose waiting loop has gone. That used to kill the
+    worker's only reply-reading thread, and the next command hung until the hard deadline."""
+    import asyncio
+    import time
+
+    from pydeno import RuntimeConfig
+
+    async def add(a: int, b: int) -> int:
+        await asyncio.sleep(0.3)
+        return a + b
+
+    with IsolatedRuntime(RuntimeConfig(timeout=20.0), request_timeout=30) as rt:
+        rt.bind_function("add", add)
+        asyncio.run(rt.eval_async("(async () => { add(1, 2); return 1 })()"))
+        start = time.monotonic()
+        assert rt.eval("2 + 2") == 4
+        assert time.monotonic() - start < 5, "the next command waited for the deadline"
+
+        # and the same with a soft timeout expiring while a host call is still pending
+        async def slow() -> int:
+            await asyncio.sleep(5)
+            return 1
+
+        rt.bind_function("slow", slow)
+
+        async def expire() -> None:
+            try:
+                await rt.eval_async("slow()", timeout=0.5)
+            except Exception:  # noqa: BLE001
+                pass
+
+        asyncio.run(expire())
+        if not rt.is_closed():
+            assert rt.eval("3 + 3") == 6

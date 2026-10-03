@@ -67,3 +67,42 @@ def test_a_probe_that_succeeds_then_fails_its_cleanup_is_still_a_breach() -> Non
     # An unsandboxed test process can write, so the write probe succeeded; the failed cleanup
     # must not turn that into "refused".
     assert "write-file" in breaches
+
+
+@pytest.mark.linux_only
+def test_threads_are_counted_the_way_the_kernel_counts_them() -> None:
+    import threading
+
+    from pydeno import _sandbox
+
+    before = _sandbox._thread_count_here()  # noqa: SLF001
+    stop = threading.Event()
+    t = threading.Thread(target=stop.wait)
+    t.start()
+    try:
+        assert _sandbox._thread_count_here() == before + 1  # noqa: SLF001
+    finally:
+        stop.set()
+        t.join()
+
+
+@pytest.mark.linux_only
+@pytest.mark.as_root
+def test_a_root_worker_that_cannot_become_nobody_still_loses_its_capabilities() -> None:
+    code = textwrap.dedent(
+        """
+        import os
+        from pydeno import _sandbox
+        def refuse(*a, **k):
+            raise PermissionError("no")
+        os.setuid = refuse
+        report = _sandbox.drop_privileges()
+        caps = [l for l in open("/proc/self/status") if l.startswith("CapEff")][0].split()[1]
+        print(report.get("uid_after"), int(caps, 16))
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60
+    ).stdout.split()
+    assert out[0] == "0", out  # still root...
+    assert out[1] == "0", out  # ...but holding nothing
