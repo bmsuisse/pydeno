@@ -200,6 +200,7 @@ pub(super) struct RuntimeCoreState {
 
 impl RuntimeCoreState {
     pub(super) fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
+        crate::runtime::v8_flags::mark_v8_started();
         let registry = PythonOpRegistry::new();
         let extension = python_extension(registry.clone());
         let module_loader = Rc::new(PythonModuleLoader::new());
@@ -207,6 +208,7 @@ impl RuntimeCoreState {
         let RuntimeConfig {
             max_heap_size,
             initial_heap_size,
+            max_buffer_bytes,
             execution_timeout,
             bootstrap_script,
             enable_console,
@@ -232,9 +234,18 @@ impl RuntimeCoreState {
                 )));
             }
         }
-        let create_params = max_heap_size.map(|max| {
+        let mut create_params = max_heap_size.map(|max| {
             v8::CreateParams::default().heap_limits(initial_heap_size.unwrap_or(0), max)
         });
+        // ArrayBuffer storage is off the JS heap, so `max_heap_size` never
+        // counts it; it has its own opt-in budget.
+        if let Some(cap) = max_buffer_bytes {
+            create_params = Some(
+                create_params
+                    .unwrap_or_default()
+                    .array_buffer_allocator(crate::runtime::capped_allocator::new(cap)),
+            );
+        }
 
         let serialization_limits =
             SerializationLimits::new(max_serialization_depth, max_serialization_bytes);

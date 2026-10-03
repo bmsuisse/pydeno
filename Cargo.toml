@@ -1,6 +1,6 @@
 [package]
 name = "pydeno"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2021"
 repository = "https://github.com/bmsuisse/pydeno"
 license = "MIT"
@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"] # rlib so benches/ can link the crate directly
 
 [dependencies]
 anyhow = "1.0"
-deno_core = "0.409.0"
+deno_core = "0.412.0"
 deno_error = "0.7.0"
 fastwebsockets = { version = "0.10.0", features = ["upgrade", "unstable-split"] }
 futures = "0.3"
@@ -53,18 +53,18 @@ required-features = ["bench"]
 # Overflow checks stay ON for pydeno's own code -- they are worth having -- but
 # are turned off for third-party crates in unoptimized builds.
 #
-# `deno_core` 0.409.0 `source_map.rs:105` computes `line_number - 1` on a
-# u32 that it documents as 1-based, and V8 reports line/column 0 for some
-# syntax errors. So `rt.eval("`\\")` -- an unterminated template literal --
-# panics with "attempt to subtract with overflow" inside
+# `deno_core` 0.412.0 `source_map.rs:221` (0.409.0: `:105`) computes
+# `line_number - 1` on a u32 that it documents as 1-based, and V8 reports
+# line/column 0 for some syntax errors. So `rt.eval("`\\")` -- an unterminated
+# template literal -- panics with "attempt to subtract with overflow" inside
 # `JsError::from_v8_exception`, killing the runtime thread and turning a
 # catchable `JavaScriptError` into `RuntimeError: Failed to receive eval
 # result`. pydeno cannot fix that arithmetic, and the release build users
 # actually get wraps instead of panicking, so a debug-only panic in a
 # dependency is not a bug this project can act on -- it just makes the debug
-# test suite unrunnable. Found by the new debug pytest job; pre-existing on
-# `main`, and previously hidden because the suite died before reaching the
-# fuzz test that generates that input.
+# test suite unrunnable. Pinned by
+# `tests/test_thread_stack_size.py::test_a_zero_column_syntax_error_does_not_kill_the_runtime_thread`;
+# re-check it on every `deno_core` bump.
 #
 # Scoped to `package."*"`, which in Cargo means dependencies and *not* the
 # local crate, so an overflow in pydeno's own arithmetic still panics loudly.

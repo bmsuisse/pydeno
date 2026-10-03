@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.5.0 — 2026-10-03
+
+No breaking changes: every new limit is opt-in and `Runtime` is unchanged.
+
+### Changed
+
+- **`deno_core` 0.409 -> 0.412** (still V8 150.4, the newest V8 any `deno_core` supports; see
+  `scripts/check_engine.py`). The debug-build overflow workaround in `Cargo.toml` stays: 0.412 still has
+  the `source_map` subtraction bug (now at line 221), pinned by a test.
+- **Lighter**: the release extension is stripped and link-time optimised (macOS: 60 MB -> 43 MB;
+  nearly all of the rest is V8 and its built-in Intl data). `import pydeno` no longer loads the
+  parent-side machinery (`asyncio`, `subprocess`, `tempfile`, the tool bridge, snapshot auth):
+  those exports are lazy, so a plain `Runtime` user's import dropped from ~51 ms to ~19 ms.
+- **Fused native JSON** for the isolation wire: results and call arguments are parsed and decoded
+  (and encoded and written) in one native pass, with the GIL released while parsing. A 2 MB frame
+  takes ~18 ms each way instead of ~60-80 ms; moving 50k small objects costs ~35 ms of overhead
+  (it was ~144 ms). The Python codec remains the reference and fallback, and the two are tested
+  against each other, including lone surrogates (valid in JavaScript, refused by `serde_json`).
+  The native parser is deliberately stricter than `json.loads` about encodings (no BOM, no
+  UTF-16/32, no raw surrogates).
+- `scripts/gen_syscall_tables.py` regenerates `tests/data/syscalls.json` from a pinned Linux tag
+  (v7.0), so the kernel tables the seccomp numbers are checked against are reproducible.
+- **Native wire codec** (`src/runtime/wire.rs`): `IsolatedRuntime` encodes and decodes values in
+  Rust. Structured results cost far less to move across the boundary (50k small objects: overhead
+  144 ms -> 59 ms). The Python codec stays as the reference and fallback, and
+  `tests/test_wire_native.py` checks the two agree on results *and* error messages, including on
+  hostile input and with hypothesis-generated trees.
+
+### Fixed
+
+- Dropping a `SnapshotBuilder` without calling `build()` no longer leaks its isolate
+  (it is now released on drop).
+
+### Added
+
+- **`pydeno.IsolatedRuntime`**: the same guest in a supervised worker
+  *process*, so guest code can no longer abort or wedge the host, and an
+  escaped V8 lands somewhere that cannot do much. Measured against
+  pydantic/monty's security suite, an in-process `Runtime` is taken down by
+  `new Array(2**32-1).fill(0)` and `'a'.repeat(2**28).match(/a/g)` (V8 fatal
+  OOM) and ignores `timeout=` for `sort`/`reverse`/`map` on a sparse array (an
+  uninterruptible native builtin). Under `IsolatedRuntime` each ends in a
+  catchable error. Layers:
+  - Copied from Monty's design: length-prefixed frames with a hard cap, a
+    bounded decoder that treats the worker as untrusted (fuzzed), an empty
+    worker environment, parent-side hard-kill deadlines that pause during host
+    callbacks, crash detection, and a `max_host_calls` budget.
+  - **OS sandbox** applied in the worker before the isolate exists: macOS
+    Seatbelt (deny by default); Linux Landlock plus a seccomp-bpf filter that
+    denies new processes, the network, mounts, kernel interfaces, IPC with the
+    host user's other processes, file-metadata changes, identity changes and
+    acting on any other pid. `sandbox="auto" | "require" | "off"`; read
+    `.sandbox` for what is active. Found by a systematic assume-breach sweep
+    (`scripts/redteam_syscalls.py`); the filter denies well over a hundred
+    syscalls and every one is checked against the kernel's own tables.
+  - **No privileges**: a worker started as root drops to `nobody` with an empty
+    capability set and bounding set.
+  - **Empty root** (Linux, where unprivileged user namespaces are allowed): the
+    worker gets private mount, network, IPC and UTS namespaces and an empty
+    tmpfs root, so it cannot even tell which host paths exist (`sandbox_extras`,
+    `empty_root=False` to skip). Anything newer than the reviewed syscall range
+    is denied by default (`ENOSYS`).
+  - **`--jitless` V8** by default (`jitless=False` to allow the JIT and
+    WebAssembly): no JIT compiler, the source of most V8 exploits.
+  - **`max_memory`** (default 1 GiB) enforced by the worker itself every
+    ~20ms (dedicated exit code, like Monty's allocator) and by the parent every
+    ~50ms; covers WebAssembly and resizable buffers, which no in-process limit
+    can. A 60 s hard deadline is also on by default.
+  - **Smaller syscall surface** (second pass): NUMA policy (`mbind`, `set_mempolicy`),
+    filesystem mutation (`mkdirat`, `unlinkat`, `renameat`, `linkat`, `symlinkat`, `mknodat`),
+    file-to-file copies (`splice`, `tee`, `sendfile`, `copy_file_range`), POSIX timers, protection
+    keys and re-entering Landlock/seccomp are denied, including x86_64's older path-based spellings
+    (`mkdir`, `unlink`, `rename`, ...) that aarch64 never had. Checked against pptxgenjs, three.js,
+    Vega-Lite and dagre bundles under the full Linux sandbox.
+  - **`prewarm`** (default on): one ready spare worker is kept so the next runtime starts in
+    about 15-45 ms instead of about 100 ms (macOS; the low end when the spare is used soon after
+    it started). The guest also loses `SharedArrayBuffer`, `Atomics`,
+    `WeakRef` and `FinalizationRegistry` (shared-memory timers, observable GC).
+  - **`pydeno.WEB_POLYFILLS`**: opt-in, pure-JS browser basics (virtual-time timers, `TextEncoder`,
+    `btoa`, `Blob`, `EventTarget`) so real libraries run in the sandbox. Tested with pptxgenjs,
+    three.js, Vega-Lite, dagre (`vendor/libs/`), identical to `Runtime`.
+  - **Hostile-peer hardening** (from an independent review): the host waits
+    on a worker with bounded writes (`write_stall_timeout`, default 10 s), so a
+    worker that stops reading cannot freeze the caller; host-callback time no
+    longer pauses the deadline forever (`max_host_wait`, default 600 s, plus a
+    CPU-time cap of twice the deadline, and `max_inflight_host_calls`, default
+    64); hash-flood sets and dicts, ints past 2^53 and oversized argument lists
+    are refused by the decoder; an idle worker that grows or spins is killed;
+    `fcntl`/`ioctl` signal-owner commands, path `truncate` and process-group or
+    user selectors on `setpriority`/`ioprio_set` are denied;
+    `sandbox="require"` fails unless *every* layer of the platform applied;
+    `redact_host_errors=True` hides host exception text from the guest.
+  - **`clock=` and `random_seed=`**: a frozen guest clock (`Date`, `Intl`) and a
+    seeded `Math.random`, Monty's `os_policy` for time and entropy.
+  - The worker runs with `TZ=UTC`, no core dumps and bounded file size, so the
+    host timezone and locale no longer reach the guest.
+  Supports `eval`, `eval_async`, `bind_function`, `bind_object`, `revoke_op`,
+  `add_static_module`, `set_module_resolver`, `set_module_loader`,
+  `eval_module`, `eval_module_async`, `on_console` and `ToolBridge`; streams,
+  snapshots, the inspector and function handles are not supported yet.
+  Verified on macOS arm64 and Linux (Debian, Ubuntu 22.04/24.04, Fedora,
+  AlmaLinux, Amazon Linux; Python 3.10-3.14); CI runs the matrix on x86_64 and
+  aarch64 and under simulated kernels without Landlock or seccomp. See
+  `docs/guides/advanced/isolation.md`.
+- **`pydeno.sign_snapshot` / `verify_snapshot`**: HMAC-authenticate a V8
+  snapshot before loading it. V8 deserialises snapshot bytes without validating
+  them, so a tampered snapshot is a crash or worse; `verify_snapshot` raises
+  `SnapshotAuthenticationError` and never returns bytes that failed the check.
+- `SECURITY.md`: how to report a vulnerability, what is in scope, the threat
+  model, and the hardening to turn on.
+- `pydeno._pydeno._set_v8_flags` (private): process-global V8 flags, refused
+  once any `Runtime` exists. Used by the isolated worker.
+- **`RuntimeConfig(max_buffer_bytes=...)`** caps live `ArrayBuffer` /
+  `SharedArrayBuffer` bytes with a custom V8 allocator
+  (`src/runtime/capped_allocator.rs`). V8 does not count that storage against
+  `max_heap_size`, so a guest under `max_heap_size=64MB` could allocate
+  gigabytes. An over-budget allocation throws a catchable `RangeError`. It is
+  opt-in and independent of `max_heap_size`, whose meaning is unchanged.
+  `WebAssembly.Memory` and resizable-buffer growth are not covered (V8 offers
+  only process-global flags for them); use `IsolatedRuntime(max_memory=...)`.
+- `tests/test_monty_parity_security.py` ports the attack categories from
+  Monty's security suite. Its strict-`xfail` cases are the sinks an in-process
+  `Runtime` cannot contain; `tests/test_isolated_runtime.py` shows each is
+  contained by `IsolatedRuntime`.
+
 ## 0.4.5 — 2026-09-29
 
 - Publish a manylinux_2_28 `aarch64` wheel, built and tested on a native ARM runner, so Linux ARM installs no longer fall back to the sdist (which needs Rust and a compiler).

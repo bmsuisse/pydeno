@@ -223,6 +223,10 @@ pub struct RuntimeConfig {
     /// Initial heap size in bytes (None = V8 default).
     pub initial_heap_size: Option<usize>,
 
+    /// Cap on live `ArrayBuffer` / `SharedArrayBuffer` bytes (None = uncapped).
+    /// V8 does not count these against `max_heap_size`.
+    pub max_buffer_bytes: Option<usize>,
+
     /// Optional timeout for script execution.
     pub execution_timeout: Option<Duration>,
 
@@ -294,6 +298,7 @@ impl Default for RuntimeConfig {
         Self {
             max_heap_size: None,
             initial_heap_size: None,
+            max_buffer_bytes: None,
             execution_timeout: None,
             bootstrap_script: None,
             enable_console: Some(false),
@@ -353,6 +358,7 @@ impl RuntimeConfig {
         max_serialization_depth = None,
         max_serialization_bytes = None,
         force_kill_grace = None,
+        max_buffer_bytes = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -367,6 +373,7 @@ impl RuntimeConfig {
         max_serialization_depth: Option<usize>,
         max_serialization_bytes: Option<usize>,
         force_kill_grace: Option<&Bound<'_, PyAny>>,
+        max_buffer_bytes: Option<usize>,
     ) -> PyResult<Self> {
         if bootstrap.is_some() && snapshot.is_some() {
             return Err(conflict_error());
@@ -395,6 +402,9 @@ impl RuntimeConfig {
                 .transpose()?
                 .unwrap_or(defaults.max_serialization_bytes),
             force_kill_grace: Self::optional_duration(force_kill_grace)?,
+            max_buffer_bytes: max_buffer_bytes
+                .map(|b| positive(b, "max_buffer_bytes"))
+                .transpose()?,
         })
     }
 
@@ -526,6 +536,24 @@ impl RuntimeConfig {
     #[getter]
     fn max_serialization_bytes(&self) -> usize {
         self.max_serialization_bytes
+    }
+
+    /// Cap on live ArrayBuffer/SharedArrayBuffer bytes, or `None` if uncapped.
+    #[getter]
+    fn max_buffer_bytes(&self) -> Option<usize> {
+        self.max_buffer_bytes
+    }
+
+    /// Set the ArrayBuffer byte cap; `None` removes it.
+    #[setter]
+    fn set_max_buffer_bytes(&mut self, bytes: Option<usize>) -> PyResult<()> {
+        if bytes == Some(0) {
+            return Err(PyValueError::new_err(
+                "max_buffer_bytes must be a positive integer",
+            ));
+        }
+        self.max_buffer_bytes = bytes;
+        Ok(())
     }
 
     /// Get the force-kill grace period in seconds, or `None` if disabled.

@@ -19,13 +19,19 @@ env:
   # tests never needs a bump here, only deleting them does. This is the
   # assertion that makes a mass-skip fail the job -- see
   # `scripts/check_test_report.py` for the full rationale.
-  MIN_PYTHON_TESTS: "553"
+  MIN_PYTHON_TESTS: "700"
   # Skips are unverified tests, so the budget is zero. The suite has exactly
   # one conditional skip (`tests/test_idle_cpu.py`, skipped above 16 CPUs) and
   # GitHub's macOS runners are well under that, so zero is correct here. Every
   # skip is printed with its reason regardless, so a new one is visible before
   # anyone tolerates it.
   MAX_SKIPPED: "0"
+  # Deliberate expected failures, kept out of the skip budget: the in-process
+  # `Runtime` cannot contain these native-builtin crashes and hangs (they are
+  # contained by `IsolatedRuntime`, see `tests/test_monty_parity_security.py`),
+  # plus two off-heap memory sinks. Ten is the exact current count; a new xfail
+  # is a decision and should raise this in the same commit.
+  MAX_XFAILED: "10"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -37,6 +43,7 @@ jobs:
   # cannot see that class of bug at all.
   pytest:
     name: pytest (${{ matrix.profile }})
+    timeout-minutes: 45
     # macos-latest, matching `benchmarks.yml`: the Linux cdylib build currently
     # fails to link V8 (rust-lld TLS relocation vs `-shared`), a pre-existing
     # issue tracked separately. Moving these jobs to Linux is a follow-up, and
@@ -72,7 +79,7 @@ jobs:
       # before anything has had a chance to look green.
       - name: Collect tests
         run: |
-          uv run python -m pytest tests/ --co -q \
+          uv run python scripts/collect_guard.py 180 tests/ --co -q \
             -p no:randomly --strict-markers --strict-config \
             | tee collect-${{ matrix.profile }}.log
 
@@ -94,7 +101,8 @@ jobs:
             --junit junit-${{ matrix.profile }}.xml \
             --collect-log collect-${{ matrix.profile }}.log \
             --min-tests "$MIN_PYTHON_TESTS" \
-            --max-skipped "$MAX_SKIPPED"
+            --max-skipped "$MAX_SKIPPED" \
+            --max-xfailed "$MAX_XFAILED"
 
       - name: Fail if pytest itself failed
         if: steps.pytest.outcome != 'success'
@@ -110,6 +118,7 @@ jobs:
   # container produced a wheel".
   pytest-linux-wheel:
     name: pytest (linux wheel)
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -151,7 +160,7 @@ jobs:
       # a collection error or a mass-skip fails this job exactly as loudly.
       - name: Collect tests
         run: |
-          .wheel-venv/bin/python -m pytest tests/ --co -q \
+          .wheel-venv/bin/python scripts/collect_guard.py 180 tests/ --co -q \
             -p no:randomly --strict-markers --strict-config \
             | tee collect-linux-wheel.log
 
@@ -170,13 +179,120 @@ jobs:
             --junit junit-linux-wheel.xml \
             --collect-log collect-linux-wheel.log \
             --min-tests "$MIN_PYTHON_TESTS" \
-            --max-skipped "$MAX_SKIPPED"
+            --max-skipped "$MAX_SKIPPED" \
+            --max-xfailed "$MAX_XFAILED"
 
       - name: Fail if pytest itself failed
         if: steps.pytest.outcome != 'success'
         run: |
           echo "::error::pytest exited non-zero against the installed linux wheel"
           exit 1
+
+  # The isolation layers are kernel features (seccomp, Landlock) whose behaviour depends on
+  # the architecture (the filter hard-codes syscall numbers per arch), the kernel, and
+  # whatever the container runtime does around them. None of that can be trusted from one
+  # developer machine, so build the wheel natively on each architecture and run the
+  # isolation, red-team and escape suites inside many distro images on real kernels.
+  linux-wheels:
+    name: build wheels (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build manylinux_2_28 wheels (every CPython the container has)
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --find-interpreter
+          manylinux: 2_28
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  linux-matrix:
+    name: ${{ matrix.image }} / ${{ matrix.profile }} (${{ matrix.arch }})
+    needs: linux-wheels
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CONTAINER_RUNTIME: docker
+      # A host AppArmor profile must not decide which sandbox layers apply.
+      EXTRA_RUN_ARGS: --security-opt apparmor=unconfined
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        profile: [default]
+        image:
+          - python:3.10-slim
+          - python:3.11-slim
+          - python:3.12-slim
+          - python:3.13-slim
+          - python:3.14-slim
+          - debian:bookworm
+          - debian:trixie
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - fedora:latest
+          - almalinux:9
+          - amazonlinux:2023
+        include:
+          - {arch: x86_64, runner: ubuntu-latest}
+          - {arch: aarch64, runner: ubuntu-24.04-arm}
+          # Kernels that lack a feature: the sandbox must degrade, never crash, and
+          # `sandbox="require"` must refuse to start. Two images are enough; the kernel
+          # feature is what varies.
+          - {arch: x86_64, runner: ubuntu-latest, image: "ubuntu:24.04", profile: no-landlock}
+          - {arch: x86_64, runner: ubuntu-latest, image: "ubuntu:24.04", profile: no-seccomp}
+          - {arch: x86_64, runner: ubuntu-latest, image: "ubuntu:24.04", profile: none}
+          - {arch: aarch64, runner: ubuntu-24.04-arm, image: "ubuntu:24.04", profile: no-landlock}
+          - {arch: aarch64, runner: ubuntu-24.04-arm, image: "ubuntu:24.04", profile: no-seccomp}
+          - {arch: aarch64, runner: ubuntu-24.04-arm, image: "ubuntu:24.04", profile: none}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheels
+
+      - name: Isolation, red-team and escape suites in ${{ matrix.image }}
+        run: scripts/linux_matrix.sh wheels "${{ matrix.image }}" "${{ matrix.profile }}"
+
+  # The strict-xfail probes (in-process crashes that IsolatedRuntime contains) take minutes
+  # and do not depend on the kernel, so they run in one cell per architecture.
+  linux-parity-xfails:
+    name: monty-parity xfails (${{ matrix.arch }})
+    needs: linux-wheels
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CONTAINER_RUNTIME: docker
+      EXTRA_RUN_ARGS: --security-opt apparmor=unconfined
+      PYTEST_TARGETS: tests/test_monty_parity_security.py
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, runner: ubuntu-latest}
+          - {arch: aarch64, runner: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheels
+      - run: scripts/linux_matrix.sh wheels python:3.13-slim default
 
   cargo-test:
     name: cargo test

@@ -1,0 +1,1125 @@
+"""`IsolatedRuntime`: guest JavaScript in a worker process the parent can kill.
+
+`Runtime` runs V8 inside the host process, so a guest that makes V8 abort
+(`new Array(2**32-1).fill(0)`) or sits in one uninterruptible native builtin
+(`sparse.sort()`) takes the host with it, and `timeout=` cannot help.
+`IsolatedRuntime` keeps the same guest behind a process boundary, the way
+pydantic/monty's pool does: the worker dies, the parent observes it and raises.
+
+Trust model, copied from Monty: every frame from the worker is untrusted input
+(`_wire.loads` / `decode_value` bound its size, depth and vocabulary), the worker
+starts with an empty environment, and a worker that misbehaves is killed rather
+than argued with. Host functions never leave this process; the worker only holds
+stubs that ask for them by id.
+
+This is a process boundary, not an OS sandbox. A guest that escapes V8 would land
+in a disposable, secret-free process; confining what that process may do (seccomp,
+`sandbox_init`, containers) stays the host's job, as it does for Monty.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import contextvars
+import inspect
+import itertools
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import weakref
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from . import _sandbox, _wire
+from ._pydeno import (
+    JavaScriptError,
+    RuntimeConfig,
+    RuntimeForceKilled,
+    RuntimeTerminated,
+    RuntimeTimeout,
+)
+
+__all__ = ["IsolatedRuntime", "WorkerCrashed"]
+
+_ERROR_CLASSES: dict[str, type[Exception]] = {
+    cls.__name__: cls
+    for cls in (
+        JavaScriptError,
+        RuntimeTimeout,
+        RuntimeTerminated,
+        RuntimeForceKilled,
+        RuntimeError,
+        ValueError,
+        TypeError,
+    )
+}
+
+_CONFIG_KEYS = (
+    "max_heap_size",
+    "initial_heap_size",
+    "max_buffer_bytes",
+    "timeout",
+    "bootstrap",
+    "enable_console",
+    "max_serialization_depth",
+    "max_serialization_bytes",
+    "force_kill_grace",
+)
+_UNSUPPORTED_CONFIG = ("inspector",)
+
+_MAX_REMOTE_MESSAGE = 64 * 1024
+_POLL_SECONDS = 0.1
+_RSS_EVERY_SECONDS = 0.05
+_STDERR_TAIL_BYTES = 2048
+_IDLE_CHECK_SECONDS = 0.25
+# A worker with nothing to do has no business burning CPU. A little is normal (V8 finishes
+# collecting garbage after a command), so this is generous; a compromised idle worker mining
+# or spinning is not.
+_IDLE_CPU_LIMIT_SECONDS = 2.0
+# Worker CPU may exceed wall-clock time (V8 collects garbage on other threads), so the CPU cap
+# is a multiple of the hard deadline rather than equal to it.
+_CPU_CAP_FACTOR = 2.0
+
+# Defaults for code you do not trust. Pass `None` to remove one; a sandbox that
+# silently has no limits until you remember to set them is not much of a sandbox.
+DEFAULT_MAX_MEMORY = 1024 * 1024 * 1024
+DEFAULT_REQUEST_TIMEOUT = 60.0
+DEFAULT_MAX_HOST_WAIT = 600.0
+DEFAULT_MAX_INFLIGHT_HOST_CALLS = 64
+DEFAULT_WRITE_STALL_TIMEOUT = 10.0
+
+# Set while a host function runs on behalf of the guest, so a function that tries to call back
+# into the same runtime fails clearly instead of deadlocking on it. (A thread-local covers the
+# synchronous path; a context variable also covers asynchronous handlers, which run on the
+# caller's event loop and see the context their coroutine was started in.)
+_IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "pydeno_in_host_call", default=False
+)
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _clean(text: str, limit: int = 500) -> str:
+    """Text that came from the worker, made safe to put in an exception message and a log:
+    no control or escape characters, bounded length."""
+    return _CONTROL.sub("?", text)[:limit]
+
+
+class _Default:
+    def __repr__(self) -> str:
+        return "<default>"
+
+
+_DEFAULT: Any = _Default()
+
+_LIVE: weakref.WeakSet[IsolatedRuntime] = weakref.WeakSet()
+
+
+class WorkerCrashed(RuntimeError):
+    """The worker process died, was killed, or broke protocol. The runtime is closed."""
+
+
+class _HostCallBudgetExceeded(Exception):
+    """Internal: the guest asked for more host calls than `max_host_calls` allows."""
+
+
+def _clock_ms(clock: datetime | float | int | None) -> int | None:
+    """A frozen instant as whole epoch milliseconds, or None for the real clock."""
+    if clock is None:
+        return None
+    if isinstance(clock, datetime):
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=timezone.utc)
+        return int(clock.timestamp() * 1000)
+    if isinstance(clock, bool) or not isinstance(clock, (int, float)):
+        raise ValueError("clock must be a datetime, epoch seconds, or None")
+    if (
+        not math.isfinite(clock) or abs(clock) > 8.64e12
+    ):  # the range of a JS Date, in seconds
+        raise ValueError("clock is outside the range a JavaScript Date can hold")
+    return int(clock * 1000)
+
+
+def _seconds(value: float | int | timedelta | None) -> float | None:
+    if value is None:
+        return None
+    return value.total_seconds() if isinstance(value, timedelta) else float(value)
+
+
+class _Pump:
+    """State of the one command in flight: its limits and its host callbacks.
+
+    Three limits, because each one alone has a way round:
+
+    - the **hard deadline**, in wall-clock time that does not run while a host callback does
+      (a slow tool must not eat the guest's budget);
+    - a cap on the **total time spent waiting on host callbacks**, because "paused while a
+      callback is outstanding" is exactly what a guest can arrange to be true forever, by
+      always keeping one asynchronous call in flight;
+    - a cap on the **CPU the worker burns**, which is the one thing a guest cannot hide:
+      computing costs CPU whether or not a callback is outstanding.
+    """
+
+    def __init__(
+        self,
+        hard_timeout: float | None,
+        loop: asyncio.AbstractEventLoop | None,
+        *,
+        max_host_wait: float | None = None,
+        cpu_cap: float | None = None,
+        cpu_start: float | None = None,
+    ) -> None:
+        self.loop = loop
+        self.hard = hard_timeout
+        self.deadline = (
+            None if hard_timeout is None else time.monotonic() + hard_timeout
+        )
+        self.max_host_wait = max_host_wait
+        self.cpu_cap = cpu_cap
+        self.cpu_start = cpu_start
+        self._outstanding = 0
+        self._paused_at = 0.0
+        self._paused_total = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def outstanding(self) -> int:
+        return self._outstanding
+
+    def begin_call(self) -> None:
+        """The deadline stops while the host runs a callback, as in Monty."""
+        with self._lock:
+            if self._outstanding == 0:
+                self._paused_at = time.monotonic()
+            self._outstanding += 1
+
+    def end_call(self) -> None:
+        with self._lock:
+            self._outstanding -= 1
+            if self._outstanding == 0:
+                paused = time.monotonic() - self._paused_at
+                self._paused_total += paused
+                if self.deadline is not None:
+                    self.deadline += paused
+
+    def expired(self) -> bool:
+        with self._lock:
+            if self.deadline is None or self._outstanding:
+                return False
+            return time.monotonic() > self.deadline
+
+    def waited_too_long(self) -> bool:
+        """Has the guest spent more than `max_host_wait` waiting on host callbacks?"""
+        if self.max_host_wait is None:
+            return False
+        with self._lock:
+            waited = self._paused_total
+            if self._outstanding:
+                waited += time.monotonic() - self._paused_at
+            return waited > self.max_host_wait
+
+
+class IsolatedRuntime:
+    """A `Runtime` whose V8 isolate lives in a supervised worker process.
+
+    Args:
+        config: Limits and bootstrap for the guest. `inspector` and `on_console`
+            are not supported across the boundary yet.
+        max_memory: Kill the worker if its resident memory exceeds this many bytes
+            (default 1 GiB; `None` removes the limit). Enforced twice: by the worker itself every ~20ms (it exits with a dedicated
+            code) and by the parent every ~50ms (Linux and macOS).
+        request_timeout: Hard wall-clock limit per command, enforced by killing the
+            worker. Time spent running host callbacks is not charged. By default it is
+            the command's own `timeout` plus `timeout_grace`, or 60s when the command has
+            no timeout; pass `None` to remove the hard deadline.
+        timeout_grace: Seconds the worker gets past a soft `timeout` before it is killed.
+        max_host_calls: Total host-function calls the guest may make over this runtime's
+            life, then the worker is killed. The guest's clock is paused while a host
+            callback runs, so an endless stream of quick calls needs its own cap.
+            (`None`: unlimited.)
+        max_host_wait: Most time (seconds, default 600) one command may spend waiting on host
+            callbacks in total. The hard deadline does not run while a callback does, which a
+            guest could exploit by always keeping one asynchronous call in flight; this bounds it.
+            The worker's CPU use is also capped at twice the hard deadline per command, which
+            callbacks cannot pause. `None` removes the wait cap.
+        max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);
+            further ones are answered with an error instead of being run.
+        write_stall_timeout: If the worker stops reading its input and the pipe stays full this
+            long (seconds, default 10), the worker is killed rather than letting the host block
+            forever. `None` waits indefinitely.
+        redact_host_errors: Replace the message of an exception raised by a host function with a
+            generic one before the guest sees it (the exception's class name is kept). Use this
+            when your tools' error text can contain paths, queries or secrets.
+        sandbox: OS confinement for the worker (macOS Seatbelt; Linux Landlock + seccomp).
+            "auto" applies whatever the platform offers. "require" refuses to start unless
+            *every* layer the platform has is in force (macOS: Seatbelt; Linux: Landlock and
+            seccomp), so a kernel that lacks one cannot silently weaken you. "off" disables it.
+            Read `.sandbox` for what is active.
+        empty_root: On Linux, also give the worker a private mount namespace whose root is
+            empty, plus empty network and IPC namespaces, so it cannot even tell which host paths
+            exist. Needs unprivileged user namespaces; silently skipped where they are not
+            allowed (see `.sandbox_extras`).
+        jitless: Run V8 in the worker with `--jitless`: no JIT compiler and no
+            WebAssembly, which removes the largest class of V8 exploits at a modest
+            speed cost. Pass `False` to allow WebAssembly and JIT speed.
+        v8_flags: Extra V8 flags for the worker, applied before the isolate exists.
+        clock: Freeze the guest's clock at this instant (a `datetime`, naive meaning UTC, or
+            epoch seconds). `Date.now()`, `new Date()` and `Intl.DateTimeFormat#format()`
+            then never advance, which removes the wall clock as a timing source (a busy loop
+            can still count) and makes runs reproducible. `None`: the real clock.
+        random_seed: Seed `Math.random` (V8's `--random-seed`) for reproducible runs.
+        python: Interpreter for the worker (default: this one).
+
+    A worker crash, a hard timeout or a memory kill closes the runtime and raises
+    (`WorkerCrashed` or `RuntimeTimeout`); create a new `IsolatedRuntime` to continue.
+    """
+
+    def __init__(
+        self,
+        config: RuntimeConfig | None = None,
+        *,
+        max_memory: int | None = _DEFAULT,
+        request_timeout: float | int | None = _DEFAULT,
+        timeout_grace: float | int = 2.0,
+        max_host_calls: int | None = None,
+        max_host_wait: float | int | None = _DEFAULT,
+        max_inflight_host_calls: int | None = _DEFAULT,
+        write_stall_timeout: float | int | None = _DEFAULT,
+        redact_host_errors: bool = False,
+        sandbox: str = "auto",
+        empty_root: bool = True,
+        jitless: bool = True,
+        v8_flags: Sequence[str] = (),
+        clock: datetime | float | int | None = None,
+        random_seed: int | None = None,
+        python: str | None = None,
+        prewarm: bool = True,
+    ) -> None:
+        clock_ms = _clock_ms(clock)
+        if random_seed is not None and (
+            isinstance(random_seed, bool)
+            or not isinstance(random_seed, int)
+            or not 0 <= random_seed < 2**31
+        ):
+            raise ValueError("random_seed must be an integer in [0, 2**31)")
+        if max_memory is _DEFAULT:
+            max_memory = DEFAULT_MAX_MEMORY
+        if max_host_calls is not None and max_host_calls < 0:
+            raise ValueError("max_host_calls must be non-negative")
+        if sandbox not in ("auto", "require", "off"):
+            raise ValueError("sandbox must be 'auto', 'require' or 'off'")
+        if max_memory is not None and max_memory <= 0:
+            raise ValueError("max_memory must be a positive integer")
+        if os.name != "posix":
+            raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
+        config = config or RuntimeConfig()
+        for attr in _UNSUPPORTED_CONFIG:
+            if getattr(config, attr, None) is not None:
+                raise ValueError(
+                    f"RuntimeConfig.{attr} is not supported by IsolatedRuntime yet"
+                )
+
+        self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
+        self._soft_timeout = _seconds(config.timeout)
+        self._max_memory = max_memory
+        # Three states: unset (soft timeout + grace, else a default ceiling), a number,
+        # or an explicit None meaning "no hard deadline".
+        self._request_timeout: float | None | Any = (
+            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
+        )
+        self._max_host_calls = max_host_calls
+        self._host_calls = 0
+        self._max_host_wait = (
+            DEFAULT_MAX_HOST_WAIT
+            if max_host_wait is _DEFAULT
+            else _seconds(max_host_wait)
+        )
+        self._max_inflight = (
+            DEFAULT_MAX_INFLIGHT_HOST_CALLS
+            if max_inflight_host_calls is _DEFAULT
+            else max_inflight_host_calls
+        )
+        if self._max_inflight is not None and self._max_inflight < 1:
+            raise ValueError("max_inflight_host_calls must be at least 1")
+        self._stall = (
+            DEFAULT_WRITE_STALL_TIMEOUT
+            if write_stall_timeout is _DEFAULT
+            else _seconds(write_stall_timeout)
+        )
+        self._redact = bool(redact_host_errors)
+        self._grace = float(timeout_grace)
+        self._python = python or sys.executable
+        seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
+        self._options: dict[str, Any] = {
+            "sandbox": sandbox,
+            "empty_root": empty_root,
+            "v8_flags": (["--jitless"] if jitless else [])
+            + seed_flags
+            + list(v8_flags),
+            "max_memory": max_memory,
+        }
+        if clock_ms is not None:
+            self._options["clock_ms"] = clock_ms
+        #: What the worker reports after start-up: the OS layers in force
+        #: ("seatbelt", "landlock+seccomp", ... or "none") and the V8 flags set.
+        self.sandbox = "none"
+        #: Bonus layers that also took effect, e.g. ["emptyroot"] (a private mount namespace
+        #: with nothing in it; needs unprivileged user namespaces, so it is not everywhere).
+        self.sandbox_extras: list[str] = []
+        self.v8_flags: list[str] = []
+
+        self._handlers: dict[int, tuple[Callable[..., Any], bool]] = {}
+        self._token_to_hid: dict[int, int] = {}
+        self._hids = itertools.count(1)
+        self._cmd_ids = itertools.count(1)
+        self._lock = threading.Lock()
+        self._guard = threading.local()
+        self._closed = False
+        self._last_rss_check = 0.0
+        if config.on_console is not None:
+            # `console.*` in the guest calls this in the parent, like any host function.
+            console_hid = next(self._hids)
+            self._handlers[console_hid] = (config.on_console, False)
+            self._options["console_hid"] = console_hid
+
+        self._idle_cpu_base: float | None = None
+        self._idle_since = time.monotonic()
+
+        # A worker started ahead of time (Python up, everything imported, waiting for `init`)
+        # saves most of the ~55 ms start-up. The default interpreter only: a custom `python=`
+        # (the tests' fake workers) is always spawned fresh.
+        self._proc, self._stderr = (
+            _take_worker()
+            if prewarm and python is None
+            else _start_worker(self._python)
+        )
+        stdin_fd = self._proc.stdin.fileno()  # type: ignore[union-attr]
+        # Non-blocking, so that a worker which stops reading its input is a timeout we can act on
+        # and not a thread stuck in write() forever.
+        os.set_blocking(stdin_fd, False)
+        self._writer = _wire.FrameWriter(stdin_fd, stall_timeout=self._stall)
+        self._reader = _wire.FrameReader(self._proc.stdout.fileno())  # type: ignore[union-attr]
+        # A runtime dropped without close() must not leave a worker behind.
+        self._finalizer = weakref.finalize(
+            self, _terminate_process, self._proc, self._stderr
+        )
+        _LIVE.add(self)
+        self._handshake()
+        if prewarm and python is None:
+            _refill_spare()
+        self._idle_since = time.monotonic()
+        self._idle_cpu_base = _sandbox.cpu_seconds(self._proc.pid)
+        threading.Thread(
+            target=_idle_watch,
+            args=(weakref.ref(self),),
+            name="pydeno-idle-watch",
+            daemon=True,
+        ).start()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _handshake(self) -> None:
+        try:
+            self._writer.send(
+                {
+                    "t": "init",
+                    "config": _wire.Enc(self._config),
+                    "options": self._options,
+                }
+            )
+            payload = self._reader.read(time.monotonic() + 30.0)
+            if payload is None:
+                raise WorkerCrashed(
+                    self._describe_death("worker exited during startup")
+                )
+            message = _wire.loads(payload)
+            if message["t"] == "error":
+                text = message.get("msg")
+                raise WorkerCrashed(
+                    "worker failed to start: "
+                    + (_clean(text) if isinstance(text, str) else "unknown error")
+                )
+            if message["t"] != "ready":
+                raise _wire.WireError("expected ready")
+            applied = message.get("sandbox")
+            if not isinstance(applied, str) or len(applied) > 64:
+                raise _wire.WireError("bad ready frame")
+            extras = message.get("extras", [])
+            if (
+                not isinstance(extras, list)
+                or len(extras) > 8
+                or not all(isinstance(x, str) and len(x) <= 32 for x in extras)
+            ):
+                raise _wire.WireError("bad ready frame")
+            self.sandbox = applied
+            self.sandbox_extras = list(extras)
+            self.v8_flags = list(self._options["v8_flags"])
+        except TimeoutError:
+            self._kill()
+            raise WorkerCrashed("worker did not become ready within 30s") from None
+        except (_wire.WireError, OSError) as exc:
+            self._kill()
+            raise WorkerCrashed(f"worker failed to start: {_clean(str(exc))}") from None
+        except WorkerCrashed:
+            self._kill()
+            raise
+
+    def _describe_death(self, prefix: str) -> str:
+        code = self._proc.poll()
+        if code is None:
+            try:
+                code = self._proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                code = None
+        if code == _sandbox.MEMORY_EXIT_CODE:
+            return (
+                f"{prefix}: worker went over max_memory={self._max_memory} and exited"
+            )
+        if code is not None and code < 0:
+            try:
+                prefix += f" (killed by {signal.Signals(-code).name})"
+            except ValueError:
+                prefix += f" (killed by signal {-code})"
+        elif code:
+            prefix += f" (exit code {code})"
+        try:
+            self._stderr.seek(0, os.SEEK_END)
+            size = self._stderr.tell()
+            self._stderr.seek(max(0, size - _STDERR_TAIL_BYTES))
+            tail = self._stderr.read().decode("utf-8", "replace").strip()
+        except (OSError, ValueError):
+            tail = ""
+        # The worker wrote this, and a compromised one can write anything: it goes into an
+        # exception message, so no control or escape characters.
+        return f"{prefix}: {_clean(tail.splitlines()[-1])}" if tail else prefix
+
+    def _kill(self) -> None:
+        self._closed = True
+        _terminate_process(self._proc, None)
+        self._reap()
+
+    def _reap(self) -> None:
+        try:
+            self._proc.wait(timeout=5)
+        except (
+            subprocess.TimeoutExpired
+        ):  # pragma: no cover - SIGKILL does not time out
+            pass
+        # Invalidate before closing: a late callback or a thread still polling must fail, not
+        # read or write whatever the process opens next under the same descriptor number.
+        self._writer.invalidate()
+        self._reader.invalidate()
+        for stream in (self._proc.stdin, self._proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        _LIVE.discard(self)
+
+    def is_closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Ask the worker to exit; kill it if it does not within a second."""
+        if not self._closed:
+            self._closed = True
+            try:
+                self._writer.send({"t": "close"})
+                self._proc.wait(timeout=1)
+            except (OSError, _wire.WireError, subprocess.TimeoutExpired):
+                pass
+            self._kill()
+        # Idempotent, and done even when a crash already closed the runtime: the file that held
+        # the worker's stderr must not wait for the garbage collector.
+        try:
+            self._stderr.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> IsolatedRuntime:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- requests ----------------------------------------------------------
+
+    def _hard_timeout(self, soft: float | None) -> float | None:
+        if self._request_timeout is not _DEFAULT:
+            return self._request_timeout  # a number, or None: the caller opted out
+        return DEFAULT_REQUEST_TIMEOUT if soft is None else soft + self._grace
+
+    def _request(
+        self,
+        message: dict[str, Any],
+        *,
+        soft_timeout: float | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> Any:
+        if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
+            raise RuntimeError(
+                "an IsolatedRuntime cannot be re-entered from its own host functions"
+            )
+        with self._lock:
+            if self._closed:
+                raise WorkerCrashed("runtime is closed")
+            message["id"] = cmd_id = next(self._cmd_ids)
+            hard = self._hard_timeout(soft_timeout)
+            cpu_start = _sandbox.cpu_seconds(self._proc.pid)
+            pump = _Pump(
+                hard,
+                loop,
+                max_host_wait=self._max_host_wait,
+                cpu_cap=None if hard is None else hard * _CPU_CAP_FACTOR,
+                cpu_start=cpu_start,
+            )
+            try:
+                self._writer.send(message)
+            except _wire.WireError as exc:
+                raise TypeError(str(exc)) from None
+            except _wire.StalledWrite:
+                self._kill()
+                raise WorkerCrashed(
+                    f"worker stopped reading its input for {self._stall:g}s; killed"
+                ) from None
+            except OSError:
+                self._kill()
+                raise WorkerCrashed(self._describe_death("worker is gone")) from None
+            try:
+                return self._pump(cmd_id, pump)
+            finally:
+                # Where "idle" starts: what the worker burns from here on, with no command
+                # running, is the idle watchdog's business.
+                self._idle_since = time.monotonic()
+                self._idle_cpu_base = _sandbox.cpu_seconds(self._proc.pid)
+
+    def _pump(self, cmd_id: int, pump: _Pump) -> Any:
+        last_check = time.monotonic()
+        remote: Exception | None = None
+        try:
+            while True:
+                try:
+                    poll = time.monotonic() + _POLL_SECONDS
+                    payload = self._reader.read(poll)
+                except TimeoutError:
+                    self._supervise(pump)
+                    last_check = time.monotonic()
+                    continue
+                # The limits are enforced on a clock, not on silence. If they ran only when
+                # the pipe went quiet, a guest that never lets it go quiet (a loop of cheap
+                # host calls) would switch the hard deadline and memory ceiling off.
+                now = time.monotonic()
+                if now - last_check >= _POLL_SECONDS:
+                    self._supervise(pump)
+                    last_check = now
+                if payload is None:
+                    self._kill()
+                    raise WorkerCrashed(self._describe_death("worker process died"))
+                message = _wire.loads_decoded(payload)
+                kind = message["t"]
+                if kind == "call":
+                    self._on_call(message, pump)
+                elif kind in ("result", "error") and message.get("id") == cmd_id:
+                    self._check_memory(force=True)
+                    if kind == "result":
+                        return message.get("v")  # already decoded by `loads_decoded`
+                    # Built here, raised after the guard below: a guest's own JavaScriptError is
+                    # an answer, not a fault, and must reach the caller unchanged.
+                    remote = self._remote_error(message)
+                    break
+                else:
+                    raise _wire.WireError(f"unexpected {_clean(str(kind), 32)!r} frame")
+        except (WorkerCrashed, RuntimeTimeout):
+            raise  # our own verdicts from the supervisor, already acted on
+        except _HostCallBudgetExceeded as exc:
+            self._kill()
+            raise WorkerCrashed(str(exc)) from None
+        except _wire.WireError as exc:
+            self._kill()
+            raise WorkerCrashed(f"worker broke protocol: {_clean(str(exc))}") from None
+        except OSError:
+            self._kill()
+            raise WorkerCrashed(self._describe_death("lost the worker")) from None
+        except Exception as exc:  # noqa: BLE001
+            # Whatever else went wrong, it came from reading what the worker sent: a field of
+            # the wrong type, an absurd nesting depth. The worker is the one at fault, and a
+            # worker that sends nonsense is killed, not left half-synchronised with us.
+            self._kill()
+            raise WorkerCrashed(
+                f"worker sent a malformed frame ({type(exc).__name__})"
+            ) from None
+        assert remote is not None
+        raise remote
+
+    def _idle_check(self) -> None:
+        """One pass of the idle watchdog. Skips itself while a command holds the runtime: the
+        pump supervises then."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self._closed:
+                return
+            try:
+                self._check_memory(force=True)
+            except WorkerCrashed:
+                return  # `_check_memory` has already killed it
+            base = self._idle_cpu_base
+            if base is None:
+                return
+            now_cpu = _sandbox.cpu_seconds(self._proc.pid)
+            # A small flat allowance plus a thin trickle (1% of a core) that grows with idle time,
+            # so a healthy worker that sits idle for days is never mistaken for a runaway one.
+            allowed = _IDLE_CPU_LIMIT_SECONDS + 0.01 * (
+                time.monotonic() - self._idle_since
+            )
+            if now_cpu is not None and now_cpu - base > allowed:
+                self._kill()
+        finally:
+            self._lock.release()
+
+    def _supervise(self, pump: _Pump) -> None:
+        """Parent-side backstops: the hard deadline and the memory ceiling."""
+        if pump.expired():
+            self._kill()
+            raise RuntimeTimeout(
+                f"worker exceeded its {pump.hard:g}s hard deadline and was killed"
+            )
+        if pump.waited_too_long():
+            self._kill()
+            raise RuntimeTimeout(
+                f"host callbacks kept the guest waiting for more than "
+                f"{pump.max_host_wait:g}s in one command (max_host_wait); worker killed"
+            )
+        if pump.cpu_cap is not None and pump.cpu_start is not None:
+            now_cpu = _sandbox.cpu_seconds(self._proc.pid)
+            if now_cpu is not None and now_cpu - pump.cpu_start > pump.cpu_cap:
+                self._kill()
+                raise RuntimeTimeout(
+                    f"worker used more than {pump.cpu_cap:g}s of CPU in one command "
+                    f"and was killed"
+                )
+        self._check_memory()
+
+    def _check_memory(self, *, force: bool = False) -> None:
+        """Kill the worker if its RSS is over `max_memory`. Sampled, so a spike that
+        ends between samples is only caught by the check made as each command finishes."""
+        if self._max_memory is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_rss_check < _RSS_EVERY_SECONDS:
+            return
+        self._last_rss_check = now
+        rss = _sandbox.rss_bytes(self._proc.pid)
+        if rss is not None and rss > self._max_memory:
+            self._kill()
+            raise WorkerCrashed(
+                f"worker used {rss} bytes, over max_memory={self._max_memory}; killed"
+            )
+
+    @staticmethod
+    def _remote_error(message: dict[str, Any]) -> Exception:
+        kind = message.get("kind")
+        # `kind` is the worker's field: only a string can name one of our classes.
+        cls = (
+            _ERROR_CLASSES.get(kind, RuntimeError)
+            if isinstance(kind, str)
+            else RuntimeError
+        )
+        text = message.get("msg")
+        if not isinstance(text, str):
+            return cls("worker reported an error")
+        # The text is the worker's to choose, and a frame can be megabytes: keep an exception
+        # message an exception message, not a way to make the parent hold (and log) a huge string.
+        if len(text) > _MAX_REMOTE_MESSAGE:
+            text = (
+                text[:_MAX_REMOTE_MESSAGE]
+                + f"... [{len(text) - _MAX_REMOTE_MESSAGE} more characters]"
+            )
+        return cls(text)
+
+    # -- host callbacks ----------------------------------------------------
+
+    def _on_call(self, message: dict[str, Any], pump: _Pump) -> None:
+        cid, hid, args = message.get("cid"), message.get("hid"), message.get("args")
+        # One lookup, not a membership test followed by a second one: another thread may revoke
+        # in between.
+        entry = self._handlers.get(hid) if isinstance(hid, int) else None
+        if (
+            not isinstance(cid, int)
+            or isinstance(cid, bool)
+            or entry is None
+            or not isinstance(args, list)
+        ):
+            # An id the worker was never given is not a capability it holds.
+            raise _wire.WireError("call for an unknown host function")
+        self._host_calls += 1
+        if self._max_host_calls is not None and self._host_calls > self._max_host_calls:
+            # Monty's `max_suspensions`: while a host callback runs, the guest's
+            # clock is paused, so an unbounded stream of quick calls needs its own cap.
+            raise _HostCallBudgetExceeded(
+                f"guest made more than max_host_calls={self._max_host_calls} host calls"
+            )
+        handler, is_async = entry
+        # All the arguments under one budget: decoding each on its own would multiply the limit
+        # by the argument count.
+        decoded = args  # `loads_decoded` already decoded them, under one shared budget
+        if self._max_inflight is not None and pump.outstanding >= self._max_inflight:
+            # Refused rather than run: the guest sees an error for this call, and nothing the
+            # host owns is touched. Without a cap the number of asynchronous calls (and the
+            # tasks and memory behind them) is whatever the guest asks for.
+            self._send_reply(
+                {
+                    "t": "reply",
+                    "cid": cid,
+                    "err": f"more than {self._max_inflight} host calls in flight",
+                    "etype": "RuntimeError",
+                },
+                None,
+            )
+            return
+        pump.begin_call()
+        if is_async and pump.loop is not None:
+            coro = _call_guarded(handler, decoded)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coro, pump.loop)
+            except Exception as exc:  # noqa: BLE001 - e.g. the caller's loop has closed
+                coro.close()
+                self._send_reply(self._error(cid, exc), pump)
+                return
+            future.add_done_callback(
+                lambda fut: self._finish_async_call(cid, pump, fut)
+            )
+            return
+        try:
+            self._guard.in_host_call = True
+            try:
+                value = handler(*decoded)
+                if inspect.isawaitable(value):
+                    value = asyncio.run(_await(value))
+                reply = {"t": "reply", "cid": cid, "v": _wire.Enc(value)}
+            finally:
+                self._guard.in_host_call = False
+        except Exception as exc:  # noqa: BLE001 - the guest sees the failure, the host keeps running
+            reply = self._error(cid, exc)
+        self._send_reply(reply, pump)
+
+    def _error(self, cid: int, exc: BaseException) -> dict[str, Any]:
+        return _error_reply(cid, exc, redact=self._redact)
+
+    def _finish_async_call(self, cid: int, pump: _Pump, future: Any) -> None:
+        try:
+            reply = {"t": "reply", "cid": cid, "v": _wire.Enc(future.result())}
+        except BaseException as exc:  # noqa: BLE001
+            reply = self._error(cid, exc)
+        self._send_reply(reply, pump)
+
+    def _send_reply(self, reply: dict[str, Any], pump: _Pump | None) -> None:
+        try:
+            if self._closed:
+                return  # the descriptors may already belong to something else
+            try:
+                self._writer.send(reply)
+            except _wire.WireError as exc:
+                self._writer.send(self._error(reply["cid"], exc))
+        except _wire.StalledWrite:
+            # The worker stopped reading what we send. Waiting longer only freezes whoever is
+            # sending (possibly the caller's event loop); kill it and let the pump report it.
+            self._kill()
+        except OSError:
+            pass  # worker already gone; the pump will report it
+        finally:
+            if pump is not None:
+                pump.end_call()
+
+    # -- public API --------------------------------------------------------
+
+    def eval(self, code: str) -> Any:
+        """Evaluate JavaScript synchronously in the worker."""
+        return self._request(
+            {"t": "eval", "code": code}, soft_timeout=self._soft_timeout
+        )
+
+    async def eval_async(
+        self, code: str, *, timeout: float | int | timedelta | None = None
+    ) -> Any:
+        """Evaluate JavaScript, awaiting promises. Async host functions run on this loop."""
+        soft = _seconds(timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        loop = asyncio.get_running_loop()
+        message = {"t": "eval_async", "code": code, "timeout": soft}
+        try:
+            return await asyncio.to_thread(
+                self._request, message, soft_timeout=soft, loop=loop
+            )
+        except asyncio.CancelledError:
+            # The thread cannot be interrupted, and the worker is mid-command.
+            self._kill()
+            raise
+
+    def bind_function(self, name: str, handler: Callable[..., Any]) -> int:
+        """Expose a host function as a global; returns its capability token."""
+        hid = next(self._hids)
+        is_async = inspect.iscoroutinefunction(handler)
+        self._handlers[hid] = (handler, is_async)
+        try:
+            token = self._request(
+                {"t": "bind_function", "name": name, "hid": hid, "async": is_async}
+            )
+        except BaseException:
+            self._handlers.pop(hid, None)
+            raise
+        if not _is_token(token):
+            self._handlers.pop(hid, None)
+            self._kill()
+            raise WorkerCrashed("worker returned a malformed capability token")
+        self._token_to_hid[token] = hid
+        return token
+
+    def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
+        """Expose a mapping as a global object; callables become host functions."""
+        entries: dict[str, Any] = {}
+        hids: dict[str, int] = {}
+        for key, value in obj.items():
+            if callable(value):
+                hid = next(self._hids)
+                is_async = inspect.iscoroutinefunction(value)
+                self._handlers[hid] = (value, is_async)
+                hids[key] = hid
+                entries[key] = {"hid": hid, "async": is_async}
+            else:
+                entries[key] = {"v": _wire.Enc(value)}
+        try:
+            tokens = self._request(
+                {"t": "bind_object", "name": name, "entries": entries}
+            )
+        except BaseException:
+            for hid in hids.values():
+                self._handlers.pop(hid, None)
+            raise
+        if not isinstance(tokens, dict) or not all(
+            isinstance(k, str) and _is_token(v) for k, v in tokens.items()
+        ):
+            for hid in hids.values():
+                self._handlers.pop(hid, None)
+            self._kill()
+            raise WorkerCrashed("worker returned malformed capability tokens")
+        for key, token in tokens.items():
+            if key in hids:
+                self._token_to_hid[token] = hids[key]
+        return tokens
+
+    def revoke_op(self, op_id: int) -> bool:
+        """Revoke a capability. The host handler is dropped as well as the worker's token."""
+        revoked = self._request({"t": "revoke", "token": op_id})
+        hid = self._token_to_hid.pop(op_id, None)
+        if hid is not None:
+            self._handlers.pop(hid, None)
+        return bool(revoked)
+
+    def add_static_module(self, name: str, source: str) -> None:
+        self._request({"t": "add_module", "name": name, "source": source})
+
+    def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
+        """Resolve import specifiers with a host function: `(specifier, referrer) -> str | None`."""
+        hid = next(self._hids)
+        self._handlers[hid] = (resolver, False)
+        try:
+            self._request({"t": "set_module_resolver", "hid": hid})
+        except BaseException:
+            self._handlers.pop(hid, None)
+            raise
+
+    def set_module_loader(self, loader: Callable[[str], Any]) -> None:
+        """Supply module source with a host function: `(specifier) -> str`, sync or async.
+
+        The source comes back across the process boundary as plain text; the worker, which
+        is the one that compiles it, never sees the loader itself."""
+        hid = next(self._hids)
+        self._handlers[hid] = (loader, inspect.iscoroutinefunction(loader))
+        try:
+            self._request({"t": "set_module_loader", "hid": hid})
+        except BaseException:
+            self._handlers.pop(hid, None)
+            raise
+
+    def eval_module(self, specifier: str) -> Any:
+        """Evaluate a module synchronously and return its namespace as a dict."""
+        return self._request(
+            {"t": "eval_module", "specifier": specifier},
+            soft_timeout=self._soft_timeout,
+        )
+
+    async def eval_module_async(
+        self, specifier: str, *, timeout: float | int | timedelta | None = None
+    ) -> Any:
+        """Evaluate a module, awaiting top-level await; async host callbacks run on this loop."""
+        soft = _seconds(timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        loop = asyncio.get_running_loop()
+        message = {"t": "eval_module_async", "specifier": specifier, "timeout": soft}
+        try:
+            return await asyncio.to_thread(
+                self._request, message, soft_timeout=soft, loop=loop
+            )
+        except asyncio.CancelledError:
+            self._kill()  # the thread cannot be interrupted, and the worker is mid-command
+            raise
+
+
+def _error_reply(
+    cid: int, exc: BaseException, *, redact: bool = False
+) -> dict[str, Any]:
+    """Tell the worker what a host function raised: its class name and its message, separately,
+    exactly what an in-process `Runtime` would hand to guest JS as `e.name` and `e.message`.
+    A value that could not be encoded is the guest's TypeError, not a protocol fault.
+
+    `redact` keeps the class name (guests branch on it) but replaces the message, for hosts whose
+    tools put paths, queries or secrets in their error text."""
+    etype = "TypeError" if isinstance(exc, _wire.WireError) else type(exc).__name__
+    text = "host function failed" if redact else str(exc)
+    return {"t": "reply", "cid": cid, "err": text, "etype": etype}
+
+
+def _is_token(value: object) -> bool:
+    """A capability token is a plain integer; anything else from the worker is nonsense."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+async def _await(awaitable: Any) -> Any:
+    return await awaitable
+
+
+async def _call_guarded(handler: Callable[..., Any], args: list[Any]) -> Any:
+    """Run an asynchronous host function with the re-entrancy flag set in *its* context, so that
+    a handler calling back into the runtime that is waiting on it fails instead of deadlocking."""
+    token = _IN_HOST_CALL.set(True)
+    try:
+        return await handler(*args)
+    finally:
+        _IN_HOST_CALL.reset(token)
+
+
+def _start_worker(python: str) -> tuple[subprocess.Popen[bytes], Any]:
+    stderr = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close() / finalizer
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            [python, "-I", "-m", "pydeno._worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            env={},  # no host secrets ever reach the worker
+            close_fds=True,
+            start_new_session=True,  # so a kill takes any stray child with it
+            bufsize=0,
+        )
+    except BaseException:
+        stderr.close()
+        raise
+    return proc, stderr
+
+
+# One worker kept ready. It holds no configuration and no data: it is a Python process that has
+# finished importing and is blocked reading `init`, the same state a fresh spawn reaches, only
+# earlier. It is handed out at most once (popped under the lock), and it exits by itself if the
+# parent dies (stdin EOF) or is killed at interpreter exit.
+_SPARE: tuple[subprocess.Popen[bytes], Any] | None = None
+_SPARE_LOCK = threading.Lock()
+
+
+def _take_worker() -> tuple[subprocess.Popen[bytes], Any]:
+    global _SPARE  # noqa: PLW0603
+    with _SPARE_LOCK:
+        spare, _SPARE = _SPARE, None
+    if spare is not None:
+        if spare[0].poll() is None:
+            return spare
+        _terminate_process(*spare)  # died while waiting: reap it, start fresh
+    return _start_worker(sys.executable)
+
+
+def _refill_spare() -> None:
+    def fill() -> None:
+        global _SPARE  # noqa: PLW0603
+        try:
+            worker = _start_worker(sys.executable)
+        except OSError:
+            return
+        with _SPARE_LOCK:
+            if _SPARE is None:
+                _SPARE = worker
+                return
+        _terminate_process(*worker)
+
+    threading.Thread(target=fill, name="pydeno-prewarm", daemon=True).start()
+
+
+def _discard_spare() -> None:
+    global _SPARE  # noqa: PLW0603
+    with _SPARE_LOCK:
+        spare, _SPARE = _SPARE, None
+    if spare is not None:
+        _terminate_process(*spare)
+
+
+def _terminate_process(proc: subprocess.Popen[bytes], stderr: Any) -> None:
+    """Kill a worker's whole process group and reap it. Safe to call on one that is already
+    gone, which is what makes it usable both from `_kill` and as a garbage-collection finalizer."""
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL does not time out
+        pass
+    if stderr is not None:
+        try:
+            stderr.close()
+        except OSError:
+            pass
+
+
+def _idle_watch(ref: weakref.ref[IsolatedRuntime]) -> None:
+    """Supervise the worker *between* commands too.
+
+    The per-command checks only run while a command does. A compromised worker that waits until
+    it is idle to eat memory or spin would otherwise go unnoticed until the next command. Holds
+    the runtime only weakly, so a forgotten runtime can still be collected (and its worker killed
+    by the finalizer)."""
+    while True:
+        rt = ref()
+        if rt is None or rt._closed:  # noqa: SLF001
+            return
+        try:
+            rt._idle_check()  # noqa: SLF001
+        except Exception:  # noqa: BLE001, S110 - a watchdog must never die of its own check
+            pass
+        del rt
+        time.sleep(_IDLE_CHECK_SECONDS)
+
+
+def _kill_all_at_exit() -> None:
+    for runtime in list(_LIVE):
+        try:
+            runtime._kill()
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+
+atexit.register(_kill_all_at_exit)
+atexit.register(_discard_spare)

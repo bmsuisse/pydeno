@@ -186,6 +186,7 @@ if __name__ == "__main__":
 
 When building AI agents with code execution, always keep security in mind:
 
+- **Use [`IsolatedRuntime`](../guides/advanced/isolation.md) for untrusted code** - a process boundary so a V8 abort or an uninterruptible loop cannot take your service down
 - **Set resource limits** - Use [`RuntimeConfig`][pydeno.RuntimeConfig] to limit memory ([`max_heap_size`][pydeno.RuntimeConfig.max_heap_size]) and always specify `timeout` in [`eval_async()`][pydeno.eval_async]
 - **Create fresh runtimes** - Use a new [`Runtime`][pydeno.Runtime] instance for each execution or user session to ensure isolation
 - **Validate code patterns** - Check generated code using LLM for dangerous patterns (infinite loops, excessive recursion) before execution

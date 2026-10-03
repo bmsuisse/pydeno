@@ -48,5 +48,19 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
         runtime::python::_debug_active_runtime_threads,
         m
     )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(runtime::v8_flags::_set_v8_flags, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        runtime::wire::_wire_decode_values,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
+        runtime::wire_json::_wire_loads_decoded,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(runtime::wire_json::_wire_dumps, m)?)?;
+    m.add(
+        "WireNativeError",
+        m.py().get_type::<runtime::wire::WireNativeError>(),
+    )?;
     Ok(())
 }

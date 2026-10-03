@@ -110,12 +110,14 @@ class RuntimeConfig:
         max_serialization_depth: int | None = None,
         max_serialization_bytes: int | None = None,
         force_kill_grace: float | int | timedelta | None = None,
+        max_buffer_bytes: int | None = None,
     ) -> None:
         """
         Create a new runtime configuration.
 
         Args:
-            max_heap_size: Maximum heap size in bytes
+            max_heap_size: Maximum JS heap size in bytes. Does *not* bound
+                ``ArrayBuffer`` storage; see ``max_buffer_bytes``.
             initial_heap_size: Initial heap size in bytes
             bootstrap: JavaScript source code to execute on startup
             timeout: Execution timeout in seconds (float or int). A fired
@@ -185,6 +187,16 @@ class RuntimeConfig:
     @max_heap_size.setter
     def max_heap_size(self, bytes: int) -> None:
         """Set maximum heap size in bytes."""
+        ...
+
+    @property
+    def max_buffer_bytes(self) -> int | None:
+        """Cap on live ``ArrayBuffer`` / ``SharedArrayBuffer`` bytes (``None`` = uncapped)."""
+        ...
+
+    @max_buffer_bytes.setter
+    def max_buffer_bytes(self, bytes: int | None) -> None:
+        """Set the buffer cap. An allocation over it throws a catchable ``RangeError``."""
         ...
 
     @property

@@ -93,6 +93,8 @@ with Runtime(config) as runtime:
 !!! warning "Heap Limit Considerations"
     - Exceeding the heap limit raises `RuntimeError` with "Heap limit exceeded"
     - Do not set the heap limit too low as it may prevent V8 from starting properly
+    - `max_heap_size` does not count `ArrayBuffer` storage; cap that with `max_buffer_bytes`
+    - Neither stops a native builtin that aborts V8 or ignores `timeout=`; see [Isolated runtime](../guides/advanced/isolation.md)
 
 ### Memory Footprint
 

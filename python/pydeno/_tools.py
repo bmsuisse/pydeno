@@ -298,12 +298,13 @@ class ToolBridge:
 
     @staticmethod
     def _reject_non_runtime(runtime: object) -> None:
+        from ._isolated import IsolatedRuntime
         from ._pydeno import Runtime
 
-        if not isinstance(runtime, Runtime):
+        if not isinstance(runtime, (Runtime, IsolatedRuntime)):
             raise TypeError(
-                f"ToolBridge.attach expects a pydeno.Runtime, got "
-                f"{type(runtime).__name__}"
+                f"ToolBridge.attach expects a pydeno.Runtime or IsolatedRuntime, "
+                f"got {type(runtime).__name__}"
             )
 
     def __repr__(self) -> str:

@@ -326,6 +326,11 @@ the absent surfaces as absent.
 ### Memory Management
 
 - Each runtime has its own V8 heap (configured via `max_heap_size`)
+- `ArrayBuffer` storage is budgeted separately by `max_buffer_bytes`
+  (`src/runtime/capped_allocator.rs`), because V8 does not charge it to the heap
+- `IsolatedRuntime` moves the isolate into a supervised worker process for code
+  that must not be able to abort or wedge the host; design in
+  `docs/superpowers/specs/2026-10-02-isolated-runtime-design.md`
 - Serialization limits prevent OOM attacks (`max_depth`, `max_bytes`)
 - Circular reference detection during conversion
 - Automatic garbage collection by V8

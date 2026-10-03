@@ -63,11 +63,23 @@ impl SnapshotBuilder {
     }
 }
 
+impl Drop for SnapshotBuilder {
+    fn drop(&mut self) {
+        // A `JsRuntimeForSnapshot` that is dropped without `snapshot()` leaks its isolate and
+        // can abort the process at exit. Consuming it the way `build` does releases it
+        // properly; the bytes are discarded.
+        if let Some(runtime) = self.runtime.take() {
+            drop(runtime.snapshot());
+        }
+    }
+}
+
 fn already_built() -> RuntimeError {
     RuntimeError::internal("Snapshot has already been built")
 }
 
 fn create_runtime() -> Result<JsRuntimeForSnapshot, CoreError> {
+    crate::runtime::v8_flags::mark_v8_started();
     // `try_new` registers the isolate with the current tokio handle; without
     // one (plain Python caller thread) a V8 delayed task later aborts the
     // process. Merely entering a current-thread runtime is enough here.

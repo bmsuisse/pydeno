@@ -181,6 +181,8 @@ When JavaScript code exceeds the configured heap limit, the runtime terminates a
 !!! warning "Set memory limits for untrusted code"
     Always configure `max_heap_size` when running untrusted JavaScript to prevent memory exhaustion attacks. The runtime will terminate gracefully when the limit is reached.
 
+    `max_heap_size` bounds the **JS heap only**. `ArrayBuffer` / `SharedArrayBuffer` storage is off-heap, so also set `max_buffer_bytes` (an over-budget allocation throws a catchable `RangeError`). Neither limit can stop a single native builtin that aborts V8 or ignores `timeout=` (for example `new Array(2 ** 32 - 1).fill(0)`); for code you do not trust, use [`IsolatedRuntime`](../guides/advanced/isolation.md).
+
 ## Stopping Stuck Code
 
 Any script can be stopped, including ones that never return to JavaScript.
