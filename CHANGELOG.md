@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0 — unreleased
+## 0.6.0 — 2026-10-03
 
 Sandbox hardening round 2 (independent review by three models and Copilot, plus prior-art research),
 agent sessions, and a pydantic-ai integration. See [`docs/security-report.md`](docs/security-report.md)
