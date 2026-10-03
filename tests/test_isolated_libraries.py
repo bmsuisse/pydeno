@@ -180,7 +180,11 @@ def test_a_library_cannot_use_its_cpu_budget_to_outlive_the_deadline() -> None:
     with IsolatedRuntime(_config(), request_timeout=3.0) as rt:
         asyncio.run(rt.eval_async(_sources(files), timeout=60))
         with pytest.raises(RuntimeTimeout):
-            rt.eval("let s = 0; for (;;) { s += typeof dagre.layout }")
+            # Numeric on purpose: appending to a string here would grow without bound and trip the
+            # memory ceiling before the deadline, which is a different (also contained) failure.
+            rt.eval(
+                "let s = 0; for (;;) { s += new dagre.graphlib.Graph().nodeCount() + 1 }"
+            )
 
 
 # --- the polyfills themselves (pure JS, so they are checked directly) ----------------------
