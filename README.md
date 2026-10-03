@@ -276,7 +276,8 @@ slower than with the JIT; `jitless=False` trades that back for a larger attack s
 ## Integrations
 
 - [**FastMCP tool bridge**](examples/fastmcp_tool_bridge.py): expose FastMCP tools to sandboxed JS via `bind_function` and an in-process `fastmcp.Client`
-- [**pydantic-ai "code mode" agent**](examples/pydantic_ai_agent.py): the model submits one JS batch script instead of many separate tool calls, run safely with a timeout
+- [**pydantic-ai code mode (`JSCodeMode`)**](docs/guides/pydantic-ai.md): the JavaScript counterpart of pydantic-ai's Monty-based code mode. The agent gets one `run_javascript` tool; your other tools become typed `tools.*` functions the model's code calls with `await` and `Promise.all`, with retries, usage limits and approvals mapped onto pydantic-ai's own. Runs offline: [`examples/pydantic_ai_agent.py`](examples/pydantic_ai_agent.py). `pip install "pydeno[pydantic-ai]"`
+- [**Agent sessions (`AgentSandbox`)**](docs/guides/agent-sessions.md): state across turns, pause and resume at every tool call (approval flows), a signed replay journal you can `dump()` and `load()`, and the tool descriptions and `.d.ts` for your prompt
 - [**ToolBridge**](examples/tool_bridge.py): several Python tools with a total call budget, typed errors the model's JS can branch on, and `console.log` routed back to Python
 - [**Monty + pydeno**](examples/monty_and_pydeno.py): the model's Python runs in [Monty][monty], its JavaScript in pydeno, both sandboxed, sharing one tool and one call budget; Python computes, a Vega-Lite chart is drawn in JS
 - [**Vendored npm libraries**](examples/vendored_npm_libraries.py): run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles inside the sandbox; see the [guide](https://bmsuisse.github.io/pydeno/guides/advanced/vendored-npm-libraries/)

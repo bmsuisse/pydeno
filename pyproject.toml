@@ -30,6 +30,10 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+# `pydeno.integrations.pydantic_ai` (JSCodeMode); plain pydeno has no runtime dependencies.
+pydantic-ai = ["pydantic-ai-slim>=2.46,<3"]
+
 [project.urls]
 Homepage = "https://github.com/bmsuisse/pydeno"
 Repository = "https://github.com/bmsuisse/pydeno"
