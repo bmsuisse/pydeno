@@ -56,6 +56,27 @@ When DevTools is connected, execution stops at `debugger;` and you can:
 
 Use [`runtime.inspector_endpoints()`][pydeno.Runtime.inspector_endpoints] to get the `devtools_frontend_url` and `websocket_url` for connecting.
 
+## Builds without the inspector
+
+The inspector server (an HTTP/WebSocket listener built on `hyper`, `hyper-util`, `fastwebsockets`
+and tokio's `net` feature) is the cargo feature `inspector`. It is on by default, so the published
+wheels include it. A minimal build drops it:
+
+```bash
+maturin build --release --no-default-features
+```
+
+In that build `InspectorConfig` still exists, so code that constructs one still imports. But
+creating a `Runtime` with `RuntimeConfig(inspector=...)` raises
+`RuntimeError: ... pydeno was built without inspector support ...` instead of starting without
+the debugger. `pydeno._pydeno._INSPECTOR_AVAILABLE` tells you which build you have.
+
+`IsolatedRuntime` already refuses an inspector config, and its worker's sandbox denies network
+sockets. The minimal build is defence in depth (no listener code or network crates in the
+binary), not a fix for a reachable hole. CI builds it on every push (`minimal-build` in
+`.github/workflows/test.yml`), runs the isolated-runtime suites against it, and prints its size
+and dependency difference.
+
 ## Next Steps
 
 - Learn about [Snapshots](snapshots.md) to pre-load code for faster debugging
