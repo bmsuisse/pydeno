@@ -423,11 +423,13 @@ class SessionPool:
             entry.gone = True
             sandbox, entry.sandbox = entry.sandbox, None
         try:
+            if (
+                sandbox is not None
+            ):  # first: it is out of the map, nothing else will close it
+                await sandbox.close()
             counter = await self._stored_counter(owner, session_id)
             if entry is not None:
                 counter = max(counter, entry.counter)
-            if sandbox is not None:
-                await sandbox.close()
             await self._store.delete(self._journal_key(owner, session_id))
             await self._store.set(
                 self._counter_key(owner, session_id),

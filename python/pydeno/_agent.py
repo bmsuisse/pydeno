@@ -2637,16 +2637,23 @@ def _prelude(
   const forEach = call(Set.prototype.forEach);
   const size = call(Object.getOwnPropertyDescriptor(Set.prototype, "size").get);
   const push = call(Array.prototype.push);
-  const shift = call(Array.prototype.shift);
   const allSettled = Promise.allSettled.bind(Promise);
   const NewPromise = Promise;
   const inflight = new Set();
   const limit = {limit};
-  const waiting = [];
+  // Waiting calls as a linked list of object literals: own data properties only, so nothing a
+  // guest plants on `Array.prototype` or `Object.prototype` sees (or swaps) a queued call.
+  let head = null;
+  let tail = null;
   let active = 0;
   const release = () => {{
     active--;
-    if (waiting.length && active < limit) shift(waiting)();
+    if (head !== null && active < limit) {{
+      const next = head;
+      head = next.next;
+      if (head === null) tail = null;
+      next.run();
+    }}
   }};
   const issue = (raw, args) => {{
     active++;
@@ -2657,7 +2664,9 @@ def _prelude(
   }};
   const track = (raw, name) => ({{ [name](...args) {{
     const p = active < limit ? issue(raw, args) : new NewPromise((resolve, reject) => {{
-      push(waiting, () => {{ try {{ resolve(issue(raw, args)); }} catch (e) {{ reject(e); }} }});
+      const node = {{ run: () => {{ try {{ resolve(issue(raw, args)); }} catch (e) {{ reject(e); }} }}, next: null }};
+      if (tail === null) {{ head = node; }} else {{ tail.next = node; }}
+      tail = node;
     }});
     add(inflight, p);
     const done = () => {{ remove(inflight, p); }};
