@@ -64,7 +64,9 @@ def test_integer_likes_are_accepted_as_counts() -> None:
 
 
 @pytest.mark.parametrize(
-    "value", [1e300, 10**400, Decimal("1e400")], ids=["1e300", "10**400", "Decimal1e400"]
+    "value",
+    [1e300, 10**400, Decimal("1e400")],
+    ids=["1e300", "10**400", "Decimal1e400"],
 )
 @pytest.mark.parametrize("name", ["request_timeout", "max_host_wait", "timeout_grace"])
 def test_huge_durations_are_a_value_error(name: str, value: object) -> None:
@@ -277,7 +279,9 @@ async def test_a_slow_async_tool_still_pauses_the_async_runtime_deadline() -> No
         assert await rt.eval("slow()") == 1
 
 
-async def test_console_during_an_async_tool_does_not_eat_the_console_allowance() -> None:
+async def test_console_during_an_async_tool_does_not_eat_the_console_allowance() -> (
+    None
+):
     # While a tool is in flight the deadline is paused anyway; console time then is not charged to
     # the console allowance (it would otherwise be counted twice).
     async def slow() -> int:

@@ -75,7 +75,6 @@ from ._isolated import (
     _limit_int,
     _limit_seconds,
     _revoked_handler,
-    _seconds,
     _session_options,
     _start_worker,
     _terminate_process,
@@ -688,7 +687,7 @@ class AsyncIsolatedRuntime:
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # See IsolatedRuntime: a catchable RangeError instead of an RSS kill.
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
-        self._soft_timeout = _seconds(config.timeout)
+        self._soft_timeout = _limit_seconds("RuntimeConfig.timeout", config.timeout)
         self._max_memory = max_memory
         self._host_calls = 0
         self._request_timeout: float | None | Any
@@ -1459,9 +1458,18 @@ class AsyncIsolatedRuntime:
                 f"guest made more than max_host_calls={self._max_host_calls} host calls"
             )
         handler, is_async = entry
-        if self._max_inflight is not None and (
-            pump.outstanding >= self._max_inflight
-            or self._async_inflight >= self._max_inflight
+        # Console output is the guest's own work, not a tool call: it pauses the deadline only
+        # within the command's console allowance (see `_Pump`). It is synchronous (the worker waits
+        # for it), so it is never one of the calls in flight and the in-flight cap does not refuse
+        # it; `max_host_calls` still counts it (above).
+        console = hid == self._options.get("console_hid")
+        if (
+            not console
+            and self._max_inflight is not None
+            and (
+                pump.outstanding >= self._max_inflight
+                or self._async_inflight >= self._max_inflight
+            )
         ):
             await self._send_reply(
                 {
@@ -1473,13 +1481,12 @@ class AsyncIsolatedRuntime:
                 None,
             )
             return
-        # Console output is the guest's own work, not a tool call: its handling time is charged to
-        # the guest (see IsolatedRuntime._on_call), so the deadline is not paused for it.
-        console = hid == self._options.get("console_hid")
-        if not console:
+        if console:
+            pump.begin_console()
+        else:
             pump.begin_call()
         loop = asyncio.get_running_loop()
-        if is_async:
+        if is_async and not console:
             self._async_inflight += 1
             # `create_task` copies the current context, which is the caller's: the handler sees
             # the caller's contextvars.
@@ -1500,8 +1507,12 @@ class AsyncIsolatedRuntime:
             self._redact,
             self._serial,
         )
-        frame = await self._await_or_death(fut)
-        await self._send_reply(frame, None if console else pump)
+        try:
+            frame = await self._await_or_death(fut)
+            await self._send_reply(frame, None if console else pump)
+        finally:
+            if console:
+                pump.end_console()
 
     async def _async_call(
         self, handler: Callable[..., Any], args: list[Any], cid: int, pump: _Pump

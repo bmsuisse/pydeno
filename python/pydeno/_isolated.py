@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import _sandbox, _wire
+from ._limits import limit_int, limit_seconds
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_RESULT_BYTES,
@@ -273,37 +274,8 @@ def _seconds(value: float | int | timedelta | None) -> float | None:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
-def _limit_seconds(
-    name: str, value: float | int | timedelta | None, *, allow_zero: bool = False
-) -> float | None:
-    """A duration limit: None, or a finite number of seconds (> 0, or >= 0 with `allow_zero`).
-
-    A limit is a comparison, and every comparison with NaN is false: a NaN deadline never fires,
-    silently. Infinity is a unit mistake or a config typo, not a way to say "no limit" (that is
-    None). Python's `json` parses both, so they can come from a configuration file."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float, timedelta)):
-        raise TypeError(f"{name} must be a number of seconds, a timedelta, or None")
-    seconds = _seconds(value)
-    assert seconds is not None
-    if not math.isfinite(seconds) or seconds < 0 or (seconds == 0 and not allow_zero):
-        raise ValueError(
-            f"{name} must be a finite number of seconds "
-            f"{'>= 0' if allow_zero else '> 0'}, or None (got {seconds!r})"
-        )
-    return seconds
-
-
-def _limit_int(name: str, value: Any, *, minimum: int) -> int | None:
-    """A count limit: None or an int >= `minimum` (never a bool, a float or NaN)."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{name} must be an int or None")
-    if value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}")
-    return value
+_limit_seconds = limit_seconds
+_limit_int = limit_int
 
 
 # The options that only the parent enforces: none of them reaches the worker, so a worker started
@@ -376,6 +348,12 @@ class _Pump:
       always keeping one asynchronous call in flight;
     - a cap on the **CPU the worker burns**, which is the one thing a guest cannot hide:
       computing costs CPU whether or not a callback is outstanding.
+
+    Console output is not a tool call: it is the guest's own work, but the host's handling of it
+    (a slow terminal, a log shipper) is not. So console time pauses the deadline only up to an
+    allowance of one hard deadline per command: one slow write does not kill a run, and a flood
+    of them can at most double it (it used to stretch it up to `max_host_wait`). Console time
+    while a tool call is outstanding is covered by that call's pause and not charged twice.
     """
 
     __slots__ = (
@@ -388,6 +366,9 @@ class _Pump:
         "_outstanding",
         "_paused_at",
         "_paused_total",
+        "_console_at",
+        "_console_left",
+        "_resumed_at",
         "_lock",
     )
 
@@ -411,6 +392,9 @@ class _Pump:
         self._outstanding = 0
         self._paused_at = 0.0
         self._paused_total = 0.0
+        self._console_at = 0.0  # when the console call in progress began (0: none)
+        self._console_left = hard_timeout  # the console allowance still unspent
+        self._resumed_at = 0.0  # when the last tool pause ended
         self._lock = threading.Lock()
 
     @property
@@ -428,16 +412,37 @@ class _Pump:
         with self._lock:
             self._outstanding -= 1
             if self._outstanding == 0:
-                paused = time.monotonic() - self._paused_at
+                now = self._resumed_at = time.monotonic()
+                paused = now - self._paused_at
                 self._paused_total += paused
                 if self.deadline is not None:
                     self.deadline += paused
+
+    def begin_console(self) -> None:
+        with self._lock:
+            self._console_at = time.monotonic()
+
+    def end_console(self) -> None:
+        with self._lock:
+            grant = self._console_grant(time.monotonic())
+            if self.deadline is not None and grant:
+                self.deadline += grant
+                self._console_left -= grant  # type: ignore[operator]
+            self._console_at = 0.0
+
+    def _console_grant(self, now: float) -> float:
+        """How much of the console call in progress pauses the deadline (lock held)."""
+        if not self._console_at or self._console_left is None or self._outstanding:
+            return 0.0
+        spent = now - max(self._console_at, self._resumed_at)
+        return max(0.0, min(spent, self._console_left))
 
     def expired(self) -> bool:
         with self._lock:
             if self.deadline is None or self._outstanding:
                 return False
-            return time.monotonic() > self.deadline
+            now = time.monotonic()
+            return now > self.deadline + self._console_grant(now)
 
     def waited_too_long(self) -> bool:
         """Has the guest spent more than `max_host_wait` waiting on host callbacks?"""
@@ -562,7 +567,7 @@ class IsolatedRuntime:
             # survives. (No default heap cap: with one, V8 turns an over-cap allocation into a
             # fatal "heap limit exceeded" instead of that RangeError.)
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
-        self._soft_timeout = _seconds(config.timeout)
+        self._soft_timeout = _limit_seconds("RuntimeConfig.timeout", config.timeout)
         self._max_memory = max_memory
         self._host_calls = 0
         # `_request_timeout` has three states: unset (soft timeout + grace, else a default
@@ -1164,6 +1169,18 @@ class IsolatedRuntime:
         # All the arguments under one budget: decoding each on its own would multiply the limit
         # by the argument count.
         decoded = args  # `loads_decoded` already decoded them, under one shared budget
+        if hid == self._options.get("console_hid"):
+            # Console output is the guest's own work, not a tool call: it pauses the deadline
+            # only within the command's console allowance (see `_Pump`), not up to
+            # `max_host_wait`. It is synchronous (the worker waits for it), so it is never one of
+            # the calls in flight, and the in-flight cap does not refuse it; `max_host_calls`
+            # still counts it (above).
+            pump.begin_console()
+            try:
+                self._run_sync_handler(handler, decoded, cid, None)
+            finally:
+                pump.end_console()
+            return
         if self._max_inflight is not None and (
             pump.outstanding >= self._max_inflight
             or self._async_inflight >= self._max_inflight
@@ -1180,12 +1197,6 @@ class IsolatedRuntime:
                 },
                 None,
             )
-            return
-        if hid == self._options.get("console_hid"):
-            # Console output is the guest's own work, not a tool call: the time the host spends on
-            # it is charged to the guest. Pausing the deadline here would let a console flood
-            # stretch it by however slow the host's console handling is, up to `max_host_wait`.
-            self._run_sync_handler(handler, decoded, cid, None)
             return
         pump.begin_call()
         if is_async and pump.loop is not None:

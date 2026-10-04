@@ -339,7 +339,7 @@ class AsyncAgentSandbox(_SessionBase):
         self._core = _Core(
             rt,
             next(_SESSION_IDS),
-            max_tool_calls,
+            self._max_tool_calls,
             console=sink,
             max_output_bytes=max_output_bytes,
             max_result_bytes=max_result_bytes,

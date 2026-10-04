@@ -3,8 +3,11 @@
 A limit is a comparison: `elapsed > deadline`, `rss > max_memory`. Against NaN every comparison is
 false, so a NaN deadline, memory ceiling or call cap is a limit that never fires, and the runtime
 says nothing. Python's `json` module parses `NaN` and `Infinity`, so such a value can arrive from
-a configuration file. Every layer that takes a limit refuses one that is not a finite number in
-range, before any worker starts."""
+a configuration file. The layers tested here (`IsolatedRuntime`, `AsyncIsolatedRuntime`, pool
+`checkout()`, `AgentSandbox`) refuse a limit that is not a finite number in range when it is given,
+before it is used: at construction (before a worker starts, except for `AgentSandbox(runtime=...)`,
+whose worker the caller already started) or at checkout. `tests/test_limit_values_review.py` covers
+the async pools and sessions, `SessionPool`, the front door and per-call timeouts."""
 
 from __future__ import annotations
 
