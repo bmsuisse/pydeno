@@ -455,6 +455,89 @@ fn to_js(result: Py<PyAny>, limits: &SerializationLimits) -> Result<JSValue, JsE
     Python::attach(|py| python_to_js_value(result.into_bound(py), limits).map_err(map_pyerr))
 }
 
+/// Most index properties one value may list when it is converted, whatever the serialization
+/// budget: listing them is one native call that termination cannot interrupt, so its cost must
+/// not grow with a budget the caller raised for other reasons.
+pub(crate) const MAX_INDEXED_ELEMENTS: usize = 1 << 20;
+
+/// Proxy chains longer than this are refused: nothing legitimate nests that deep.
+const MAX_PROXY_CHAIN: usize = 64;
+
+/// The innermost target of `value` if it is a Proxy (else `value` itself), found natively.
+///
+/// A value crossing the boundary is converted as its target, and no trap runs: a trap could grow
+/// a resizable buffer after its size was checked, hide an Array from the metered array branch,
+/// or answer `ownKeys` with `[]` while V8 lists the whole target natively to check the
+/// invariants, and the converter cannot interrupt any of that. The target is exactly what the
+/// guest could have returned itself.
+pub(crate) fn proxy_target<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let mut current = value;
+    let mut links = 0;
+    while let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(current) {
+        links += 1;
+        if links > MAX_PROXY_CHAIN {
+            return Err(format!(
+                "Cannot serialize a value behind more than {MAX_PROXY_CHAIN} Proxies \
+                 (Proxy chain too deep)"
+            ));
+        }
+        if proxy.is_revoked() {
+            return Err("Cannot serialize a revoked Proxy".to_string());
+        }
+        current = proxy.get_target(scope);
+    }
+    Ok(current)
+}
+
+/// `proxy_target` for the bridge's argument copy (`prepare` in the bridge script), which has no
+/// other way to see through a Proxy without running its traps.
+#[op2]
+fn op_pydeno_proxy_target<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<v8::Local<'s, v8::Value>, JsErrorBox> {
+    proxy_target(scope, value).map_err(JsErrorBox::type_error)
+}
+
+/// How many index properties listing `value`'s own keys produces without them being stored: a
+/// typed array's element count, or a boxed string's length. Callers unwrap a Proxy first
+/// (`proxy_target`). Runs no guest code: a typed array's length and the type checks are native,
+/// and a `String` object's `length` is its own non-configurable data property, which nothing can
+/// shadow.
+pub(crate) fn indexed_length(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> usize {
+    let current = value;
+    if let Ok(typed_array) = v8::Local::<v8::TypedArray>::try_from(current) {
+        return typed_array.length();
+    }
+    if current.is_string_object() {
+        let Ok(object) = v8::Local::<v8::Object>::try_from(current) else {
+            return 0;
+        };
+        let length = v8::String::new(scope, "length").and_then(|key| object.get(scope, key.into()));
+        if let Some(length) = length.filter(|length| length.is_number()) {
+            return length.number_value(scope).unwrap_or(0.0).max(0.0) as usize;
+        }
+    }
+    0
+}
+
+/// `indexed_length` for the bridge's argument copy (`prepare` in the bridge script), which has no
+/// native way to read a boxed string's length.
+#[op2]
+fn op_pydeno_indexed_length<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    value: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let length = indexed_length(scope, value);
+    v8::Number::new(scope, length as f64).into()
+}
+
 /// Synchronously call a Python handler from JavaScript.
 #[op2]
 #[serde]
@@ -577,6 +660,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const BigIntToString = uncurry(BigInt.prototype.toString);
   const SetForEach = uncurry(Set.prototype.forEach);
   const SetAdd = uncurry(Set.prototype.add);
+  const IndexedLength = ops.op_pydeno_indexed_length;
+  const ProxyTarget = ops.op_pydeno_proxy_target;
   const PromiseThen = uncurry(Promise.prototype.then);
   const DateCtor = Date;
   const SetCtor = Set;
@@ -625,6 +710,12 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   function prepare(value, path, depth) {
     const at = path === undefined ? "argument" : path;
     const level = depth === undefined ? 0 : depth;
+    // A Proxy crosses as its innermost target, found natively, and none of its traps runs: a trap
+    // could grow a buffer after its size was checked, or make `Object.entries` list a whole target
+    // natively while answering `[]`. Throws for a revoked Proxy or a chain too deep.
+    if (IsProxy(value)) {
+      value = ProxyTarget(value);
+    }
     if (typeof value === "function") {
       rejectFunction(at);
     }
@@ -677,6 +768,18 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       return { __pydeno_type: "BigInt", value: BigIntToString(value) };
     }
     if (typeof value === "object") {
+      // A boxed string, or a typed array behind a Proxy (a bare one is a view, handled above),
+      // lists one entry per element in one native `Object.entries` call that termination cannot
+      // interrupt: charge the count before that call, not after. The count comes from native
+      // code that looks through Proxies without running their traps.
+      const indexed = IndexedLength(value);
+      if (indexed > MAX_ARG_NODES - argNodes) {
+        throw new RangeErrorCtor(
+          "Host tool argument is too large (an indexed object of " +
+            (indexed > MAX_ARG_NODES ? "more than " + MAX_ARG_NODES : indexed) +
+            " elements)"
+        );
+      }
       const result = {};
       // Indexed loops, not `for...of` or destructuring: those go through
       // `Array.prototype[Symbol.iterator]`, which the guest can replace.
@@ -1417,6 +1520,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
             op_pydeno_call_python_async(),
             op_pydeno_stream_pull_py(),
             op_pydeno_stream_cancel_py(),
+            op_pydeno_indexed_length(),
+            op_pydeno_proxy_target(),
             op_pydeno_buffer_charge(),
         ]),
         js_files: std::borrow::Cow::Owned(vec![ExtensionFileSource::new(
