@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Refuse isolated worker startup when the supervisor lacks signal authority, in every sandbox
+  mode. `sandbox_status().termination` reports a hardened-child termination probe; refusal is
+  classified as non-retryable `sandbox_unavailable` (#71).
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change

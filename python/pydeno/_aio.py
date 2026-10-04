@@ -833,6 +833,7 @@ class AsyncIsolatedRuntime:
                 (self._rtransport, self._wtransport),
             )
             await self._handshake()
+            await self._check_termination_authority()
             await self._check_limits_can_be_enforced()
         except BaseException:
             self._kill()
@@ -901,6 +902,21 @@ class AsyncIsolatedRuntime:
         except WorkerCrashed:
             self._kill()
             raise
+
+    async def _check_termination_authority(self) -> None:
+        try:
+            os.kill(self._proc.pid, 0)
+        except OSError:
+            # Startup already holds a start slot; close() would acquire it again. No guest
+            # command has run, so the trusted worker can exit through the close protocol.
+            try:
+                self._write(_CLOSE_FRAME)
+            except OSError:
+                pass
+            await self._wait_exit(_CLOSE_GRACE_SECONDS)
+            raise WorkerCrashed(
+                "worker failed to start: supervisor termination authority is unavailable"
+            ) from None
 
     async def _check_limits_can_be_enforced(self) -> None:
         """As `IsolatedRuntime._check_limits_can_be_enforced`: a limit that cannot be measured

@@ -587,6 +587,7 @@ class IsolatedRuntime:
         self._revoked_hids: dict[int, None] = {}
         _LIVE.add(self)
         self._handshake()
+        self._check_termination_authority()
         self._check_limits_can_be_enforced()
         if prewarm and python is None:
             _refill_spare()
@@ -600,6 +601,19 @@ class IsolatedRuntime:
         ).start()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _check_termination_authority(self) -> None:
+        # Check the actual worker after its privilege drop and confinement, before guest code
+        # can run. Even sandbox='off' promises parent-enforced time and resource limits.
+        try:
+            os.kill(self._proc.pid, 0)
+        except OSError:
+            # The trusted worker is still waiting for its first command. Let it exit through
+            # the protocol: a kill fallback cannot be relied upon in this configuration.
+            self.close()
+            raise WorkerCrashed(
+                "worker failed to start: supervisor termination authority is unavailable"
+            ) from None
 
     def _apply_session(self, options: dict[str, Any]) -> None:
         """Install `_session_options(...)` on a runtime nobody has used yet (a pool checkout)."""
