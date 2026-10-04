@@ -209,6 +209,9 @@ _PATH_CHARS = re.compile(r"[A-Za-z0-9\-._~!$&'()*+,;=:@/%]*")
 _QUERY_CHARS = re.compile(r"[A-Za-z0-9\-._~!$&'()*+,;=:@/%?]*")
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _ENCODED_SEPARATOR = re.compile(r"%(2[Ff]|5[Cc])")
+_PATH_PARAMS = re.compile(r";|%3[Bb]")
+_AMBIGUOUS_ESCAPE = re.compile(r"%(25|00)")
+_DOTS = re.compile(r"\.+")
 _LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 _NUMERIC_LABEL = re.compile(r"0x[0-9a-f]*|[0-9]+")
 
@@ -273,11 +276,25 @@ def _parse(url: object, schemes: frozenset[str], max_length: int) -> _Target:
         raise HttpFetchBlocked("the URL query contains characters that are not allowed")
     if _BAD_ESCAPE.search(path) or _BAD_ESCAPE.search(query):
         raise HttpFetchBlocked("the URL contains a malformed percent escape")
+    _check_path(path)
+    return _Target(scheme, host, port, explicit, path, query, is_ip)
+
+
+def _check_path(path: str) -> None:
+    """Refuse a path that two parties could read as two different paths."""
     if _ENCODED_SEPARATOR.search(path):
         raise HttpFetchBlocked("the URL path contains an encoded '/' or '\\'")
-    if any(unquote(seg) in (".", "..") for seg in path.split("/")):
+    # Backends disagree about the path: some strip `;params` from each segment (`/v1/..;/admin`
+    # is `/v1/../admin` to them), some decode twice (`%252e` is `.`), some stop at NUL. The
+    # prefix check only holds if every party reads the path the same way, so these are refused.
+    if _PATH_PARAMS.search(path):
+        raise HttpFetchBlocked(
+            "the URL path contains ';' (path parameters are not allowed)"
+        )
+    if _AMBIGUOUS_ESCAPE.search(path):
+        raise HttpFetchBlocked("the URL path contains '%25' or '%00'")
+    if any(_DOTS.fullmatch(unquote(seg)) for seg in path.split("/")):
         raise HttpFetchBlocked("the URL path contains '.' or '..' segments")
-    return _Target(scheme, host, port, explicit, path, query, is_ip)
 
 
 def _authority(authority: str) -> tuple[str, int | None, bool, bool]:
@@ -456,6 +473,12 @@ _TOKEN = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")
 _MAX_HEADER_VALUE = 1024
 
+# Threads for name resolution, shared by every `HttpFetch` in the process. The system resolver
+# cannot be cancelled: a lookup that outlives its caller's deadline keeps its thread until the OS
+# gives up (often 10-30 s), and while all of them are busy, new lookups queue behind them (each
+# caller still gets `HttpFetchTimeout` at its own deadline). Set before the first request.
+DNS_THREADS = 8
+
 _dns_pool: concurrent.futures.ThreadPoolExecutor | None = None
 _dns_pool_lock = threading.Lock()
 
@@ -465,7 +488,7 @@ def _dns_executor() -> concurrent.futures.ThreadPoolExecutor:
     with _dns_pool_lock:
         if _dns_pool is None:
             _dns_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=8, thread_name_prefix="pydeno-http-fetch-dns"
+                max_workers=DNS_THREADS, thread_name_prefix="pydeno-http-fetch-dns"
             )
         return _dns_pool
 
@@ -631,6 +654,10 @@ class HttpFetch:
         # `urljoin` silently drops tabs and newlines and strips whitespace; a Location that holds
         # any goes to the parser unjoined, which refuses it.
         if not _BAD_CHARS.search(location) and location.isascii():
+            # A relative reference is joined (and its dot segments resolved) by `urljoin`, so
+            # check its own path first: `/v1;/../admin` must not become an innocent `/admin`.
+            if not _URL.fullmatch(location) and not location.startswith("//"):
+                _check_path(re.split(r"[?#]", location, maxsplit=1)[0])
             location = urljoin(current.url, location)
         new = self._target(location)
         if current.scheme == "https" and new.scheme != "https":
@@ -850,7 +877,10 @@ def http_fetch(
         resolver: ``resolver(host, port) -> iterable of IP strings``, replacing the system
             resolver. Its answers are vetted exactly like the system's.
         ssl_context: TLS context for ``https`` (a private CA, say). Defaults to
-            ``ssl.create_default_context()``.
+            ``ssl.create_default_context()``. Keep ``check_hostname=True`` and
+            ``verify_mode=CERT_REQUIRED``: the connection is still pinned to the vetted IP
+            without them, but nothing then proves the server at that IP is the allow-listed
+            host, so the DNS-rebinding defence no longer covers *which* server answers.
 
     Returns:
         An :class:`HttpFetch`: a sync callable; ``.aio`` is the async form.

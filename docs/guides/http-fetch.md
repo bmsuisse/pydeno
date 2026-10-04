@@ -86,7 +86,7 @@ issuing the request again.
 | `response` | `"text"` | Or `"bytes"` |
 | `response_headers` | see above | Response header names passed back |
 | `resolver` | system | `resolver(host, port) -> [ip, ...]`; its answers are vetted like the system's |
-| `ssl_context` | `ssl.create_default_context()` | For a private CA, say |
+| `ssl_context` | `ssl.create_default_context()` | For a private CA, say. Keep host name verification on (see the limits below) |
 
 **Allow entries** are matched exactly:
 
@@ -116,8 +116,11 @@ What every request, and every redirect hop, goes through:
    control characters are refused outright, so a CR/LF cannot inject a header or a second request
    (percent-encoded `%0D%0A` stays encoded on the wire). Refused as well: userinfo
    (`https://user:pass@host/`, `https://allowed@evil/`), IPv6 zone ids, a port that is out of
-   range or not the entry's, `.`/`..` path segments (also percent-encoded) and encoded `/` or `\`
-   in the path, which servers decode differently and could use to step out of a path prefix.
+   range or not the entry's, and anything in the path that two servers could read differently and
+   use to step out of a path prefix: `.`/`..` segments (also percent-encoded, and in a relative
+   redirect before it is joined), encoded `/` or `\`, `;` path parameters (`/v1/..;/admin` is
+   `/admin` to backends that strip them), `%25` (decoded twice, `%252e` is `.`) and `%00`. A `;`
+   in the query string is fine.
 2. **Numeric hosts in one form only.** Browsers and libraries read `2130706433`, `0177.0.0.1`,
    `0x7f.1` and `127.1` as `127.0.0.1`. A host whose last label is numeric must be a canonical
    dotted-decimal IPv4 address, so no two parsers can disagree about which address it names.
@@ -162,11 +165,21 @@ What every request, and every redirect hop, goes through:
   send what it knows to an allowed host. If that matters, allow only hosts you trust with the
   session's data.
 - **Request methods other than GET**, request bodies and cookies: not supported.
-- **Resolver slowness.** The system resolver cannot be cancelled: a lookup that runs past the
-  deadline raises `HttpFetchTimeout` in the caller, while the lookup itself finishes in a
-  background thread (at most 8 at a time per process).
+- **Resolver slowness.** The system resolver cannot be cancelled. Lookups run on a pool shared by
+  every `HttpFetch` in the process (`pydeno.tools.http_fetch.DNS_THREADS`, 8 by default, read when
+  the first lookup starts). A lookup that runs past the deadline raises `HttpFetchTimeout` in its
+  caller, but keeps its thread until the OS resolver gives up, often 10 to 30 seconds. So an
+  allow-listed name whose DNS is broken or hangs can occupy the pool and delay every `HttpFetch`
+  in the process by up to the resolver timeout; each caller still gets `HttpFetchTimeout` at its
+  own deadline, never a hang. Only allow-listed host names are ever resolved (the allow-list check
+  comes first), so the guest cannot pick arbitrary names to stall the pool with. Pass
+  `resolver=` if you need a resolver with its own timeout.
 - **TLS policy** is Python's default context (system trust store, certificate and host name
-  verification, TLS 1.2 minimum). Pass `ssl_context=` to change it.
+  verification, TLS 1.2 minimum). Pass `ssl_context=` to change it. The DNS-rebinding defence has
+  two halves: the socket goes to the vetted IP, and the certificate proves that the server there
+  is the allow-listed host. A context with `check_hostname=False` or `verify_mode=CERT_NONE` keeps
+  the first and loses the second: the connection still goes only to a vetted public address, but
+  nothing checks which server answers there.
 - **Plain `http`** (when you add it to `schemes`) is readable and modifiable by anyone on the path.
 
 The checks are tested against a local server (`tests/test_http_fetch.py`): redirects to another

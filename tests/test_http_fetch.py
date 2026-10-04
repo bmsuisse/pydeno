@@ -329,6 +329,28 @@ class TestPublicDefaults:
 # allow-list
 # ---------------------------------------------------------------------------
 
+# Paths that a backend stripping `;params` (Tomcat, Jetty, Spring), decoding twice, or stopping at
+# NUL would read as something outside `/v1/`, while the raw string starts with `/v1/`.
+PREFIX_BYPASSES = [
+    "/v1/..;/admin",
+    "/v1/..;x=1/admin",
+    "/v1/%2e%2e;/admin",
+    "/v1/%2E%2E;/admin",
+    "/v1/..%3b/admin",
+    "/v1/..%3B/admin",
+    "/v1/%2e%2e%3B/admin",
+    "/v1/.;/ok",
+    "/v1;/../admin",
+    "/v1/ok;jsessionid=1",
+    "/v1/%252e%252e/admin",
+    "/v1/%252E%252E/admin",
+    "/v1/%25%32%65%25%32%65/admin",
+    "/v1/%252f..%252fadmin",
+    "/v1/..%00/admin",
+    "/v1/%2e%2e%00/admin",
+    "/v1/.../admin",
+]
+
 
 class TestAllowList:
     @pytest.mark.parametrize(
@@ -375,6 +397,30 @@ class TestAllowList:
         tool = make([f"fetch.test:{server.port}/v1/"])
         blocked(tool, f"http://fetch.test:{server.port}{path}")
         assert server.requests == []
+
+    @pytest.mark.parametrize("path", PREFIX_BYPASSES)
+    def test_path_parameter_and_double_decoding_bypasses(
+        self, server: Server, path: str
+    ) -> None:
+        tool = make([f"fetch.test:{server.port}/v1/"])
+        blocked(tool, f"http://fetch.test:{server.port}{path}")
+        assert server.requests == []
+
+    @pytest.mark.parametrize("path", PREFIX_BYPASSES)
+    def test_bypasses_refused_in_a_redirect(self, server: Server, path: str) -> None:
+        from urllib.parse import quote
+
+        tool = make([f"fetch.test:{server.port}/"])
+        loc = quote(f"http://fetch.test:{server.port}{path}", safe="")
+        blocked(tool, f"http://fetch.test:{server.port}/to?loc={loc}")
+        blocked(tool, f"http://fetch.test:{server.port}/to?loc={quote(path, safe='')}")
+        assert (
+            len(server.requests) == 2
+        )  # only the two redirecting responses were fetched
+
+    def test_semicolon_in_the_query_is_fine(self, server: Server) -> None:
+        tool = make([f"fetch.test:{server.port}/v1/"])
+        assert tool(f"http://fetch.test:{server.port}/v1/ok?a=1;b=2")["status"] == 200
 
     @pytest.mark.parametrize(
         "entry",
