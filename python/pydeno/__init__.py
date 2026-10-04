@@ -41,6 +41,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         describe_tools,
         typescript_stubs,
     )
+    from ._aio import AsyncIsolatedRuntime
     from ._isolated import IsolatedRuntime, WorkerCrashed
     from ._result import ExecutionResult, ResultTooLarge
     from ._schema import SchemaTool
@@ -68,6 +69,7 @@ _LAZY = {
     "ExecutionResult": "_result",
     "ResultTooLarge": "_result",
     "SchemaTool": "_schema",
+    "AsyncIsolatedRuntime": "_aio",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
     "WEB_POLYFILLS": "_polyfills",
@@ -357,6 +359,7 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
 
 
 __all__ = [
+    "AsyncIsolatedRuntime",
     "eval",
     "eval_async",
     "get_default_runtime",

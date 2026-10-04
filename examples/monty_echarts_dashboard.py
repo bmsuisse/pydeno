@@ -202,8 +202,8 @@ globalThis.buildDashboard = (width, height) => {
   const days = Array.from({ length: d.days }, (_, i) => i);
 
   const line = render({
-    title: { text: 'Daily metric: 7-day moving average, anomalies flagged' },
-    legend: { top: 28 },
+    title: { text: 'Daily metric: 7-day moving average, anomalies flagged', textStyle: { fontSize: 14 } },
+    legend: { top: 34 },
     grid: { top: 70, left: 60, right: 20, bottom: 40 },
     xAxis: { type: 'value', name: 'day', min: 0, max: d.days - 1 },
     yAxis: { type: 'value', scale: true },
@@ -221,8 +221,8 @@ globalThis.buildDashboard = (width, height) => {
   });
 
   const bar = render({
-    title: { text: 'Weekly totals by region' },
-    legend: { top: 28 },
+    title: { text: 'Weekly totals by region', textStyle: { fontSize: 14 } },
+    legend: { top: 34 },
     grid: { top: 70, left: 70, right: 20, bottom: 40 },
     xAxis: { type: 'category', name: 'week', data: d.weekly[0].map((_, w) => w + 1) },
     yAxis: { type: 'value' },
@@ -233,7 +233,7 @@ globalThis.buildDashboard = (width, height) => {
   d.correlation.forEach((row, i) => row.forEach((v, j) => cells.push([j, i, v])));
   const min = Math.min(...cells.map((c) => c[2]));
   const heat = render({
-    title: { text: 'Correlation between regions' },
+    title: { text: 'Correlation between regions', textStyle: { fontSize: 14 } },
     grid: { top: 60, left: 70, right: 90, bottom: 40 },
     xAxis: { type: 'category', data: d.regions, splitArea: { show: true } },
     yAxis: { type: 'category', data: d.regions, splitArea: { show: true } },
@@ -245,7 +245,7 @@ globalThis.buildDashboard = (width, height) => {
   });
 
   const pie = render({
-    title: { text: 'Share of total volume' },
+    title: { text: 'Share of total volume', textStyle: { fontSize: 14 } },
     legend: { bottom: 4 },
     series: [{
       type: 'pie', radius: ['35%', '65%'], center: ['50%', '50%'],

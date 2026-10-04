@@ -319,8 +319,8 @@ class TestTypescript:
                 [WEATHER, ORDER], namespace="api"
             )
 
+    @pytest.mark.needs_pydantic_ai
     def test_the_integration_still_exports_schema_tools_to_dts(self) -> None:
-        pytest.importorskip("pydantic_ai")
         from pydeno.integrations.pydantic_ai import js_tool_names, schema_tools_to_dts
 
         assert js_tool_names(["a-b"]) == {"a-b": "a_b"}

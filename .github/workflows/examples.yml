@@ -1,0 +1,135 @@
+name: Examples
+
+# Runs all nine Monty + pydeno examples against the *published* package, checks every artefact is valid,
+# and keeps what they produce (.glb, .svg, .html, .pptx and a timing table) as a workflow artifact. After a
+# release it also attaches them to the GitHub Release, so the release page shows what this version can do.
+#
+#  * after "Publish to PyPI" succeeds for a release tag  -> installs that exact version, attaches to the release
+#  * manually (workflow_dispatch)                          -> any version, or the latest
+#  * on pull requests that touch the examples              -> the latest published pydeno, as a smoke test
+
+on:
+  workflow_run:
+    workflows: ["Publish to PyPI"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "pydeno version to install (empty = latest)"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - "examples/**"
+      - "scripts/run_examples.py"
+      - "vendor/libs/**"
+      - ".github/workflows/examples.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: examples-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    # a failed publish has nothing to test
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    name: examples (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      EVENT: ${{ github.event_name }}
+      RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+      DISPATCH_VERSION: ${{ github.event.inputs.version }}
+    steps:
+      - name: Work out which version to install
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=""
+          if [ "$EVENT" = "workflow_run" ]; then
+            # the release tag, e.g. v0.6.0; refuse anything that is not exactly that shape
+            [[ "$RUN_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: $RUN_TAG"; exit 1; }
+            version="${RUN_TAG#v}"
+            echo "ref=$RUN_TAG" >> "$GITHUB_OUTPUT"
+          elif [ -n "${DISPATCH_VERSION:-}" ]; then
+            [[ "$DISPATCH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version: $DISPATCH_VERSION"; exit 1; }
+            version="$DISPATCH_VERSION"
+            echo "ref=v$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.ver.outputs.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pydeno and Monty
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          spec="pydeno"
+          if [ -n "$VERSION" ]; then spec="pydeno==$VERSION"; fi
+          # A release's wheels can take a minute to show up on the index after the publish job finishes.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if python -m pip install "$spec" pydantic-monty; then break; fi
+            echo "attempt $attempt: $spec is not installable yet; waiting"
+            sleep 30
+            if [ "$attempt" = 10 ]; then exit 1; fi
+          done
+          python -c "import importlib.metadata as m; print('pydeno', m.version('pydeno'))"
+
+      - name: Run the examples
+        shell: bash
+        run: python scripts/run_examples.py --out out
+
+      - name: Show the results
+        if: always()
+        shell: bash
+        run: |
+          if [ -f out/results.md ]; then cat out/results.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pydeno-examples-${{ matrix.os }}
+          path: out/
+          if-no-files-found: warn
+
+  attach:
+    # Only for a release (after publishing, or a manual run that names a version): put the Linux results
+    # on that release's page.
+    needs: run
+    if: github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RUN_TAG: ${{ github.event.workflow_run.head_branch || (github.event.inputs.version && format('v{0}', github.event.inputs.version)) }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pydeno-examples-ubuntu-latest
+          path: out/
+      - name: Attach to the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RUN_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a release tag: $RUN_TAG"; exit 1; }
+          (cd out && zip -qr "../pydeno-examples-${RUN_TAG}.zip" .)
+          gh release upload "$RUN_TAG" "pydeno-examples-${RUN_TAG}.zip" --clobber

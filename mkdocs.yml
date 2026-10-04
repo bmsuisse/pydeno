@@ -47,6 +47,7 @@ nav:
           - pydantic-ai code mode: guides/pydantic-ai.md
           - Advanced:
               - Isolated runtime: guides/advanced/isolation.md
+              - Async isolated runtime: guides/advanced/async.md
               - WebAssembly: guides/advanced/webassembly.md
               - Snapshots: guides/advanced/snapshots.md
               - Inspector: guides/advanced/inspector.md
@@ -59,6 +60,7 @@ nav:
       - Serverless Runtime: use-cases/serverless-runtime.md
       - Workflow Orchestration: use-cases/workflow.md
   - Security report: security-report.md
+  - Roadmap to 1.0: roadmap.md
   - API Reference:
       - pydeno Module: api/pydeno.md
       - Runtime: api/runtime.md

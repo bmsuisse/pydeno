@@ -315,6 +315,14 @@ a runaway `setInterval` is cut off), `TextEncoder`/`TextDecoder`, `btoa`/`atob`,
 tests needed). It never defines `window` or
 `document`, which would push libraries onto DOM code paths.
 
+!!! warning "Do not write your own `setTimeout`"
+    A library that loops on `setTimeout` / `requestAnimationFrame` needs a timer that honours the
+    delay. A shim such as `setTimeout = (fn) => queueMicrotask(fn)` ignores the delay, so such a
+    loop re-queues itself on the microtask queue forever and starves the isolate until the deadline
+    (ECharts server-side rendering is an example). Use `WEB_POLYFILLS`: its timers run on virtual
+    time and a runaway `setInterval` is cut off. Libraries that animate also usually have an option
+    to switch it off (`animation: false`).
+
 ## Start-up cost
 
 A worker costs about 55 ms to start (Python plus the imports), of which the sandbox is about 4 ms.
