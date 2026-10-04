@@ -328,7 +328,11 @@ class _FrameReader(asyncio.Protocol):
             end = _HEADER.size + length
             if len(buf) < end:
                 break
-            self.frames.append(bytes(buf[_HEADER.size : end]))
+            if length < _wire._COPY_VIEW_THRESHOLD:
+                self.frames.append(bytes(buf[_HEADER.size : end]))
+            else:
+                with memoryview(buf) as view, view[_HEADER.size : end] as payload:
+                    self.frames.append(bytes(payload))
             self._queued += length
             del buf[:end]
         if self._queued + len(buf) > _READ_HIGH_WATER:

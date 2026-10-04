@@ -80,6 +80,9 @@ Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/
 
 ### Changed
 
+- Large buffered frames avoid a redundant payload-sized temporary copy in the sync and async
+  readers. Small frames retain the slice path, and the sync single-read fast path is unchanged (#66).
+
 - Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
   creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
   and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s
