@@ -1,0 +1,109 @@
+name: debug-seccomp-x86 (throwaway)
+
+on:
+  push:
+    branches: [debug-seccomp-x86]
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    name: trace worker syscalls (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    env:
+      CONTAINER_RUNTIME: docker
+      EXTRA_RUN_ARGS: --security-opt apparmor=unconfined
+      PYDENO_SPEC: pydeno==0.6.1
+    steps:
+      - uses: actions/checkout@v5
+      - run: uname -a
+      - name: strace the isolation and example suites (CPython 3.10 and 3.13)
+        run: |
+          mkdir -p out
+          scripts/trace_worker_syscalls.sh "out/worker_syscalls_$(uname -m).json" python:3.10-slim python:3.13-slim
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-${{ matrix.runner }}
+          path: out/*.json
+
+  native:
+    name: native host (${{ matrix.runner }})
+    needs: trace
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v5
+      - name: use the traces this run just took (both arches)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: trace-*
+          path: tests/data
+          merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install the published wheel and overlay this branch's Python
+        run: |
+          uname -a
+          python -m pip install -q "pydeno==0.6.1" "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
+          SITE=$(python -c "import pydeno,os;print(os.path.dirname(pydeno.__file__))")
+          cp python/pydeno/*.py "$SITE"/
+      - name: start a worker (auto, then require)
+        run: |
+          python - <<'PY'
+          from pydeno import IsolatedRuntime
+          with IsolatedRuntime() as rt:
+              print("auto:", rt.sandbox, rt.sandbox_extras, rt.eval("6 * 7"))
+          try:
+              with IsolatedRuntime(sandbox="require") as rt:
+                  print("require:", rt.sandbox, rt.sandbox_extras, rt.eval("6 * 7"))
+          except Exception as exc:
+              print("require refused here:", type(exc).__name__, exc)
+          PY
+      - name: tests on the host kernel (no red-team here)
+        run: |
+          python -m pytest tests/test_isolated_runtime.py tests/test_isolated_libraries.py \
+            tests/test_seccomp_program.py tests/test_errors_taxonomy.py \
+            -q -p no:randomly -p no:cacheprovider -rsfE
+
+  container:
+    name: container ${{ matrix.image }} (${{ matrix.runner }})
+    needs: trace
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+        image: [python:3.12-slim]
+    env:
+      CONTAINER_RUNTIME: docker
+      EXTRA_RUN_ARGS: --security-opt apparmor=unconfined
+      OVERLAY_PY: "1"
+      PYTEST_TARGETS: tests/test_isolated_runtime.py tests/test_isolated_libraries.py tests/test_seccomp_program.py tests/test_redteam_syscalls.py tests/test_errors_taxonomy.py
+    steps:
+      - uses: actions/checkout@v5
+      - name: use the traces this run just took (both arches)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: trace-*
+          path: tests/data
+          merge-multiple: true
+      - name: fetch the published wheel for this arch
+        run: |
+          python3 -m pip download -q "pydeno==0.6.1" --no-deps --only-binary :all: \
+            --platform "manylinux_2_28_$(uname -m)" --python-version 3.12 -d wheels
+          ls wheels
+      - name: isolation, red-team and decision suites (PYDENO_REDTEAM_CONTAINER=1)
+        run: scripts/linux_matrix.sh wheels "${{ matrix.image }}" default

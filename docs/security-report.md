@@ -99,7 +99,7 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Landlock/userns "single-thread" check could not see native threads | **Fixed.** Counts via `/proc/self/task`. |
 | Worker with a thread bomb stays under the memory ceiling | **Fixed.** Parent kills a worker over 64 threads. |
 | `sandbox="auto"` runs with fewer layers silently | **Mitigated.** Warns; `require` refuses. The default stays `auto` (a deliberate compatibility choice). |
-| Denied calls answer `EPERM` (an exploit can probe the filter freely) | **Open.** Killing the process on never-legitimate calls is planned. |
+| Denied calls answer `EPERM` (an exploit can probe the filter freely) | **Fixed** for the never-legitimate calls (`ptrace`, `process_vm_*`, the mount family, `pivot_root`/`chroot`, `setns`/`unshare`, `kexec*`, modules, `bpf`, `perf_event_open`, `userfaultfd`, keyrings, `open_by_handle_at`, `io_uring_*`, swap, `reboot`, `acct`, the x86 relics, `setuid` and friends, `capset`): `SECCOMP_RET_KILL_PROCESS`, reported as `sandbox_violation`. Chosen from a strace of real workers on native x86_64 and aarch64 (`tests/data/worker_syscalls_*.json`), none of which makes any of them once the filter is up. Calls real code does probe (`clone3`, the self-test's `execve`/`socket`/`kill`) keep their errno. |
 | Seccomp is a deny-list with a default-deny tail for unreviewed syscalls | **Open.** An allow-list derived from tracing real workers is planned. |
 | macOS: `notify_post()` still reaches other processes; `kill(pid, 0)` still distinguishes live pids | **Open, known.** The connection to `notifyd` is made before the profile applies. |
 | Landlock access rights newer than the reviewed ABI are not handled | **Open.** |

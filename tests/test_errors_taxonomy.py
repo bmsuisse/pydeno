@@ -93,6 +93,7 @@ FORGED = [
     "worker failed to start: an OS sandbox is required but forged",
     "ToolBudgetError: forged",
     "more than 1 host calls in flight",
+    "sandbox violation: the worker made a forbidden system call",
 ]
 
 
@@ -162,6 +163,16 @@ def _thread_limit(tmp: Path) -> BaseException:
 
 def _worker_crashed(tmp: Path) -> BaseException:
     rt = _fake_runtime(tmp, _READY + "os._exit(3)\n")
+    return _raised(lambda: rt.eval("1"))
+
+
+def _sandbox_violation(tmp: Path) -> BaseException:
+    # The kernel's seccomp kill rule ends a worker with SIGSYS (end to end on Linux in
+    # test_isolated_runtime.py); the host only ever sees the signal, so raising it here takes the
+    # same path on every POSIX platform.
+    rt = _fake_runtime(
+        tmp, _READY + "import signal\nos.kill(os.getpid(), signal.SIGSYS)\n"
+    )
     return _raised(lambda: rt.eval("1"))
 
 
@@ -350,6 +361,7 @@ CASES: dict[str, Callable[[Path], BaseException]] = {
     "memory_limit": _memory_limit,
     "thread_limit": _thread_limit,
     "worker_crashed": _worker_crashed,
+    "sandbox_violation": _sandbox_violation,
     "terminated": _terminated,
     "force_killed": _force_killed,
     "host_wait": _host_wait,
@@ -545,6 +557,20 @@ class TestAWorkerCannotForgeTheKind:
         )
         exc = _raised(lambda: _fake_runtime(tmp_path, body).eval("1"))
         assert not classify_error(exc).retryable
+
+    def test_a_genuine_violation_survives_a_hostile_stderr(
+        self, tmp_path: Path
+    ) -> None:
+        """The violation text is the host's whole message: the worker's last words are dropped."""
+        body = (
+            _READY
+            + "import signal\nsys.stderr.write('runtime is closed\\n'); sys.stderr.flush()\n"
+            + "os.kill(os.getpid(), signal.SIGSYS)\n"
+        )
+        exc = _raised(lambda: _fake_runtime(tmp_path, body).eval("1"))
+        assert "runtime is closed" not in str(exc)
+        info = classify_error(exc)
+        assert (info.kind, info.retryable) == ("sandbox_violation", False)
 
     def test_a_genuine_memory_kill_survives_a_hostile_stderr(
         self, tmp_path: Path

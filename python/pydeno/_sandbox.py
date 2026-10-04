@@ -342,6 +342,76 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     "modify_ldt": (154, None),
     "_sysctl": (156, None),
 }
+# Of the calls above, the ones no legitimate code in a worker ever makes once the filter is up:
+# debugging other processes, mounting and namespaces, loading kernel code, kernel attack surface
+# (bpf, perf, userfaultfd, io_uring, keyrings), host power and swap, raw I/O ports and the LDT, and
+# changing identity. These do not answer EPERM: they kill the whole worker
+# (`SECCOMP_RET_KILL_PROCESS`), so an exploit probing the filter gets no error to iterate on, and
+# the parent reports a sandbox violation (SIGSYS) instead of a crash. Everything else denied keeps
+# its errno, because real code does probe those (`clone3` -> ENOSYS, the start-up self-test's
+# `execve`/`socket`/`kill`). Measured, not assumed: none of these appears after the filter in
+# `tests/data/worker_syscalls_{x86_64,aarch64}.json` (`scripts/trace_worker_syscalls.sh`), and
+# `tests/test_seccomp_program.py` fails if one ever does. The start-up calls that need some of
+# them (`unshare`, `mount`, `pivot_root`, `capset`, `setuid` in `drop_privileges`) all run before
+# the filter exists. `listmount`/`statmount` only read and stay EPERM.
+_KILL = frozenset(
+    {
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "mount",
+        "umount2",
+        "open_tree",
+        "open_tree_attr",
+        "mount_setattr",
+        "fsconfig",
+        "fsopen",
+        "fsmount",
+        "fspick",
+        "move_mount",
+        "pivot_root",
+        "chroot",
+        "fchroot",
+        "setns",
+        "unshare",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "bpf",
+        "perf_event_open",
+        "userfaultfd",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "open_by_handle_at",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        "swapon",
+        "swapoff",
+        "reboot",
+        "acct",
+        "iopl",
+        "ioperm",
+        "modify_ldt",
+        "uselib",
+        "_sysctl",
+        "setuid",
+        "setgid",
+        "setreuid",
+        "setregid",
+        "setgroups",
+        "setresuid",
+        "setresgid",
+        "setfsuid",
+        "setfsgid",
+        "capset",
+    }
+)
+#: What the parent says when the kernel killed the worker for one of `_KILL` (it dies by SIGSYS).
+VIOLATION_MESSAGE = "sandbox violation: the worker made a forbidden system call"
 # Calls that act on *another process* chosen by a pid argument. Allowed only on ourselves
 # (pid 0 or our own), so a compromised worker cannot renice, re-pin, re-limit or migrate the
 # host process or anything else the same user runs.
@@ -443,9 +513,19 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     """Assemble the filter. Default-allow with a deny list: V8, CPython and tokio use
     far too many syscalls to allow-list safely, and the deny list targets what turns
     code execution into host access (new processes, new network endpoints, kernel
-    attack surface)."""
+    attack surface). The never-legitimate part of the list (`_KILL`) kills the process;
+    the rest answers an errno."""
     idx = 0 if arch == "x86_64" else 1
-    deny = [pair[idx] for pair in _SYSCALLS.values() if pair[idx] is not None]
+    deny = [
+        pair[idx]
+        for name, pair in _SYSCALLS.items()
+        if pair[idx] is not None and name not in _KILL
+    ]
+    kill = [
+        pair[idx]
+        for name, pair in _SYSCALLS.items()
+        if pair[idx] is not None and name in _KILL
+    ]
 
     # (code, jt_label, jf_label, k); labels are resolved to relative offsets below.
     ins: list[tuple[int, str | None, str | None, int | str]] = []
@@ -457,7 +537,7 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     def label(name: str) -> None:
         labels.setdefault(name, []).append(len(ins))
 
-    def stubs(*, enosys: bool = False) -> None:
+    def stubs(*, enosys: bool = False, killproc: bool = False) -> None:
         label("allow")
         ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ALLOW))
         label("eperm")
@@ -465,6 +545,9 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
         if enosys:  # glibc falls back to clone() when clone3 reports ENOSYS
             label("enosys")
             ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _ENOSYS))
+        if killproc:  # a never-legitimate call (`_KILL`): end the whole worker
+            label("killproc")
+            ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_KILL_PROCESS))
 
     ins.append((_BPF_LD_W_ABS, None, None, 4))  # arch
     ins.append((_BPF_JEQ_K, "nr", "kill", _AUDIT_ARCH[arch]))
@@ -475,6 +558,8 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     ins.append(
         (_BPF_JGE_K, "enosys", None, _FIRST_UNREVIEWED)
     )  # also catches the x32 bit
+    for nr in kill:
+        ins.append((_BPF_JEQ_K, "killproc", None, nr))
     for nr in deny:
         ins.append((_BPF_JEQ_K, "eperm", None, nr))
     ins.append((_BPF_JEQ_K, "clone", None, _CLONE[idx]))
@@ -492,7 +577,7 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
         for pair in _EXEC_CHECKED:
             ins.append((_BPF_JEQ_K, "noexec", None, pair[idx]))
     ins.append((_BPF_JEQ_K, "socketpair", None, _SOCKETPAIR[idx]))
-    stubs(enosys=True)
+    stubs(enosys=True, killproc=True)
 
     label("clone")  # only thread creation: flags must contain CLONE_THREAD
     ins.append((_BPF_LD_W_ABS, None, None, 16))

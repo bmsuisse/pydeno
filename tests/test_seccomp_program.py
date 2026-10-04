@@ -93,14 +93,103 @@ def _idx(arch: str) -> int:
     return 0 if arch == "x86_64" else 1
 
 
+# Never legitimate in a worker once the filter is up, so they kill it instead of answering EPERM
+# (an exploit probing the filter gets nothing to iterate on). Written here by intent, not read
+# from `_sandbox._KILL`, so removing a name from the filter cannot also remove its test.
+MUST_KILL = {
+    # debugging or reading other processes
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    # mounts, roots and namespaces (listmount/statmount only read: they stay EPERM)
+    "mount",
+    "umount2",
+    "open_tree",
+    "open_tree_attr",
+    "mount_setattr",
+    "fsconfig",
+    "fsopen",
+    "fsmount",
+    "fspick",
+    "move_mount",
+    "pivot_root",
+    "chroot",
+    "fchroot",
+    "setns",
+    "unshare",
+    # loading code into the kernel, and kernel attack surface
+    "kexec_load",
+    "kexec_file_load",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "bpf",
+    "perf_event_open",
+    "userfaultfd",
+    "keyctl",
+    "add_key",
+    "request_key",
+    "open_by_handle_at",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    # the host's power, swap and accounting
+    "swapon",
+    "swapoff",
+    "reboot",
+    "acct",
+    # x86 relics: raw I/O ports, the LDT, uselib, sysctl(2)
+    "iopl",
+    "ioperm",
+    "modify_ldt",
+    "uselib",
+    "_sysctl",
+    # changing identity or capabilities
+    "setuid",
+    "setgid",
+    "setreuid",
+    "setregid",
+    "setgroups",
+    "setresuid",
+    "setresgid",
+    "setfsuid",
+    "setfsgid",
+    "capset",
+}
+# x86_64-only spellings; fchroot is not in a released kernel table yet (see the table tests).
+_NOT_IN_EVERY_TABLE = {"iopl", "ioperm", "modify_ldt", "uselib", "_sysctl", "fchroot"}
+DATA = Path(__file__).parent / "data"
+
+
+def _kill_nrs(arch: str) -> dict[str, int]:
+    by = _by_name(arch)
+    out = {}
+    for name in MUST_KILL:
+        if name in by:
+            out[name] = by[name]
+        else:
+            assert name in _NOT_IN_EVERY_TABLE, (
+                f"{name} is missing from the {arch} table"
+            )
+    if (
+        "fchroot" not in by
+    ):  # denied ahead of its first release, at the number it will have
+        out["fchroot"] = sb._SYSCALLS["fchroot"][_idx(arch)]  # noqa: SLF001
+    return out
+
+
+def _traced(arch: str) -> dict:
+    return json.loads((DATA / f"worker_syscalls_{arch}.json").read_text())
+
+
 class TestTheDenyList:
-    def test_every_denied_syscall_is_eperm_whatever_the_arguments(
+    def test_every_errno_denied_syscall_is_eperm_whatever_the_arguments(
         self, arch: str, prog: list
     ) -> None:
         nrs = {
             name: pair[_idx(arch)]
             for name, pair in sb._SYSCALLS.items()  # noqa: SLF001
-            if pair[_idx(arch)] is not None
+            if pair[_idx(arch)] is not None and name not in MUST_KILL
         }
         assert len(nrs) > 100
         for name, nr in nrs.items():
@@ -112,13 +201,66 @@ class TestTheDenyList:
             ):
                 assert run(prog, arch, nr, args) == ERRNO | EPERM, f"{name} with {args}"
 
-    def test_denial_is_an_errno_not_a_kill(self, arch: str, prog: list) -> None:
-        """A denied call must fail, not terminate: some libraries probe, and a kill would turn
-        a harmless probe into an outage."""
-        for pair in sb._SYSCALLS.values():  # noqa: SLF001
-            nr = pair[_idx(arch)]
-            if nr is not None:
-                assert run(prog, arch, nr) != KILL_PROCESS
+    def test_every_never_legitimate_syscall_kills_whatever_the_arguments(
+        self, arch: str, prog: list
+    ) -> None:
+        for name, nr in _kill_nrs(arch).items():
+            for args in (
+                (),
+                (0,) * 6,
+                (1, 1, 1, 1, 1, 1),
+                (2**32 - 1, 2**64 - 1, 5, 6, 7, 8),
+            ):
+                assert run(prog, arch, nr, args) == KILL_PROCESS, f"{name} with {args}"
+
+    def test_nothing_else_kills(self, arch: str, prog: list) -> None:
+        """A kill turns a harmless probe into an outage, so only the reviewed list may kill
+        (plus a foreign architecture, below): every other reviewed number answers."""
+        killed = {
+            nr
+            for nr in range(0, sb._FIRST_UNREVIEWED)  # noqa: SLF001
+            if run(prog, arch, nr) == KILL_PROCESS
+        }
+        assert killed == set(_kill_nrs(arch).values())
+
+    def test_the_filter_kills_exactly_what_this_test_lists(self) -> None:
+        assert set(sb._KILL) == MUST_KILL  # noqa: SLF001
+        assert set(sb._KILL) <= set(sb._SYSCALLS)  # noqa: SLF001
+
+    def test_nothing_a_real_worker_was_seen_doing_is_killed(
+        self, arch: str, prog: list
+    ) -> None:
+        """`tests/data/worker_syscalls_<arch>.json` is a strace of real workers over the isolation
+        and example suites, on a native machine of that architecture: every call made once the
+        filter was in force, including the ones it refused (probes), and the vDSO-backed calls
+        that can fall back to real syscalls. None of them may ever be a kill.
+        (`scripts/trace_worker_syscalls.sh` regenerates it.)"""
+        data = _traced(arch)
+        assert data["arch"] == arch
+        assert sum(r["workers_traced"] for r in data["runs"]) > 50
+        assert all(r["workers_killed_by_sigsys"] == 0 for r in data["runs"])
+        by = _by_name(arch)
+        seen = set(data["after_filter"]) | set(data["vdso_fallback"])
+        killed = sorted(
+            name
+            for name in seen
+            if name in by and run(prog, arch, by[name], (0,) * 6) == KILL_PROCESS
+        )
+        assert not killed, (
+            f"real workers make these, the filter would kill them: {killed}"
+        )
+        assert not MUST_KILL & seen
+
+    def test_what_real_workers_probe_still_answers_an_errno(
+        self, arch: str, prog: list
+    ) -> None:
+        """A refused call that real code makes is one it tolerates (a fallback, a self-test).
+        It must stay refused with an errno."""
+        data = _traced(arch)
+        by = _by_name(arch)
+        for name in data["probed"]:
+            verdict = run(prog, arch, by[name], (0,) * 6)
+            assert verdict != KILL_PROCESS, name
 
 
 class TestWhatTheWorkerNeeds:
@@ -413,11 +555,12 @@ class TestTheFutureAndTheWrongAbi:
         ):
             assert run(prog, arch, 1, audit_arch=other) == KILL_PROCESS
 
-    def test_every_reviewed_number_gets_an_explicit_answer_never_a_kill(
+    def test_every_reviewed_number_gets_an_explicit_answer(
         self, arch: str, prog: list
     ) -> None:
         verdicts = {run(prog, arch, nr) for nr in range(0, sb._FIRST_UNREVIEWED)}  # noqa: SLF001
-        assert verdicts <= {ALLOW, ERRNO | EPERM, ERRNO | ENOSYS}
+        # KILL_PROCESS only for the reviewed never-legitimate list (TestTheDenyList)
+        assert verdicts <= {ALLOW, ERRNO | EPERM, ERRNO | ENOSYS, KILL_PROCESS}
 
     def test_the_tables_stop_below_the_unreviewed_range(self, arch: str) -> None:
         real = [int(n) for n, name in TABLES[arch].items() if name != "syscalls"]

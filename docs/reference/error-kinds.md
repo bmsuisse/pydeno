@@ -40,6 +40,7 @@ is why it is a separate field and not folded into `retryable`.
 | `memory_limit` | no | yes | `WorkerCrashed`: `worker used N bytes, over max_memory=M; killed`, or the worker's own memory exit | The worker went over max_memory and was stopped. |
 | `thread_limit` | no | no | `WorkerCrashed`: `worker started N threads (limit 64); killed` | The worker started more threads than a worker may. |
 | `worker_crashed` | yes | no | any other `WorkerCrashed`: died, killed by a signal, hung, would not start | The worker process died, hung or failed to start. |
+| `sandbox_violation` | no | no | `WorkerCrashed`: `<worker process died / worker is gone / ...>: sandbox violation: the worker made a forbidden system call` (the kernel killed it with SIGSYS: a never-legitimate syscall such as `ptrace` or `mount`, Linux) | The worker made a system call the OS sandbox forbids and was killed for it. |
 | `terminated` | no | no | `RuntimeTerminated` | The runtime was terminated on request. |
 | `force_killed` | no | no | `RuntimeForceKilled` | A termination was never acknowledged; the runtime was abandoned. |
 | `host_wait` | no | yes | `RuntimeTimeout` from `max_host_wait` | Host callbacks kept the guest waiting longer than max_host_wait. |

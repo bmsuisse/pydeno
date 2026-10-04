@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SANDBOX_PY = HERE.parent / "python" / "pydeno" / "_sandbox.py"
 TABLES = HERE.parent / "tests" / "data" / "syscalls.json"
+SIGSYS = int(signal.SIGSYS)
 
 # What the child does. It applies the real sandbox, then fires one syscall with junk
 # arguments and reports. No Python-level helper may touch the filesystem after apply().
@@ -132,7 +134,9 @@ def sweep(arch: str, numbers: Iterable[int], mode: str = "sandbox") -> dict[int,
             return nr, {"name": name, "blocked": None, "outcomes": ["skipped"]}
         outcomes = [fire(nr, pat, mode)["outcome"] for pat in ARG_PATTERNS]
         raw = [fire(nr, pat, "raw")["outcome"] for pat in ARG_PATTERNS]
-        sandbox_eperm = all(o == "EPERM" for o in outcomes)
+        # The filter's never-legitimate calls (`_KILL`) kill the process with SIGSYS instead of
+        # answering EPERM; that is the filter blocking them too.
+        sandbox_eperm = all(o in ("EPERM", f"signal {SIGSYS}") for o in outcomes)
         return nr, {
             "name": name,
             # Blocked by *our filter*: EPERM to every argument pattern with the sandbox, and

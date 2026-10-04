@@ -1077,6 +1077,10 @@ class AsyncIsolatedRuntime:
             return (
                 f"{prefix}: worker went over max_memory={self._max_memory} and exited"
             )
+        if (
+            code == -signal.SIGSYS
+        ):  # the seccomp kill rule; see `_isolated._describe_death`
+            return f"{prefix}: {_sandbox.VIOLATION_MESSAGE}"
         if code is not None and code < 0:
             try:
                 prefix += f" (killed by {signal.Signals(-code).name})"

@@ -40,7 +40,8 @@ Status below is a plan, not a promise of dates.
 
 **Hardening** (each needs verification on native x86_64, not only emulation):
 
-- Seccomp as an allow-list with kill-on-violation, instead of today's deny-list.
+- Seccomp as an allow-list instead of today's deny-list. (Kill-on-violation for the never-legitimate
+  calls is done; the traced syscall set it was checked against is in `tests/data/worker_syscalls_*.json`.)
 - Kernel-enforced thread and memory caps (cgroups where available), in addition to the polling checks.
 - Tool boundary: per-tool deadlines, result caps, redacted conversion errors, argument normalisation, a
   sandboxed tool process, safe preset tools (read-only files / SQL / HTTP fetch), call audit hooks.

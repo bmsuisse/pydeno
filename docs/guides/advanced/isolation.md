@@ -83,7 +83,12 @@ inherits it. It cannot be lifted from inside the process.
   Then Landlock (no filesystem access, no TCP, no abstract unix sockets or signals outside itself
   on kernels that support those scopes) plus a seccomp-bpf filter. Read `rt.sandbox_extras` to see
   whether the empty root took effect (`["emptyroot"]`) and pass `empty_root=False` to skip it. The
-  seccomp filter denies, with `EPERM`:
+  seccomp filter denies the calls below. The ones nothing legitimate makes after start-up
+  (`ptrace`, `process_vm_*`, mounts and namespaces, modules, `kexec`, `bpf`, `perf_event_open`,
+  `userfaultfd`, `io_uring_*`, keyrings, `setuid` and friends, `capset`, ...) **kill the worker**
+  (`SECCOMP_RET_KILL_PROCESS`): the call raises `WorkerCrashed` reading
+  `sandbox violation: the worker made a forbidden system call`, which `classify_error` reports as
+  `sandbox_violation`. The rest answer `EPERM`:
     - new processes and other-process access: `execve`, `fork`, non-thread `clone`, `ptrace`,
       `process_vm_*`, `pidfd_*`, `kcmp`;
     - the network: `socket`, `connect`, `bind`, `listen`, `accept` (asyncio's `socketpair` stays);

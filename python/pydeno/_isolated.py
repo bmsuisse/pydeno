@@ -659,6 +659,10 @@ class IsolatedRuntime:
             return (
                 f"{prefix}: worker went over max_memory={self._max_memory} and exited"
             )
+        if code == -signal.SIGSYS:
+            # The seccomp filter's kill rule (`_sandbox._KILL`). The whole message is the host's:
+            # whatever the worker last wrote stays out of it.
+            return f"{prefix}: {_sandbox.VIOLATION_MESSAGE}"
         if code is not None and code < 0:
             try:
                 prefix += f" (killed by {signal.Signals(-code).name})"

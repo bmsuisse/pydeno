@@ -77,6 +77,11 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
         False,
         "The worker process died, hung or failed to start.",
     ),
+    "sandbox_violation": (
+        False,
+        False,
+        "The worker made a system call the OS sandbox forbids and was killed for it.",
+    ),
     "terminated": (False, False, "The runtime was terminated on request."),
     "force_killed": (
         False,
@@ -191,6 +196,12 @@ _MEMORY = re.compile(
     rf"(?:worker used \d+ bytes, over max_memory=\d+; killed"
     rf"|{_DEATH_PREFIX}: worker went over max_memory=\d+ and exited)"
 )
+# The kernel killed the worker with SIGSYS: the seccomp filter's kill rule (a never-legitimate
+# syscall such as ptrace or mount). Host-authored and the whole message: `_describe_death` adds
+# no worker text to it.
+_VIOLATION = re.compile(
+    rf"{_DEATH_PREFIX}: sandbox violation: the worker made a forbidden system call"
+)
 _THREADS = re.compile(r"worker started \d+ threads \(limit \d+\); killed")
 _HOST_CALLS = re.compile(r"guest made more than max_host_calls=\d+ host calls")
 _UNMEASURABLE = re.compile(
@@ -292,6 +303,13 @@ _ROWS: list[Row] = [
     ("limits_unmeasurable", lambda e, t, a: _crash(e, t, _UNMEASURABLE)),
     ("memory_limit", lambda e, t, a: _crash(e, t, _MEMORY)),
     ("thread_limit", lambda e, t, a: _crash(e, t, _THREADS)),
+    (
+        "sandbox_violation",
+        lambda e, t, a: (
+            _is(e, "pydeno._isolated", "WorkerCrashed")
+            and bool(_VIOLATION.fullmatch(t))
+        ),
+    ),
     ("host_call_budget", lambda e, t, a: _crash(e, t, _HOST_CALLS)),
     ("protocol_violation", lambda e, t, a: _crash(e, t, _PROTOCOL)),
     ("sandbox_unavailable", lambda e, t, a: _crash(e, t, _SANDBOX_REFUSED)),

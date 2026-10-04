@@ -2,7 +2,8 @@
 
 Threat model: a V8 escape gives the attacker arbitrary native code in the worker *after*
 `pydeno._sandbox.apply()`. These tests play that attacker: from a freshly sandboxed process
-they issue dangerous syscalls with junk arguments and require the answer to be `EPERM`.
+they issue dangerous syscalls with junk arguments and require the answer to be `EPERM`, or,
+for the never-legitimate ones (`MUST_KILL`), that the kernel kills the process with SIGSYS.
 
 Why `EPERM` with junk arguments proves something: the seccomp filter decides at syscall
 *entry*, before the kernel validates any argument. A syscall the filter denies therefore
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +30,10 @@ from pathlib import Path
 import pytest
 
 from pydeno import _sandbox as _installed_sandbox
+
+# The never-legitimate subset, which kills instead of answering EPERM. One intent list, kept
+# next to the filter's decision tests (pytest puts this directory on sys.path).
+from test_seccomp_program import MUST_KILL
 
 pytestmark = [pytest.mark.linux_only, pytest.mark.redteam]
 
@@ -102,6 +108,9 @@ MUST_BLOCK = {
         "nfsservctl",
         "lsm_set_self_attr",
         "personality",
+        "modify_ldt",
+        "uselib",
+        "_sysctl",
     ],
     "the network": ["socket", "connect", "bind", "listen", "accept", "accept4"],
     "IPC with the host user's other processes": [
@@ -258,8 +267,14 @@ def test_dangerous_syscall_is_denied_whatever_the_arguments(
             f"seccomp was not applied here ({layers}); the matrix profile that hides it "
             f"must not run the red-team tests"
         )
-    bad = [r for r in results if r.get("errno") != 1 or r.get("ret") != -1]
-    assert not bad, f"[{group}] {name} was reachable from the sandbox: {bad}"
+    if name in MUST_KILL:
+        # Never legitimate: the kernel kills the whole process (SECCOMP_RET_KILL_PROCESS), so
+        # the child dies by SIGSYS before it can report anything.
+        bad = [r for r in results if r.get("died") != -signal.SIGSYS]
+        assert not bad, f"[{group}] {name} did not kill the sandboxed process: {bad}"
+    else:
+        bad = [r for r in results if r.get("errno") != 1 or r.get("ret") != -1]
+        assert not bad, f"[{group}] {name} was reachable from the sandbox: {bad}"
 
 
 def test_the_sweep_actually_ran_every_listed_syscall(
@@ -285,9 +300,17 @@ def test_the_sweep_actually_ran_every_listed_syscall(
             "utime",
             "utimes",
             "futimesat",
+            "modify_ldt",
+            "uselib",
+            "_sysctl",
         }
         for n in missing
     ), missing
+
+
+def test_every_never_legitimate_syscall_is_in_the_sweep() -> None:
+    present = set(TABLES[ARCH].values())
+    assert {n for n in MUST_KILL if n in present} <= set(ALL_BLOCKED)
 
 
 # --- a worker started as root must not stay root ------------------------------------------

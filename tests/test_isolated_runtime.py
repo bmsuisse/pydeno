@@ -492,9 +492,12 @@ _SANDBOX_PROBE = textwrap.dedent(
     attempt("rename", lambda: os.rename(victim, victim + ".moved"))
     attempt("overwrite", lambda: open(victim, "w").write("pwned"))
     attempt("read_victim", lambda: open(victim).read())
-    attempt("setuid", lambda: os.setuid(os.getuid()))
-    attempt("setgid", lambda: os.setgid(os.getgid()))
-    attempt("setgroups", lambda: os.setgroups([]))
+    if not sys.platform.startswith("linux"):
+        # On Linux these are never-legitimate calls that kill the process (SIGSYS), which would
+        # end this probe: `test_identity_changes_kill_the_process` fires them one per process.
+        attempt("setuid", lambda: os.setuid(os.getuid()))
+        attempt("setgid", lambda: os.setgid(os.getgid()))
+        attempt("setgroups", lambda: os.setgroups([]))
     if sys.platform.startswith("linux"):
         attempt("setxattr", lambda: os.setxattr(victim, "user.pwned", b"1"))
     attempt("env_file", lambda: open("/proc/self/environ" if sys.platform != "darwin" else "/etc/passwd").read(1))
@@ -509,6 +512,63 @@ _SANDBOX_PROBE = textwrap.dedent(
     print(json.dumps(out))
     """
 )
+
+
+_IDENTITY_PROBE = textwrap.dedent(
+    """
+    import os, sys
+    from pydeno import _sandbox
+    import pydeno._awaitable  # noqa  (lazy imports must precede the sandbox)
+    print(_sandbox.apply(), flush=True)
+    calls = {
+        "setuid": lambda: os.setuid(os.getuid()),
+        "setgid": lambda: os.setgid(os.getgid()),
+        "setgroups": lambda: os.setgroups([]),
+    }
+    try:
+        calls[sys.argv[1]]()
+    except OSError:
+        pass
+    print("survived", flush=True)
+    """
+)
+
+# A compromised worker: it starts like the real one (the real sandbox, before any command), then
+# does what an exploit would try first and fires `ptrace` (junk arguments; the filter decides at
+# syscall entry).
+_PTRACE_WORKER = textwrap.dedent(
+    """
+    import ctypes, json, os, struct, sys, time
+    sys.path.insert(0, PYDENO_PARENT)
+    from pydeno import _sandbox
+    import pydeno._awaitable  # noqa
+    def read():
+        h = sys.stdin.buffer.read(4)
+        if len(h) < 4:
+            sys.exit(0)
+        return json.loads(sys.stdin.buffer.read(struct.unpack("<I", h)[0]))
+    def send(m):
+        b = json.dumps(m).encode()
+        sys.stdout.buffer.write(struct.pack("<I", len(b)) + b)
+        sys.stdout.buffer.flush()
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    nr = _sandbox._SYSCALLS["ptrace"][0 if os.uname().machine == "x86_64" else 1]
+    read()
+    layers = _sandbox.apply()
+    send({"t": "ready", "version": 1, "sandbox": layers, "extras": list(_sandbox.EXTRAS)})
+    cmd = read()
+    libc.syscall(nr, ctypes.c_long(-1), ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(0))
+    send({"t": "result", "id": cmd["id"], "v": "survived"})
+    time.sleep(30)
+    """
+)
+
+
+def _pydeno_parent() -> str:
+    import pydeno
+
+    return str(Path(pydeno.__file__).resolve().parent.parent)
 
 
 def _probe_sandbox() -> dict[str, str]:
@@ -620,11 +680,10 @@ _FORBIDDEN = [
     "rename",
     "overwrite",
     "read_victim",
-    "setgroups",
     "env_file",
-]
+] + ([] if sys.platform.startswith("linux") else ["setgroups"])
 # `setuid(getuid())` is a harmless no-op that succeeds on macOS; the seccomp filter
-# denies the whole family so that a worker running as root (a container) cannot change
+# kills on the whole family so that a worker running as root (a container) cannot change
 # who it is. Asserted in the Linux-only seccomp test below.
 
 
@@ -683,9 +742,6 @@ class TestOsSandbox:
             "chmod",
             "chown",
             "utime",
-            "setuid",
-            "setgid",
-            "setgroups",
             "setxattr",
             "kill_parent",
             "unix_send_path",
@@ -709,6 +765,72 @@ class TestOsSandbox:
             )
         else:
             assert "seccomp" not in str(sandbox_probe["layers"])
+
+    @pytest.mark.linux_only
+    @pytest.mark.parametrize("call", ["setuid", "setgid", "setgroups"])
+    def test_identity_changes_kill_the_process(self, call: str) -> None:
+        """Changing identity is never legitimate after start-up, so the filter kills the process
+        (SIGSYS) instead of answering EPERM: one process per call, since each one ends it."""
+        import signal
+        import subprocess
+
+        done = subprocess.run(
+            [sys.executable, "-I", "-c", _IDENTITY_PROBE, call],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            start_new_session=True,
+        )
+        lines = done.stdout.splitlines()
+        assert lines, done.stderr
+        layers = lines[0]
+        if _layer_expected("seccomp", {"layers": layers}):
+            assert done.returncode == -signal.SIGSYS, (done.returncode, done.stderr)
+            assert "survived" not in lines
+        else:
+            assert "seccomp" not in layers
+            assert done.returncode != -signal.SIGSYS
+
+    @pytest.mark.linux_only
+    def test_a_worker_that_fires_ptrace_is_killed_and_reported_as_a_violation(
+        self, tmp_path: Path
+    ) -> None:
+        """Assume a V8 escape: native code in a sandboxed worker calls `ptrace`. The kernel kills
+        the worker on the spot and the parent says why, as its own message, which
+        `classify_error` reports as a non-retryable `sandbox_violation`."""
+        from pydeno import classify_error
+
+        script = tmp_path / "ptrace_worker.py"
+        script.write_text(
+            _PTRACE_WORKER.replace("PYDENO_PARENT", repr(_pydeno_parent()))
+        )
+        wrapper = tmp_path / "ptrace_worker.sh"
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        # The fake worker applies the real sandbox itself, so the parent need not ask for one.
+        rt = IsolatedRuntime(
+            RuntimeConfig(), python=str(wrapper), sandbox="off", request_timeout=20
+        )
+        try:
+            if _layer_expected("seccomp", {"layers": rt.sandbox}):
+                assert "seccomp" in rt.sandbox
+                with pytest.raises(WorkerCrashed) as caught:
+                    rt.eval("1")
+                text = str(caught.value)
+                assert text == (
+                    "worker process died: sandbox violation: the worker made a forbidden "
+                    "system call"
+                ), text
+                info = classify_error(caught.value)
+                assert (info.kind, info.retryable) == ("sandbox_violation", False)
+                assert rt.is_closed()
+            else:
+                # no seccomp where none is expected: the call fails, the worker carries on
+                assert "seccomp" not in rt.sandbox
+                assert rt.eval("1") == "survived"
+        finally:
+            rt.close()
 
     @pytest.mark.linux_only
     @pytest.mark.parametrize(

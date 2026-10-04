@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **Linux seccomp kills on never-legitimate syscalls** (`ptrace`, `process_vm_*`, the mount family,
+  `pivot_root`/`chroot`, `setns`/`unshare`, `kexec*`, modules, `bpf`, `perf_event_open`, `userfaultfd`,
+  keyrings, `open_by_handle_at`, `io_uring_*`, swap, `reboot`, `acct`, x86 `iopl`/`ioperm`/`modify_ldt`,
+  `setuid` and friends, `capset`): `SECCOMP_RET_KILL_PROCESS` instead of `EPERM`, so an exploit gets no error
+  to iterate on. The call raises `WorkerCrashed("...: sandbox violation: the worker made a forbidden system
+  call")`, a new non-retryable `classify_error` kind `sandbox_violation`. Every other denied call keeps its
+  errno. The choice is checked against `tests/data/worker_syscalls_{x86_64,aarch64}.json`, a strace of real
+  workers over the isolation and example suites (`scripts/trace_worker_syscalls.sh`).
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change
