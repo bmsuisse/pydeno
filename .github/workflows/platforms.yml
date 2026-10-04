@@ -8,16 +8,11 @@ name: Platforms
 # `experimental` cells (free-threaded 3.14t, Windows) report but do not fail the
 # workflow until they are known-green; flip the flag when they are.
 on:
+  # 41 jobs on scarce runners: run on `main` and on demand, not on every pull request (a
+  # busy queue starved the run that gates a release). Run it for a branch with
+  # `gh workflow run platforms.yml --ref <branch>`.
   push:
-    branches: [main, "ci/platform-matrix"]
-  pull_request:
-    paths:
-      - ".github/workflows/platforms.yml"
-      - "src/**"
-      - "python/**"
-      - "tests/**"
-      - "Cargo.*"
-      - "pyproject.toml"
+    branches: [main]
   workflow_dispatch:
 
 permissions:

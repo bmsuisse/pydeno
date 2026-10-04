@@ -4,7 +4,10 @@ name: Tests
 # this, `.github/workflows/` held only publish-on-release, benchmarks and
 # docs, so every "the tests pass" claim was local and unverified.
 on:
+  # `push` on every branch plus `pull_request` ran the whole suite twice per PR push;
+  # branches are covered by their pull request, `main` by the push.
   push:
+    branches: [main]
   pull_request:
 
 permissions:
