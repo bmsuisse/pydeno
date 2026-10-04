@@ -209,7 +209,7 @@ import subprocess as _c_subprocess  # noqa: E402
 _C_CAP = 240.0
 _C_KEY = b"slice-c-journal-key-0123456789"
 _C_PROBES: dict[str, Probe] = {}
-_C_BIDI = "‮⁦"
+_C_BIDI = "\u202e\u2066"
 
 
 def _c_probe(fn: Probe) -> Probe:
@@ -218,7 +218,12 @@ def _c_probe(fn: Probe) -> Probe:
     def capped() -> bool:
         try:
             done = _c_subprocess.run(
-                [sys.executable, _c_os.path.abspath(__file__), "--slice-c-probe", fn.__name__],
+                [
+                    sys.executable,
+                    _c_os.path.abspath(__file__),
+                    "--slice-c-probe",
+                    fn.__name__,
+                ],
                 timeout=_C_CAP,
                 capture_output=True,
                 text=True,
@@ -286,7 +291,10 @@ def front_external_base_exception_leaves_an_unloadable_state() -> bool:
         with pool.checkout() as s:
             s.feed_run("const kept = 41")
             try:
-                s.feed_run("try { await stop(1) } catch (e) {} 1", external_lookup={"stop": stop})
+                s.feed_run(
+                    "try { await stop(1) } catch (e) {} 1",
+                    external_lookup={"stop": stop},
+                )
             except PydenoError:
                 pass
             state = s.dump()
@@ -334,13 +342,17 @@ def async_tool_call_storm_makes_replay_diverge() -> bool:
         return i
 
     async def go() -> bool:
-        async with AsyncAgentSandbox({"t": t}, max_tool_calls=10_000, sandbox="require") as s:
+        async with AsyncAgentSandbox(
+            {"t": t}, max_tool_calls=10_000, sandbox="require"
+        ) as s:
             r = await s.execute(_c_storm())
             if not r.ok or r.result != 0:
                 return True
             blob = await s.dump(_C_KEY)
         try:
-            restored = await AsyncAgentSandbox.load(blob, _C_KEY, {"t": t}, sandbox="require")
+            restored = await AsyncAgentSandbox.load(
+                blob, _C_KEY, {"t": t}, sandbox="require"
+            )
         except (JournalError, ReplayDivergence):
             return True
         await restored.close()
@@ -393,7 +405,9 @@ def tool_error_text_reaches_the_guest_by_default() -> bool:
     seen = []
     with AgentSandbox({"leak_base": leak_base}, sandbox="require") as s:
         # A BaseException ends the run (and the worker); neither the guest nor the error says why.
-        r = s.execute("try { await leak_base(1) } catch (e) { return e.name + e.message }")
+        r = s.execute(
+            "try { await leak_base(1) } catch (e) { return e.name + e.message }"
+        )
         seen.append(repr(r.result) + repr(r.error))
     with AgentSandbox({"leak": leak}, sandbox="require") as s:
         r = s.execute("try { await leak(1) } catch (e) { return e.name + e.message }")
@@ -422,7 +436,10 @@ def foreign_or_used_tool_call_is_accepted() -> bool:
     from pydeno import AgentSandbox, ToolCall
 
     tools = {"t": lambda x: x}
-    with AgentSandbox(tools, sandbox="require") as a, AgentSandbox(tools, sandbox="require") as b:
+    with (
+        AgentSandbox(tools, sandbox="require") as a,
+        AgentSandbox(tools, sandbox="require") as b,
+    ):
         sa, sb = a.start("return await t(1)"), b.start("return await t(2)")
         attempts = [
             lambda: a.resume(sb, 9),
@@ -462,7 +479,9 @@ def catalog_tool_reachable_or_charged_before_discovery() -> bool:
         input_schema={"type": "object"},
         callable=lambda args: ran.append(args) or "hit",
     )
-    with AgentSandbox({}, tools_catalog=[secret], max_tool_calls=5, sandbox="require") as s:
+    with AgentSandbox(
+        {}, tools_catalog=[secret], max_tool_calls=5, sandbox="require"
+    ) as s:
         s.execute(
             "for (const f of [() => tools.secret_tool({}), () => tools['secret_tool']({}),"
             " () => tools.constructor({}), () => tools.__proto__.x({})]) { try { await f() } catch {} }"
@@ -491,7 +510,9 @@ def front_invalid_answer_consumes_the_snapshot() -> bool:
     async def go() -> bool:
         async with AsyncPydeno(min_processes=1) as pool:
             async with pool.checkout() as s:
-                snap = await s.feed_start("await f(1)", external_lookup={"f": lambda x: x})
+                snap = await s.feed_start(
+                    "await f(1)", external_lookup={"f": lambda x: x}
+                )
                 try:
                     await snap.resume(error="not an exception")  # type: ignore[arg-type]
                 except TypeError:
@@ -568,13 +589,17 @@ def tampered_truncated_or_spliced_journal_loads() -> bool:
     ]
     for blob in forged:
         try:
-            AgentSandbox.load(blob, _C_KEY, tools, associated_data=b"tenant-a", sandbox="require").close()
+            AgentSandbox.load(
+                blob, _C_KEY, tools, associated_data=b"tenant-a", sandbox="require"
+            ).close()
             return True
         except JournalError:
             pass
     for ad in (b"tenant-b", b""):
         try:
-            AgentSandbox.load(one, _C_KEY, tools, associated_data=ad, sandbox="require").close()
+            AgentSandbox.load(
+                one, _C_KEY, tools, associated_data=ad, sandbox="require"
+            ).close()
             return True
         except JournalError:
             pass
@@ -599,7 +624,11 @@ def replay_calls_the_real_tool_or_crash_refunds_budget() -> bool:
     before = len(ran)
     restored = AgentSandbox.load(blob, _C_KEY, tools, sandbox="require")
     try:
-        return len(ran) != before or restored.calls_made < 3 or restored.run("return a") != 1
+        return (
+            len(ran) != before
+            or restored.calls_made < 3
+            or restored.run("return a") != 1
+        )
     finally:
         restored.close()
 
@@ -631,7 +660,12 @@ def guest_error_name_claims_a_host_failure() -> bool:
     from pydeno import AgentSandbox, classify_error
 
     with AgentSandbox({}, sandbox="require") as s:
-        for name in ("WorkerCrashed", "RuntimeTimeout", "ResultTooLarge", "JournalError"):
+        for name in (
+            "WorkerCrashed",
+            "RuntimeTimeout",
+            "ResultTooLarge",
+            "JournalError",
+        ):
             code = f"const e = new Error('worker used 9 bytes, over max_memory=1; killed'); e.name = '{name}'; throw e"
             r = s.execute(code)
             if r.error_type != "Error":
@@ -669,8 +703,12 @@ def pool_journal_too_large_refunds_the_tool_budget() -> bool:
 
     async def go() -> bool:
         async with SessionPool(
-            InMemoryJournalStore(), _C_KEY, {"big": big}, max_tool_calls=4,
-            max_journal_bytes=1 << 19, sandbox="require",
+            InMemoryJournalStore(),
+            _C_KEY,
+            {"big": big},
+            max_tool_calls=4,
+            max_journal_bytes=1 << 19,
+            sandbox="require",
         ) as pool:
             code = "for (let i = 0; i < 10; i++) { try { await big(i) } catch (e) { break } } return 1"
             await _c_pool_turns(pool, "alice", "chat", code, 3)
@@ -684,7 +722,9 @@ def pool_accepts_an_id_it_cannot_persist() -> bool:
     from pydeno import InMemoryJournalStore, SessionPool
 
     async def go() -> bool:
-        async with SessionPool(InMemoryJournalStore(), _C_KEY, {}, sandbox="require") as pool:
+        async with SessionPool(
+            InMemoryJournalStore(), _C_KEY, {}, sandbox="require"
+        ) as pool:
             owner, sid = "ä" * 256, "\U0001f600" * 256
             try:
                 sb = await pool.get(owner, sid)
@@ -718,7 +758,14 @@ def pool_drop_loses_to_a_concurrent_restore() -> bool:
 
     async def go() -> bool:
         store = SlowStore()
-        async with SessionPool(store, _C_KEY, {}, idle_timeout=0.01, eviction_interval=1000, sandbox="require") as pool:
+        async with SessionPool(
+            store,
+            _C_KEY,
+            {},
+            idle_timeout=0.01,
+            eviction_interval=1000,
+            sandbox="require",
+        ) as pool:
             async with pool.session("o", "s") as sb:
                 await sb.run("globalThis.secret = 'kept'; return 1")
             await _c_asyncio.sleep(0.05)
@@ -734,7 +781,9 @@ def pool_drop_loses_to_a_concurrent_restore() -> bool:
             await getting
             await pool.release("o", "s")
             async with pool.session("o", "s") as sb:
-                state = await sb.run("return typeof secret === 'undefined' ? 'fresh' : secret")
+                state = await sb.run(
+                    "return typeof secret === 'undefined' ? 'fresh' : secret"
+                )
         return state != "fresh"
 
     return _c_asyncio.run(go())
@@ -799,7 +848,10 @@ def cli_prints_guest_terminal_escapes() -> bool:
         ["-c", "throw new Error('\\x1b[2J\\u202e')"],
     ):
         done = _c_subprocess.run(
-            [sys.executable, "-m", "pydeno", *args], capture_output=True, text=True, timeout=120
+            [sys.executable, "-m", "pydeno", *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         text = done.stdout + done.stderr
         if "\x1b" in text or any(c in text for c in _C_BIDI):
@@ -824,7 +876,11 @@ def guest_bidi_controls_reach_host_messages() -> bool:
         if any(c in (r.error or "") for c in _C_BIDI):
             return True
     out = io.StringIO()
-    with Pydeno(min_processes=1) as pool, pool.checkout() as sess, contextlib.redirect_stdout(out):
+    with (
+        Pydeno(min_processes=1) as pool,
+        pool.checkout() as sess,
+        contextlib.redirect_stdout(out),
+    ):
         sess.feed_run(f"console.log('a{_C_BIDI}\\x1b[31mb')")
     return any(c in out.getvalue() for c in _C_BIDI + "\x1b")
 
