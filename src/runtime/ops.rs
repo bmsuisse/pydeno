@@ -192,7 +192,10 @@ fn page_size() -> usize {
     *PAGE.get_or_init(|| {
         // SAFETY: `getpagesize` takes no arguments and only reads a constant.
         let size = unsafe { getpagesize() };
-        usize::try_from(size).ok().filter(|s| *s > 0).unwrap_or(4096)
+        usize::try_from(size)
+            .ok()
+            .filter(|s| *s > 0)
+            .unwrap_or(4096)
     })
 }
 

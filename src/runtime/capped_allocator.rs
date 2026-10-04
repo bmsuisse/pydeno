@@ -185,6 +185,7 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(0),
             cap: 100,
+            refused: AtomicBool::new(false),
         };
         assert!(b.reserve(60));
         assert!(!b.reserve(41));
@@ -198,6 +199,7 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(0),
             cap: 4096,
+            refused: AtomicBool::new(false),
         };
         let first = take(&b, 4096, true);
         assert!(!first.is_null());
@@ -219,6 +221,7 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(0),
             cap: 100,
+            refused: AtomicBool::new(false),
         };
         unsafe { free(&b, ptr::null_mut(), 50) };
         b.release(10);
@@ -235,6 +238,7 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(1),
             cap: usize::MAX,
+            refused: AtomicBool::new(false),
         };
         assert!(!b.reserve(usize::MAX));
     }

@@ -336,7 +336,9 @@ def a_refused_allocation_does_not_leave_the_runtime_terminated() -> bool:
     # Genuine heap exhaustion must still end in a termination, every time (a terminated runtime
     # stays terminated: that is `max_heap_size`'s documented effect, so each try is a new one).
     for _ in range(3):
-        with Runtime(RuntimeConfig(max_buffer_bytes=cap, max_heap_size=256 * 2**20)) as rt:
+        with Runtime(
+            RuntimeConfig(max_buffer_bytes=cap, max_heap_size=256 * 2**20)
+        ) as rt:
             try:
                 rt.eval("const a = []; for (;;) a.push(new Array(100000).fill(1))")
                 return True
@@ -439,12 +441,24 @@ def poisoned_error_prototype_cannot_hang_the_in_process_runtime() -> bool:
         for mode in ("sync", "async"):
             try:
                 out = subprocess.run(
-                    [sys.executable, "-c", _IN_PROCESS_DEADLINE_PROBE, str(_DEADLINE), poison, trigger, mode],
+                    [
+                        sys.executable,
+                        "-c",
+                        _IN_PROCESS_DEADLINE_PROBE,
+                        str(_DEADLINE),
+                        poison,
+                        trigger,
+                        mode,
+                    ],
                     capture_output=True,
                     text=True,
                     timeout=6 * _DEADLINE,
                 )
-                elapsed = float(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else 1e9
+                elapsed = (
+                    float(out.stdout.strip().splitlines()[-1])
+                    if out.stdout.strip()
+                    else 1e9
+                )
             except subprocess.TimeoutExpired:
                 elapsed = 1e9
             if elapsed > 4 * _DEADLINE:
@@ -486,7 +500,11 @@ def a_refused_bind_runs_no_guest_getter() -> bool:
     fired = []
     for setup in _BIND_GETTERS:
         with Runtime(RuntimeConfig(timeout=2.0)) as rt:
-            rt.eval("globalThis.__hits = 0; globalThis.tools = new Proxy({}, {}); " + setup + "; 0")
+            rt.eval(
+                "globalThis.__hits = 0; globalThis.tools = new Proxy({}, {}); "
+                + setup
+                + "; 0"
+            )
             try:
                 rt.bind_object("tools", {"f": lambda: 1})
                 fired.append("bound onto a Proxy")
