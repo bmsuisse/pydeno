@@ -71,6 +71,8 @@ from ._isolated import (
     _clock_ms,
     _error_reply,
     _is_token,
+    _limit_int,
+    _limit_seconds,
     _revoked_handler,
     _seconds,
     _session_options,
@@ -666,12 +668,9 @@ class AsyncIsolatedRuntime:
             raise ValueError("random_seed must be an integer in [0, 2**31)")
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
-        if max_host_calls is not None and max_host_calls < 0:
-            raise ValueError("max_host_calls must be non-negative")
+        max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
-        if max_memory is not None and max_memory <= 0:
-            raise ValueError("max_memory must be a positive integer")
         if os.name != "posix":
             raise NotImplementedError(
                 "AsyncIsolatedRuntime currently supports POSIX only"
@@ -1560,7 +1559,7 @@ class AsyncIsolatedRuntime:
     ) -> Any:
         """Evaluate JavaScript in the worker, awaiting a promise result. Host functions (sync or
         async) run while it waits, with the caller's contextvars."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         return await self._request(
@@ -1573,7 +1572,7 @@ class AsyncIsolatedRuntime:
         self, specifier: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate a module (awaiting top-level await) and return its namespace as a dict."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         return await self._request(

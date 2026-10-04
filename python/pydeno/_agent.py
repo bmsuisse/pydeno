@@ -59,6 +59,7 @@ from ._isolated import (
     IsolatedRuntime,
     _checked_console,
     _clock_ms,
+    _limit_seconds,
     _seconds,
 )
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
@@ -1311,8 +1312,8 @@ class _SessionBase:
         runtime._handlers[hid] = (_checked_console(sink), False)  # noqa: SLF001
         runtime._apply_session(  # noqa: SLF001
             {
-                "_request_timeout": _seconds(timeout),
-                "_max_host_wait": _seconds(max_pause),
+                "_request_timeout": _limit_seconds("timeout", timeout),
+                "_max_host_wait": _limit_seconds("max_pause", max_pause),
             }
         )
         self._redact = bool(runtime._redact)  # noqa: SLF001

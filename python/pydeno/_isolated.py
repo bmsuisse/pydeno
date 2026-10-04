@@ -257,6 +257,39 @@ def _seconds(value: float | int | timedelta | None) -> float | None:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
+def _limit_seconds(
+    name: str, value: float | int | timedelta | None, *, allow_zero: bool = False
+) -> float | None:
+    """A duration limit: None, or a finite number of seconds (> 0, or >= 0 with `allow_zero`).
+
+    A limit is a comparison, and every comparison with NaN is false: a NaN deadline never fires,
+    silently. Infinity is a unit mistake or a config typo, not a way to say "no limit" (that is
+    None). Python's `json` parses both, so they can come from a configuration file."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, timedelta)):
+        raise TypeError(f"{name} must be a number of seconds, a timedelta, or None")
+    seconds = _seconds(value)
+    assert seconds is not None
+    if not math.isfinite(seconds) or seconds < 0 or (seconds == 0 and not allow_zero):
+        raise ValueError(
+            f"{name} must be a finite number of seconds "
+            f"{'>= 0' if allow_zero else '> 0'}, or None (got {seconds!r})"
+        )
+    return seconds
+
+
+def _limit_int(name: str, value: Any, *, minimum: int) -> int | None:
+    """A count limit: None or an int >= `minimum` (never a bool, a float or NaN)."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int or None")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
 # The options that only the parent enforces: none of them reaches the worker, so a worker started
 # ahead of time (`SandboxPool`) can be given them when it is handed out.
 SESSION_OPTIONS = (
@@ -283,31 +316,33 @@ def _session_options(
     """The parent-side options, validated and normalised, as the runtime attributes that hold
     them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
     an option set at checkout means exactly what it means in the constructor."""
-    if max_host_calls is not None and max_host_calls < 0:
-        raise ValueError("max_host_calls must be non-negative")
+    max_host_calls = _limit_int("max_host_calls", max_host_calls, minimum=0)
     max_inflight = (
         DEFAULT_MAX_INFLIGHT_HOST_CALLS
         if max_inflight_host_calls is _DEFAULT
-        else max_inflight_host_calls
+        else _limit_int("max_inflight_host_calls", max_inflight_host_calls, minimum=1)
     )
-    if max_inflight is not None and max_inflight < 1:
-        raise ValueError("max_inflight_host_calls must be at least 1")
+    grace = _limit_seconds("timeout_grace", timeout_grace, allow_zero=True)
+    if grace is None:
+        raise TypeError("timeout_grace must be a number of seconds")
     return {
         "_request_timeout": (
-            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
+            _DEFAULT
+            if request_timeout is _DEFAULT
+            else _limit_seconds("request_timeout", request_timeout)
         ),
-        "_grace": float(timeout_grace),
+        "_grace": grace,
         "_max_host_calls": max_host_calls,
         "_max_host_wait": (
             DEFAULT_MAX_HOST_WAIT
             if max_host_wait is _DEFAULT
-            else _seconds(max_host_wait)
+            else _limit_seconds("max_host_wait", max_host_wait)
         ),
         "_max_inflight": max_inflight,
         "_stall": (
             DEFAULT_WRITE_STALL_TIMEOUT
             if write_stall_timeout is _DEFAULT
-            else _seconds(write_stall_timeout)
+            else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
     }
@@ -490,12 +525,9 @@ class IsolatedRuntime:
             raise ValueError("random_seed must be an integer in [0, 2**31)")
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
-        if max_host_calls is not None and max_host_calls < 0:
-            raise ValueError("max_host_calls must be non-negative")
+        max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
-        if max_memory is not None and max_memory <= 0:
-            raise ValueError("max_memory must be a positive integer")
         if os.name != "posix":
             raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
         config = config or RuntimeConfig()
@@ -1204,7 +1236,7 @@ class IsolatedRuntime:
         self, code: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate JavaScript, awaiting promises. Async host functions run on this loop."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
@@ -1253,7 +1285,7 @@ class IsolatedRuntime:
         """`eval_async` (promises are awaited) returning an `ExecutionResult`; see `execute`."""
         capture = OutputCapture(max_output_bytes)
         check_limit("max_result_bytes", max_result_bytes)
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
@@ -1437,7 +1469,7 @@ class IsolatedRuntime:
         self, specifier: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate a module, awaiting top-level await; async host callbacks run on this loop."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
