@@ -132,8 +132,8 @@ def _apply_precompiled_seatbelt() -> bool:
     thread = _precompile_thread
     if thread is None:
         return False
-    thread.join()
-    if not _precompiled:
+    thread.join(timeout=5.0)  # never seen to take more than ~10 ms
+    if thread.is_alive() or not _precompiled:
         return False
     profile, sandbox_apply, free_profile = _precompiled.pop()
     try:
