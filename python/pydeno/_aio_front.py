@@ -18,11 +18,22 @@ import asyncio
 import contextvars
 import functools
 import inspect
-import itertools
+import weakref
 from collections.abc import Callable
 from typing import Any, Literal
 
-from ._agent import _MISSING, _TOOL_OF, Done, Failed, ToolCall, _ToolThread
+from ._agent import (
+    _MISSING,
+    _SESSION_IDS,
+    _TOOL_OF,
+    Done,
+    Failed,
+    ToolCall,
+    _log,
+    _ThreadsExhausted,
+    _ToolThread,
+    _unavailable,
+)
 from ._aio import AsyncIsolatedRuntime
 from ._aio_agent import AsyncAgentSandbox, apreinstall
 from ._front import (
@@ -32,8 +43,11 @@ from ._front import (
     PydenoComplete,
     PydenoCrashedError,
     PydenoError,
+    DEFAULT_MAX_TOOL_THREADS,
     PydenoLimits,
+    ToolThreadLimitError,
     _check_lookup,
+    _tool_budget,
     _check_pool_arguments,
     _compile_check,
     _ended,
@@ -59,8 +73,6 @@ from ._isolated import WorkerCrashed
 from ._sandbox_pool import AsyncSandboxPool
 
 __all__ = ["AsyncPydeno", "AsyncPydenoSession", "AsyncPydenoSnapshot"]
-
-_FRONT_SESSIONS = itertools.count(1)
 
 
 class _Pool(AsyncSandboxPool):
@@ -101,8 +113,10 @@ class AsyncPydeno:
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
         dump_key: bytes | None = None,
+        max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
     ) -> None:
         self._key = _check_pool_arguments(min_processes, sandbox, jitless, dump_key)
+        self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
         self._sandbox = sandbox
@@ -318,8 +332,12 @@ class AsyncPydenoSession:
         self._printer = _Printer()
         self._entered = False
         self._busy = False
-        self._sid = next(_FRONT_SESSIONS)
-        self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}")
+        # One id namespace with the agent sessions' (the self-close guard compares them).
+        self._sid = next(_SESSION_IDS)
+        self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}", pool._budget)  # noqa: SLF001
+        self._refused: BaseException | None = None
+        # A session dropped without close() must not keep its tool thread (or its budget).
+        weakref.finalize(self, self._tools.close)
 
     async def __aenter__(self) -> AsyncPydenoSession:
         if self._entered:
@@ -399,6 +417,7 @@ class AsyncPydenoSession:
         calls, names = _check_lookup(external_lookup, sync=False)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
+        self._refused = None
         try:
             step = await self._start(agent, prepared)
             while isinstance(step, ToolCall):
@@ -550,9 +569,13 @@ class AsyncPydenoSession:
             else:
                 # A plain function may block: never on the loop, and never on a thread another
                 # session uses (its thread-locals, or a wedged call, stay this session's).
-                result = await asyncio.wrap_future(
-                    self._tools.submit(context.run, fn, *args)
-                )
+                try:
+                    submitted = self._tools.submit(context.run, fn, *args)
+                except _ThreadsExhausted as exc:
+                    self._refused = exc
+                    _log.warning("pydeno: a tool call was refused: %s", exc)
+                    return _MISSING, _unavailable()
+                result = await asyncio.wrap_future(submitted)
                 if inspect.isawaitable(result):
                     result = await result
         except asyncio.CancelledError:
@@ -565,7 +588,10 @@ class AsyncPydenoSession:
         if isinstance(step, Done):
             return _output(step.value)
         assert isinstance(step, Failed)
-        raise _ended(step.error, self._agent) from None
+        error = _ended(step.error, self._agent)
+        if self._refused is not None and not isinstance(error, PydenoCrashedError):
+            raise ToolThreadLimitError(str(self._refused), self._refused) from error
+        raise error from None
 
     async def _step(
         self, step: Any, calls: dict[str, Any]

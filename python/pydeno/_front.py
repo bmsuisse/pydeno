@@ -61,7 +61,11 @@ from ._agent import (
     _error_class,
     _open_journal,
     _public,
+    _PROCESS_THREADS,
+    _ThreadBudget,
+    _ThreadsExhausted,
     _TOOL_OF,
+    _unavailable,
     preinstall,
 )
 from ._isolated import IsolatedRuntime, WorkerCrashed
@@ -81,9 +85,12 @@ __all__ = [
     "PydenoSnapshot",
     "PydenoSyntaxError",
     "PydenoTimeoutError",
+    "ToolThreadLimitError",
 ]
 
 DEFAULT_MIN_PROCESSES = 2
+#: Session tool threads one pool may hold at once (see `Pydeno(max_tool_threads=...)`).
+DEFAULT_MAX_TOOL_THREADS = 128
 _MIB = 1024 * 1024
 #: The limits every session gets unless told otherwise (see `PydenoLimits`).
 DEFAULT_LIMITS: dict[str, Any] = {
@@ -291,6 +298,15 @@ class PydenoTimeoutError(PydenoCrashedError, TimeoutError):
     `max_host_wait_secs`). A `TimeoutError`; the session is over."""
 
     timed_out = True
+
+
+class ToolThreadLimitError(PydenoError):
+    """An external call was refused because a thread budget is spent: the pool's
+    ``max_tool_threads`` (or the process-wide ceiling), typically held by tools of killed runs
+    that have not returned yet. Raised by the feed whose call was refused if that feed then
+    failed; always logged (logger ``pydeno``). The guest only saw its call fail like any other
+    host error (``RuntimeError: host function failed``), nothing about the host. The session
+    survives; other pools and sessions are unaffected."""
 
 
 _JS_MESSAGE = re.compile(
@@ -1032,6 +1048,16 @@ class _Reaper:
                 pass
 
 
+def _tool_budget(max_tool_threads: int) -> _ThreadBudget:
+    if (
+        isinstance(max_tool_threads, bool)
+        or not isinstance(max_tool_threads, int)
+        or max_tool_threads < 1
+    ):
+        raise ValueError("max_tool_threads must be a positive int")
+    return _ThreadBudget(max_tool_threads, "this pool", parent=_PROCESS_THREADS)
+
+
 def _check_pool_arguments(
     min_processes: int, sandbox: str, jitless: bool, dump_key: bytes | None
 ) -> bytes:
@@ -1086,6 +1112,14 @@ class Pydeno:
             `load_session` / `load_snapshot` check. Default: a random key per `Pydeno`, so state
             loads only into the pool that dumped it; pass your own (from a secret store) to load
             it in another process.
+        max_tool_threads: Most session tool threads this pool's sessions may hold at once
+            (default 128). A session gets its own threads at its first external call: two for
+            a `PydenoSession` (its loop and its tool thread), one for an `AsyncPydenoSession`;
+            they end with the session, except that a tool that never returns keeps its thread
+            after its run is killed. Past the
+            cap, an external call that needs a new thread is refused (`ToolThreadLimitError` for
+            the host, a generic failure for the guest), in this pool only. A process-wide
+            ceiling (`pydeno._agent.MAX_TOOL_THREADS`, 512) stays as the last resort.
 
     The first worker starts in the constructor (a platform that cannot sandbox fails here, not
     at the first checkout) and the rest in the background, so the first checkout is fast. Use
@@ -1100,8 +1134,10 @@ class Pydeno:
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
         dump_key: bytes | None = None,
+        max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
     ) -> None:
         self._key = _check_pool_arguments(min_processes, sandbox, jitless, dump_key)
+        self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
         self._sandbox = sandbox
@@ -1185,13 +1221,14 @@ class Pydeno:
             rt.close()
             raise
         agent._core.console.user = printer  # noqa: SLF001
+        agent._core.tools.budget = self._budget  # noqa: SLF001
         return agent
 
     def _load(self, state: bytes, limits: _Limits) -> AgentSandbox:
         seed = _journal_seed(state, self._key)
         rt = self._runtime(limits, seed)
         try:
-            return AgentSandbox.load(
+            agent = AgentSandbox.load(
                 state,
                 self._key,
                 {_EXTERNAL: _external_placeholder},
@@ -1202,6 +1239,8 @@ class Pydeno:
         except BaseException as exc:
             rt.close()
             raise _load_failure(exc) from exc
+        agent._core.tools.budget = self._budget  # noqa: SLF001
+        return agent
 
 
 def _journal_seed(state: bytes, key: bytes) -> int:
@@ -1361,6 +1400,7 @@ class PydenoSession:
         calls, names = _check_lookup(external_lookup, sync=True)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
+        agent._core.refused = None  # noqa: SLF001
 
         def answer(call: ToolCall) -> Any:
             unpacked = _unpack(call)
@@ -1398,6 +1438,7 @@ class PydenoSession:
         calls, names = _check_lookup(external_lookup, sync=False)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
+        agent._core.refused = None  # noqa: SLF001
         try:
             return self._step(self._start(agent, prepared), calls)
         except BaseException:
@@ -1527,7 +1568,11 @@ class PydenoSession:
         context = contextvars.copy_context()
         context.run(_TOOL_OF.set, core.session_id)
         # The session's own tool thread: never shared with another session.
-        future = core.tools.submit(context.run, self._call_external, fn, name, args)
+        try:
+            future = core.tools.submit(context.run, self._call_external, fn, name, args)
+        except _ThreadsExhausted as exc:
+            core.note_refusal(exc)  # answered with the generic error, as feed_run does
+            return _MISSING, _unavailable()
         rt = core.rt
         while True:
             try:
@@ -1563,7 +1608,11 @@ class PydenoSession:
         if isinstance(step, Done):
             return _output(step.value)
         assert isinstance(step, Failed)
-        raise _ended(step.error, self._agent) from None
+        error = _ended(step.error, self._agent)
+        refused = self._agent._core.refused if self._agent is not None else None  # noqa: SLF001
+        if refused is not None and not isinstance(error, PydenoCrashedError):
+            raise ToolThreadLimitError(str(refused), refused) from error
+        raise error from None
 
     def _step(
         self, step: Any, calls: dict[str, Any]

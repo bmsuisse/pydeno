@@ -21,6 +21,9 @@
   worker from the calling thread, which enforces every limit also while a tool runs (tools are answered
   on the session's own threads, never shared with another session). Journals are unchanged: a dump
   from either path replays on the other.
+- Session tool threads are capped per pool (`Pydeno(max_tool_threads=128)`, then a process ceiling of
+  512); a refused call fails generically for the guest and raises `ToolThreadLimitError` (a
+  `PydenoError`) for the host. A session dropped without `close()` gives its threads back.
 
 Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 

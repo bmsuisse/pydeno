@@ -180,10 +180,20 @@ What limits it:
   that gap.
 - **An external function that never returns keeps its session's thread.** Its run is ended,
   your thread released and the session is over, so it cannot start another: one session leaves
-  at most its tool thread and its loop thread behind, and other sessions are unaffected. The
-  process caps live session tool threads at `pydeno._agent.MAX_TOOL_THREADS` (512); past it, an
-  external call that needs a new thread fails in the guest with `ToolThreadLimitError` (only that
-  call; running sessions keep theirs). Give your externals their own timeouts.
+  at most one wedged thread behind. Threads are capped **per pool**: `Pydeno(max_tool_threads=128)`
+  (the default) counts the threads its sessions hold, two per `PydenoSession` that has called an
+  external (its loop and its tool thread), one per `AsyncPydenoSession`; a session's threads end
+  with it, also when it is dropped without `close()`. Past the cap, an external call that needs a
+  new thread is refused **in that pool only**: the guest sees its call fail exactly like a tool
+  raising a redacted `RuntimeError` (`host function failed`, nothing about the host), the host gets
+  a log record (logger `pydeno`) and, if the feed then fails, `ToolThreadLimitError` (a
+  `PydenoError`). A process-wide ceiling (`pydeno._agent.MAX_TOOL_THREADS`, 512) stays behind every
+  pool as the last resort; a fork()ed child starts from zero. Give your externals their own
+  timeouts.
+- **`AsyncAgentSandbox` (the older class) still runs plain tools on a thread pool shared by every
+  session in the process** (32 threads, or your `handler_executor`): tools that block there can
+  starve other sessions' tools. `AsyncPydeno` does not have this limit (each session has its own
+  tool thread); pass a `handler_executor` per tenant if you use `AsyncAgentSandbox` directly.
 - **The first command after a worker has sat idle is slower** (0.3 to 1 ms on macOS) whatever
   sends it.
 - Monty is faster again: its workers are reused between sessions (pydeno's are single-use, by

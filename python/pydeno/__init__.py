@@ -42,6 +42,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         PydenoSnapshot,
         PydenoSyntaxError,
         PydenoTimeoutError,
+        ToolThreadLimitError,
     )
     from ._agent import (
         AgentSandbox,
@@ -94,6 +95,7 @@ _LAZY = {
     "PydenoSyntaxError": "_front",
     "PydenoCrashedError": "_front",
     "PydenoTimeoutError": "_front",
+    "ToolThreadLimitError": "_front",
     "AsyncPydeno": "_aio_front",
     "AsyncPydenoSession": "_aio_front",
     "AsyncPydenoSnapshot": "_aio_front",
@@ -430,6 +432,7 @@ __all__ = [
     "PydenoSyntaxError",
     "PydenoCrashedError",
     "PydenoTimeoutError",
+    "ToolThreadLimitError",
     "classify_error",
     "ErrorInfo",
     "check_source",

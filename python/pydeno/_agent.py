@@ -39,6 +39,7 @@ import hmac
 import inspect
 import itertools
 import json
+import logging
 import math
 import os
 import queue
@@ -824,18 +825,41 @@ class _Core:
         # A tool of this session is running (on its loop or its tool thread): closing then must
         # not wait for either, since the tool may never return.
         self.tool_busy = False
+        self._loop_budget: _ThreadBudget | None = None
+        # The last tool call refused for want of a thread (host-side detail), if any.
+        self.refused: BaseException | None = None
 
-    def ensure_loop(self) -> asyncio.AbstractEventLoop:
+    def ensure_loop(self, *, for_tools: bool = False) -> asyncio.AbstractEventLoop:
+        """The session's loop, started on first use. Started for a tool call (`for_tools`), its
+        thread counts against the session's thread budget like its tool thread does (a tool can
+        wedge it); raises `_ThreadsExhausted` if that budget is spent."""
         with self._loop_lock:
             if self.loop is None:
                 if self.closed:
                     raise RuntimeError("the session is closed")
-                self.loop = asyncio.new_event_loop()
-                self.thread = threading.Thread(
-                    target=self._serve, name="pydeno-agent-loop", daemon=True
-                )
-                self.thread.start()
+                budget = self.tools.budget if for_tools else None
+                if budget is not None:
+                    budget.acquire()
+                try:
+                    loop = asyncio.new_event_loop()
+                    self.thread = threading.Thread(
+                        target=self._serve, name="pydeno-agent-loop", daemon=True
+                    )
+                    self.loop = loop
+                    self._loop_budget = budget
+                    self.thread.start()
+                except BaseException:
+                    self.loop = None
+                    if budget is not None:
+                        budget.release()
+                    raise
             return self.loop
+
+    def note_refusal(self, exc: BaseException) -> None:
+        """A tool call refused for want of a thread: tell the host (the guest is told nothing
+        but that the call failed)."""
+        self.refused = exc
+        _log.warning("pydeno: a tool call was refused: %s", exc)
 
     def charge(self, name: str) -> None:
         """One tool call against the session's budget (refused past it)."""
@@ -875,6 +899,8 @@ class _Core:
         try:
             self.loop.run_forever()
         finally:
+            if self._loop_budget is not None:
+                self._loop_budget.release()
             try:
                 for task in asyncio.all_tasks(self.loop):
                     task.cancel()
@@ -1610,17 +1636,75 @@ _TOOL_OF: contextvars.ContextVar[int | None] = contextvars.ContextVar(
 )
 
 
-class ToolThreadLimitError(ToolError):
-    """The process already runs `MAX_TOOL_THREADS` session tool threads (most of them, typically,
-    stuck in tools whose runs were killed): no new session tool thread is started until some
-    of them finish. Only the call that needed a new thread fails; running ones are unaffected."""
+class _ThreadsExhausted(RuntimeError):
+    """Internal: a session thread could not start because a thread budget is spent. The host
+    hears about it (a log record, and `PydenoSession.feed_run` raises `ToolThreadLimitError` if the
+    feed then fails); the guest only sees its tool call fail like any other host error."""
 
 
-#: Most session tool threads alive in the process at once. Each session gets at most one (plus
-#: its loop thread), so this bounds how many sessions with wedged tools a process tolerates.
+_log = logging.getLogger("pydeno")
+# What the guest sees for a tool call refused for want of a thread: exactly what a tool raising
+# a plain RuntimeError looks like under redaction, so it learns nothing about the host.
+_UNAVAILABLE = "host function failed"
+
+
+def _unavailable() -> RuntimeError:
+    exc = RuntimeError(_UNAVAILABLE)
+    exc._pydeno_public = True  # type: ignore[attr-defined] # the same text in every mode
+    return exc
+
+
+class _ThreadBudget:
+    """A cap on the session threads (tool threads, and loop threads started for tools) alive at
+    once, for one pool (`Pydeno(max_tool_threads=...)`), chained to the process-wide ceiling.
+    A pool can never hold more than its own cap, so one tenant spending its share fails only
+    itself. Fork-safe: a fork()ed child starts from zero (it has none of the parent's threads)."""
+
+    def __init__(
+        self, limit: int, what: str, parent: _ThreadBudget | None = None
+    ) -> None:
+        self.limit = limit
+        self.what = what
+        self.parent = parent
+        self.count = 0
+        self.lock = threading.Lock()
+        _BUDGETS.add(self)
+
+    def acquire(self) -> None:
+        with self.lock:
+            if self.count >= self.limit:
+                raise _ThreadsExhausted(
+                    f"{self.what} already runs {self.limit} session tool threads (most likely "
+                    "stuck in tools whose runs were killed); no new one starts until some finish"
+                )
+            if self.parent is not None:
+                self.parent.acquire()
+            self.count += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self.count -= 1
+        if self.parent is not None:
+            self.parent.release()
+
+    def _after_fork(self) -> None:
+        self.lock = threading.Lock()
+        self.count = 0
+
+
+_BUDGETS: weakref.WeakSet[_ThreadBudget] = weakref.WeakSet()
+#: The process-wide ceiling on live session tool threads: the last resort behind each pool's own
+#: `max_tool_threads`. Each session holds at most two (its tool thread and its loop thread).
 MAX_TOOL_THREADS = 512
-_TOOL_THREADS_LOCK = threading.Lock()
-_TOOL_THREADS_ALIVE = 0
+_PROCESS_THREADS = _ThreadBudget(MAX_TOOL_THREADS, "this process")
+
+
+def _budgets_after_fork() -> None:
+    for budget in list(_BUDGETS):
+        budget._after_fork()  # noqa: SLF001
+
+
+os.register_at_fork(after_in_child=_budgets_after_fork)
 
 
 class _ToolThread:
@@ -1629,47 +1713,42 @@ class _ToolThread:
     blocks forever, or that leaves thread-local state behind, affects only its own session.
     One call at a time. `close()` lets it exit after the call in progress, without waiting."""
 
-    __slots__ = ("_lock", "_name", "_queue", "_started", "_closed")
+    __slots__ = ("_closed", "_held", "_lock", "_name", "_queue", "_started", "budget")
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, budget: _ThreadBudget | None = None) -> None:
         self._name = name
         self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._lock = threading.Lock()
         self._started = False
         self._closed = False
+        #: What the thread counts against (a pool's budget, else the process ceiling).
+        self.budget = budget or _PROCESS_THREADS
+        self._held: _ThreadBudget | None = None
 
     def submit(
         self, fn: Callable[..., Any], *args: Any
     ) -> concurrent.futures.Future[Any]:
-        global _TOOL_THREADS_ALIVE  # noqa: PLW0603
+        """Raises `_ThreadsExhausted` if the thread must start and its budget is spent."""
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
         with self._lock:
             if self._closed:
                 raise RuntimeError("the session is closed")
             if not self._started:
-                with _TOOL_THREADS_LOCK:
-                    if _TOOL_THREADS_ALIVE >= MAX_TOOL_THREADS:
-                        raise _public(
-                            ToolThreadLimitError(
-                                f"this process already runs {MAX_TOOL_THREADS} session tool "
-                                "threads; no new one can start until some finish"
-                            )
-                        )
-                    _TOOL_THREADS_ALIVE += 1
+                budget = self.budget
+                budget.acquire()
                 try:
                     threading.Thread(
                         target=self._serve, name=self._name, daemon=True
                     ).start()
                 except BaseException:
-                    with _TOOL_THREADS_LOCK:
-                        _TOOL_THREADS_ALIVE -= 1
+                    budget.release()
                     raise
+                self._held = budget
                 self._started = True
             self._queue.put((future, fn, args))
         return future
 
     def _serve(self) -> None:
-        global _TOOL_THREADS_ALIVE  # noqa: PLW0603
         try:
             while True:
                 item = self._queue.get()
@@ -1684,8 +1763,9 @@ class _ToolThread:
                     future.set_exception(exc)
                 del future, fn, args, item  # hold nothing of a finished call
         finally:
-            with _TOOL_THREADS_LOCK:
-                _TOOL_THREADS_ALIVE -= 1
+            held = self._held
+            if held is not None:
+                held.release()
 
     def close(self) -> None:
         with self._lock:
@@ -1706,7 +1786,13 @@ class _LazyLoop:
         self._core = core
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._core.ensure_loop(), name)
+        core = self._core
+        try:
+            loop = core.ensure_loop(for_tools=True)
+        except _ThreadsExhausted as exc:
+            core.note_refusal(exc)
+            raise _unavailable() from None
+        return getattr(loop, name)
 
 
 class _Slot:
@@ -2171,9 +2257,12 @@ class AgentSandbox(_SessionBase):
             if inspect.iscoroutinefunction(fn):
                 # A task made inside the context runs in (a copy of) it.
                 return await context.run(loop.create_task, fn(*args))
-            result = await asyncio.wrap_future(
-                core.tools.submit(context.run, fn, *args)
-            )
+            try:
+                submitted = core.tools.submit(context.run, fn, *args)
+            except _ThreadsExhausted as exc:
+                core.note_refusal(exc)
+                raise _unavailable() from None
+            result = await asyncio.wrap_future(submitted)
             if inspect.isawaitable(result):
                 result = await result
             return result
