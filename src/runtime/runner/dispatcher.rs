@@ -2,7 +2,8 @@
 //! handle commands, and park when there is nothing to do.
 
 use super::core::{
-    is_stalled_module_evaluation, runtime_error_indicates_termination, RuntimeCoreState,
+    is_stalled_module_evaluation, leaves_module_evaluation_pending,
+    runtime_error_indicates_termination, RuntimeCoreState,
 };
 use super::jobs::{
     call_function_async_job, eval_async_job, resume_function_call_job, stream_read_job,
@@ -121,8 +122,25 @@ impl RuntimeDispatcher {
                     if runtime_error_indicates_termination(&runtime_err) {
                         true
                     } else if is_stalled_module_evaluation(&runtime_err)
-                        && (self.active_job.is_none() || self.core.abandoned_module_evaluation)
+                        && self.active_job.is_some()
                     {
+                        // Nothing else is left to run. If the active job has settled, the report
+                        // is not about it: let it finish with its own outcome. If it has not and
+                        // an earlier evaluation was abandoned, the report may be that one's; keep
+                        // the job waiting (its deadline still applies). Otherwise it is stuck.
+                        let settled = self.active_job.as_mut().map(|job| job.poll(&mut self.core));
+                        match settled {
+                            Some(Poll::Ready(result)) => {
+                                self.complete_active_job(result);
+                                continue;
+                            }
+                            _ if self.core.abandoned_module_evaluation => true,
+                            _ => {
+                                self.complete_active_job(Err(runtime_err));
+                                continue;
+                            }
+                        }
+                    } else if is_stalled_module_evaluation(&runtime_err) {
                         // An abandoned module evaluation that deno_core keeps reporting on every
                         // poll. Nothing else is outstanding (deno_core only reports a stall then),
                         // so treat the loop as drained: serve commands, honour termination, and
@@ -205,7 +223,9 @@ impl RuntimeDispatcher {
     fn complete_active_job(&mut self, result: RuntimeResult<crate::runtime::js_value::JSValue>) {
         if let Some(job) = self.active_job.take() {
             // A module evaluation that did not complete may stay pending in deno_core for good.
-            if result.is_err() && job.kind() == RuntimeCallKind::EvalModuleAsync {
+            if job.kind() == RuntimeCallKind::EvalModuleAsync
+                && result.as_ref().is_err_and(leaves_module_evaluation_pending)
+            {
                 self.core.abandoned_module_evaluation = true;
             }
             self.core

@@ -324,8 +324,7 @@ impl RuntimeCoreState {
         if let Some(heap_limit_bytes) = max_heap_size {
             let termination = termination.clone();
             js_runtime.add_near_heap_limit_callback(move |current_limit, initial_limit| {
-                termination.ensure_reason("Heap limit exceeded");
-                if termination.request() {
+                if termination.request_with_reason("Heap limit exceeded") {
                     log::error!(
                         "V8 isolate is nearing its heap limit; terminating execution \
                          (configured_heap_limit={heap_limit_bytes}, \
@@ -776,18 +775,31 @@ impl RuntimeCoreState {
     pub(super) fn eval_module_sync(&mut self, specifier: &str) -> RuntimeResult<JSValue> {
         self.with_timing(RuntimeCallKind::EvalModuleSync, |this| {
             let module_id = this.load_module(specifier)?;
-            let receiver = this.js_runtime.mod_evaluate(module_id);
-            let result = futures::executor::block_on(
+            let mut receiver = Box::pin(this.js_runtime.mod_evaluate(module_id));
+            let result = match futures::executor::block_on(
                 this.js_runtime
                     .run_event_loop(PollEventLoopOptions::default()),
-            )
-            .map_err(|err| this.translate_core_error(err))
-            .and_then(|()| {
-                futures::executor::block_on(receiver).map_err(|err| this.translate_core_error(err))
-            });
-            if result.is_err() {
-                // Whatever stopped it, this evaluation may stay pending in deno_core for good.
-                this.abandoned_module_evaluation = true;
+            ) {
+                Ok(()) => futures::executor::block_on(receiver.as_mut())
+                    .map_err(|err| this.translate_core_error(err)),
+                Err(err) => {
+                    let err = this.translate_core_error(err);
+                    // deno_core reports a stalled top-level `await` once nothing else is left to
+                    // run; it may be an earlier, abandoned evaluation's. If this module has
+                    // settled, its own outcome stands.
+                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                    match std::future::Future::poll(receiver.as_mut(), &mut cx) {
+                        std::task::Poll::Ready(settled) if is_stalled_module_evaluation(&err) => {
+                            settled.map_err(|err| this.translate_core_error(err))
+                        }
+                        _ => Err(err),
+                    }
+                }
+            };
+            if let Err(err) = &result {
+                if leaves_module_evaluation_pending(err) {
+                    this.abandoned_module_evaluation = true;
+                }
             }
             result?;
             // A bare top-level `queueMicrotask` is not on the path the event
@@ -938,6 +950,15 @@ pub(super) fn is_stalled_module_evaluation(err: &RuntimeError) -> bool {
     let text = err.to_string();
     text.contains("Top-level await promise never resolved")
         || text.contains("Module evaluation is still pending after multiple event loop iterations")
+}
+
+/// Whether a module evaluation that ended in `err` may stay pending in deno_core: it was cut
+/// short (timeout, termination) or is stuck on a top-level `await`. A module that threw or failed
+/// to resolve has settled and leaves nothing behind.
+pub(super) fn leaves_module_evaluation_pending(err: &RuntimeError) -> bool {
+    matches!(err, RuntimeError::Timeout { .. })
+        || runtime_error_indicates_termination(err)
+        || is_stalled_module_evaluation(err)
 }
 
 pub(super) fn runtime_error_indicates_termination(err: &RuntimeError) -> bool {

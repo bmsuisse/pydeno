@@ -76,6 +76,19 @@ impl TerminationController {
         first
     }
 
+    /// Request termination with `reason`. The first request's reason replaces whatever a
+    /// deadline left in the slot (a timed-out call may still be unwinding), and it is written
+    /// under the same lock `reason()` and `clear_handled_reason()` take, so whoever observes the
+    /// request reads this reason. A repeat request leaves the first one's reason in place.
+    pub fn request_with_reason(&self, reason: impl Into<String>) -> bool {
+        let mut guard = lock(&self.inner.reason);
+        let first = self.request();
+        if first {
+            *guard = Some(reason.into());
+        }
+        first
+    }
+
     pub fn terminate_execution(&self) {
         self.inner.isolate_handle.terminate_execution();
     }
@@ -90,8 +103,9 @@ impl TerminationController {
     /// Forget the reason of a termination that has been handled (cancelled), so a later,
     /// unrelated termination does not report it. Kept while a termination is requested.
     pub(super) fn clear_handled_reason(&self) {
+        let mut guard = lock(&self.inner.reason);
         if !self.is_requested() {
-            *self.inner.reason.lock().unwrap() = None;
+            *guard = None;
         }
     }
 

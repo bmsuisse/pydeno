@@ -53,7 +53,7 @@
   settles): later commands, timeouts and `TerminationHandle.terminate()` are served as usual, and the idle
   runtime thread does not spin.
 - After a deadline has fired, a later `TerminationHandle.terminate()` reports its own reason instead of the
-  earlier timeout's.
+  earlier timeout's, also when it lands while the timed-out call is still returning.
 - Evaluating a module again after its first evaluation timed out or was terminated explains that, instead
   of failing with `Uncaught null`.
 
