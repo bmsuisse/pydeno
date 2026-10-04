@@ -36,7 +36,7 @@ from pydeno import (
     _sandbox,
     undefined,
 )
-from pydeno import _aio
+from pydeno import _aio, _compat
 from pydeno._aio import AsyncIsolatedRuntime
 from pydeno._isolated import _HARDENING_V8_FLAGS, _MAX_WORKER_THREADS
 
@@ -542,7 +542,7 @@ class TestCancellationAndClose:
     async def test_asyncio_timeout_around_eval_is_a_cancellation(self) -> None:
         rt = await _rt(timeout=30.0)
         with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.3):
+            async with _compat.timeout(0.3):
                 await rt.eval("while (true) {}")
         assert rt.is_closed()
         await rt.close()

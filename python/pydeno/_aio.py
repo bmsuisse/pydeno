@@ -45,7 +45,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import _isolated, _sandbox, _wire
+from . import _compat, _isolated, _sandbox, _wire
 from ._isolated import (
     DEFAULT_MAX_MEMORY,
     DEFAULT_REQUEST_TIMEOUT,
@@ -507,12 +507,12 @@ class _Supervisor:
             return
         _SUPERVISORS.setdefault(self.loop, self)
         if self.task is None or self.task.done():
-            # An empty context: the supervisor must not carry the creating task's contextvars.
+            # An empty context: the supervisor must not carry the creating task's contextvars. A
+            # task copies the context it is created in, so create it inside an empty one
+            # (`create_task(context=...)` needs Python 3.11; this supports 3.10).
             try:
-                self.task = self.loop.create_task(
-                    self._run(),
-                    name="pydeno-aio-supervisor",
-                    context=contextvars.Context(),
+                self.task = contextvars.Context().run(
+                    self.loop.create_task, self._run(), name="pydeno-aio-supervisor"
                 )
             except RuntimeError:  # a loop on its way down; atexit reaps what is left
                 pass
@@ -872,7 +872,7 @@ class AsyncIsolatedRuntime:
                     }
                 )
             )
-            async with asyncio.timeout(_HANDSHAKE_SECONDS):
+            async with _compat.timeout(_HANDSHAKE_SECONDS):
                 payload = await self._next_frame()
             if payload is None:
                 await self._reap(0.5)
@@ -1222,7 +1222,7 @@ class AsyncIsolatedRuntime:
         if not self._wproto.paused:
             return
         try:
-            async with asyncio.timeout(self._stall):
+            async with _compat.timeout(self._stall):
                 await self._wproto.drain()
         except TimeoutError:
             raise _wire.StalledWrite(
@@ -1336,7 +1336,7 @@ class AsyncIsolatedRuntime:
         # then calls back into this runtime would otherwise wait on its own command forever.
         try:
             if self._lock.locked():
-                async with asyncio.timeout(
+                async with _compat.timeout(
                     None if hard is None else hard + self._grace
                 ):
                     await self._lock.acquire()

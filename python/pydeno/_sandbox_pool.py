@@ -34,6 +34,7 @@ import weakref
 from collections.abc import Generator
 from typing import Any
 
+from . import _compat
 from ._aio import AsyncIsolatedRuntime
 from ._isolated import SESSION_OPTIONS, IsolatedRuntime, _session_options
 from ._limits import limit_int
@@ -567,7 +568,7 @@ class AsyncSandboxPool:
             return False
         cond = self._cond
         try:
-            async with asyncio.timeout(timeout):
+            async with _compat.timeout(timeout):
                 async with cond:
                     await cond.wait_for(
                         lambda: self._closed or len(self._ready) >= self._size
