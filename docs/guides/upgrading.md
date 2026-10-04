@@ -62,6 +62,19 @@ you have today.
 0.6.1 fixed a macOS-only bug: the sandboxed worker aborted at start on Python 3.10 to 3.12. If you are on
 0.6.0 there, upgrade.
 
+## 0.7.x to the next release: the `Pydeno` front door
+
+**Nothing breaks.** `Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits and errors are new
+names; every existing class keeps its behaviour, and the docs now lead with `Pydeno` and file the
+building blocks under "Advanced".
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| New: `Pydeno`, `AsyncPydeno`, `PydenoSession`, `AsyncPydenoSession`, `PydenoSnapshot`, `AsyncPydenoSnapshot`, `PydenoComplete`, `PydenoLimits` and the `PydenoError` family | new | Adopters | See the [front-door guide](quickstart-pydeno.md); a Monty user can keep their code's shape |
+| `AgentSandbox` / `AsyncAgentSandbox` accept `runtime=` (an already-built, fresh runtime, such as a pool checkout) | new, opt-in | Nobody unless passed | Nothing |
+| `classify_error()` sees through a `PydenoError` to the pydeno exception it wraps | new | Nobody | Nothing |
+| `SandboxPool` builds its runtimes through an overridable core (`_core_type`, private) | internal | Nobody | Nothing |
+
 ## Safe to bump?
 
 **From 0.4.x to 0.5.0** (`Runtime` users: nothing to change)

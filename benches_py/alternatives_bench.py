@@ -2,6 +2,7 @@
 
     python benches_py/alternatives_bench.py pydeno       # needs pydeno
     python benches_py/alternatives_bench.py pydeno-pool  # pydeno.SandboxPool checkouts
+    python benches_py/alternatives_bench.py pydeno-front # pydeno.Pydeno (the front door)
     python benches_py/alternatives_bench.py monty        # needs pydantic-monty
     python benches_py/alternatives_bench.py denobox      # needs denobox (and `deno` on PATH)
 
@@ -117,6 +118,45 @@ def bench_pydeno_pool(n: int, calls: int) -> None:
         )
 
 
+def bench_pydeno_front(n: int, calls: int) -> None:
+    """`Pydeno` (the front door) on its defaults: a `SandboxPool` underneath, every session an
+    `AgentSandbox` on a checked-out worker. Measured exactly like `pydeno-pool` and Monty, plus the
+    session's own costs, so the front door's overhead over a raw pool checkout is visible."""
+    from pydeno import Pydeno
+
+    new, enter, warm, ten, leave = [], [], [], [], []
+    with Pydeno() as pool:
+        for _ in range(n):
+            pool._pool.wait_ready(30)  # noqa: SLF001 - a warm pool, as for pydeno-pool
+            t = time.perf_counter()
+            session = pool.checkout()
+            session.__enter__()
+            enter.append((time.perf_counter() - t) * 1000)
+            session.feed_run("1 + 1")
+            new.append((time.perf_counter() - t) * 1000)
+            t = time.perf_counter()
+            session.__exit__(None, None, None)
+            leave.append((time.perf_counter() - t) * 1000)
+        pool._pool.wait_ready(30)  # noqa: SLF001
+        with pool.checkout() as s:
+            for _ in range(calls):
+                warm.append(timed(lambda: s.feed_run("1 + 1")))
+        for _ in range(n):
+            pool._pool.wait_ready(30)  # noqa: SLF001
+            t = time.perf_counter()
+            with pool.checkout() as s:
+                s.feed_run("var x = 0")
+                for _ in range(10):
+                    s.feed_run("x = x + 1\nx")
+            ten.append((time.perf_counter() - t) * 1000)
+    summarise("pydeno Pydeno (warm checkout + feed_run('1 + 1'))", new, warm, ten)
+    for label, values in (("checkout (enter)", enter), ("session exit", leave)):
+        print(
+            f"| pydeno Pydeno {label} alone | {statistics.median(values):.3f} "
+            f"({pct(values, 0.95):.3f}) | | |"
+        )
+
+
 def bench_monty(n: int, calls: int) -> None:
     from pydantic_monty import Monty
 
@@ -172,6 +212,7 @@ def main() -> None:
     {
         "pydeno": bench_pydeno,
         "pydeno-pool": bench_pydeno_pool,
+        "pydeno-front": bench_pydeno_front,
         "monty": bench_monty,
         "denobox": bench_denobox,
     }[which](n, calls)

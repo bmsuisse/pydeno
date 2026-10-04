@@ -41,12 +41,13 @@ nav:
           - Code Evaluation: concepts/evaluation.md
           - Type Conversion: concepts/types.md
       - Guides:
-          - Bindings: guides/bindings.md
-          - Modules: guides/modules.md
-          - Agent sessions: guides/agent-sessions.md
+          - "Pydeno: the front door": guides/quickstart-pydeno.md
           - pydantic-ai code mode: guides/pydantic-ai.md
           - Upgrading: guides/upgrading.md
           - Advanced:
+              - Agent sessions: guides/agent-sessions.md
+              - Bindings: guides/bindings.md
+              - Modules: guides/modules.md
               - Isolated runtime: guides/advanced/isolation.md
               - Async isolated runtime: guides/advanced/async.md
               - Async agent sessions and pool: guides/advanced/async-agent-sessions.md

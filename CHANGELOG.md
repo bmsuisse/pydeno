@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`Pydeno` / `AsyncPydeno`: one front door, shaped like Monty.** `with Pydeno() as pool:`,
+  `with pool.checkout(limits=...) as session:`, `session.feed_run(code, inputs=, external_lookup=,
+  print_callback=)` (the feed's trailing expression is its result; state persists), `feed_start` with a
+  `PydenoSnapshot` at every external call (`resume`, `resume_auto`, `dump`), `dump` / `load_session` /
+  `load_snapshot` (signed, replayed deterministically on a fresh worker), `worker_pid`, `PydenoLimits`
+  (Monty's `ResourceLimits` mapped onto pydeno's limits) and typed errors (`PydenoError`,
+  `PydenoRuntimeError`, `PydenoSyntaxError`, `PydenoCrashedError`, `PydenoTimeoutError`, which is a
+  `TimeoutError`; `classify_error` sees through them). Secure by default: `sandbox="require"` with no
+  silent downgrade, jitless V8, host errors redacted, every limit set, single-use workers from a warm
+  `SandboxPool`. `benches_py/alternatives_bench.py pydeno-front` measures it.
+- `AgentSandbox(runtime=...)` / `AsyncAgentSandbox(runtime=...)`: run a session on an already-built
+  runtime (a pool checkout); its seed (and frozen clock, if any) become the session's.
+
+Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change
