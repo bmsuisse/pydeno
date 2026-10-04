@@ -181,8 +181,9 @@ fn byte_count(raw: f64) -> Option<usize> {
         .then_some(raw as usize)
 }
 
+#[cfg(unix)]
 extern "C" {
-    // POSIX; on every platform pydeno builds for. No crate needed for one call.
+    // POSIX libc; no crate needed for one call. Windows has no `getpagesize` to link.
     fn getpagesize() -> std::ffi::c_int;
 }
 
@@ -191,7 +192,11 @@ fn page_size() -> usize {
     static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGE.get_or_init(|| {
         // SAFETY: `getpagesize` takes no arguments and only reads a constant.
+        #[cfg(unix)]
         let size = unsafe { getpagesize() };
+        // Windows commits in 4 KiB pages on x86_64 and aarch64.
+        #[cfg(not(unix))]
+        let size = 4096;
         usize::try_from(size)
             .ok()
             .filter(|s| *s > 0)
