@@ -8,16 +8,14 @@ name: Platforms
 # `experimental` cells (free-threaded 3.14t, Windows) report but do not fail the
 # workflow until they are known-green; flip the flag when they are.
 on:
+  # 41 jobs on scarce runners: run on `main` and on demand, not on every pull request (a
+  # busy queue starved the run that gates a release). Workflow edits still validate on PRs.
+  # Run it for any other branch with
+  # `gh workflow run platforms.yml --ref <branch>`.
   push:
-    branches: [main, "ci/platform-matrix"]
+    branches: [main]
   pull_request:
-    paths:
-      - ".github/workflows/platforms.yml"
-      - "src/**"
-      - "python/**"
-      - "tests/**"
-      - "Cargo.*"
-      - "pyproject.toml"
+    paths: [".github/workflows/platforms.yml"]
   workflow_dispatch:
 
 permissions:
@@ -74,6 +72,17 @@ jobs:
           uv pip install --python .venv maturin "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
           uv run --no-sync --python .venv maturin develop --uv --release
 
+      # Same collect-then-run-then-check shape as test.yml: a collection error or a mass-skip must fail
+      # the cell, and `check_test_report.py` needs the collect log to count what was never run.
+      # The 180-second collection watchdog matches test.yml and bounds stuck imports on slow runners.
+      - name: Collect tests
+        shell: bash
+        run: |
+          PY=.venv/bin/python
+          [ -x "$PY" ] || PY=.venv/Scripts/python.exe
+          "$PY" scripts/collect_guard.py 180 tests/ --co -q -p no:randomly \
+            --strict-markers --strict-config | tee collect.log
+
       - name: Run the suite
         shell: bash
         run: |
@@ -89,4 +98,5 @@ jobs:
           PY=.venv/bin/python
           [ -x "$PY" ] || PY=.venv/Scripts/python.exe
           "$PY" scripts/check_test_report.py --label "${{ matrix.os }} py${{ matrix.python }}" \
-            --junit junit.xml --min-tests 500 --max-skipped 0 --max-xfailed 10
+            --junit junit.xml --collect-log collect.log --min-tests 500 \
+            --max-skipped 0 --max-xfailed 10

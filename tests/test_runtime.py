@@ -21,6 +21,7 @@ from pydeno import (
     RuntimeConfig,
     RuntimeStats,
     RuntimeTerminated,
+    RuntimeTimeout,
     SnapshotBuilder,
     undefined,
 )
@@ -923,11 +924,11 @@ class TestRuntimeTimeout:
         with Runtime() as runtime:
             # Promise that never resolves
             code = "new Promise(() => {})"
-            with pytest.raises(RuntimeError) as exc_info:
+            start = time.monotonic()
+            with pytest.raises(RuntimeTimeout):
                 await runtime.eval_async(code, timeout=0.1)
-            message = str(exc_info.value)
-            assert "Evaluation failed" in message
-            assert "pending" in message
+            assert time.monotonic() - start < 2.0
+            assert runtime.eval("1 + 1") == 2
 
     @pytest.mark.asyncio
     async def test_eval_async_no_timeout(self):
