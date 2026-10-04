@@ -119,8 +119,12 @@ _IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 _NATIVE_FRAME = re.compile(r"0x[0-9a-fA-F]{4,}|\.(?:so|dylib)\b|\+\s*\d+\s*$")
-# Control and escape characters, and the Unicode bidirectional controls that reorder a line.
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]")
+# Control and escape characters, the Unicode bidirectional controls that reorder a line, and the
+# invisible format characters (see `_result._CONTROL` for the list and the reasoning).
+_CONTROL = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f­͏؜᠎​-‏ -‮⁠-⁩"
+    r"︀-️﻿￹-￻\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+)
 
 
 def _clean(text: str, limit: int = 500) -> str:
