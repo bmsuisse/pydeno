@@ -293,7 +293,7 @@ impl RuntimeCoreState {
                     }
                 }));
             }
-            op_state.put(BufferBudget(buffer_budget));
+            op_state.put(BufferBudget(buffer_budget.clone()));
             op_state.put(tracked);
         }
 
@@ -339,7 +339,18 @@ impl RuntimeCoreState {
 
         if let Some(heap_limit_bytes) = max_heap_size {
             let termination = termination.clone();
+            let budget = buffer_budget.clone();
             js_runtime.add_near_heap_limit_callback(move |current_limit, initial_limit| {
+                // V8 also invokes this as the last resort of a *failed external backing-store
+                // allocation* (an ArrayBuffer the budget refused), with the JS heap nowhere near
+                // its limit. Terminating then turned a catchable RangeError into a runtime that
+                // answered every later command with "Heap limit exceeded". The allocator flags
+                // its refusal right before V8 gets here; taking the flag means "not the heap":
+                // the limit goes back unchanged and V8 fails that allocation as it should. A
+                // heap that really is at its limit never sets the flag and terminates as before.
+                if budget.as_ref().is_some_and(|b| b.take_refusal()) {
+                    return current_limit;
+                }
                 termination.ensure_reason("Heap limit exceeded");
                 if termination.request() {
                     log::error!(

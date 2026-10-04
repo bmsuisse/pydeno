@@ -20,7 +20,7 @@ use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use deno_core::v8;
@@ -32,6 +32,11 @@ const ALIGN: usize = 16;
 pub struct Budget {
     live: AtomicUsize,
     cap: usize,
+    /// Set right before the allocator refuses a backing store. V8 then collects garbage and, as
+    /// the last resort of that same allocation attempt, invokes the near-heap-limit callback;
+    /// the callback takes this flag to tell "the budget said no" (a catchable RangeError for the
+    /// guest, the heap is fine) from a heap that really is at its limit (terminate).
+    refused: AtomicBool,
 }
 
 impl Budget {
@@ -39,7 +44,13 @@ impl Budget {
         Arc::new(Self {
             live: AtomicUsize::new(0),
             cap,
+            refused: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the allocator has just refused a backing store; cleared by the read.
+    pub fn take_refusal(&self) -> bool {
+        self.refused.swap(false, Ordering::AcqRel)
     }
 
     /// Reserve `len` bytes, or `false` if that would exceed the cap.
@@ -86,6 +97,9 @@ pub fn set_thread_sweeper(sweeper: Sweeper) {
 
 /// Reserve `len`, sweeping once and retrying before refusing.
 fn reserve_or_sweep(budget: &Budget, len: usize) -> bool {
+    // A stale flag from an earlier refusal is cleared by the next request, so it can only be
+    // read by the callback V8 invokes within the refused allocation itself.
+    budget.refused.store(false, Ordering::Release);
     if budget.reserve(len) {
         return true;
     }
@@ -97,7 +111,11 @@ fn reserve_or_sweep(budget: &Budget, len: usize) -> bool {
             }
         }
     });
-    budget.reserve(len)
+    if budget.reserve(len) {
+        return true;
+    }
+    budget.refused.store(true, Ordering::Release);
+    false
 }
 
 fn take(budget: &Budget, len: usize, zeroed: bool) -> *mut c_void {
