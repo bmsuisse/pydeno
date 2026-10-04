@@ -88,30 +88,49 @@ _SEATBELT_PROFILE = """
 _SANDBOX_LIB = "/usr/lib/libsandbox.1.dylib"
 _precompiled: list[tuple[int, Callable[..., int], Callable[..., object]]] = []
 _precompile_thread: threading.Thread | None = None
+#: Which call put the Seatbelt profile in force: "precompiled", "sandbox_init", or "" (none yet).
+SEATBELT_PATH = ""
+#: Why the precompiled path was not used (library missing, the compiler's own error text, apply
+#: refused, ...), or "" if it was. Parent-side diagnostics only: it goes into the worker's start-up
+#: failure message, never to guest code.
+PRECOMPILE_ERROR = ""
 
 
 def _compile_seatbelt() -> None:
+    global PRECOMPILE_ERROR  # noqa: PLW0603
     try:
         lib = ctypes.CDLL(_SANDBOX_LIB)
         compile_string = lib.sandbox_compile_string
         sandbox_apply = lib.sandbox_apply
         free_profile = lib.sandbox_free_profile
-    except (OSError, AttributeError):
+        free_error = lib.sandbox_free_error
+    except (OSError, AttributeError) as exc:
+        PRECOMPILE_ERROR = f"libsandbox unavailable: {exc}"
         return
     compile_string.restype = ctypes.c_void_p
+    # The error is a malloc'd C string the caller frees, so it is taken as a raw pointer.
     compile_string.argtypes = [
         ctypes.c_char_p,
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_void_p),
     ]
     sandbox_apply.restype = ctypes.c_int
     sandbox_apply.argtypes = [ctypes.c_void_p]
     free_profile.restype = None
     free_profile.argtypes = [ctypes.c_void_p]
-    err = ctypes.c_char_p()
+    free_error.restype = None
+    free_error.argtypes = [ctypes.c_void_p]
+    err = ctypes.c_void_p()
     profile = compile_string(_SEATBELT_PROFILE.encode(), None, ctypes.byref(err))
+    if err.value:
+        text = ctypes.string_at(err.value).decode("utf-8", "replace")
+        free_error(err)
+        if not profile:
+            PRECOMPILE_ERROR = f"profile did not compile: {text}"
     if profile:
         _precompiled.append((profile, sandbox_apply, free_profile))
+    elif not PRECOMPILE_ERROR:
+        PRECOMPILE_ERROR = "profile did not compile (no error text)"
 
 
 def precompile_seatbelt() -> None:
@@ -129,21 +148,37 @@ def precompile_seatbelt() -> None:
 
 
 def _apply_precompiled_seatbelt() -> bool:
+    """True only if the precompiled profile is now in force."""
+    global PRECOMPILE_ERROR  # noqa: PLW0603
     thread = _precompile_thread
     if thread is None:
         return False
     thread.join(timeout=5.0)  # never seen to take more than ~10 ms
-    if thread.is_alive() or not _precompiled:
+    if thread.is_alive():
+        PRECOMPILE_ERROR = "compile still running after 5 s"
         return False
+    if not _precompiled:
+        return False  # PRECOMPILE_ERROR says why
     profile, sandbox_apply, free_profile = _precompiled.pop()
     try:
-        return sandbox_apply(profile) == 0
+        rc = sandbox_apply(profile)
     finally:
         free_profile(profile)
+    if rc != 0:
+        PRECOMPILE_ERROR = f"sandbox_apply returned {rc}"
+        return False
+    return True
+
+
+def seatbelt_note() -> str:
+    """ " (precompile: ...)" when the precompiled path was not used, for failure messages."""
+    return f" (precompile: {PRECOMPILE_ERROR})" if PRECOMPILE_ERROR else ""
 
 
 def _apply_seatbelt() -> bool:
+    global SEATBELT_PATH  # noqa: PLW0603
     if _apply_precompiled_seatbelt():
+        SEATBELT_PATH = "precompiled"
         return True
     # `sandbox_init` lives in libsystem_sandbox, which libSystem re-exports, so it is already
     # loaded in every process. Looking it up there saves `ctypes.util` (and `shutil`, which it
@@ -158,7 +193,10 @@ def _apply_seatbelt() -> bool:
     ]
     err = ctypes.c_char_p()
     # flags=0: the first argument is a raw SBPL profile, not a named one.
-    return lib.sandbox_init(_SEATBELT_PROFILE.encode(), 0, ctypes.byref(err)) == 0
+    if lib.sandbox_init(_SEATBELT_PROFILE.encode(), 0, ctypes.byref(err)) != 0:
+        return False
+    SEATBELT_PATH = "sandbox_init"
+    return True
 
 
 # --------------------------------------------------------------------------- Linux

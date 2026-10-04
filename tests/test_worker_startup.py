@@ -70,27 +70,96 @@ def test_precompiled_seatbelt_is_what_gets_applied() -> None:
         from pydeno import _sandbox
         _sandbox.precompile_seatbelt()
         applied = _sandbox.apply()
-        # Consumed by apply(): the precompiled profile was used, not sandbox_init.
-        print(applied, _sandbox._precompile_thread is not None, len(_sandbox._precompiled))
+        print(applied, _sandbox.SEATBELT_PATH, repr(_sandbox.PRECOMPILE_ERROR))
         print("breaches", _sandbox.attest())
         """
     )
-    assert out.splitlines() == ["seatbelt True 0", "breaches []"]
+    assert out.splitlines() == ["seatbelt precompiled ''", "breaches []"]
 
 
 @pytest.mark.darwin_only
-def test_seatbelt_falls_back_to_sandbox_init_when_precompile_fails() -> None:
+def test_precompiled_apply_reports_success_only_when_in_force() -> None:
+    # `_apply_precompiled_seatbelt` must say True only for a profile that sandbox_apply accepted.
+    out = _run(
+        """
+        from pydeno import _sandbox
+        _sandbox.precompile_seatbelt()
+        _sandbox._precompile_thread.join()
+        profile, _, free = _sandbox._precompiled.pop()
+        _sandbox._precompiled.append((profile, lambda _p: -1, free))
+        print(_sandbox._apply_precompiled_seatbelt(), repr(_sandbox.PRECOMPILE_ERROR))
+        """
+    )
+    assert out.splitlines() == ["False 'sandbox_apply returned -1'"]
+
+
+@pytest.mark.darwin_only
+def test_seatbelt_falls_back_to_sandbox_init_when_apply_fails() -> None:
+    out = _run(
+        """
+        import os
+        from pydeno import _sandbox
+        _sandbox.precompile_seatbelt()
+        _sandbox._precompile_thread.join()
+        profile, _, free = _sandbox._precompiled.pop()
+        _sandbox._precompiled.append((profile, lambda _p: -1, free))
+        print(_sandbox.apply(), _sandbox.SEATBELT_PATH, repr(_sandbox.PRECOMPILE_ERROR))
+        # The fallback really put the profile in force: no file can be opened any more.
+        try:
+            os.open("/etc/hosts", os.O_RDONLY)
+            print("open allowed")
+        except PermissionError:
+            print("open denied")
+        print("breaches", _sandbox.attest())
+        """
+    )
+    assert out.splitlines() == [
+        "seatbelt sandbox_init 'sandbox_apply returned -1'",
+        "open denied",
+        "breaches []",
+    ]
+
+
+@pytest.mark.darwin_only
+def test_seatbelt_falls_back_to_sandbox_init_when_the_library_is_missing() -> None:
     out = _run(
         """
         from pydeno import _sandbox
         _sandbox._SANDBOX_LIB = "/nonexistent/libsandbox.dylib"
         _sandbox.precompile_seatbelt()
         _sandbox._precompile_thread.join()
-        print(len(_sandbox._precompiled), _sandbox.apply())
+        print(len(_sandbox._precompiled), _sandbox.apply(), _sandbox.SEATBELT_PATH)
+        print(_sandbox.PRECOMPILE_ERROR.startswith("libsandbox unavailable:"))
         print("breaches", _sandbox.attest())
         """
     )
-    assert out.splitlines() == ["0 seatbelt", "breaches []"]
+    assert out.splitlines() == ["0 seatbelt sandbox_init", "True", "breaches []"]
+
+
+@pytest.mark.darwin_only
+def test_a_profile_that_does_not_compile_keeps_the_compilers_message() -> None:
+    # A broken profile is told apart from a missing library: the compiler's own error text is
+    # kept (and its buffer freed). The real profile is restored before applying, so the fallback
+    # still confines the process.
+    out = _run(
+        """
+        from pydeno import _sandbox
+        real = _sandbox._SEATBELT_PROFILE
+        _sandbox._SEATBELT_PROFILE = "(version 1) (deny default) (no-such-operation)"
+        _sandbox.precompile_seatbelt()
+        _sandbox._precompile_thread.join()
+        _sandbox._SEATBELT_PROFILE = real
+        error = _sandbox.PRECOMPILE_ERROR
+        print(error.startswith("profile did not compile: "), len(error) > 25)
+        print(_sandbox.apply(), _sandbox.SEATBELT_PATH, "precompile:" in _sandbox.seatbelt_note())
+        print("breaches", _sandbox.attest())
+        """
+    )
+    assert out.splitlines() == [
+        "True True",
+        "seatbelt sandbox_init True",
+        "breaches []",
+    ]
 
 
 @pytest.mark.darwin_only

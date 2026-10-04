@@ -424,7 +424,7 @@ class _Worker:
             if breaches:
                 raise RuntimeError(
                     f"sandbox self-test failed: the worker could still {breaches} "
-                    f"(applied: {applied})"
+                    f"(applied: {applied}){_sandbox.seatbelt_note()}"
                 )
         if mode == "require":
             # "require" means every layer this platform has, not "at least one": a kernel that
@@ -433,7 +433,7 @@ class _Worker:
             if missing:
                 raise RuntimeError(
                     f"an OS sandbox is required but {sorted(missing)} could not be applied "
-                    f"here (applied: {applied})"
+                    f"here (applied: {applied}){_sandbox.seatbelt_note()}"
                 )
             if (
                 sys.platform.startswith("linux")
