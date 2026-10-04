@@ -37,6 +37,7 @@ from pydeno import (
     PydenoCrashedError,
     PydenoError,
     PydenoRuntimeError,
+    SessionBusy,
     SessionPool,
     StaleJournal,
     WorkerCrashed,
@@ -789,6 +790,88 @@ class TestSessionPoolLifecycle:
             async with pool.session("o", "s") as again:
                 await again.execute(_LOOP % (9, "t"))
         assert len(ran) == 4
+
+
+class TestSessionPoolQueueAndDrop:
+    """A get queued behind a lease keeps its timeout and wakes on drop/close, even when it
+    arrives in the instant a lease is handed to an earlier waiter; drop() waits for a write of
+    the old session still in flight; close() retries a release that failed while it waited."""
+
+    async def _late_get(self, finish: str) -> BaseException | object:
+        pool = SessionPool(
+            InMemoryJournalStore(), KEY, {}, acquire_timeout=0.5, sandbox=MODE
+        )
+        try:
+            await pool.get("o", "s")  # A holds
+            b = asyncio.ensure_future(pool.get("o", "s"))  # B queues
+            await asyncio.sleep(0.1)
+
+            async def a_again() -> object:
+                await pool.release("o", "s")
+                return await pool.get("o", "s")  # no suspension in between
+
+            a = asyncio.ensure_future(a_again())
+            await asyncio.wait_for(b, 5)  # B has the lease, A queued behind it
+            if finish == "close":
+                await pool.close()
+            elif finish == "drop":
+                await pool.drop("o", "s")
+            done, _ = await asyncio.wait({a}, timeout=4)
+            assert done, f"{finish}: a queued get hung"
+            return a.exception() or a.result()
+        finally:
+            if not pool._closed:  # noqa: SLF001
+                await pool.close()
+
+    async def test_a_queued_get_keeps_its_timeout(self) -> None:
+        assert isinstance(await self._late_get("hold"), SessionBusy)
+
+    async def test_a_queued_get_wakes_on_drop(self) -> None:
+        got = await self._late_get("drop")
+        assert not isinstance(got, BaseException) or isinstance(got, SessionBusy)
+
+    async def test_a_queued_get_wakes_on_close(self) -> None:
+        got = await self._late_get("close")
+        assert isinstance(got, RuntimeError) and "closed" in str(got)
+
+    async def test_drop_waits_for_a_write_in_flight(self) -> None:
+        ran, tools = [], {"t": lambda i: ran.append(i) or i}
+        store = _CtlStore()
+        async with SessionPool(
+            store, KEY, tools, max_tool_calls=4, sandbox=MODE
+        ) as pool:
+            async with pool.session("o", "s") as sb:
+                await sb.execute("await t(0)")
+            sb = await pool.get("o", "s")
+            await sb.execute("globalThis.secret = 'old'; await t(1)")
+            gate = store.gate("set", "journal")
+            releasing = asyncio.ensure_future(pool.release("o", "s"))
+            await store.until_reached("set", "journal")
+            dropping = asyncio.ensure_future(pool.drop("o", "s"))
+            await asyncio.sleep(0.2)
+            store.fail[("delete", "journal")] = 1  # the release's clean-up delete fails
+            gate.set()
+            await asyncio.gather(releasing, return_exceptions=True)
+            await dropping
+            async with pool.session("o", "s") as fresh:
+                assert await fresh.run("return typeof secret") == "undefined"
+                assert fresh.calls_remaining == 4
+
+    async def test_close_retries_a_release_that_failed_while_it_waited(self) -> None:
+        ran, tools = [], {"t": lambda i: ran.append(i) or i}
+        store = _CtlStore()
+        pool = SessionPool(store, KEY, tools, max_tool_calls=4, sandbox=MODE)
+        sb = await pool.get("o", "s")
+        await sb.execute("await t(0); await t(1); await t(2)")
+        gate = store.gate("set", "journal")
+        store.fail[("set", "journal")] = 1
+        releasing = asyncio.ensure_future(pool.release("o", "s"))
+        await store.until_reached("set", "journal")
+        closing = asyncio.ensure_future(pool.close())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.gather(releasing, closing, return_exceptions=True)
+        assert await _remaining(store, tools, max_tool_calls=4) == 1
 
 
 def test_the_text_filter_covers_the_cli_filter() -> None:
