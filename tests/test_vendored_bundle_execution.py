@@ -90,11 +90,11 @@ BUILD_TIMEOUT = 120.0
 
 
 def _polyfills() -> str:
-    return POLYFILLS_PATH.read_text()
+    return POLYFILLS_PATH.read_text(encoding="utf-8")
 
 
 def _bundle() -> str:
-    return BUNDLE_PATH.read_text()
+    return BUNDLE_PATH.read_text(encoding="utf-8")
 
 
 # --- the deck --------------------------------------------------------------

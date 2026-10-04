@@ -22,6 +22,56 @@ _EXPECTED_SANDBOX = os.environ.get("PYDENO_EXPECT_SANDBOX")
 _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 
 
+# IsolatedRuntime, AgentSandbox and the sandbox are POSIX-only (they import `resource`; the OS
+# sandbox is Seatbelt / Landlock+seccomp), so these modules cannot even be imported on Windows.
+# Not collected there, which is the "deselected, never skipped" rule applied at file level.
+collect_ignore = (
+    [
+        "test_agent_sandbox.py",
+        "test_bridge_poisoning.py",
+        "test_default_runtime_isolation.py",
+        "test_idle_cpu.py",
+        "test_isolated_attack_classes.py",
+        "test_isolated_capability_denial.py",
+        "test_isolated_determinism.py",
+        "test_isolated_fuzz.py",
+        "test_isolated_hardening_round2.py",
+        "test_isolated_hardening_round3.py",
+        "test_isolated_libraries.py",
+        "test_isolated_lifecycle.py",
+        "test_isolated_limits.py",
+        "test_isolated_review_findings.py",
+        "test_isolated_runtime.py",
+        "test_isolated_tools.py",
+        "test_polyfill_timers.py",
+        "test_redteam_syscalls.py",
+        "test_sandbox_attest.py",
+        "test_sandbox_syscall_tables.py",
+        "test_seccomp_program.py",
+        "test_tool_bridge.py",
+        "test_stress_concurrency.py",
+        "test_timeout_overhead.py",
+        "test_sandbox_attest_edges.py",
+        "test_review_regressions.py",
+        "test_aio_isolated_runtime.py",
+        "test_aio_agent.py",
+        "test_session_pool.py",
+        "test_agent_execution_result.py",
+        "test_agent_journal_recovery.py",
+        "test_agent_schema_tools.py",
+        "test_status.py",
+        "test_errors_taxonomy.py",
+        "test_preflight.py",
+        "test_seatbelt_profile.py",
+        "test_aio_agent_results.py",
+        "test_aio_agent_recovery.py",
+        "test_aio_agent_schema_tools.py",
+        "test_agent_replay_public_errors.py",
+    ]
+    if sys.platform == "win32"
+    else []
+)
+
 _PLATFORM_MARKERS = {
     "linux_only": sys.platform.startswith("linux"),
     "darwin_only": sys.platform == "darwin",

@@ -1,0 +1,92 @@
+name: Platforms
+
+# The same suite on every GitHub-hosted environment pydeno could plausibly run on:
+# native Ubuntu (x86_64 and arm64), macOS (arm64 and Intel) and Windows, across
+# CPython 3.10-3.14. `test.yml` stays the gate (macOS debug/release, Linux wheel,
+# container matrix); this answers "does it work *there*" without slowing it down.
+#
+# `experimental` cells (free-threaded 3.14t, Windows) report but do not fail the
+# workflow until they are known-green; flip the flag when they are.
+on:
+  push:
+    branches: [main, "ci/platform-matrix"]
+  pull_request:
+    paths:
+      - ".github/workflows/platforms.yml"
+      - "src/**"
+      - "python/**"
+      - "tests/**"
+      - "Cargo.*"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
+          - macos-14
+          - macos-15
+          - macos-15-intel
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Windows has no IsolatedRuntime (POSIX-only: Seatbelt / Landlock+seccomp); the
+          # in-process Runtime is what is checked there.
+          - { os: windows-2022, python: "3.12", experimental: true }
+          - { os: windows-2025, python: "3.12", experimental: true }
+          - { os: windows-2025, python: "3.14", experimental: true }
+          - { os: windows-11-arm, python: "3.13", experimental: true }
+          # Free-threaded CPython.
+          - { os: ubuntu-24.04, python: "3.14t", experimental: true }
+          - { os: macos-15, python: "3.14t", experimental: true }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platforms-${{ matrix.os }}-${{ matrix.python }}
+
+      - name: Build the extension and install the test dependencies
+        shell: bash
+        run: |
+          uv venv --python "${{ matrix.python }}" .venv
+          uv pip install --python .venv maturin "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
+          uv run --no-sync --python .venv maturin develop --uv --release
+
+      - name: Run the suite
+        shell: bash
+        run: |
+          PY=.venv/bin/python
+          [ -x "$PY" ] || PY=.venv/Scripts/python.exe
+          "$PY" -m pytest tests/ -v -p no:randomly --strict-markers --strict-config \
+            --junitxml=junit.xml
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          PY=.venv/bin/python
+          [ -x "$PY" ] || PY=.venv/Scripts/python.exe
+          "$PY" scripts/check_test_report.py --label "${{ matrix.os }} py${{ matrix.python }}" \
+            --junit junit.xml --min-tests 500 --max-skipped 0 --max-xfailed 10
