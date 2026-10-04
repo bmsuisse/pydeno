@@ -56,7 +56,7 @@ from ._front import (
     _compile_check,
     _ended,
     _external_placeholder,
-    _external_result,
+    _checked_answer,
     _failure,
     _fresh_seed,
     _is_js_syntax,
@@ -216,14 +216,17 @@ class AsyncPydeno:
         await agent.__aenter__()
         return agent
 
-    async def _load(self, state: bytes, limits: _Limits) -> AsyncAgentSandbox:
-        seed = _journal_seed(state, self._key)
+    async def _load(
+        self, state: bytes, limits: _Limits, associated_data: bytes = b""
+    ) -> AsyncAgentSandbox:
+        seed = _journal_seed(state, self._key, associated_data)
         rt = await self._runtime(limits, seed)
         try:
             return await AsyncAgentSandbox.load(
                 state,
                 self._key,
                 {_EXTERNAL: _external_placeholder},
+                associated_data=associated_data,
                 runtime=rt,
                 timeout=limits.timeout,
                 max_pause=limits.max_pause,
@@ -285,7 +288,7 @@ class AsyncPydenoSnapshot:
         error: BaseException | None = None,
     ) -> AsyncPydenoSnapshot | PydenoComplete:
         """See `PydenoSnapshot.resume`."""
-        value, error = _external_result(result, value, error)
+        value, error = _checked_answer(result, value, error)
         self._take()
         return await self._session._answer(self, value, error)  # noqa: SLF001
 
@@ -305,9 +308,9 @@ class AsyncPydenoSnapshot:
             value, error = _MISSING, exc
         return await session._answer(self, value, error)  # noqa: SLF001
 
-    async def dump(self) -> bytes:
+    async def dump(self, *, associated_data: bytes = b"") -> bytes:
         """The suspended session, signed (see `AsyncPydenoSession.dump`)."""
-        return await self._session.dump()
+        return await self._session.dump(associated_data=associated_data)
 
     def __repr__(self) -> str:
         return (
@@ -496,19 +499,24 @@ class AsyncPydenoSession:
     # -- durability ----------------------------------------------------------
 
     @_exclusive_async
-    async def dump(self) -> bytes:
-        """See `PydenoSession.dump`."""
+    async def dump(self, *, associated_data: bytes = b"") -> bytes:
+        """See `PydenoSession.dump` (and its `associated_data`)."""
+        if not isinstance(associated_data, (bytes, bytearray)):
+            raise TypeError("associated_data must be bytes")
         try:
-            return await self._dumpable().dump(self._pool._key)  # noqa: SLF001
+            return await self._dumpable().dump(
+                self._pool._key,  # noqa: SLF001
+                associated_data=associated_data,
+            )
         except PydenoError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise PydenoError(f"cannot dump this session: {exc}", exc) from exc
 
     @_exclusive_async
-    async def load_session(self, state: bytes) -> None:
+    async def load_session(self, state: bytes, *, associated_data: bytes = b"") -> None:
         """See `PydenoSession.load_session`."""
-        await self._replace(state, suspended=False)
+        await self._replace(state, suspended=False, associated_data=associated_data)
 
     @_exclusive_async
     async def load_snapshot(
@@ -517,10 +525,13 @@ class AsyncPydenoSession:
         *,
         print_callback: Callable[[Literal["stdout", "stderr"], str], Any] | None = None,
         external_lookup: dict[str, Any] | None = None,
+        associated_data: bytes = b"",
     ) -> AsyncPydenoSnapshot:
         """See `PydenoSession.load_snapshot`."""
         calls, _ = _check_lookup(external_lookup, sync=False)
-        agent = await self._replace(state, suspended=True)
+        agent = await self._replace(
+            state, suspended=True, associated_data=associated_data
+        )
         self._printer.callback = _printer_for(print_callback)
         step = agent.pending
         assert step is not None
@@ -528,12 +539,14 @@ class AsyncPydenoSession:
         assert isinstance(snapshot, AsyncPydenoSnapshot)
         return snapshot
 
-    async def _replace(self, state: bytes, *, suspended: bool) -> AsyncAgentSandbox:
+    async def _replace(
+        self, state: bytes, *, suspended: bool, associated_data: bytes = b""
+    ) -> AsyncAgentSandbox:
         old = self._agent
         if old is None:
             self._live()
         self._printer.callback = None
-        new = await self._pool._load(state, self._limits)  # noqa: SLF001
+        new = await self._pool._load(state, self._limits, associated_data)  # noqa: SLF001
         if (new.pending is not None) != suspended:
             await new.close()
             raise PydenoError(

@@ -122,9 +122,11 @@ class TestRestoredSessionsHaveTheSameGlobals:
     def test_sync(self, pool: Pydeno) -> None:
         with pool.checkout() as session:
             names = session.feed_run(_GLOBALS)
-            # Only the prelude's own (non-enumerable) settle step, which every session has.
+            # Only the prelude's own (non-enumerable) compile check and settle step, which every
+            # session has.
             assert [n for n in names if n.startswith("__pydeno_agent")] == [
-                "__pydeno_agent_settle"
+                "__pydeno_agent_compiles",
+                "__pydeno_agent_settle",
             ]
             session.feed_run('var probe = "__pydeno_agent_clock" in globalThis')
             state = session.dump()
