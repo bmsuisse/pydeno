@@ -181,6 +181,32 @@ fn byte_count(raw: f64) -> Option<usize> {
         .then_some(raw as usize)
 }
 
+extern "C" {
+    // POSIX; on every platform pydeno builds for. No crate needed for one call.
+    fn getpagesize() -> std::ffi::c_int;
+}
+
+/// The OS page size, read once.
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        // SAFETY: `getpagesize` takes no arguments and only reads a constant.
+        let size = unsafe { getpagesize() };
+        usize::try_from(size).ok().filter(|s| *s > 0).unwrap_or(4096)
+    })
+}
+
+/// What a resizable backing store of `bytes` really commits: V8 maps and commits it in whole
+/// pages, so a one-byte buffer holds a page of RSS. Charging the raw `byteLength` let 40,000
+/// one-byte buffers (40 KB charged) commit hundreds of MB. Zero stays zero (nothing committed).
+fn committed_pages(bytes: usize) -> usize {
+    if bytes == 0 {
+        return 0;
+    }
+    let page = page_size();
+    bytes.div_ceil(page).saturating_mul(page)
+}
+
 /// Set the bytes `buffer` (a resizable ArrayBuffer or growable SharedArrayBuffer) holds of the
 /// `max_buffer_bytes` budget: the growth is reserved (after a GC and sweep if the cap is hit),
 /// a shrink is released, zero forgets the buffer. `false` when the cap would be exceeded; `true`
@@ -203,6 +229,9 @@ fn op_pydeno_buffer_charge<'s>(
     else {
         return false;
     };
+    // The budget counts what the process commits, so every charge, release and table entry is
+    // in whole pages; the bridge keeps talking in byteLengths.
+    let bytes = committed_pages(bytes);
     let Some(key_name) = v8::String::new(scope, BUFFER_ID_KEY) else {
         return false;
     };
