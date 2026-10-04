@@ -9,7 +9,12 @@ when the work starts; cancelling the task still propagates to the future.
 from __future__ import annotations
 
 from collections.abc import Awaitable
-from typing import Any
+
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any
 
 __all__ = ["as_coroutine"]
 

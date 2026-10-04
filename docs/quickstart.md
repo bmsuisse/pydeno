@@ -16,6 +16,33 @@ pip install pydeno  # or `uv install pydeno`
     Supports macOS (Apple Silicon) and Linux (x86_64, ARM64) with glibc ([manylinux](https://github.com/pypa/manylinux)). Windows and musl-based distributions (e.g., Alpine) are not supported currently.
 
 
+## Start here: `Pydeno`
+
+For code you did not write (an agent's, a user's), use `Pydeno`: a pool of pre-started workers, each
+in its own OS sandbox and used for one session only. It has the same shape as Monty's `Monty`.
+
+```python
+from pydeno import Pydeno
+
+with Pydeno() as pool:
+    with pool.checkout() as session:
+        session.feed_run("const x = 20")
+        session.feed_run("x + 1")                                   # 21
+        session.feed_run("await lookup(7)", external_lookup={"lookup": lambda i: i * 6})  # 42
+```
+
+```python
+from pydeno import AsyncPydeno
+
+async with AsyncPydeno() as pool:
+    async with pool.checkout() as session:
+        await session.feed_run("1 + 1")                             # 2
+```
+
+The [front-door guide](guides/quickstart-pydeno.md) covers the defaults, limits, errors, snapshots
+and the Monty-to-pydeno mapping. The rest of this page is the in-process `Runtime`, for code you
+trust.
+
 ## Run JavaScript from Python
 
 Use [`pydeno.eval`][pydeno.eval] to evaluate JavaScript code directly:
@@ -30,6 +57,20 @@ Use [`pydeno.eval`][pydeno.eval] to evaluate JavaScript code directly:
 ```
 
 `pydeno.eval()` runs synchronously and returns the result immediately.
+
+## Run JavaScript from the command line
+
+The `pydeno` command evaluates an expression in the sandboxed worker and prints the result as JSON:
+
+```bash
+$ pydeno '[1, 2, 3].map(x => x * 2)'
+[2, 4, 6]
+$ echo 'Promise.resolve("done")' | pydeno --raw
+done
+```
+
+It exits non-zero on a JavaScript error, with the error on stderr. See [Command line](guides/cli.md)
+for `--timeout`, `--max-memory`, `--raw` and the exit codes.
 
 ## Share functions and data
 

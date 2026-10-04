@@ -1,0 +1,11 @@
+http_fetch_tls.pem is a self-signed TEST certificate and private key for the name fetch.test,
+used only by tests/test_http_fetch.py (the TLS cases). It is not a secret and is trusted by
+nothing except those tests, which load it as their own CA. It is committed because the standard
+library cannot generate certificates and the test dependencies include no library that can.
+
+Regenerate (valid 100 years, key and certificate concatenated):
+
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 \
+    -subj /CN=fetch.test -addext subjectAltName=DNS:fetch.test \
+    -addext basicConstraints=critical,CA:TRUE -keyout key.pem -out cert.pem
+  cat key.pem cert.pem > http_fetch_tls.pem

@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 from typing import Any, Literal
 
+from ._limits import limit_int
 from ._pydeno import JavaScriptError, JsUndefined
 
 __all__ = [
@@ -45,6 +46,24 @@ DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 TRUNCATED_MARKER = "[truncated]"
 
 _STDOUT_LEVELS = frozenset({"log", "info", "debug"})
+# Console text is the guest's to choose and a host prints, logs or hands to a model: no control or
+# escape characters (an ANSI sequence can clear a terminal, retitle it or hide a line; a carriage
+# return overwrites one), no Unicode bidirectional controls (they reorder what a terminal shows, so
+# a line reads as something it is not), and no invisible format characters (zero-width joiners and
+# spaces, the BOM, soft hyphen, line/paragraph separators, variation selectors, TAG characters:
+# text a reader never sees but a model does). Emoji sequences lose their joiners and variation
+# selectors, which become "?" between the separate emoji; a sandbox's log prefers that to an
+# invisible payload. Newlines and tabs stay, so multi-line output keeps its shape. The same rule
+# the worker's error text follows (`_isolated._CONTROL`), and a superset of the CLI's filter
+# (`pydeno._cli.inert_text`; a test compares the two over every code point).
+_CONTROL = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u034f\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891"
+    r"\u08e2\u115f\u1160\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164"
+    r"\ud800-\udfff\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb\U000110bd\U000110cd"
+    r"\U00013430-\U0001343f\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    r"\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+)
+UNSAFE_TEXT = _CONTROL
 _MAX_DEPTH = 200
 _GUEST_ERROR = re.compile(r"^(?:Uncaught )?([A-Za-z_$][A-Za-z0-9_$]{0,63})(?::|$)")
 _EVAL_PREFIX = "Evaluation failed: "
@@ -102,9 +121,12 @@ class ExecutionResult:
 
 
 def check_limit(name: str, value: Any) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive int")
-    return value
+    """A positive byte count: `TypeError` for a non-integer (or a bool), `ValueError` below 1."""
+    if value is None:
+        raise TypeError(f"{name} must be a positive int")
+    result = limit_int(name, value, minimum=1)
+    assert result is not None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +194,7 @@ class OutputCapture:
             return  # full: do not even format it
         if not isinstance(args, (list, tuple)):
             args = [args]
-        line = " ".join(format_console_arg(a) for a in args) + "\n"
+        line = _CONTROL.sub("?", " ".join(format_console_arg(a) for a in args)) + "\n"
         with self._lock:
             if stream.cut:
                 return

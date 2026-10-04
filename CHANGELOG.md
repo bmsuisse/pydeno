@@ -6,6 +6,266 @@
   mode. `sandbox_status().termination` reports a hardened-child termination probe; refusal is
   classified as non-retryable `sandbox_unavailable` (#71).
 
+- Bound the async parent's queued frame count as well as payload bytes (#65). Empty or tiny
+  frames from a compromised worker now trigger backpressure while the consumer is idle.
+
+### Added
+
+- **`pydeno` command** (`[project.scripts]`, same as `python -m pydeno`): evaluates JavaScript from an
+  argument, `-c`, `-f FILE` or stdin and prints the result as JSON (`--raw` for plain strings). Runs in
+  `IsolatedRuntime(sandbox="require")`; `--timeout` (default 30 s), `--max-memory`, `--sandbox auto`,
+  `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
+  unavailable, 5 other runtime failure, 6 result has no JSON form; the error and its `classify_error`
+  kind go to stderr. Input is read up to 16 MiB (bounded, so `-f /dev/zero` cannot fill memory),
+  guest output is stripped of control, format and other invisible characters, and integers past
+  2^53 - 1 print as JSON strings. See [`docs/guides/cli.md`](docs/guides/cli.md).
+- **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
+  (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
+  code in an `AgentSandbox` session that keeps its state between calls and returns the
+  `ExecutionResult` fields with output and result caps.
+- **`Pydeno` / `AsyncPydeno`: one front door, shaped like Monty.** `with Pydeno() as pool:`,
+  `with pool.checkout(limits=...) as session:`, `session.feed_run(code, inputs=, external_lookup=,
+  print_callback=)` (the feed's trailing expression is its result; state persists), `feed_start` with a
+  `PydenoSnapshot` at every external call (`resume`, `resume_auto`, `dump`), `dump` / `load_session` /
+  `load_snapshot` (signed, replayed deterministically on a fresh worker), `worker_pid`, `PydenoLimits`
+  (Monty's `ResourceLimits` mapped onto pydeno's limits) and typed errors (`PydenoError`,
+  `PydenoRuntimeError`, `PydenoSyntaxError`, `PydenoCrashedError`, `PydenoTimeoutError`, which is a
+  `TimeoutError`; `classify_error` sees through them). Secure by default: `sandbox="require"` with no
+  silent downgrade, jitless V8, host errors redacted, every limit set, single-use workers from a warm
+  `SandboxPool`. `benches_py/alternatives_bench.py pydeno-front` measures it.
+- `AgentSandbox(runtime=...)` / `AsyncAgentSandbox(runtime=...)`: run a session on an already-built
+  runtime (a pool checkout); its seed (and frozen clock, if any) become the session's.
+- Faster sessions: a `Pydeno` worker arrives with the session's setup pre-installed (checkout does no
+  worker round trip, about 0.1 ms), and `AgentSandbox.run()` / `execute()` (and `feed_run`) drive the
+  worker from the calling thread, which enforces every limit also while a tool runs (tools are answered
+  on the session's own threads, never shared with another session). Journals are unchanged: a dump
+  from either path replays on the other.
+- Session tool threads are capped per pool (`Pydeno(max_tool_threads=128)`, clamped to a process
+  ceiling of 512; caps are upper bounds drawn from that ceiling, not reservations, and `Pydeno()` warns
+  when the open pools' caps add up to more). A refused call is journaled and charged like a failed
+  tool call, fails generically for the guest, is logged once per session for the host, and raises
+  `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
+  gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
+- **`strict_eval=True`: no code generation from strings in the guest** (#42). On `IsolatedRuntime`,
+  `AsyncIsolatedRuntime`, `SandboxPool` / `AsyncSandboxPool` (a spawn option: fixed per pool, refused
+  per checkout), `AgentSandbox` / `AsyncAgentSandbox` and `Pydeno` / `AsyncPydeno`. `eval`, `new
+  Function` and the async/generator function constructors throw `EvalError` however the guest reaches
+  them; the host's own scripts still run. It appends V8's `--disallow-code-generation-from-strings`
+  after the hardening flags, frozen with them. Sessions record it in their journal (only when on, so
+  default journals are unchanged) and refuse to load a journal under the other setting. It does not
+  cover WebAssembly with `jitless=False`, and it guards trusted code against injected strings rather
+  than containing hostile code (a guest can ship its own interpreter); see the isolation guide. Off
+  by default.
+- `vendor/libs/vega-interpreter-2.3.2.bundle.js` (BSD-3-Clause, 5 KB): Vega's CSP-safe expression
+  interpreter, so Vega and Vega-Lite render under `strict_eval=True`. The library tests now also run
+  d3, turf and ECharts SSR, and every library under strict eval.
+- **Cargo feature `inspector`** (on by default, so the published wheels are unchanged). It gates the DevTools
+  inspector server and its network crates (`hyper`, `hyper-util`, `fastwebsockets`, `http`, `http-body-util`,
+  tokio's `net`). A `--no-default-features` build keeps `InspectorConfig` as a type, but `Runtime` with an
+  inspector configured raises `RuntimeError` ("built without inspector support"). `pydeno._pydeno._INSPECTOR_AVAILABLE`
+  reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
+  size and dependency difference. See `docs/guides/advanced/inspector.md`.
+
+Nothing changes for existing code except `python -m pydeno` (see Changed), the limit fixes
+and the red-team restrictions under Security; see
+[`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+
+### Security
+
+- **0.8 red team, host boundary and state** (#75 slice C; probes in `scripts/autoresearch/metric_security.py`,
+  tests in `tests/test_redteam_boundary.py`, details in `docs/security-report.md`):
+  - `SessionPool`: a restored session keeps the tool budget it has already spent, also after its
+    journal outgrew `max_journal_bytes` (a journal without state that charges the spent calls is
+    stored instead), when calls on one session overlap, and when a release fails (the session then
+    stays live until a release succeeds). `get` checks a live session against the stored counter
+    and `release` refuses (`StaleJournal`) to store over a newer journal; this catches one pool
+    picking up a session another released, not overlapping leases in two pools, so sessions must
+    be routed to one pool. `close()` stores every unsaved session (leased ones as after a crash),
+    warns about any it cannot store, and wakes waiting `get`s. Ids must be valid UTF-8.
+    **Behaviour change.**
+  - Agent sessions queue concurrent tool calls past `max_inflight_host_calls - 1` and issue them in
+    order; they were refused depending on timing, which the journal did not record.
+  - A tool raising a `BaseException` during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run
+    like a crash (recorded as lost); the journal stays loadable.
+  - Tool names that would replace a guest global (bare-global tools), and names starting with
+    `__pydeno` / `__host_op`, are refused. **Behaviour change.**
+  - `SessionPool.drop()` holds the session's place while it works and wins against an overlapping
+    `get` or `release`; `pool.session()` releases only its own lease; journal associated data may be
+    up to 4096 bytes, so every valid pool id persists.
+  - Front door: the syntax check after a failed feed uses captured intrinsics; `dump` / `load_session` /
+    `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot; `feed_start`
+    surfaces snapshots only for the feed's declared functions.
+  - Captured console output, error messages and the default printer use one filter with the CLI's
+    set: control characters, bidirectional controls, line separators and invisible format characters
+    (zero-width joiners and spaces, variation selectors, soft hyphen, BOM, Unicode tags, ...) become
+    `?`. **Behaviour change** for output that contained them.
+
+- **Large indexed values are checked before they are expanded.** A typed array other than
+  `Uint8Array`, or a boxed `String` (also behind a Proxy), returned as a result or stream chunk or
+  passed to a host function, was expanded into one key per element in a single native call before the
+  serialization budget (or the host-call argument cap) was checked. A 16 MB value took hundreds of
+  megabytes and ran several times past `timeout=`; a Proxy around one, passed to a host function in
+  plain `Runtime`, could run V8 out of memory. Such values are now refused at once; small ones convert
+  as before. Upgrade note: whatever `max_serialization_bytes` is, a typed array or `String` object of
+  more than 1,048,576 elements is refused as a result (return a `Uint8Array` over its buffer instead).
+- **A Proxy crosses the boundary as its target, and no trap runs.** In a result, stream chunk or
+  host-function argument, a Proxy's traps ran during conversion, so guest code could act mid-conversion:
+  an `ownKeys` trap could grow a resizable buffer after its size was checked (16 million keys listed
+  past the budget), a Proxy hid an Array from the metered array path, and `ownKeys() { return [] }`
+  made the engine walk the whole target for free at every reference. A Proxy is now unwrapped natively
+  to its innermost target, which is converted instead; a revoked Proxy or a chain of more than 64 is
+  refused. Upgrade note: a Proxy whose traps synthesise values now arrives as its target's data, and a
+  Proxy around an Array arrives as a list (it used to be a dict of indices).
+- **`v8_flags` that cannot take effect are refused.** deno_core's start-up switches on `Temporal`,
+  `Float16Array`, explicit resource management, source-phase and deferred imports and the native
+  `queueMicrotask` after the worker's flags, so a flag such as `--no-harmony-temporal` was undone
+  while `IsolatedRuntime.v8_flags` listed it. `IsolatedRuntime` now raises `ValueError` before it
+  starts a worker. Upgrade note: code that passed one of these flags gets an error instead of a silent
+  no-op; remove the flag, or use the opt-in `v8_flags=["--no-js-shipping"]`, which does switch these
+  features off (together with the other newest ones; see the isolation guide).
+- Numbers outside the 64-bit integer range now come back as floats (`2**63` used to return
+  `2**63 - 1`).
+- **Limit values are validated.** Durations (`request_timeout`, `max_host_wait`, `write_stall_timeout`,
+  `RuntimeConfig.timeout`, per-call `timeout=`, `AgentSandbox` `timeout`/`max_pause`, `SessionPool`
+  `ttl`/`counter_ttl`/`eviction_interval`/`idle_timeout`, `PydenoLimits` seconds) must be `None` or a
+  finite number of seconds above zero and at most about 70 years (`threading.TIMEOUT_MAX / 4`);
+  `timeout_grace`, `SessionPool(acquire_timeout=)` and `get(timeout=)` may be 0. Counts (`max_memory`,
+  `max_host_calls`, `max_inflight_host_calls`, `max_tool_calls`, `max_journal_bytes`, output caps, pool
+  sizes, `max_sessions`, `max_per_owner`, `max_suspensions`, `max_tool_threads`) must be an int between
+  their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
+  before and turned the limit off without saying so (every comparison with NaN is false); Python's
+  `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
+  wrong type raises `TypeError`, a bad value `ValueError`.
+- **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
+  host runs a tool, and console calls were treated the same way, so time spent handling a flood of
+  `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`
+  (600 s by default). Console time now pauses the deadline for at most one hard deadline in total per
+  command: one slow write does not end a run, and a flood can at most double it. Console time while a
+  tool call is in flight is covered by that call's pause. Console calls are no longer refused by
+  `max_inflight_host_calls` (they are synchronous, never in flight) and still count toward
+  `max_host_calls`.
+- **`Pydeno`'s default printer is capped.** Without a `print_callback`, a feed's console output goes to
+  the host's stdout/stderr; it now stops after 1 MiB per feed with one `[truncated]` line (it was
+  unbounded: about 150 MB in 2 s measured). An explicit `print_callback` gets everything.
+- **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
+  installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
+  `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
+  Proxy namespace that swallowed `defineProperty`, an accessor returning a throwaway object, a read-only or
+  setter global, or a replaced `Array.prototype[Symbol.iterator]`, and the bind then installed nothing while
+  the host still received and exposed the op tokens. The bind now defines own data properties only, runs no
+  guest-replaceable built-in, and raises `Cannot bind '<name>': ...` (exposing no token) when the existing
+  global is an accessor, read-only, a Proxy, a function, a class instance, or frozen. An existing plain
+  object is still extended, a writable global (including a `var`) is still replaced, and an inherited
+  property is shadowed rather than written through. A built-in object (`Object.prototype`, `Math`,
+  `Array.prototype`, `%IteratorPrototype%`...) is refused as a namespace too, and the refusal's error carries a
+  pre-rendered stack so a guest `Error.prepareStackTrace` does not run inside the host's bind.
+- `ToolBridge.attach(..., namespace=None)` is all-or-nothing: when a later tool is refused, the tools this
+  call already bound are revoked before the error propagates.
+- The Python-stream helper `__pydeno_from_py_stream` is fixed in place like the other bridge globals (it was
+  defined after them and stayed writable), and the bridge builds streams with a captured `ReadableStream` and
+  a prototype-less source. A guest could otherwise run code inside a host `bind_object` (or any hand-over of a
+  Python stream), see every stream id and substitute its own value.
+- The `ReadableStream` polyfill keeps its state in a private WeakMap, so setters a guest plants on
+  `ReadableStream.prototype` no longer run (and receive the stream's source) when the bridge creates a stream.
+  Recognising a guest's `ReadableStream` result no longer uses `instanceof globalThis.ReadableStream` (a guest
+  `Symbol.hasInstance` or a replaced global could turn every object result into a stream); it checks the
+  prototype chain against the prototype captured at startup.
+- A refused bind's error has own `name`, `message`, `constructor` (`null`), `cause`, `stack` and
+  `Symbol.for("errorAdditionalPropertyKeys")` (everything deno_core reads when it converts the error, including
+  the `constructor` walk of its AggregateError check), so reading it runs no getter from a prototype or
+  constructor.
+  No deadline covers a bind, so a looping getter there used to block `bind_object` indefinitely (and an
+  `IsolatedRuntime` bind until the worker's hard deadline killed it). A non-extensible global object is
+  refused with the same clear error, and the handlers a refused bind registered are dropped instead of kept for
+  the runtime's lifetime.
+- The built-in set behind the namespace check is collected from the standard global names only, so objects a
+  host snapshot puts on the global object are bindable again (this was a regression in the previous change),
+  and now also covers `CallSite.prototype`, `%SegmentsPrototype%`, the iterator-helper prototypes and the
+  `ReadableStream` polyfill.
+- The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
+  `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
+  (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
+  properties, so an index setter on `Array.prototype` neither sees nor replaces them.
+- **`max_buffer_bytes` now covers resizable buffers.** V8 allocates a resizable `ArrayBuffer`
+  (`new ArrayBuffer(n, {maxByteLength})`), a growable `SharedArrayBuffer`, and the copy `transfer()` makes of
+  a resizable buffer from its own page allocator, not the embedder's, so the cap never saw them: a guest could
+  commit gigabytes under a cap of a few hundred megabytes, and filling the buffer was a `max_memory` kill
+  instead of the promised catchable `RangeError`. The bridge now charges their committed bytes to the same
+  budget at construction, `resize`/`grow` and `transfer*`, through one op that keys each buffer by a private
+  symbol and holds it weakly; when a charge would exceed the cap the op forces a GC, gives collected buffers'
+  bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget; the
+  allocator does the same cheap sweep before refusing a fixed-length buffer, and the bookkeeping is bounded
+  (it is swept as it doubles and capped). Resizable buffers are charged in whole OS pages, which is what V8
+  commits for them (a one-byte resizable buffer costs a page). `instanceof`, subclassing, `Symbol.species`
+  and the prototype objects are unchanged.
+- **A refused allocation no longer leaves the runtime terminated.** With `max_heap_size` set, an
+  `ArrayBuffer` the buffer cap refused was reported to the guest as a `RangeError` but also marked the
+  runtime as over its heap limit, so every later command failed with `RuntimeTerminated`. Only a JS heap
+  that really is at its limit terminates now, and a refusal no longer stays flagged after V8's final retry
+  (a later real heap overflow used to be taken for a refusal, and V8 then aborted the process). `WebAssembly.Memory`
+  remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
+- **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
+  `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's
+  stderr capture file under `RLIMIT_FSIZE` (1 MiB), and deno_core's `op_print` unwraps the flush of the
+  failed write, so the worker aborted (SIGABRT). The worker no longer lets the engine echo console output;
+  `on_console` and `capture_console` are unaffected.
+- **Captured console output carries no control or escape characters.** `execute()` (and the agent layer's
+  `ExecutionResult`) cleaned error text but returned `stdout`/`stderr` with raw ANSI/C1 sequences; they now
+  follow the same rule (newlines and tabs stay), and both also drop the Unicode bidirectional controls that
+  reorder a line and the invisible format characters (zero-width joiners and spaces, the BOM, soft hyphen,
+  line and paragraph separators, variation selectors, TAG characters) that carry text a reader never sees
+  but a model does. Emoji sequences lose their joiners and skin-tone modifiers and render as their parts.
+  An `on_console` callback still receives the guest's text raw; sanitise it before printing.
+
+### Fixed
+
+- `IsolatedRuntime` and `AsyncIsolatedRuntime` raise `ValueError` for a `max_memory` (or a
+  `RuntimeConfig` limit) above 2^53 - 1. Such a value used to reach the worker as a tagged object
+  and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be
+  interpreted as an integer"); `max_memory=2**62` was enough, since it derives
+  `max_buffer_bytes = 2**60`.
+- Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
+  the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
+  even when the guest's error was still being read at that point.
+- The runtime stays usable after a module evaluation times out (or waits on a top-level `await` that never
+  settles): later commands, timeouts and `TerminationHandle.terminate()` are served as usual, and the idle
+  runtime thread does not spin. Known limit: after that, a *new* module stuck on a top-level `await` is no
+  longer reported at once; it waits for its timeout (forever without one). See the modules guide.
+- After a deadline has fired, a later `TerminationHandle.terminate()` reports its own reason instead of the
+  earlier timeout's, also when it lands while the timed-out call is still returning.
+- Evaluating a module again after its first evaluation timed out or was terminated explains that, instead
+  of failing with `Uncaught null`.
+
+### Changed
+
+- **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
+  positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
+  [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+- Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
+  creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
+  and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s
+  ~8 ms; same profile, same self-test, falls back to `sandbox_init`); the worker never loads `ssl` (asyncio
+  imports it only optionally, and the worker has no network) and, on Python 3.14, never imports `typing`.
+- Lower warm-call overhead of `IsolatedRuntime` (#47): a warm `eval("1 + 1")` went from about 112 to 67 µs
+  (interleaved A/B, 30 rounds, medians; debug build of the extension on a loaded macOS arm64 machine, so
+  release numbers will differ). Where it came from:
+  - Reading the worker's CPU time on macOS no longer opens libSystem through a fresh `ctypes.CDLL` per call
+    (about 30 µs, done twice per command); `proc_pidinfo` and the timebase are resolved once, and
+    `_sandbox.usage(pid)` returns memory, CPU time and thread count from one kernel read (about 2 µs).
+  - A command's CPU baseline is the latest cached reading (the previous command's final check, or the idle
+    watchdog's, re-read if older than 0.5 s) instead of a fresh one, as `AsyncIsolatedRuntime` already did.
+    CPU time only grows, so an older baseline can only charge a command more, never less. The end-of-command
+    check is one reading for the memory ceiling, the thread cap and the idle baseline.
+  - The worker reads the next command on its main thread instead of handing it over from a reader thread.
+    The helper thread reads only while a command waits on host calls; a parent killed while a command runs
+    without one is caught by the worker's watchdog thread (it now always runs, and exits the worker when its
+    parent pid changes).
+  No limit, wire check or sandbox requirement changed.
+- `bind_function(name, ...)` now defines exactly the global property `name`. A dotted name such as `"a.b"`
+  used to be spliced into a script and assign `globalThis.a.b`; it now defines a property literally named
+  `"a.b"`. Use `bind_object` for a namespace.
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change

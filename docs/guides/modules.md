@@ -262,6 +262,16 @@ When JavaScript tries to `import "something"`, the resolution happens in this or
 - **No file system access**: JavaScript can't read files directly. You must provide all code via modules or bindings.
 - **No Node.js built-ins**: Modules like `fs`, `http`, `path` aren't available unless you polyfill them.
 - **No CommonJS**: Only ES6 modules (`import`/`export`) are supported, not `require()`.
+- **One main module per runtime**: `eval_module` / `eval_module_async` load a main module, and a runtime
+  has one. Evaluating a different module later fails (`Trying to create "main" module`); import further
+  modules with a dynamic `import()`. A main module whose evaluation timed out or was terminated cannot be
+  evaluated again in the same runtime.
+- **Set a timeout on module work after one was cut short**: a module evaluation that timed out (or waits on
+  a top-level `await` that never settles) stays pending inside the engine for the life of the runtime. The
+  runtime keeps working, but from then on the engine can no longer report a *new* top-level `await` that is
+  stuck as an error: a later `import()` of such a module waits for its timeout instead of failing at once,
+  and without a timeout it waits for good. Pass `timeout=` (or set `RuntimeConfig(timeout=...)`), or start a
+  fresh runtime after a module timeout.
 
 ## Next Steps
 

@@ -327,6 +327,11 @@ def classify_error(exc: BaseException, *, via_agent: bool = False) -> ErrorInfo:
     worker's `max_host_wait`, so that timeout is reported as `max_pause` instead of `host_wait`.
     """
     try:
+        # The `Pydeno` front door's errors wrap the one pydeno raised; that one decides.
+        # (A session is an AgentSandbox, hence `via_agent`.)
+        inner = getattr(exc, "_pydeno_inner", None)
+        if isinstance(inner, BaseException) and inner is not exc:
+            return classify_error(inner, via_agent=True)
         text = str(exc)
         for kind, test in _ROWS:
             if not test(exc, text, via_agent):

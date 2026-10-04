@@ -125,28 +125,60 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
 ```
 
 - **`await pool.get(owner, session_id)`** leases the session: the live one if there is one,
-  otherwise it is restored from the store by replay, otherwise a fresh session starts.
+  otherwise it is restored from the store by replay, otherwise a fresh session starts. If the
+  session's worker died and its journal is over `max_journal_bytes`, `get` stores the journal that
+  keeps the spent budget and raises `JournalTooLarge`; the next `get` starts from that.
 - **`await pool.release(owner, session_id)`** dumps the journal, stores it with the TTL and ends the
   lease. The session stays live (no replay on the next `get`) until it is evicted.
 - **`await pool.drop(owner, session_id)`** closes the session (killing a run in progress, even
-  under someone else's lease), deletes its journal and advances its counter.
+  under someone else's lease), deletes its journal and advances its counter. A `get` of the session
+  made while `drop` is at work waits for it and then starts a fresh session. The fresh session has
+  a fresh tool budget: `drop` is your decision to start over. `drop` closes the worker first, then
+  waits for a write of the session still in flight (a release storing it) before emptying the
+  store, so that write cannot bring the dropped state back; a networked store that applies a write
+  after the client gave up on it (a cancelled or timed-out request) can still slip one through.
 - **`pool.session(owner, session_id)`** is `get` + `release` as an `async with` block. The release
-  also happens when the block raises: a JavaScript error leaves the session valid, and a session
-  whose worker died is not persisted.
+  also happens when the block raises: a JavaScript error leaves the session valid, and for a
+  session whose worker died it stores the last good journal plus a `lost` record charging what the
+  lost run spent. The block releases only its own lease: if the session was
+  dropped and leased again by someone else meanwhile, leaving the block leaves that lease alone.
+  A bare `release(owner, session_id)` ends whatever lease the session has, so prefer the block.
 - `tools` takes whatever `AgentSandbox` takes (callables, `SchemaTool`s, MCP-style mappings) or an
   `(owner, session_id) -> tools` function; `tools_catalog=` gives every session a lazy catalog, and
   discovery survives a restore. `max_tool_calls`, `namespace` and `max_result_bytes` apply to new
   sessions; a restored session takes them from its journal.
-- Owner and session ids are strings of up to 256 characters without `:` or control characters.
+- Owner and session ids are strings of up to 256 characters without `:` or control characters,
+  valid as UTF-8 (no lone surrogates); every such id fits in the signature's associated data. The
+  ids appear in error messages: do not put secrets in them.
+- A `release` that fails (for example while a run of the session is still in progress) leaves the
+  session live: it is not evicted until a later `release` stores it, and `close()` tries once
+  more (and warns, with a `RuntimeWarning`, about any session it cannot store). The same holds for
+  a session the host keeps using after its `release`.
+- `close()` stores every session not stored since it last ran, leased ones as after a crash (a run
+  in progress is killed and recorded as lost), and wakes waiting `get`s, which raise `RuntimeError`.
+- A journal that expires (`ttl`) is gone like a dropped one: the next `get` starts a fresh session
+  with a fresh tool budget. Keep `ttl` at least as long as budgets must hold.
 
 ### Concurrency: serialised, or rejected with `SessionBusy`
+
+The pool sets no timeout on store calls: a store that never answers holds up the `get`, `release`,
+`drop` or `close()` waiting for it (and `get`s queued behind that lease, up to their own
+`acquire_timeout`). Give your store client its own timeouts.
 
 A session has at most one lease. A second `get` of a leased session **waits** for the release, up
 to `acquire_timeout` (default 30 s, per call `get(..., timeout=)`), then raises `SessionBusy`.
 `acquire_timeout=0` rejects at once instead of waiting. Different sessions run concurrently.
 
-This holds within one pool. Two processes sharing a store do not lock each other out: route each
-owner to one process (sticky sessions), or put a lock in front of the pool.
+This holds within one pool. **Route each session to one pool** (sticky sessions, or one
+process that owns the store). Each pool keeps live sessions in memory, so a lock around `get` and
+`release` does not make two pools one: what one pool runs is only in the store once it releases.
+The pool checks what it can: `get` compares a live session with the counter in the store and
+restores the stored journal when another pool stored a newer one, and `release` refuses to store
+over a newer journal (`StaleJournal`, the live copy is discarded). That only catches one pool
+picking a session up after the other released it. **Any overlapping leases of one session in two
+pools can together use more than its budget**: each lease runs on its own copy, and the second
+release is refused only after its calls ran. The checks cost one store read per `get` of a live
+session.
 
 ### Rollback protection
 
@@ -174,9 +206,12 @@ expire before the journals do.
 ### Size cap
 
 `max_journal_bytes` caps each session's journal. A session that outgrows it is not stored
-half-way: `release` closes it, deletes its stored journal, advances its counter and raises
-`JournalTooLarge` (a `JournalError`). The next `get` starts a fresh session. Keep long-lived state
-out of the journal by keeping runs short, or raise the cap.
+half-way: `release` closes it and stores, under the next counter, a journal **without its state**
+that only charges every tool call the session made (a `lost` record), then raises
+`JournalTooLarge` (a `JournalError`). The next `get` restores a session with no globals and that
+budget already spent (`lost_runs == 1`). (It used to start a fresh session with a fresh budget.)
+Keep long-lived state out of the journal by keeping runs short, or raise the cap; `drop` the
+session if you do want to start over with a fresh budget.
 
 ### Crash safety
 

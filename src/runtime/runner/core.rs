@@ -1,20 +1,24 @@
 //! [`RuntimeCoreState`]: the V8 isolate and everything that lives beside it on
 //! the runtime thread.
 
-use super::convert::{caught_call_error, global_helper, CallError, Converter};
+use super::convert::{
+    capture_stream_prototype, caught_call_error, global_helper, CallError, Converter,
+};
 use super::termination::{TerminationController, Watchdog, WatchdogToken};
 use super::FunctionCallResult;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::error::{JsExceptionDetails, RuntimeError, RuntimeResult};
 use crate::runtime::handle::BoundObjectProperty;
+use crate::runtime::inspector::{InspectorConnectionState, InspectorMetadata};
+#[cfg(feature = "inspector")]
 use crate::runtime::inspector::{
-    InspectorConnectionState, InspectorMetadata, InspectorRegistration,
-    InspectorRegistrationParams, InspectorServer,
+    InspectorRegistration, InspectorRegistrationParams, InspectorServer,
 };
 use crate::runtime::js_value::{JSValue, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{
-    python_extension, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
+    python_extension, BufferBudget, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
+    SharedBuffers,
 };
 use crate::runtime::stats::{
     ActivitySummary, HeapSnapshot, RuntimeCallKind, RuntimeStatsSnapshot, RuntimeStatsState,
@@ -146,6 +150,7 @@ impl Drop for OwnedSnapshot {
     }
 }
 
+#[cfg(feature = "inspector")]
 struct InspectorRuntimeState {
     _server: InspectorServer,
     registration: InspectorRegistration,
@@ -154,6 +159,11 @@ struct InspectorRuntimeState {
     has_waited: bool,
     connection_state: InspectorConnectionState,
 }
+
+/// Never constructed: a build without the `inspector` feature refuses an
+/// inspector config before the runtime exists.
+#[cfg(not(feature = "inspector"))]
+enum InspectorRuntimeState {}
 
 /// Parse an absolute specifier, or resolve a bare one against `pydeno://runtime/`.
 fn module_specifier(specifier: &str) -> RuntimeResult<ModuleSpecifier> {
@@ -196,6 +206,16 @@ pub(super) struct RuntimeCoreState {
     #[allow(dead_code)]
     startup_snapshot: Option<OwnedSnapshot>,
     pub(super) py_stream_registry: PyStreamRegistry,
+    /// A module evaluation was abandoned (timed out, terminated, or stuck on a top-level `await`
+    /// that will never settle). deno_core keeps it pending for good and reports it as a stalled
+    /// top-level await on every later event-loop poll; once this is set, that report is about the
+    /// abandoned module, not about the work in hand.
+    pub(super) abandoned_module_evaluation: bool,
+    /// The main module this runtime loaded (deno_core allows one), and whether its evaluation was
+    /// cut short. Loading it again then fails inside deno_core with an opaque error; this lets
+    /// `load_module` say why without reading deno_core's message.
+    main_module: Option<String>,
+    main_module_incomplete: bool,
 }
 
 impl RuntimeCoreState {
@@ -238,12 +258,15 @@ impl RuntimeCoreState {
             v8::CreateParams::default().heap_limits(initial_heap_size.unwrap_or(0), max)
         });
         // ArrayBuffer storage is off the JS heap, so `max_heap_size` never
-        // counts it; it has its own opt-in budget.
-        if let Some(cap) = max_buffer_bytes {
+        // counts it; it has its own opt-in budget. The budget is shared with the
+        // bridge (through OpState below), which charges the resizable buffers V8
+        // allocates past this allocator.
+        let buffer_budget = max_buffer_bytes.map(crate::runtime::capped_allocator::Budget::new);
+        if let Some(budget) = &buffer_budget {
             create_params = Some(
                 create_params
                     .unwrap_or_default()
-                    .array_buffer_allocator(crate::runtime::capped_allocator::new(cap)),
+                    .array_buffer_allocator(crate::runtime::capped_allocator::new(budget.clone())),
             );
         }
 
@@ -253,6 +276,12 @@ impl RuntimeCoreState {
         let mut snapshot_source = snapshot.map(OwnedSnapshot::new);
         let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
 
+        #[cfg(not(feature = "inspector"))]
+        if inspector.is_some() {
+            return Err(RuntimeError::internal(
+                crate::runtime::inspector::INSPECTOR_UNAVAILABLE,
+            ));
+        }
         let inspector_enabled = inspector.is_some();
         let mut js_runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![extension],
@@ -272,6 +301,23 @@ impl RuntimeCoreState {
             // Must precede *any* script: the sync op path reads the limits
             // from OpState, and console capture / bootstrap logging call ops.
             op_state.put(serialization_limits);
+            let tracked = SharedBuffers::default();
+            if buffer_budget.is_some() {
+                // A fixed-length allocation V8 refuses on our budget retries after a GC: let
+                // it find the bytes of collected resizable buffers released first. Only a weak
+                // reference crosses into the thread-local, so the hook can never reach V8
+                // handles after OpState (and with it the isolate) is gone.
+                let weak = Rc::downgrade(&tracked);
+                crate::runtime::capped_allocator::set_thread_sweeper(Box::new(move |budget| {
+                    if let Some(table) = weak.upgrade() {
+                        if let Ok(mut table) = table.try_borrow_mut() {
+                            table.sweep(budget);
+                        }
+                    }
+                }));
+            }
+            op_state.put(BufferBudget(buffer_budget.clone()));
+            op_state.put(tracked);
         }
 
         if inspector_enabled {
@@ -316,9 +362,19 @@ impl RuntimeCoreState {
 
         if let Some(heap_limit_bytes) = max_heap_size {
             let termination = termination.clone();
+            let budget = buffer_budget.clone();
             js_runtime.add_near_heap_limit_callback(move |current_limit, initial_limit| {
-                termination.ensure_reason("Heap limit exceeded");
-                if termination.request() {
+                // V8 also invokes this as the last resort of a *failed external backing-store
+                // allocation* (an ArrayBuffer the budget refused), with the JS heap nowhere near
+                // its limit. Terminating then turned a catchable RangeError into a runtime that
+                // answered every later command with "Heap limit exceeded". The allocator flags
+                // its refusal right before V8 gets here; taking the flag means "not the heap":
+                // the limit goes back unchanged and V8 fails that allocation as it should. A
+                // heap that really is at its limit never sets the flag and terminates as before.
+                if budget.as_ref().is_some_and(|b| b.take_refusal()) {
+                    return current_limit;
+                }
+                if termination.request_with_reason("Heap limit exceeded") {
                     log::error!(
                         "V8 isolate is nearing its heap limit; terminating execution \
                          (configured_heap_limit={heap_limit_bytes}, \
@@ -334,6 +390,9 @@ impl RuntimeCoreState {
             });
         }
 
+        #[cfg(not(feature = "inspector"))]
+        let inspector_state: Option<InspectorRuntimeState> = None;
+        #[cfg(feature = "inspector")]
         let inspector_state = match inspector {
             Some(cfg) => {
                 let connection_state = InspectorConnectionState::default();
@@ -365,6 +424,11 @@ impl RuntimeCoreState {
             None => None,
         };
 
+        let stream_prototype = {
+            deno_core::scope!(scope, js_runtime);
+            capture_stream_prototype(scope).map(Rc::new)
+        };
+
         Ok(Self {
             js_runtime,
             registry,
@@ -376,6 +440,7 @@ impl RuntimeCoreState {
                 next_fn_id: Default::default(),
                 limits: serialization_limits,
                 streams: Rc::new(JsStreamRegistry::new()),
+                stream_prototype,
             },
             pending_calls: Default::default(),
             next_pending_call_id: Default::default(),
@@ -386,9 +451,26 @@ impl RuntimeCoreState {
             inspector_state,
             startup_snapshot: snapshot_source,
             py_stream_registry,
+            abandoned_module_evaluation: false,
+            main_module: None,
+            main_module_incomplete: false,
         })
     }
 
+    #[cfg(not(feature = "inspector"))]
+    pub(super) fn inspector_info(&self) -> Option<(InspectorMetadata, InspectorConnectionState)> {
+        self.inspector_state.as_ref().map(|state| match *state {})
+    }
+
+    #[cfg(not(feature = "inspector"))]
+    pub(super) fn ensure_inspector_ready(&mut self) -> RuntimeResult<()> {
+        if let Some(state) = &self.inspector_state {
+            match *state {}
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "inspector")]
     pub(super) fn inspector_info(&self) -> Option<(InspectorMetadata, InspectorConnectionState)> {
         self.inspector_state.as_ref().map(|state| {
             (
@@ -398,6 +480,7 @@ impl RuntimeCoreState {
         })
     }
 
+    #[cfg(feature = "inspector")]
     pub(super) fn ensure_inspector_ready(&mut self) -> RuntimeResult<()> {
         if let Some(state) = self.inspector_state.as_mut() {
             if state.has_waited {
@@ -509,6 +592,7 @@ impl RuntimeCoreState {
     /// and kill the next, unrelated, call. A no-op when none is pending.
     pub(super) fn cancel_pending_termination(&mut self) {
         let _ = self.js_runtime.v8_isolate().cancel_terminate_execution();
+        self.termination.clear_handled_reason();
     }
 
     /// Resolve `watchdog` and, if it fired, turn the call's outcome into a timeout.
@@ -521,11 +605,11 @@ impl RuntimeCoreState {
         if let Some(watchdog) = watchdog {
             let (fired, duration) = self.resolve_watchdog(watchdog);
             if fired {
+                // The deadline passed, whatever the call produced meanwhile: a guest error whose
+                // conversion ran into the deadline (a looping `cause` getter, say) is reported as
+                // the timeout it is, not as the guest's error.
                 let message = format!("{context} timed out after {}ms", duration.as_millis());
-                return match result {
-                    Err(err) if !runtime_error_indicates_termination(&err) => Err(err),
-                    _ => Err(RuntimeError::timeout(message)),
-                };
+                return Err(RuntimeError::timeout(message));
             }
         }
         result
@@ -670,6 +754,11 @@ impl RuntimeCoreState {
             }
             return Ok(());
         }
+        // Refused: the handlers were never reachable; drop them rather than keep them for the
+        // runtime's lifetime.
+        for token in op_tokens {
+            registry.revoke(token);
+        }
         match try_catch.exception() {
             Some(exception) => Err(js_error(JsError::from_v8_exception(try_catch, exception))),
             None => Err(RuntimeError::internal(
@@ -723,9 +812,27 @@ impl RuntimeCoreState {
     /// Load `specifier` as the main module (loading is blocking in deno_core).
     pub(super) fn load_module(&mut self, specifier: &str) -> RuntimeResult<ModuleId> {
         let module_specifier = module_specifier(specifier)?;
-        futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier)).map_err(
-            |e| RuntimeError::internal(format!("Failed to load module '{}': {}", specifier, e)),
-        )
+        let resolved = module_specifier.to_string();
+        let again_after_cut_short =
+            self.main_module_incomplete && self.main_module.as_deref() == Some(resolved.as_str());
+        let loaded =
+            futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier));
+        match loaded {
+            Ok(module_id) => {
+                if self.main_module.is_none() {
+                    self.main_module = Some(resolved);
+                }
+                Ok(module_id)
+            }
+            Err(_) if again_after_cut_short => Err(RuntimeError::internal(format!(
+                "Failed to load module '{specifier}': its earlier evaluation did not complete \
+                 (it timed out or was terminated), so it cannot be evaluated again in this runtime"
+            ))),
+            Err(e) => Err(RuntimeError::internal(format!(
+                "Failed to load module '{}': {}",
+                specifier, e
+            ))),
+        }
     }
 
     pub(super) fn module_namespace(&mut self, module_id: ModuleId) -> RuntimeResult<JSValue> {
@@ -741,18 +848,44 @@ impl RuntimeCoreState {
     pub(super) fn eval_module_sync(&mut self, specifier: &str) -> RuntimeResult<JSValue> {
         self.with_timing(RuntimeCallKind::EvalModuleSync, |this| {
             let module_id = this.load_module(specifier)?;
-            let receiver = this.js_runtime.mod_evaluate(module_id);
-            futures::executor::block_on(
+            let mut receiver = Box::pin(this.js_runtime.mod_evaluate(module_id));
+            let result = match futures::executor::block_on(
                 this.js_runtime
                     .run_event_loop(PollEventLoopOptions::default()),
-            )
-            .map_err(|err| this.translate_core_error(err))?;
-            futures::executor::block_on(receiver).map_err(|err| this.translate_core_error(err))?;
+            ) {
+                Ok(()) => futures::executor::block_on(receiver.as_mut())
+                    .map_err(|err| this.translate_core_error(err)),
+                Err(err) => {
+                    let err = this.translate_core_error(err);
+                    // deno_core reports a stalled top-level `await` once nothing else is left to
+                    // run; it may be an earlier, abandoned evaluation's. If this module has
+                    // settled, its own outcome stands.
+                    let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+                    match std::future::Future::poll(receiver.as_mut(), &mut cx) {
+                        std::task::Poll::Ready(settled) if is_stalled_module_evaluation(&err) => {
+                            settled.map_err(|err| this.translate_core_error(err))
+                        }
+                        _ => Err(err),
+                    }
+                }
+            };
+            if let Err(err) = &result {
+                this.note_module_evaluation_failure(err);
+            }
+            result?;
             // A bare top-level `queueMicrotask` is not on the path the event
             // loop waited for; drain it like `eval_sync` does.
             this.drain_microtasks();
             this.module_namespace(module_id)
         })
+    }
+
+    /// Record what a main-module evaluation that ended in `err` leaves behind.
+    pub(super) fn note_module_evaluation_failure(&mut self, err: &RuntimeError) {
+        if leaves_module_evaluation_pending(err) {
+            self.abandoned_module_evaluation = true;
+            self.main_module_incomplete = true;
+        }
     }
 
     pub(super) fn call_function_sync(
@@ -888,6 +1021,39 @@ impl RuntimeCoreState {
             streams,
         ))
     }
+}
+
+/// V8's text for a module evaluation stuck on a top-level `await`.
+const STALLED_TOP_LEVEL_AWAIT: &str = "Top-level await promise never resolved";
+
+/// Whether `err` is deno_core's report that a module evaluation is stuck on a top-level `await`
+/// with nothing left that could settle it.
+///
+/// Decided from the error's shape, not its text alone, so a guest cannot pass its own rejection
+/// off as one: deno_core builds the report from a V8 message (not a thrown value), so it has no
+/// error name, exactly V8's text, and the one frame of the stalled `await`. A guest `Error` with
+/// that message carries its name; a non-`Error` thrown value comes back as "Uncaught ...". The
+/// deadlock variant is a deno_core error, never a JavaScript one.
+pub(super) fn is_stalled_module_evaluation(err: &RuntimeError) -> bool {
+    match err {
+        RuntimeError::JavaScript(details) => {
+            details.name.is_none()
+                && details.message.as_deref() == Some(STALLED_TOP_LEVEL_AWAIT)
+                && details.frames.len() == 1
+        }
+        other => other
+            .to_string()
+            .contains("Module evaluation is still pending after multiple event loop iterations"),
+    }
+}
+
+/// Whether a module evaluation that ended in `err` may stay pending in deno_core: it was cut
+/// short (timeout, termination) or is stuck on a top-level `await`. A module that threw or failed
+/// to resolve has settled and leaves nothing behind.
+pub(super) fn leaves_module_evaluation_pending(err: &RuntimeError) -> bool {
+    matches!(err, RuntimeError::Timeout { .. })
+        || runtime_error_indicates_termination(err)
+        || is_stalled_module_evaluation(err)
 }
 
 pub(super) fn runtime_error_indicates_termination(err: &RuntimeError) -> bool {

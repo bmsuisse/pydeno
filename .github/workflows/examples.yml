@@ -19,6 +19,7 @@ on:
         required: false
         default: ""
   pull_request:
+    branches: [main]  # sub-PRs into an integration branch do not run CI; the PR to main does
     paths:
       - "examples/**"
       - "scripts/run_examples.py"

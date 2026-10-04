@@ -204,3 +204,86 @@ class TestBindingScale:
             assert rt.eval("v()") == 1
             rt.bind_function("v", lambda: 2)
             assert rt.eval("v()") == 2
+
+
+class TestLimitsTooLargeForTheWire:
+    """A limit the worker cannot receive as an integer is refused up front.
+
+    Integers past 2**53 - 1 cross the wire as a tagged object, so `max_memory=2**62` (which derives
+    `max_buffer_bytes = 2**60`) used to fail inside the worker with "argument 'max_buffer_bytes':
+    'dict' object cannot be interpreted as an integer", reported as a `WorkerCrashed`."""
+
+    @pytest.mark.parametrize("max_memory", [2**53, 2**62, 10**30], ids=str)
+    def test_huge_max_memory_is_a_value_error(self, max_memory: int) -> None:
+        with pytest.raises(ValueError, match="max_memory must be at most"):
+            IsolatedRuntime(max_memory=max_memory, sandbox="off")
+
+    def test_huge_config_limit_is_a_value_error(self) -> None:
+        cfg = RuntimeConfig(max_buffer_bytes=2**60)
+        with pytest.raises(ValueError, match="max_buffer_bytes must be at most"):
+            IsolatedRuntime(cfg, sandbox="off")
+
+    def test_the_largest_accepted_max_memory_starts(self) -> None:
+        with IsolatedRuntime(max_memory=2**53 - 1, sandbox="off") as rt:
+            assert rt.eval("1 + 1") == 2
+
+    @pytest.mark.parametrize("max_memory", [2**53, 2**62], ids=str)
+    def test_async_runtime_refuses_too(self, max_memory: int) -> None:
+        from pydeno import AsyncIsolatedRuntime
+
+        with pytest.raises(ValueError, match="max_memory must be at most"):
+            AsyncIsolatedRuntime(max_memory=max_memory, sandbox="off")
+
+
+class TestTheCpuCapWithACachedBaseline:
+    """A command's CPU baseline is the latest cached reading, not a fresh one per command (two
+    readings per command were a third of the warm-call cost). CPU time only grows, so an older
+    baseline can only charge a command more, never less; these pin that it still catches a
+    burner and that the baseline never runs ahead of the worker's real CPU time."""
+
+    def test_a_cpu_burning_command_is_still_caught(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from pydeno import _isolated
+
+        # cap = hard deadline x factor: 2 s x 0.1 = 0.2 s of CPU, far inside the 2 s deadline,
+        # so only the CPU cap can be what stops it.
+        monkeypatch.setattr(_isolated, "_CPU_CAP_FACTOR", 0.1)
+        with IsolatedRuntime(request_timeout=2.0) as rt:
+            for _ in range(200):  # warm: the baseline is now the cached reading
+                assert rt.eval("1 + 1") == 2
+            start = time.monotonic()
+            with pytest.raises(RuntimeTimeout, match="CPU in one command"):
+                rt.eval("for (;;) {}")
+            assert time.monotonic() - start < 2.0, "the wall-clock deadline fired first"
+            assert rt.is_closed()
+
+    def test_the_baseline_is_never_newer_than_the_worker_cpu_time(self) -> None:
+        from pydeno import _sandbox
+
+        with IsolatedRuntime() as rt:
+            for _ in range(50):
+                rt.eval(
+                    "(() => { let s = 0; for (let i = 0; i < 1e4; i++) s += i; return s })()"
+                )
+                cached = rt._last_cpu  # noqa: SLF001
+                assert cached is not None
+                now = _sandbox.cpu_seconds(rt._proc.pid)  # noqa: SLF001
+                assert now is not None and cached <= now
+
+    def test_a_stale_baseline_is_read_afresh(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from pydeno import _isolated, _sandbox
+
+        calls: list[int] = []
+        real = _sandbox.cpu_seconds
+
+        def spy(pid: int) -> float | None:
+            calls.append(pid)
+            return real(pid)
+
+        with IsolatedRuntime() as rt:
+            rt.eval("1")
+            monkeypatch.setattr(_sandbox, "cpu_seconds", spy)
+            rt.eval("1")
+            assert calls == [], "a fresh baseline was read on the warm path"
+            rt._last_cpu_at -= _isolated._CPU_BASELINE_MAX_AGE + 1  # noqa: SLF001
+            rt.eval("1")
+            assert calls == [rt._proc.pid]  # noqa: SLF001
