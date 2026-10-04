@@ -37,6 +37,11 @@ pub struct Budget {
     /// the callback takes this flag to tell "the budget said no" (a catchable RangeError for the
     /// guest, the heap is fine) from a heap that really is at its limit (terminate).
     refused: AtomicBool,
+    /// Set when the callback consumes a refusal. V8 makes one more attempt right after that
+    /// last-resort collection; if it is refused too it must not flag again, or the flag outlives
+    /// the allocation and a later, genuine heap overflow is taken for a refusal (the callback
+    /// hands V8 its limit back unchanged and V8 aborts the process).
+    after_callback: AtomicBool,
 }
 
 impl Budget {
@@ -45,12 +50,17 @@ impl Budget {
             live: AtomicUsize::new(0),
             cap,
             refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         })
     }
 
     /// Whether the allocator has just refused a backing store; cleared by the read.
     pub fn take_refusal(&self) -> bool {
-        self.refused.swap(false, Ordering::AcqRel)
+        let refused = self.refused.swap(false, Ordering::AcqRel);
+        if refused {
+            self.after_callback.store(true, Ordering::Release);
+        }
+        refused
     }
 
     /// Reserve `len` bytes, or `false` if that would exceed the cap.
@@ -100,6 +110,9 @@ fn reserve_or_sweep(budget: &Budget, len: usize) -> bool {
     // A stale flag from an earlier refusal is cleared by the next request, so it can only be
     // read by the callback V8 invokes within the refused allocation itself.
     budget.refused.store(false, Ordering::Release);
+    // The attempt V8 makes right after the callback took a refusal: whatever it decides, it must
+    // not flag (see `after_callback`).
+    let follows_callback = budget.after_callback.swap(false, Ordering::AcqRel);
     if budget.reserve(len) {
         return true;
     }
@@ -114,7 +127,9 @@ fn reserve_or_sweep(budget: &Budget, len: usize) -> bool {
     if budget.reserve(len) {
         return true;
     }
-    budget.refused.store(true, Ordering::Release);
+    if !follows_callback {
+        budget.refused.store(true, Ordering::Release);
+    }
     false
 }
 
@@ -186,6 +201,7 @@ mod tests {
             live: AtomicUsize::new(0),
             cap: 100,
             refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         assert!(b.reserve(60));
         assert!(!b.reserve(41));
@@ -200,6 +216,7 @@ mod tests {
             live: AtomicUsize::new(0),
             cap: 4096,
             refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         let first = take(&b, 4096, true);
         assert!(!first.is_null());
@@ -222,6 +239,7 @@ mod tests {
             live: AtomicUsize::new(0),
             cap: 100,
             refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         unsafe { free(&b, ptr::null_mut(), 50) };
         b.release(10);
@@ -239,7 +257,27 @@ mod tests {
             live: AtomicUsize::new(1),
             cap: usize::MAX,
             refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         assert!(!b.reserve(usize::MAX));
+    }
+
+    #[test]
+    fn the_attempt_after_the_callback_does_not_leave_a_refusal_behind() {
+        let b = Budget {
+            live: AtomicUsize::new(0),
+            cap: 100,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
+        };
+        // V8: refused attempt, (GC, retries), last-resort callback, one final attempt.
+        assert!(take(&b, 200, false).is_null());
+        assert!(b.take_refusal());
+        assert!(take(&b, 200, false).is_null());
+        // A later genuine heap overflow must not find a stale refusal.
+        assert!(!b.take_refusal());
+        // The next refused allocation is flagged again.
+        assert!(take(&b, 200, false).is_null());
+        assert!(b.take_refusal());
     }
 }

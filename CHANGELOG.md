@@ -58,7 +58,8 @@
 - **A refused allocation no longer leaves the runtime terminated.** With `max_heap_size` set, an
   `ArrayBuffer` the buffer cap refused was reported to the guest as a `RangeError` but also marked the
   runtime as over its heap limit, so every later command failed with `RuntimeTerminated`. Only a JS heap
-  that really is at its limit terminates now. `WebAssembly.Memory`
+  that really is at its limit terminates now, and a refusal no longer stays flagged after V8's final retry
+  (a later real heap overflow used to be taken for a refusal, and V8 then aborted the process). `WebAssembly.Memory`
   remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
 - **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
   `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's

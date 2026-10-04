@@ -174,6 +174,11 @@ trusted. Ordinary JavaScript errors and soft timeouts leave it usable.
 | `max_buffer_bytes` | live `ArrayBuffer` / `SharedArrayBuffer` bytes, resizable ones included (their committed size) | a catchable `RangeError` |
 | `max_memory` | worker RSS | the worker is killed |
 
+The resizable-buffer charge wraps the built-ins when the runtime starts. A host `SnapshotBuilder`
+bootstrap runs before that, so a native `ArrayBuffer` constructor or `resize`/`grow`/`transfer` it keeps a
+reference to (and hands to the guest) is not charged. Snapshot code is host code; do not expose such a
+reference to guest code. (`IsolatedRuntime` refuses snapshots.)
+
 ## What works across the boundary
 
 `eval`, `eval_async`, `bind_function`, `bind_object`, `revoke_op`, `add_static_module`,
