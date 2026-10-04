@@ -190,6 +190,159 @@ def huge_result_is_refused_without_killing_the_parent() -> bool:
             return rt.eval("1 + 1") != 2 if not rt.is_closed() else False
 
 
+# --- the deadline must survive a poisoned Error ---------------------------------------------------------------
+# After `timeout=` terminates the guest, the host converts the termination into an error
+# (deno_core's `JsError::from_v8_exception`), which reads properties of a guest-controlled error
+# object: `constructor`, `name`, `message`, `cause`, `stack`, the registered symbol
+# `errorAdditionalPropertyKeys`, and runs `Error.prepareStackTrace`. A getter planted on
+# `Error.prototype` (or on the thrown instance) then runs *after* the termination was consumed,
+# unbounded by the deadline. The same reads happen for a thrown error and a rejected promise.
+_ERROR_POISONS = {
+    "ctor": "Object.defineProperty(Error.prototype, 'constructor', {get() { for (;;) {} }, configurable: true});",
+    "cause": "Object.defineProperty(Error.prototype, 'cause', {get() { for (;;) {} }, configurable: true});",
+    "name": "Object.defineProperty(Error.prototype, 'name', {get() { for (;;) {} }, configurable: true});",
+    "message": "Object.defineProperty(Error.prototype, 'message', {get() { for (;;) {} }, configurable: true});",
+    "stack": "Object.defineProperty(Error.prototype, 'stack', {get() { for (;;) {} }, configurable: true});",
+    "ctor_name": "Object.defineProperty(Error, 'name', {get() { for (;;) {} }, configurable: true});",
+    "object_ctor": "Object.defineProperty(Object.prototype, 'constructor', {get() { for (;;) {} }, configurable: true});",
+    "prepare_stack_trace": "Error.prepareStackTrace = () => { for (;;) {} };",
+    "additional_keys": "Object.defineProperty(Error.prototype, Symbol.for('errorAdditionalPropertyKeys'), {get() { for (;;) {} }, configurable: true});",
+    "instance_message": "globalThis.__e = new Error('m'); Object.defineProperty(__e, 'message', {get() { for (;;) {} }});",
+    "instance_name": "globalThis.__e = new Error('m'); Object.defineProperty(__e, 'name', {get() { for (;;) {} }});",
+}
+_ERROR_TRIGGERS = {
+    "spin": "for (;;) {}",
+    "throw": "throw (globalThis.__e || new Error('x'))",
+    "reject": "Promise.reject(globalThis.__e || new Error('r')); for (;;) {}",
+}
+_DEADLINE = 1.0
+_IN_PROCESS_DEADLINE_PROBE = """
+import asyncio, json, sys, time
+from pydeno import Runtime, RuntimeConfig
+deadline, poison, trigger, mode = float(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+t = time.monotonic()
+try:
+    with Runtime(RuntimeConfig(timeout=deadline)) as rt:
+        if mode == "sync":
+            rt.eval(poison + " " + trigger)
+        else:
+            asyncio.run(rt.eval_async(poison + " (async () => { " + trigger + " })()", timeout=deadline))
+except Exception:
+    pass
+print(json.dumps(time.monotonic() - t))
+"""
+
+
+def _poison_cases():  # type: ignore[no-untyped-def]
+    for pname, poison in _ERROR_POISONS.items():
+        for tname, trigger in _ERROR_TRIGGERS.items():
+            if pname.startswith("instance_") and tname == "spin":
+                continue  # an instance getter needs the instance to reach the host
+            yield f"{pname}/{tname}", poison, trigger
+
+
+@probe
+def poisoned_error_prototype_cannot_outlive_the_deadline_isolated() -> bool:
+    """Every variant must end (timeout or error) within 4x the deadline, through the
+    deadline, not through the hard kill of the worker."""
+    late = []
+    for name, poison, trigger in _poison_cases():
+        with IsolatedRuntime(
+            RuntimeConfig(timeout=_DEADLINE), sandbox="require", request_timeout=8
+        ) as rt:
+            t = time.monotonic()
+            try:
+                rt.eval(poison + " " + trigger)
+            except Exception:  # noqa: BLE001
+                pass
+            if time.monotonic() - t > 4 * _DEADLINE or rt.is_closed():
+                late.append(name)
+    if late:
+        print(f"    late: {late}", file=sys.stderr)
+    return bool(late)
+
+
+@probe
+def poisoned_error_prototype_cannot_hang_the_in_process_runtime() -> bool:
+    """Same, on `Runtime`, each case in its own process under a hard cap so a hang cannot take
+    the battery with it (`eval` and `eval_async`)."""
+    import subprocess
+
+    late = []
+    for name, poison, trigger in _poison_cases():
+        for mode in ("sync", "async"):
+            try:
+                out = subprocess.run(
+                    [sys.executable, "-c", _IN_PROCESS_DEADLINE_PROBE, str(_DEADLINE), poison, trigger, mode],
+                    capture_output=True,
+                    text=True,
+                    timeout=6 * _DEADLINE,
+                )
+                elapsed = float(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else 1e9
+            except subprocess.TimeoutExpired:
+                elapsed = 1e9
+            if elapsed > 4 * _DEADLINE:
+                late.append(f"{name}/{mode}")
+    if late:
+        print(f"    late: {late}", file=sys.stderr)
+    return bool(late)
+
+
+# --- a refused bind runs no guest code ------------------------------------------------------------------------
+_BIND_GETTERS = [
+    "Object.defineProperty(TypeError.prototype, 'constructor', {get() { globalThis.__hits++; return TypeError }, configurable: true})",
+    "Object.defineProperty(Error.prototype, 'constructor', {get() { globalThis.__hits++; return Error }, configurable: true})",
+    "Object.defineProperty(Object.prototype, 'constructor', {get() { globalThis.__hits++; return Object }, configurable: true})",
+    "Object.defineProperty(TypeError, 'name', {get() { globalThis.__hits++; return 'TypeError' }, configurable: true})",
+    "Object.defineProperty(Error, 'name', {get() { globalThis.__hits++; return 'Error' }, configurable: true})",
+    "Object.defineProperty(Object, 'name', {get() { globalThis.__hits++; return 'Object' }, configurable: true})",
+]
+_REFUSED_BIND_LOOP_PROBE = """
+import sys
+from pydeno import Runtime, RuntimeConfig
+with Runtime(RuntimeConfig(timeout=1.0)) as rt:
+    rt.eval("globalThis.tools = new Proxy({}, {}); " + sys.argv[1] + "; 0")
+    try:
+        rt.bind_object("tools", {"f": lambda: 1})
+    except Exception:
+        pass
+print("done")
+"""
+
+
+@probe
+def a_refused_bind_runs_no_guest_getter() -> bool:
+    """The error a refused `bind_object` hands the host is converted by the host with no deadline
+    around it: a getter on `constructor` or `name` of the error's class chain must not fire, and a
+    looping one must not hang the host."""
+    import subprocess
+
+    fired = []
+    for setup in _BIND_GETTERS:
+        with Runtime(RuntimeConfig(timeout=2.0)) as rt:
+            rt.eval("globalThis.__hits = 0; globalThis.tools = new Proxy({}, {}); " + setup + "; 0")
+            try:
+                rt.bind_object("tools", {"f": lambda: 1})
+                fired.append("bound onto a Proxy")
+            except Exception:  # noqa: BLE001
+                pass
+            if rt.eval("globalThis.__hits"):
+                fired.append(setup[22:60])
+    for setup in _BIND_GETTERS:
+        looping = setup.replace("globalThis.__hits++; return", "for (;;) {}; return")
+        try:
+            subprocess.run(
+                [sys.executable, "-c", _REFUSED_BIND_LOOP_PROBE, looping],
+                capture_output=True,
+                timeout=8,
+            )
+        except subprocess.TimeoutExpired:
+            fired.append("hang: " + setup[22:60])
+    if fired:
+        print(f"    fired: {fired}", file=sys.stderr)
+    return bool(fired)
+
+
 # --- the console channel ---------------------------------------------------------------------------------------
 @probe
 def console_echo_of_a_large_line_does_not_kill_the_worker() -> bool:
