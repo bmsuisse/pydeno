@@ -333,20 +333,16 @@ def a_refused_allocation_does_not_leave_the_runtime_terminated() -> bool:
                 return True
         except Exception:  # noqa: BLE001
             return True
-        # Genuine heap exhaustion must still end in a termination, every time.
-        for _ in range(3):
+    # Genuine heap exhaustion must still end in a termination, every time (a terminated runtime
+    # stays terminated: that is `max_heap_size`'s documented effect, so each try is a new one).
+    for _ in range(3):
+        with Runtime(RuntimeConfig(max_buffer_bytes=cap, max_heap_size=256 * 2**20)) as rt:
             try:
                 rt.eval("const a = []; for (;;) a.push(new Array(100000).fill(1))")
                 return True
             except Exception as exc:  # noqa: BLE001
                 if "Terminated" not in type(exc).__name__ and "Heap" not in str(exc):
                     return True
-            # A terminated isolate is reusable from the next command on.
-            try:
-                if rt.eval("2 + 2") != 4:
-                    return True
-            except Exception:  # noqa: BLE001
-                return True
     return False
 
 
