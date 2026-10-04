@@ -9,25 +9,40 @@
 //!
 //! The budget is *live* bytes: `free` returns what `allocate` took, so a guest
 //! that drops its buffers can allocate again.
+//!
+//! V8 does not route *resizable* `ArrayBuffer`s (nor growable
+//! `SharedArrayBuffer`s) through this allocator: their backing stores come from
+//! its page allocator. The bridge JS in `ops.rs` charges those to the same
+//! [`Budget`] through `op_pydeno_buffer_reserve` / `op_pydeno_buffer_release`,
+//! which is why the budget is shared (`Arc`) rather than owned by the allocator.
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use deno_core::v8;
 
 // ponytail: 16 covers every typed-array element size V8 hands the allocator; raise if it ever asks for more.
 const ALIGN: usize = 16;
 
-struct Budget {
+/// A live-byte budget with a hard cap, shared by the allocator and the bridge.
+pub struct Budget {
     live: AtomicUsize,
     cap: usize,
 }
 
 impl Budget {
+    pub fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            cap,
+        })
+    }
+
     /// Reserve `len` bytes, or `false` if that would exceed the cap.
-    fn reserve(&self, len: usize) -> bool {
+    pub fn reserve(&self, len: usize) -> bool {
         self.live
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 live.checked_add(len).filter(|total| *total <= self.cap)
@@ -35,7 +50,7 @@ impl Budget {
             .is_ok()
     }
 
-    fn release(&self, len: usize) {
+    pub fn release(&self, len: usize) {
         // Saturating: a stray double release must not wrap `live` past `cap`
         // and refuse every later allocation.
         let _ = self
@@ -103,14 +118,10 @@ static VTABLE: v8::RustAllocatorVtable<Budget> = v8::RustAllocatorVtable {
     drop: drop_budget,
 };
 
-/// An allocator that refuses to hold more than `cap_bytes` live.
-pub fn new(cap_bytes: usize) -> v8::UniqueRef<v8::Allocator> {
-    let budget = std::sync::Arc::new(Budget {
-        live: AtomicUsize::new(0),
-        cap: cap_bytes,
-    });
+/// An allocator that charges every backing store it hands out to `budget`.
+pub fn new(budget: Arc<Budget>) -> v8::UniqueRef<v8::Allocator> {
     // SAFETY: the handle is an `Arc<Budget>` raw pointer and `VTABLE` matches `Budget`.
-    unsafe { v8::new_rust_allocator(std::sync::Arc::into_raw(budget), &VTABLE) }
+    unsafe { v8::new_rust_allocator(Arc::into_raw(budget), &VTABLE) }
 }
 
 #[cfg(test)]

@@ -16,7 +16,8 @@ use crate::runtime::inspector::{
 use crate::runtime::js_value::{JSValue, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{
-    python_extension, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
+    python_extension, BufferBudget, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
+    ResizableBuffers,
 };
 use crate::runtime::stats::{
     ActivitySummary, HeapSnapshot, RuntimeCallKind, RuntimeStatsSnapshot, RuntimeStatsState,
@@ -240,12 +241,17 @@ impl RuntimeCoreState {
             v8::CreateParams::default().heap_limits(initial_heap_size.unwrap_or(0), max)
         });
         // ArrayBuffer storage is off the JS heap, so `max_heap_size` never
-        // counts it; it has its own opt-in budget.
-        if let Some(cap) = max_buffer_bytes {
+        // counts it; it has its own opt-in budget. The budget is shared with the
+        // bridge (through OpState below), which charges the resizable buffers V8
+        // allocates past this allocator.
+        let buffer_budget = max_buffer_bytes.map(crate::runtime::capped_allocator::Budget::new);
+        if let Some(budget) = &buffer_budget {
             create_params = Some(
                 create_params
                     .unwrap_or_default()
-                    .array_buffer_allocator(crate::runtime::capped_allocator::new(cap)),
+                    .array_buffer_allocator(crate::runtime::capped_allocator::new(
+                        budget.clone(),
+                    )),
             );
         }
 
@@ -274,6 +280,8 @@ impl RuntimeCoreState {
             // Must precede *any* script: the sync op path reads the limits
             // from OpState, and console capture / bootstrap logging call ops.
             op_state.put(serialization_limits);
+            op_state.put(BufferBudget(buffer_budget));
+            op_state.put(ResizableBuffers::default());
         }
 
         if inspector_enabled {
