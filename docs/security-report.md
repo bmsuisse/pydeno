@@ -163,6 +163,44 @@ not supported, so its findings are summarised in one line below.
 | Linux: the thread cap is sampled, not kernel-enforced | **Open.** A pids cgroup or `RLIMIT_NPROC` in the new user namespace is planned. |
 | Hosts that mount `/proc` with `hidepid` make the worker's usage unreadable | **Open.** `require` refuses to start there (fail closed); `auto` warns. |
 
+### Round 4: host boundary and state (0.8 red team, slice C)
+
+What the host believes about the guest, and what the guest can make the host do: tools and external
+functions, error redaction, journals and replay, `SessionPool`, the `Pydeno` front door, and the text
+pydeno writes for the host. Every row has a probe in `scripts/autoresearch/metric_security.py`
+(section "slice C", each run in a fresh interpreter under a time cap) and a regression test in
+`tests/test_redteam_boundary.py`.
+
+| Finding | Status |
+|---|---|
+| `SessionPool`: a session whose journal outgrew `max_journal_bytes` restarted with a fresh tool budget | **Fixed.** The pool stores a journal without state that charges every spent call; the next `get` restores that budget. |
+| Agent sessions (unreleased driving path): a tool raising a `BaseException` left a journal that `load()` refused | **Fixed.** Such a tool ends the run like a crash (worker killed, run recorded as lost with what it spent). |
+| Agent sessions: concurrent tool calls past `max_inflight_host_calls` were refused depending on timing, which the journal did not record, so such a journal could fail to replay | **Fixed.** The session's wrappers queue calls past the cap and issue them in order. |
+| Front door (unreleased): the syntax check after a failed feed depended on guest-replaceable built-ins and ran outside the journal | **Fixed.** The check uses intrinsics the prelude captured before guest code. |
+| `SessionPool`: a `get` concurrent with `drop()` could restore the session being dropped; a `session()` block could end a newer lease of a session dropped meanwhile | **Fixed.** A barrier holds the session's place during `drop`; `session()` releases only its own lease. |
+| `SessionPool` accepted 256-character non-ASCII ids that `release` then refused (associated data over 1024 bytes) | **Fixed.** Associated data may be 4096 bytes. |
+| `Pydeno` dumps could not be bound to a tenant or a counter: any state a pool dumped loaded into any of its sessions, including an older dump of the same session (its external-call budget restored) | **Fixed (opt-in).** `dump` / `load_session` / `load_snapshot` take `associated_data=`; documented. |
+| Tool names equal to the session's or the guest's globals (`__pydeno_agent_settle`, `globalThis`, `JSON`, `console`, ...) were accepted and silently broke the session or the tool | **Fixed.** Refused for bare-global tools; reserved prefixes always. |
+| A front-door answer the session refuses (`resume(error="...")`) used up the snapshot, leaving the session paused forever | **Fixed.** Checked before the snapshot is used. |
+| Captured console output (`ExecutionResult.stdout`/`stderr`), error messages and the default printer passed bidi overrides and zero-width characters through, and captured output also escape sequences; the CLI printed results and errors raw | **Fixed.** One shared filter (C0/C1 except tab and newline, bidi controls, zero-width space, BOM). Values and a custom `print_callback` stay raw (documented). |
+| The CLI runs code in-process with no deadline | **Open, by design of the current CLI.** The sandboxed CLI is in PR #49. |
+| Rollback of a stored journal by someone who can write both the journal and its counter | **Open, known** (documented since 0.7). |
+| A guest can still make its own journal fail to replay (a run that only fits `timeout` on a quiet machine) | **Documented.** Treat a failed restore as lost state and carry the spent budget over. |
+
+Tried and held: forged, truncated, bit-flipped and spliced journals, journals under another tenant's
+associated data or key, moved or rolled-back pool journals; resuming another session's call, a forged
+`ToolCall`, a used call, or a pre-dump call after `load`; catalog tools before discovery (refused and
+not charged), including through `constructor`/`__proto__`; tool arguments (40 MB strings, 100k-deep and
+cyclic nesting, Symbols, functions, Proxies with throwing traps, getters, `__proto__` keys, huge
+`BigInt`s, out-of-range dates, lone surrogates, `Map`/`Set` with unhashable members); tool results that
+cannot cross; errors from tools (redacted by default, also for `BaseException`); guest error names that
+claim host failures; the guest's view of time and entropy (`Date`, `Temporal`, `Intl`, no
+`performance`/`crypto`; seeded `Math.random` replays); calls from escaped run wrappers (charged and
+journaled); re-entering, closing or dumping a session from its own tool; contextvars across calls;
+`http_fetch` URL and address parsing (dot segments, encoded separators, IPv4-mapped/NAT64/6to4/Teredo
+and other embedded forms, trailing-dot and confusable hosts); weird callables as tools (partials,
+bound methods, classes, async generators, builtins).
+
 ### Rejected after measuring
 
 - `--single-threaded`: no reduction in threads, +79% GC time. Not adopted.

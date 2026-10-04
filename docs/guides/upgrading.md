@@ -64,9 +64,10 @@ you have today.
 
 ## 0.7.x to the next release: the `Pydeno` front door
 
-**Nothing breaks.** `Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits and errors are new
-names; every existing class keeps its behaviour, and the docs now lead with `Pydeno` and file the
-building blocks under "Advanced".
+`Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits and errors are new names, and the docs
+now lead with `Pydeno` and file the building blocks under "Advanced". Existing classes keep their
+behaviour, except for the restrictions from the 0.8 red team listed after the first table (three of
+them are marked **BREAKING**).
 
 | Change | Affects | Who notices | What to change |
 |---|---|---|---|
@@ -77,6 +78,21 @@ building blocks under "Advanced".
 | `AgentSandbox.run()` / `execute()` drive the worker from the calling thread, which keeps enforcing every limit; tool calls are answered on the session's own threads (a tool thread for plain functions, its loop thread for coroutine functions; started at its first tool call, never shared with another session), in the order the guest made them, as before, each call in a fresh copy of the caller's context, instead of on the calling thread | `AgentSandbox` | Tools that read the caller's **thread-local** state (`threading.local()`): they no longer see it. Tools see the caller's contextvars as before (a copy per call) | Keep per-call state in contextvars or closures, not thread-locals |
 | `AsyncAgentSandbox.run()` / `execute()` stop waiting for a tool once its run has ended (the supervisor killed the worker for `max_pause`, the CPU cap or memory): the call raises at once instead of when the tool returns; the tool is cancelled | `AsyncAgentSandbox` | Nobody, unless they waited for a slow tool to finish after its run was killed | Nothing |
 | `SandboxPool` builds its runtimes through an overridable core (`_core_type`, private) | internal | Nobody | Nothing |
+
+Restrictions and fixes from the 0.8 red team (host boundary and state). The first three can change
+behaviour you have today:
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| **BREAKING:** a tool named like a guest global (`JSON`, `Promise`, `console`, `globalThis`, `eval`, `Math`, ...) installed as a bare global, a namespace with such a name, or any tool name starting with `__pydeno` / `__host_op`, is refused with `ValueError` | `AgentSandbox`, `AsyncAgentSandbox`, `SessionPool` | Constructing the session raises (such a tool replaced the global and broke the session or was unreachable) | Rename the tool, or pass `namespace="tools"` (`tools.JSON(...)` is fine) |
+| **BREAKING:** `SessionPool` keeps a session's spent tool budget when its journal outgrows `max_journal_bytes`: the next `get` restores a stateless session with the budget spent (`lost_runs == 1`) instead of a fresh one | `SessionPool` | Code that relied on `JournalTooLarge` handing out a fresh budget | `drop()` the session if you want to start over with a fresh budget |
+| **BREAKING:** `ExecutionResult.stdout`/`stderr` (and `Done`/`Failed`'s), error messages and the front door's default printer replace C0/C1 controls (except tab and newline), bidirectional overrides and isolates, zero-width space, word joiner and BOM with `?`; the CLI prints results and errors the same way | `IsolatedRuntime.execute`, agent sessions, `Pydeno`, `python -m pydeno` | Guests that print ANSI colours or explicit bidi controls; tests comparing such output | Nothing for ordinary text (ZWJ/ZWNJ and RTL letters are kept). A `print_callback` of your own still gets the raw text |
+| A tool that raises a `BaseException` (`SystemExit`, `KeyboardInterrupt`, a cancellation) during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run like a crash (`WorkerCrashed`, run recorded as lost); it used to reach the guest as an error that the journal did not record | `AgentSandbox`, `Pydeno` | Tools that raise `SystemExit` & co. on purpose | Raise an `Exception` subclass for answers the guest should see |
+| Concurrent tool calls past `max_inflight_host_calls - 1` wait their turn instead of failing with "more than 64 host calls in flight" | agent sessions, `Pydeno` | Guests that counted on those failures | Nothing |
+| `SessionPool.drop()` makes a concurrent `get` wait and then start fresh; `pool.session()` releases only its own lease | `SessionPool` | Nobody (fixes) | Prefer `async with pool.session(...)` over bare `release` |
+| `PydenoSession.dump` / `load_session` / `load_snapshot` (and the async ones, and `snapshot.dump`) take `associated_data=` | new, opt-in | Nobody unless passed | Bind dumps to a tenant and a counter you keep if they leave your control |
+| A front-door snapshot is no longer used up by an answer the session refuses (`resume(error="...")`) | `Pydeno` | Nobody (fix) | Nothing |
+| Journal associated data may be up to 4096 bytes (was 1024) | agent sessions, `SessionPool` | Nobody (a relaxation: 256-character non-ASCII pool ids now persist) | Nothing |
 
 ## Safe to bump?
 

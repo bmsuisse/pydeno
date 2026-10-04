@@ -28,9 +28,30 @@
   `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
   gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
 
-Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+Nothing changes for existing code except the red-team restrictions under Security below; see
+[`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
+
+- **0.8 red team, host boundary and state** (#75 slice C; probes in `scripts/autoresearch/metric_security.py`,
+  tests in `tests/test_redteam_boundary.py`, details in `docs/security-report.md`):
+  - `SessionPool` keeps a session's spent tool budget when its journal outgrows `max_journal_bytes`
+    (it stores a stateless journal charging the spent calls; it used to start over with a fresh
+    budget). **Behaviour change.**
+  - Agent sessions queue concurrent tool calls past `max_inflight_host_calls - 1` and issue them in
+    order; they were refused depending on timing, which the journal did not record.
+  - A tool raising a `BaseException` during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run
+    like a crash (recorded as lost); the journal stays loadable.
+  - Tool names that would replace a guest global (bare-global tools), and names starting with
+    `__pydeno` / `__host_op`, are refused. **Behaviour change.**
+  - `SessionPool.drop()` holds the session's place while it works, so a concurrent `get` cannot
+    restore it; `pool.session()` releases only its own lease; journal associated data may be up to
+    4096 bytes, so every valid pool id persists.
+  - Front door: the syntax check after a failed feed uses captured intrinsics; `dump` / `load_session` /
+    `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot.
+  - Captured console output, error messages, the default printer and the CLI replace control characters,
+    bidirectional overrides and zero-width characters with `?`. **Behaviour change** for output that
+    contained them.
 
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;

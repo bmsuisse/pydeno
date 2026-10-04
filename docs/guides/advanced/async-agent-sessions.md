@@ -129,15 +129,21 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
 - **`await pool.release(owner, session_id)`** dumps the journal, stores it with the TTL and ends the
   lease. The session stays live (no replay on the next `get`) until it is evicted.
 - **`await pool.drop(owner, session_id)`** closes the session (killing a run in progress, even
-  under someone else's lease), deletes its journal and advances its counter.
+  under someone else's lease), deletes its journal and advances its counter. A `get` of the session
+  made while `drop` is at work waits for it and then starts a fresh session. The fresh session has
+  a fresh tool budget: `drop` is your decision to start over.
 - **`pool.session(owner, session_id)`** is `get` + `release` as an `async with` block. The release
   also happens when the block raises: a JavaScript error leaves the session valid, and a session
-  whose worker died is not persisted.
+  whose worker died is not persisted. The block releases only its own lease: if the session was
+  dropped and leased again by someone else meanwhile, leaving the block leaves that lease alone.
+  A bare `release(owner, session_id)` ends whatever lease the session has, so prefer the block.
 - `tools` takes whatever `AgentSandbox` takes (callables, `SchemaTool`s, MCP-style mappings) or an
   `(owner, session_id) -> tools` function; `tools_catalog=` gives every session a lazy catalog, and
   discovery survives a restore. `max_tool_calls`, `namespace` and `max_result_bytes` apply to new
   sessions; a restored session takes them from its journal.
-- Owner and session ids are strings of up to 256 characters without `:` or control characters.
+- Owner and session ids are strings of up to 256 characters without `:` or control characters
+  (any 256 characters fit in the signature's associated data). The ids appear in error messages:
+  do not put secrets in them.
 
 ### Concurrency: serialised, or rejected with `SessionBusy`
 
@@ -174,9 +180,12 @@ expire before the journals do.
 ### Size cap
 
 `max_journal_bytes` caps each session's journal. A session that outgrows it is not stored
-half-way: `release` closes it, deletes its stored journal, advances its counter and raises
-`JournalTooLarge` (a `JournalError`). The next `get` starts a fresh session. Keep long-lived state
-out of the journal by keeping runs short, or raise the cap.
+half-way: `release` closes it and stores, under the next counter, a journal **without its state**
+that only charges every tool call the session made (a `lost` record), then raises
+`JournalTooLarge` (a `JournalError`). The next `get` restores a session with no globals and that
+budget already spent (`lost_runs == 1`). (It used to start a fresh session with a fresh budget.)
+Keep long-lived state out of the journal by keeping runs short, or raise the cap; `drop` the
+session if you do want to start over with a fresh budget.
 
 ### Crash safety
 
