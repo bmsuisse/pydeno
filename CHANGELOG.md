@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Bound the async parent's queued frame count as well as payload bytes (#65). Empty or tiny
+  frames from a compromised worker now trigger backpressure while the consumer is idle.
+
 ### Added
 
 - **`pydeno` command** (`[project.scripts]`, same as `python -m pydeno`): evaluates JavaScript from an
