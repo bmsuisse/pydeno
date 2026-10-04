@@ -204,3 +204,32 @@ class TestBindingScale:
             assert rt.eval("v()") == 1
             rt.bind_function("v", lambda: 2)
             assert rt.eval("v()") == 2
+
+
+class TestLimitsTooLargeForTheWire:
+    """A limit the worker cannot receive as an integer is refused up front.
+
+    Integers past 2**53 - 1 cross the wire as a tagged object, so `max_memory=2**62` (which derives
+    `max_buffer_bytes = 2**60`) used to fail inside the worker with "argument 'max_buffer_bytes':
+    'dict' object cannot be interpreted as an integer", reported as a `WorkerCrashed`."""
+
+    @pytest.mark.parametrize("max_memory", [2**53, 2**62, 10**30], ids=str)
+    def test_huge_max_memory_is_a_value_error(self, max_memory: int) -> None:
+        with pytest.raises(ValueError, match="max_memory must be at most"):
+            IsolatedRuntime(max_memory=max_memory, sandbox="off")
+
+    def test_huge_config_limit_is_a_value_error(self) -> None:
+        cfg = RuntimeConfig(max_buffer_bytes=2**60)
+        with pytest.raises(ValueError, match="max_buffer_bytes must be at most"):
+            IsolatedRuntime(cfg, sandbox="off")
+
+    def test_the_largest_accepted_max_memory_starts(self) -> None:
+        with IsolatedRuntime(max_memory=2**53 - 1, sandbox="off") as rt:
+            assert rt.eval("1 + 1") == 2
+
+    @pytest.mark.parametrize("max_memory", [2**53, 2**62], ids=str)
+    def test_async_runtime_refuses_too(self, max_memory: int) -> None:
+        from pydeno import AsyncIsolatedRuntime
+
+        with pytest.raises(ValueError, match="max_memory must be at most"):
+            AsyncIsolatedRuntime(max_memory=max_memory, sandbox="off")
