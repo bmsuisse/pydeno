@@ -62,7 +62,7 @@ you have today.
 0.6.1 fixed a macOS-only bug: the sandboxed worker aborted at start on Python 3.10 to 3.12. If you are on
 0.6.0 there, upgrade.
 
-## 0.7.x to the next release: the `Pydeno` front door
+## 0.7.x to 0.8.0: the `Pydeno` front door
 
 **Three things change behaviour: `python -m pydeno`** (the CLI rows below), **the limit fixes**
 (the last rows of the first table) **and the restrictions from the 0.8 red team** (the second table;

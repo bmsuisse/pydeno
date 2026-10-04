@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-04
+
+Highlights: one Monty-shaped front door (`Pydeno` / `AsyncPydeno`) as the default path, much faster
+start-up and warm calls, a command line and an `llm` plugin, an allow-listed `http_fetch` tool, a
+`strict_eval` profile, and a large hardening pass over the worker, the bridge, the limits and the
+session pools. See "Upgrading" for the few behaviour changes.
+
+Security note: this release hardens behaviour of 0.7.0. A restored `SessionPool` session now keeps the
+tool budget it has already spent, a failing result conversion no longer keeps handles, and several
+limit values that were silently accepted are now refused. Upgrading is recommended for hosts that
+rely on `max_tool_calls` or on limits for untrusted code.
 
 - Refuse isolated worker startup when the supervisor lacks signal authority, in every sandbox
   mode. `sandbox_status().termination` reports a hardened-child termination probe; refusal is
