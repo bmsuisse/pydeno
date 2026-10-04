@@ -64,17 +64,21 @@ Nothing changes for existing code except `python -m pydeno` (see Changed); see
 
 ### Security
 
-- **Large indexed values are charged before they are expanded.** A typed array other than
-  `Uint8Array`, or a boxed `String`, returned as a result or passed to a host function, was expanded
-  into one key per element in a single native call before the serialization budget (or the host-call
-  argument cap) was checked. A 16 MB value took hundreds of megabytes and ran several times past
-  `timeout=`. Such values are now refused at once with the usual size error; small ones convert as
-  before.
+- **Large indexed values are checked before they are expanded.** A typed array other than
+  `Uint8Array`, or a boxed `String` (also behind a Proxy), returned as a result or stream chunk or
+  passed to a host function, was expanded into one key per element in a single native call before the
+  serialization budget (or the host-call argument cap) was checked. A 16 MB value took hundreds of
+  megabytes and ran several times past `timeout=`; a Proxy around one, passed to a host function in
+  plain `Runtime`, could run V8 out of memory. Such values are now refused at once; small ones convert
+  as before. Upgrade note: whatever `max_serialization_bytes` is, a typed array or `String` object of
+  more than 1,048,576 elements is refused as a result (return a `Uint8Array` over its buffer instead).
 - **`v8_flags` that cannot take effect are refused.** deno_core's start-up switches on `Temporal`,
   `Float16Array`, explicit resource management, source-phase and deferred imports and the native
   `queueMicrotask` after the worker's flags, so a flag such as `--no-harmony-temporal` was undone
-  while `IsolatedRuntime.v8_flags` listed it. It now raises at start-up. Upgrade note: code that
-  passed one of these flags gets an error instead of a silent no-op; remove the flag.
+  while `IsolatedRuntime.v8_flags` listed it. `IsolatedRuntime` now raises `ValueError` before it
+  starts a worker. Upgrade note: code that passed one of these flags gets an error instead of a silent
+  no-op; remove the flag, or use the opt-in `v8_flags=["--no-js-shipping"]`, which does switch these
+  features off (together with the other newest ones; see the isolation guide).
 - Numbers outside the 64-bit integer range now come back as floats (`2**63` used to return
   `2**63 - 1`).
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
