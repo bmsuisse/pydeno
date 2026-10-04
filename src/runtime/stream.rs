@@ -166,20 +166,23 @@ impl JsStreamRegistry {
         &self,
         scope: &mut v8::PinScope<'_, '_>,
         stream_value: v8::Local<'_, v8::Value>,
-    ) -> u32 {
-        let id = self.next_id.get();
-        self.next_id.set(id.wrapping_add(1));
+    ) -> RuntimeResult<u32> {
+        let mut entries = self.entries.borrow_mut();
+        let mut next = self.next_id.get();
+        let id = crate::runtime::registration_id::allocate_id(&mut next, &entries)
+            .ok_or_else(|| RuntimeError::internal("JS stream registration IDs exhausted"))?;
+        self.next_id.set(next);
         let entry = JsStreamEntry {
             stream: v8::Global::new(scope, stream_value),
             reader: None,
             chunks: 0,
             transferred_bytes: 0,
         };
-        self.entries.borrow_mut().insert(id, entry);
+        entries.insert(id, entry);
         let mut stats = self.stats.borrow_mut();
         stats.active = stats.active.saturating_add(1);
         stats.total = stats.total.saturating_add(1);
-        id
+        Ok(id)
     }
 
     pub fn release(&self, stream_id: u32) {
@@ -313,7 +316,12 @@ impl PyStreamRegistry {
         iterable: Py<PyAny>,
         task_locals: TaskLocals,
     ) -> RuntimeResult<u32> {
-        let stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        // The entries lock serializes allocation and insertion across clones.
+        let mut next = self.next_id.load(Ordering::Relaxed);
+        let stream_id = crate::runtime::registration_id::allocate_id(&mut next, &entries)
+            .ok_or_else(|| RuntimeError::internal("Python stream registration IDs exhausted"))?;
+        self.next_id.store(next, Ordering::Relaxed);
         let entry = Arc::new(PyStreamEntry {
             iterable,
             iterator: AsyncMutex::new(None),
@@ -321,7 +329,7 @@ impl PyStreamRegistry {
             closed: AtomicBool::new(false),
             serialization_limits: self.serialization_limits,
         });
-        self.entries.lock().unwrap().insert(stream_id, entry);
+        entries.insert(stream_id, entry);
         self.active.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
         Ok(stream_id)

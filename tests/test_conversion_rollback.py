@@ -148,3 +148,19 @@ async def test_cancelling_eval_async_at_any_moment_releases_its_result() -> None
                 pass
             task = None
             assert await _settled(rt) == (0, 0), f"iteration {i} left handles behind"
+
+
+@pytest.mark.parametrize("code", ["() => 1", "new ReadableStream()"])
+def test_finalizer_creation_failure_leaves_registration_untracked(monkeypatch, code):
+    import weakref
+
+    def fail_finalizer(*args, **kwargs):
+        raise RuntimeError("injected finalizer creation failure")
+
+    with Runtime() as rt, monkeypatch.context() as patch:
+        patch.setattr(weakref, "finalize", fail_finalizer)
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="injected finalizer"):
+                rt.eval(code)
+            assert handles(rt) == (0, 0)
+            assert rt._debug_tracked_function_count() == 0

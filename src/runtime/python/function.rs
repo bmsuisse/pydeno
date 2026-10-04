@@ -35,7 +35,6 @@ impl JsFunction {
         fn_id: u32,
         serialization_limits: SerializationLimits,
     ) -> PyResult<Py<Self>> {
-        handle.track_function_id(fn_id);
         let finalizer = JsFunctionFinalizer {
             handle: Mutex::new(Some(handle.clone())),
             fn_id,
@@ -43,13 +42,15 @@ impl JsFunction {
         let py_obj = Py::new(
             py,
             Self {
-                handle: RefCell::new(Some(handle)),
+                handle: RefCell::new(Some(handle.clone())),
                 fn_id,
                 closed: Cell::new(false),
                 serialization_limits,
             },
         )?;
         attach_finalizer(py, &py_obj, finalizer)?;
+        // Rollback owns the ID until both wrapper and finalizer exist.
+        handle.track_function_id(fn_id);
         Ok(py_obj)
     }
 

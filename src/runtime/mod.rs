@@ -11,6 +11,7 @@ pub mod js_value;
 pub mod loader;
 pub mod ops;
 pub mod python;
+mod registration_id;
 pub mod runner;
 pub mod snapshot;
 pub mod stats;
