@@ -22,6 +22,7 @@
 #   PYTEST_TARGETS     what to run (default: the isolation and escape suites)
 #   OVERLAY_PY=1       copy ./python/pydeno/*.py over the installed wheel, for iterating on
 #                      Python-only changes without rebuilding the wheel (local use only)
+#   MIN_TESTS         minimum selected test count (default: 1 for focused local runs)
 #   KEEP_OUT=1         leave the junit/collect logs in OUT_DIR
 #   EXTRA_RUN_ARGS     extra flags for `run` (CI passes `--security-opt apparmor=unconfined`
 #                      so a host AppArmor profile cannot change which sandbox layers apply)
@@ -38,7 +39,7 @@ OUT=${OUT_DIR:-$(mktemp -d)}
 mkdir -p "$OUT"
 # The monty-parity file is left out by default: its strict xfails run the in-process crash
 # probes for minutes and do not depend on the kernel. One cell runs it (PYTEST_TARGETS=...).
-TARGETS=${PYTEST_TARGETS:-"tests/test_isolated_runtime.py tests/test_isolated_lifecycle.py tests/test_isolated_determinism.py tests/test_isolated_fuzz.py tests/test_snapshot_auth.py tests/test_redteam_syscalls.py tests/test_sandbox_syscall_tables.py tests/test_known_escape_techniques.py tests/test_guest_globals.py tests/test_isolated_libraries.py tests/test_isolated_review_findings.py"}
+TARGETS=${PYTEST_TARGETS:-"tests/test_isolated_runtime.py tests/test_isolated_lifecycle.py tests/test_isolated_determinism.py tests/test_isolated_fuzz.py tests/test_snapshot_auth.py tests/test_redteam_syscalls.py tests/test_sandbox_syscall_tables.py tests/test_known_escape_techniques.py tests/test_guest_globals.py tests/test_isolated_libraries.py tests/test_isolated_review_findings.py tests/test_aio_isolated_runtime.py tests/test_isolated_limits.py tests/test_status.py tests/test_sandbox_attest.py tests/test_sandbox_attest_edges.py"}
 
 case "$PROFILE" in
   default)     BLOCK=""; EXPECT="landlock+seccomp" ;;
@@ -120,14 +121,14 @@ r.close()
 mkdir -p /work && cp -r /src/tests /work/tests && cp -r /src/vendor /work/vendor && cp /src/pyproject.toml /work/ && cd /work
 echo "== $(. /etc/os-release; echo "$PRETTY_NAME") | $(/tmp/v/bin/python -V) | glibc $(ldd --version 2>/dev/null | head -1 | grep -o '[0-9.]*$' || echo '?') | kernel $(uname -r) | $(uname -m)"
 # shellcheck disable=SC2086
-/tmp/v/bin/python -m pytest $PYTEST_TARGETS --co -q -p no:randomly --strict-markers --strict-config \
+/tmp/v/bin/python /src/scripts/collect_guard.py 180 $PYTEST_TARGETS --co -q -p no:randomly --strict-markers --strict-config \
   | tee /out/collect.log | tail -1
 set +e
 # shellcheck disable=SC2086
 /tmp/v/bin/python -m pytest $PYTEST_TARGETS -q --no-header -p no:randomly -p no:cacheprovider \
-  --strict-markers --strict-config -rsfE --junitxml=/out/junit.xml > /tmp/pytest.out 2>&1
+  --strict-markers --strict-config -rsfE --junitxml=/out/junit.xml > /out/pytest.log 2>&1
 CODE=$?
-tail -${TAIL_LINES:-25} /tmp/pytest.out
+tail -${TAIL_LINES:-25} /out/pytest.log
 exit "$CODE"
 INNER_EOF
 chmod +x "$INNER"
@@ -149,7 +150,7 @@ set -e
 if [ -f "$OUT/junit.xml" ]; then
   python3 "$ROOT/scripts/check_test_report.py" --label "$IMAGE/$PROFILE" \
     --junit "$OUT/junit.xml" --collect-log "$OUT/collect.log" \
-    --min-tests 1 --max-skipped "${MAX_SKIPPED:-0}" --max-xfailed "${MAX_XFAILED:-10}" \
+    --min-tests "${MIN_TESTS:-1}" --max-skipped "${MAX_SKIPPED:-0}" --max-xfailed "${MAX_XFAILED:-10}" \
     || STATUS=1
 else
   echo "::error::$IMAGE/$PROFILE: no junit report; the container did not finish" >&2
