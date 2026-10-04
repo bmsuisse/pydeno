@@ -45,6 +45,15 @@ DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 TRUNCATED_MARKER = "[truncated]"
 
 _STDOUT_LEVELS = frozenset({"log", "info", "debug"})
+# What guest text must not carry into captured output, an exception message, a log or a terminal:
+# C0 and C1 controls except tab and newline (escape sequences, carriage returns), bidirectional
+# overrides, embeddings and isolates (text that displays in another order than it reads), and the
+# invisible zero-width space, word joiner and byte-order mark. Each is replaced by "?". ZWJ/ZWNJ
+# stay: scripts and emoji need them.
+UNSAFE_TEXT = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u180e\u200b\u200e\u200f\u202a-\u202e"
+    "\u2060\u2066-\u2069\ufeff]"
+)
 _MAX_DEPTH = 200
 _GUEST_ERROR = re.compile(r"^(?:Uncaught )?([A-Za-z_$][A-Za-z0-9_$]{0,63})(?::|$)")
 _EVAL_PREFIX = "Evaluation failed: "
@@ -172,7 +181,9 @@ class OutputCapture:
             return  # full: do not even format it
         if not isinstance(args, (list, tuple)):
             args = [args]
-        line = " ".join(format_console_arg(a) for a in args) + "\n"
+        line = (
+            UNSAFE_TEXT.sub("?", " ".join(format_console_arg(a) for a in args)) + "\n"
+        )
         with self._lock:
             if stream.cut:
                 return

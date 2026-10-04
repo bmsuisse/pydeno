@@ -43,6 +43,7 @@ from typing import Any
 
 from . import _sandbox, _wire
 from ._result import (
+    UNSAFE_TEXT,
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_RESULT_BYTES,
     ExecutionResult,
@@ -123,7 +124,8 @@ _IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 _NATIVE_FRAME = re.compile(r"0x[0-9a-fA-F]{4,}|\.(?:so|dylib)\b|\+\s*\d+\s*$")
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Guest (or worker) text bound for an exception message, a log or a terminal: see `_result`.
+_CONTROL = UNSAFE_TEXT
 
 
 def _clean(text: str, limit: int = 500) -> str:

@@ -5,6 +5,14 @@ import sys
 from pathlib import Path
 
 from pydeno import JavaScriptError, Runtime, undefined
+from pydeno._isolated import _CONTROL
+
+
+def _safe(text: object) -> str:
+    """What the code produced, made safe for a terminal: the result and error text are the
+    script's to choose, and escape sequences or bidirectional overrides in them would drive or
+    disguise what the terminal shows."""
+    return _CONTROL.sub("?", str(text))
 
 
 def main() -> None:
@@ -33,17 +41,19 @@ def main() -> None:
             else:
                 file_path = Path(args.file)
                 if not file_path.exists():
-                    print(f"Error: File '{file_path}' not found", file=sys.stderr)
+                    print(
+                        f"Error: File '{_safe(file_path)}' not found", file=sys.stderr
+                    )
                     sys.exit(1)
                 code = file_path.read_text(encoding="utf-8")
             result = rt.eval(code)
             if result is not undefined:
-                print(result)
+                print(_safe(result))
     except JavaScriptError as e:
-        print(f"JavaScript Error: {e}", file=sys.stderr)
+        print(f"JavaScript Error: {_safe(e)}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {_safe(e)}", file=sys.stderr)
         sys.exit(1)
 
 
