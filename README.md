@@ -162,7 +162,10 @@ The threat model is in [`SECURITY.md`](SECURITY.md); the details are in [the iso
   fakes, and Linux on many distros and both CPU architectures (details below).
 
 **What we do not claim.** A V8 bug is *contained* in the worker, not prevented. V8 is a large engine we cannot
-audit end to end, which is why the layers around it exist; there has been no independent outside security review
+audit end to end, which is why the layers around it exist. We also cannot lock the engine down completely:
+real libraries such as three.js, Vega and ECharts need much of the language, so a restriction becomes a
+default only when those libraries still run (`strict_eval` stays opt-in for that reason). The containment is
+the process and the OS sandbox, not a minimal engine; there has been no independent outside security review
 yet (it is planned before 1.0, see the [roadmap](docs/roadmap.md)). The in-process `Runtime` is **not** safe for
 hostile code: use `Pydeno` / `IsolatedRuntime`. Windows has no isolated worker. For multi-tenant use, put the
 whole process in a locked-down container or microVM ([deployment guidance](SECURITY.md)).
