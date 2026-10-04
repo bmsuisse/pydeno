@@ -12,6 +12,8 @@ Arrays already charge their length before walking; these values now do the same.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 
 import pytest
@@ -96,3 +98,156 @@ def test_a_huge_boxed_string_argument_is_refused_before_it_is_listed(
             rt.eval("f(new String('x'.repeat(2 ** 24)))")
         assert time.monotonic() - started < QUICK
         assert rt.eval("f(new String('ab'))") == 1  # small ones still cross
+
+
+# --- a Proxy around the value, and the budget/cap arithmetic (review of #80) -------------------------------
+# The in-process cases run in a child process with a hard timeout: before the fix, a Proxy around a huge
+# typed array passed to a host function ran V8 out of memory, which aborts the whole process.
+
+_CHILD = r"""
+import asyncio, sys, time
+from pydeno import Runtime, RuntimeConfig
+
+mode, expr, budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
+kwargs = {"timeout": 10.0}
+if budget:
+    kwargs["max_serialization_bytes"] = budget
+started = time.monotonic()
+try:
+    with Runtime(RuntimeConfig(**kwargs)) as rt:
+        rt.bind_function("f", lambda *a: len(a))
+        if mode == "eval":
+            out = rt.eval(expr)
+        elif mode == "async":
+
+            async def run():
+                return await rt.eval_async(expr, timeout=10.0)
+
+            out = asyncio.run(run())
+        else:  # stream: a JS ReadableStream whose one chunk is `expr`
+
+            async def read():
+                stream = await rt.eval_async(
+                    "(async () => new ReadableStream({start(c) { c.enqueue("
+                    + expr
+                    + "); c.close(); }}))()"
+                )
+                return [chunk async for chunk in stream]
+
+            out = asyncio.run(read())
+    print("OK", type(out).__name__)
+except Exception as exc:
+    print("ERR", type(exc).__name__, str(exc)[:200].replace("\n", " "))
+print("TOOK", round(time.monotonic() - started, 2))
+"""
+
+
+def _child(mode: str, expr: str, budget: int = 0) -> tuple[str, float]:
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD, mode, expr, str(budget)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, f"child died ({proc.returncode}): {proc.stderr[-500:]}"
+    lines = proc.stdout.strip().splitlines()
+    return lines[-2], float(lines[-1].split()[1])
+
+
+_PROXIED = [
+    "new Proxy(new Int8Array(2 ** 24), {})",
+    "new Proxy(new String('x'.repeat(2 ** 24)), {})",
+    "new Proxy(new Proxy(new Float64Array(2 ** 24), {}), {})",
+]
+
+
+@pytest.mark.parametrize("mode", ["eval", "async", "stream"])
+@pytest.mark.parametrize("expr", _PROXIED)
+def test_a_proxy_around_a_huge_indexed_result_is_refused_up_front(
+    mode: str, expr: str
+) -> None:
+    outcome, took = _child(
+        mode, f"Promise.resolve({expr})" if mode == "async" else expr
+    )
+    assert outcome.startswith("ERR"), outcome
+    assert "Serialization size" in outcome, outcome
+    assert took < QUICK, (took, outcome)
+
+
+@pytest.mark.parametrize("expr", _PROXIED)
+def test_a_proxy_around_a_huge_indexed_argument_is_refused_up_front(expr: str) -> None:
+    outcome, took = _child("eval", f"f({expr})")
+    assert outcome.startswith("ERR"), outcome
+    assert "too large" in outcome, outcome
+    assert took < QUICK, (took, outcome)
+
+
+def test_a_proxy_around_a_huge_typed_array_is_refused_by_the_isolated_worker() -> None:
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=TIMEOUT), request_timeout=TIMEOUT * 2
+    ) as rt:
+        rt.bind_function("f", lambda *a: len(a))
+        for expr in (_PROXIED[0], f"f({_PROXIED[0]})"):
+            started = time.monotonic()
+            with pytest.raises(Exception, match="Serialization size|too large"):
+                rt.eval(expr)
+            assert time.monotonic() - started < QUICK
+        assert rt.eval("1 + 1") == 2
+
+
+def test_small_proxied_values_still_convert() -> None:
+    with Runtime() as rt:
+        rt.bind_function("f", lambda *a: a[0])
+        assert rt.eval("new Proxy(new Float64Array([1.5]), {})") == {"0": 1.5}
+        assert rt.eval("new Proxy(new String('ab'), {})") == {"0": "a", "1": "b"}
+        assert rt.eval("f(new Proxy(new String('ab'), {}))") == {"0": "a", "1": "b"}
+        assert rt.eval("f(new Proxy({a: 1}, {}))") == {"a": 1}
+
+
+def _largest_accepted(rt: Runtime, template: str, high: int) -> int:
+    low = 0
+    while low < high:
+        mid = (low + high + 1) // 2
+        try:
+            rt.eval(template % mid)
+            low = mid
+        except RuntimeError:
+            high = mid - 1
+    return low
+
+
+@pytest.mark.parametrize(
+    ("indexed", "plain"),
+    [
+        ("new Int8Array(%d)", "Object.assign({}, new Int8Array(%d))"),
+        (
+            "new String('x'.repeat(%d))",
+            "Object.assign({}, new String('x'.repeat(%d)))",
+        ),
+    ],
+)
+def test_the_up_front_check_does_not_lower_the_documented_budget(
+    indexed: str, plain: str
+) -> None:
+    """The up-front charge is a check, not an extra cost: an indexed value is accepted exactly
+    when a plain object with the same keys and values is."""
+    with Runtime(RuntimeConfig(max_serialization_bytes=1_000_000)) as rt:
+        n = _largest_accepted(rt, plain, 400_000)
+        assert n > 0
+        rt.eval(indexed % n)  # must not raise
+        with pytest.raises(RuntimeError, match="Serialization size"):
+            rt.eval(indexed % (n + 1))
+
+
+def test_a_raised_budget_does_not_bring_back_the_unbounded_listing() -> None:
+    outcome, took = _child("eval", "new Float64Array(2 ** 24)", budget=2**31)
+    assert outcome.startswith("ERR"), outcome
+    assert "elements" in outcome, outcome
+    assert took < QUICK, (took, outcome)
+    outcome, took = _child(
+        "eval", "f(new Proxy(new Int8Array(2 ** 24), {}))", budget=2**31
+    )
+    assert outcome.startswith("ERR"), outcome
+    assert "too large" in outcome, outcome
+    assert took < QUICK, (took, outcome)

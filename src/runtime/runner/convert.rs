@@ -2,6 +2,7 @@
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::ops::{indexed_length, MAX_INDEXED_ELEMENTS};
 use crate::runtime::stream::JsStreamRegistry;
 use deno_core::error::JsError;
 use deno_core::v8;
@@ -127,26 +128,6 @@ fn is_readable_stream(
         current = prototype;
     }
     false
-}
-
-/// How many index properties `obj` lists without storing them: a typed array's element count, or
-/// a boxed string's length. Runs no guest code: a typed array's length is native, and a `String`
-/// object's `length` is its own non-configurable data property, which nothing can shadow.
-fn indexed_length(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<'_, v8::Value>,
-    obj: v8::Local<'_, v8::Object>,
-) -> usize {
-    if let Ok(typed_array) = v8::Local::<v8::TypedArray>::try_from(value) {
-        return typed_array.length();
-    }
-    if value.is_string_object() {
-        let length = v8::String::new(scope, "length").and_then(|key| obj.get(scope, key.into()));
-        if let Some(length) = length.filter(|length| length.is_number()) {
-            return length.number_value(scope).unwrap_or(0.0).max(0.0) as usize;
-        }
-    }
-    0
 }
 
 /// Look up the global JS helper function `name` (installed by the ops bootstrap).
@@ -387,12 +368,21 @@ impl Converter {
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             circular_check(seen, obj)?;
 
-            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings have one
-            // virtual own property per element: listing them for a 16 MB `Int8Array` builds 16
-            // million index strings in one native call that termination cannot interrupt. Charge
-            // the element count first, as the array branch does, so that fails before the listing.
-            tracker
-                .add_bytes(indexed_length(scope, value, obj).saturating_mul(size_of::<usize>()))?;
+            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings, also behind
+            // a Proxy, have one virtual own property per element: listing them for a 16 MB
+            // `Int8Array` builds 16 million index strings in one native call that termination
+            // cannot interrupt. So before the listing: every element costs at least one byte of
+            // key, checked against the budget (not added: the walk below charges the real cost),
+            // and a fixed cap bounds the listing however large the budget is.
+            let indexed = indexed_length(scope, value);
+            tracker.check_room(indexed)?;
+            if indexed > MAX_INDEXED_ELEMENTS {
+                return Err(RuntimeError::internal(format!(
+                    "Cannot serialize a typed array or String object of more than \
+                     {MAX_INDEXED_ELEMENTS} elements (whatever max_serialization_bytes is); \
+                     return a Uint8Array over its buffer, or a slice"
+                )));
+            }
 
             let prop_names = obj
                 .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())

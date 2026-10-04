@@ -408,6 +408,19 @@ impl LimitTracker {
         self.max_bytes
     }
 
+    /// Error if `bytes` more would go past `max_bytes`, without counting them: for a lower bound
+    /// checked before work whose real cost is charged as it happens.
+    pub fn check_room(&self, bytes: usize) -> RuntimeResult<()> {
+        let total = self.current_bytes.saturating_add(bytes);
+        if total > self.max_bytes {
+            return Err(RuntimeError::internal(byte_limit_message(
+                total,
+                self.max_bytes,
+            )));
+        }
+        Ok(())
+    }
+
     /// Add to the byte count; errors past `max_bytes`. Saturating so an
     /// "unlimited" (`usize::MAX`) tracker cannot overflow.
     pub fn add_bytes(&mut self, bytes: usize) -> RuntimeResult<()> {

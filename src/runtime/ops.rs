@@ -16,6 +16,7 @@ use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
 use crate::runtime::stream::PyStreamRegistry;
 use deno_core::ascii_str;
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::Extension;
 use deno_core::ExtensionFileSource;
 use deno_core::OpState;
@@ -249,6 +250,61 @@ fn to_js(result: Py<PyAny>, limits: &SerializationLimits) -> Result<JSValue, JsE
     Python::attach(|py| python_to_js_value(result.into_bound(py), limits).map_err(map_pyerr))
 }
 
+/// Most index properties one value may list when it is converted, whatever the serialization
+/// budget: listing them is one native call that termination cannot interrupt, so its cost must
+/// not grow with a budget the caller raised for other reasons.
+pub(crate) const MAX_INDEXED_ELEMENTS: usize = 1 << 20;
+
+/// Proxy chains longer than this are treated as unbounded: nothing legitimate nests that deep,
+/// and listing the keys of a chain walks every link natively.
+const MAX_PROXY_CHAIN: usize = 64;
+
+/// How many index properties listing `value`'s own keys produces without them being stored: a
+/// typed array's element count, or a boxed string's length, looking through any Proxy around it
+/// (a Proxy without an `ownKeys` trap forwards the listing to its target). `usize::MAX` for a
+/// Proxy chain too long to follow. Runs no guest code: a Proxy's target, a typed array's length
+/// and the type checks are native, and a `String` object's `length` is its own non-configurable
+/// data property, which nothing can shadow.
+pub(crate) fn indexed_length(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> usize {
+    let mut current = value;
+    let mut links = 0;
+    while let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(current) {
+        links += 1;
+        if links > MAX_PROXY_CHAIN {
+            return usize::MAX;
+        }
+        // A revoked Proxy's target is null: nothing to list.
+        current = proxy.get_target(scope);
+    }
+    if let Ok(typed_array) = v8::Local::<v8::TypedArray>::try_from(current) {
+        return typed_array.length();
+    }
+    if current.is_string_object() {
+        let Ok(object) = v8::Local::<v8::Object>::try_from(current) else {
+            return 0;
+        };
+        let length = v8::String::new(scope, "length").and_then(|key| object.get(scope, key.into()));
+        if let Some(length) = length.filter(|length| length.is_number()) {
+            return length.number_value(scope).unwrap_or(0.0).max(0.0) as usize;
+        }
+    }
+    0
+}
+
+/// `indexed_length` for the bridge's argument copy (`prepare` in the bridge script), which has no
+/// other way to see through a Proxy.
+#[op2]
+fn op_pydeno_indexed_length<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    value: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let length = indexed_length(scope, value);
+    v8::Number::new(scope, length as f64).into()
+}
+
 /// Synchronously call a Python handler from JavaScript.
 #[op2]
 #[serde]
@@ -371,7 +427,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const BigIntToString = uncurry(BigInt.prototype.toString);
   const SetForEach = uncurry(Set.prototype.forEach);
   const SetAdd = uncurry(Set.prototype.add);
-  const StringValueOf = uncurry(String.prototype.valueOf);
+  const IndexedLength = ops.op_pydeno_indexed_length;
   const PromiseThen = uncurry(Promise.prototype.then);
   const DateCtor = Date;
   const SetCtor = Set;
@@ -472,18 +528,17 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       return { __pydeno_type: "BigInt", value: BigIntToString(value) };
     }
     if (typeof value === "object") {
-      // A boxed string lists one entry per character, all in one native `Object.entries` call
-      // that termination cannot interrupt: charge its length before that call, not after.
-      // `String.prototype.valueOf` is a brand check that runs no guest code (it throws for
-      // anything else, a Proxy included).
-      let boxedLength = 0;
-      try {
-        boxedLength = StringValueOf(value).length;
-      } catch (_) {
-        // not a String object
-      }
-      if (boxedLength > MAX_ARG_NODES - argNodes) {
-        throw new RangeErrorCtor("Host tool argument is too large (a String object of " + boxedLength + " characters)");
+      // A boxed string, or a typed array behind a Proxy (a bare one is a view, handled above),
+      // lists one entry per element in one native `Object.entries` call that termination cannot
+      // interrupt: charge the count before that call, not after. The count comes from native
+      // code that looks through Proxies without running their traps.
+      const indexed = IndexedLength(value);
+      if (indexed > MAX_ARG_NODES - argNodes) {
+        throw new RangeErrorCtor(
+          "Host tool argument is too large (an indexed object of " +
+            (indexed > MAX_ARG_NODES ? "more than " + MAX_ARG_NODES : indexed) +
+            " elements)"
+        );
       }
       const result = {};
       // Indexed loops, not `for...of` or destructuring: those go through
@@ -1059,6 +1114,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
             op_pydeno_call_python_async(),
             op_pydeno_stream_pull_py(),
             op_pydeno_stream_cancel_py(),
+            op_pydeno_indexed_length(),
         ]),
         js_files: std::borrow::Cow::Owned(vec![ExtensionFileSource::new(
             "ext:pydeno/python_bridge.js",
