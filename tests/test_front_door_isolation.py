@@ -132,6 +132,23 @@ def test_thread_locals_never_cross_sessions_sync() -> None:
             assert not a_threads & {name for _, name in got}
 
 
+def test_no_thread_ever_serves_two_sessions() -> None:
+    """More sessions than any shared pool could have threads: each still gets threads no other
+    session ever used (so no thread-local can travel between them)."""
+    seen: dict[str, int] = {}
+    with Pydeno(sandbox=MODE, min_processes=2) as pool:
+        for i in range(70):
+            with pool.checkout() as session:
+                name = session.feed_run(
+                    "await who()",
+                    external_lookup={"who": lambda: threading.current_thread().name},
+                )
+            assert name not in seen, (
+                f"session {i} reused session {seen.get(name)}'s thread"
+            )
+            seen[name] = i
+
+
 async def test_thread_locals_never_cross_sessions_async() -> None:
     async with AsyncPydeno(sandbox=MODE, min_processes=2) as pool:
         for _ in range(3):
