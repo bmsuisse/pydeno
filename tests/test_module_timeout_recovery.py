@@ -312,3 +312,44 @@ def test_a_termination_after_a_timeout_reports_its_own_reason() -> None:
         with pytest.raises(RuntimeTerminated) as info:
             rt.eval("1")
         assert "timed out" not in str(info.value)
+
+
+# The stall report was recognised by its text alone, so a guest's own unhandled rejection with
+# that message was swallowed as an abandoned module, and the runtime then took a later, genuinely
+# stuck top-level await for that module's leftovers (with no timeout: waiting forever).
+_SPOOFED_STALL = textwrap.dedent(
+    """
+    import asyncio, time
+    from pydeno import Runtime
+    async def main():
+        rt = Runtime()
+        rt.add_static_module("never", "export const n = 1; await new Promise(() => {});")
+        rt.eval("Promise.reject(new Error('Top-level await promise never resolved')); 0")
+        rt.eval("1")  # let the event loop see the rejection
+        start = time.monotonic()
+        try:
+            await asyncio.wait_for(rt.eval_async("import('never')"), 10)
+            print("returned")
+        except asyncio.TimeoutError:
+            print("hung")
+        except Exception as exc:
+            stalled = "Top-level await promise never resolved" in str(exc)
+            print("stalled" if stalled else type(exc).__name__, round(time.monotonic() - start, 2))
+    asyncio.run(main())
+    """
+)
+
+
+def test_a_guest_rejection_is_not_taken_for_a_stalled_module() -> None:
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", _SPOOFED_STALL],
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError("the runtime stopped answering") from None
+    parts = done.stdout.split()
+    assert parts and parts[0] == "stalled", (done.stdout, done.stderr[-400:])
+    assert float(parts[1]) < 3.0

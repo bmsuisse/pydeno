@@ -203,6 +203,11 @@ pub(super) struct RuntimeCoreState {
     /// top-level await on every later event-loop poll; once this is set, that report is about the
     /// abandoned module, not about the work in hand.
     pub(super) abandoned_module_evaluation: bool,
+    /// The main module this runtime loaded (deno_core allows one), and whether its evaluation was
+    /// cut short. Loading it again then fails inside deno_core with an opaque error; this lets
+    /// `load_module` say why without reading deno_core's message.
+    main_module: Option<String>,
+    main_module_incomplete: bool,
 }
 
 impl RuntimeCoreState {
@@ -399,6 +404,8 @@ impl RuntimeCoreState {
             startup_snapshot: snapshot_source,
             py_stream_registry,
             abandoned_module_evaluation: false,
+            main_module: None,
+            main_module_incomplete: false,
         })
     }
 
@@ -742,24 +749,27 @@ impl RuntimeCoreState {
     /// Load `specifier` as the main module (loading is blocking in deno_core).
     pub(super) fn load_module(&mut self, specifier: &str) -> RuntimeResult<ModuleId> {
         let module_specifier = module_specifier(specifier)?;
-        futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier)).map_err(
-            |e| {
-                let detail = e.to_string();
-                // deno_core's only words for a module whose earlier evaluation never finished.
-                if detail.contains("Uncaught null") {
-                    RuntimeError::internal(format!(
-                        "Failed to load module '{specifier}': its earlier evaluation did not \
-                         complete (it timed out or was terminated), so it cannot be evaluated \
-                         again in this runtime"
-                    ))
-                } else {
-                    RuntimeError::internal(format!(
-                        "Failed to load module '{}': {}",
-                        specifier, detail
-                    ))
+        let resolved = module_specifier.to_string();
+        let again_after_cut_short =
+            self.main_module_incomplete && self.main_module.as_deref() == Some(resolved.as_str());
+        let loaded =
+            futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier));
+        match loaded {
+            Ok(module_id) => {
+                if self.main_module.is_none() {
+                    self.main_module = Some(resolved);
                 }
-            },
-        )
+                Ok(module_id)
+            }
+            Err(_) if again_after_cut_short => Err(RuntimeError::internal(format!(
+                "Failed to load module '{specifier}': its earlier evaluation did not complete \
+                 (it timed out or was terminated), so it cannot be evaluated again in this runtime"
+            ))),
+            Err(e) => Err(RuntimeError::internal(format!(
+                "Failed to load module '{}': {}",
+                specifier, e
+            ))),
+        }
     }
 
     pub(super) fn module_namespace(&mut self, module_id: ModuleId) -> RuntimeResult<JSValue> {
@@ -797,9 +807,7 @@ impl RuntimeCoreState {
                 }
             };
             if let Err(err) = &result {
-                if leaves_module_evaluation_pending(err) {
-                    this.abandoned_module_evaluation = true;
-                }
+                this.note_module_evaluation_failure(err);
             }
             result?;
             // A bare top-level `queueMicrotask` is not on the path the event
@@ -807,6 +815,14 @@ impl RuntimeCoreState {
             this.drain_microtasks();
             this.module_namespace(module_id)
         })
+    }
+
+    /// Record what a main-module evaluation that ended in `err` leaves behind.
+    pub(super) fn note_module_evaluation_failure(&mut self, err: &RuntimeError) {
+        if leaves_module_evaluation_pending(err) {
+            self.abandoned_module_evaluation = true;
+            self.main_module_incomplete = true;
+        }
     }
 
     pub(super) fn call_function_sync(
@@ -944,12 +960,28 @@ impl RuntimeCoreState {
     }
 }
 
+/// V8's text for a module evaluation stuck on a top-level `await`.
+const STALLED_TOP_LEVEL_AWAIT: &str = "Top-level await promise never resolved";
+
 /// Whether `err` is deno_core's report that a module evaluation is stuck on a top-level `await`
 /// with nothing left that could settle it.
+///
+/// Decided from the error's shape, not its text alone, so a guest cannot pass its own rejection
+/// off as one: deno_core builds the report from a V8 message (not a thrown value), so it has no
+/// error name, exactly V8's text, and the one frame of the stalled `await`. A guest `Error` with
+/// that message carries its name; a non-`Error` thrown value comes back as "Uncaught ...". The
+/// deadlock variant is a deno_core error, never a JavaScript one.
 pub(super) fn is_stalled_module_evaluation(err: &RuntimeError) -> bool {
-    let text = err.to_string();
-    text.contains("Top-level await promise never resolved")
-        || text.contains("Module evaluation is still pending after multiple event loop iterations")
+    match err {
+        RuntimeError::JavaScript(details) => {
+            details.name.is_none()
+                && details.message.as_deref() == Some(STALLED_TOP_LEVEL_AWAIT)
+                && details.frames.len() == 1
+        }
+        other => other
+            .to_string()
+            .contains("Module evaluation is still pending after multiple event loop iterations"),
+    }
 }
 
 /// Whether a module evaluation that ended in `err` may stay pending in deno_core: it was cut

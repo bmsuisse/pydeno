@@ -51,7 +51,8 @@
   even when the guest's error was still being read at that point.
 - The runtime stays usable after a module evaluation times out (or waits on a top-level `await` that never
   settles): later commands, timeouts and `TerminationHandle.terminate()` are served as usual, and the idle
-  runtime thread does not spin.
+  runtime thread does not spin. Known limit: after that, a *new* module stuck on a top-level `await` is no
+  longer reported at once; it waits for its timeout (forever without one). See the modules guide.
 - After a deadline has fired, a later `TerminationHandle.terminate()` reports its own reason instead of the
   earlier timeout's, also when it lands while the timed-out call is still returning.
 - Evaluating a module again after its first evaluation timed out or was terminated explains that, instead

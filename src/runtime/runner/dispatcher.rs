@@ -2,8 +2,7 @@
 //! handle commands, and park when there is nothing to do.
 
 use super::core::{
-    is_stalled_module_evaluation, leaves_module_evaluation_pending,
-    runtime_error_indicates_termination, RuntimeCoreState,
+    is_stalled_module_evaluation, runtime_error_indicates_termination, RuntimeCoreState,
 };
 use super::jobs::{
     call_function_async_job, eval_async_job, resume_function_call_job, stream_read_job,
@@ -223,10 +222,10 @@ impl RuntimeDispatcher {
     fn complete_active_job(&mut self, result: RuntimeResult<crate::runtime::js_value::JSValue>) {
         if let Some(job) = self.active_job.take() {
             // A module evaluation that did not complete may stay pending in deno_core for good.
-            if job.kind() == RuntimeCallKind::EvalModuleAsync
-                && result.as_ref().is_err_and(leaves_module_evaluation_pending)
-            {
-                self.core.abandoned_module_evaluation = true;
+            if job.kind() == RuntimeCallKind::EvalModuleAsync {
+                if let Err(err) = &result {
+                    self.core.note_module_evaluation_failure(err);
+                }
             }
             self.core
                 .stats_state
