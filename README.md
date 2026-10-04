@@ -53,6 +53,46 @@ with IsolatedRuntime(RuntimeConfig(timeout=2.0), sandbox="require") as rt:
 pip install pydeno     # or: uv pip install pydeno     (Python 3.10+, macOS or Linux)
 ```
 
+The same call, sync and async ([isolation guide][guide-isolation], [async guide][guide-async]):
+
+<table>
+<tr><th>Sync</th><th>Async</th></tr>
+<tr>
+<td>
+
+```python
+from pydeno import IsolatedRuntime
+
+with IsolatedRuntime(sandbox="require") as rt:
+    rt.bind_function("double", lambda x: x * 2)
+    print(rt.eval("double(21)"))  # 42
+```
+
+</td>
+<td>
+
+```python
+import asyncio
+from pydeno import AsyncIsolatedRuntime
+
+async def main():
+    async with AsyncIsolatedRuntime(sandbox="require") as rt:
+        await rt.bind_function("double", lambda x: x * 2)
+        print(await rt.eval("double(21)"))  # 42
+
+asyncio.run(main())
+```
+
+</td>
+</tr>
+</table>
+
+From a shell, the same sandboxed worker ([command line guide][guide-cli]):
+
+```bash
+pydeno '[1, 2, 3].map(x => x * 2)'     # prints [2, 4, 6]; exit code 1 on a JavaScript error
+```
+
 **Tools the guest can call**, with a total budget:
 
 ```python
@@ -318,3 +358,6 @@ this problem; the two sandboxes work well side by side.
 [pydeno-pypi]: https://pypi.org/project/pydeno/
 [pydeno-docs]: https://bmsuisse.github.io/pydeno/
 [workflows-tests]: https://github.com/bmsuisse/pydeno/actions/workflows/test.yml
+[guide-isolation]: https://bmsuisse.github.io/pydeno/guides/advanced/isolation/
+[guide-async]: https://bmsuisse.github.io/pydeno/guides/advanced/async/
+[guide-cli]: https://bmsuisse.github.io/pydeno/guides/cli/

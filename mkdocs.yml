@@ -44,6 +44,7 @@ nav:
           - Bindings: guides/bindings.md
           - Modules: guides/modules.md
           - Agent sessions: guides/agent-sessions.md
+          - Command line: guides/cli.md
           - pydantic-ai code mode: guides/pydantic-ai.md
           - Upgrading: guides/upgrading.md
           - Advanced:
