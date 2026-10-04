@@ -92,6 +92,7 @@ behaviour you have today:
 | `SessionPool.drop()` makes a concurrent `get` wait and then start fresh; `pool.session()` releases only its own lease | `SessionPool` | Nobody (fixes) | Prefer `async with pool.session(...)` over bare `release` |
 | `PydenoSession.dump` / `load_session` / `load_snapshot` (and the async ones, and `snapshot.dump`) take `associated_data=` | new, opt-in | Nobody unless passed | Bind dumps to a tenant and a counter you keep if they leave your control |
 | A front-door snapshot is no longer used up by an answer the session refuses (`resume(error="...")`) | `Pydeno` | Nobody (fix) | Nothing |
+| `feed_start` surfaces snapshots only for functions in that feed's `external_lookup`; a call to another name throws a `ReferenceError` in the guest | `Pydeno` | Drivers that expected snapshots for names they did not declare | Declare every function the feed may call |
 | Journal associated data may be up to 4096 bytes (was 1024) | agent sessions, `SessionPool` | Nobody (a relaxation: 256-character non-ASCII pool ids now persist) | Nothing |
 
 ## Safe to bump?

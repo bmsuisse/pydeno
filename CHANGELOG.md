@@ -48,7 +48,8 @@ Nothing changes for existing code except the red-team restrictions under Securit
     restore it; `pool.session()` releases only its own lease; journal associated data may be up to
     4096 bytes, so every valid pool id persists.
   - Front door: the syntax check after a failed feed uses captured intrinsics; `dump` / `load_session` /
-    `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot.
+    `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot; `feed_start`
+    surfaces snapshots only for the feed's declared functions.
   - Captured console output, error messages, the default printer and the CLI replace control characters,
     bidirectional overrides and zero-width characters with `?`. **Behaviour change** for output that
     contained them.

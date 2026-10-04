@@ -245,6 +245,7 @@ class AsyncPydenoSnapshot:
 
     __slots__ = (
         "_call",
+        "_declared",
         "_lookup",
         "_session",
         "_used",
@@ -260,10 +261,14 @@ class AsyncPydenoSnapshot:
         name: str,
         args: tuple[Any, ...],
         lookup: dict[str, Any],
+        declared: frozenset[str] | None = None,
     ) -> None:
         self._session = session
         self._call = call
         self._lookup = lookup
+        # The functions the feed declared (None: not known, after `load_snapshot` without
+        # `external_lookup`); calls to any other name are refused, never surfaced.
+        self._declared = declared
         self._used = False
         self.function_name = name
         self.args = args
@@ -491,7 +496,9 @@ class AsyncPydenoSession:
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         try:
-            return await self._step(await self._start(agent, prepared), calls)
+            return await self._step(
+                await self._start(agent, prepared), calls, frozenset(calls)
+            )
         except BaseException:
             self._printer.callback = None
             raise
@@ -535,7 +542,12 @@ class AsyncPydenoSession:
         self._printer.callback = _printer_for(print_callback)
         step = agent.pending
         assert step is not None
-        snapshot = await self._step(step, calls)
+        snapshot = await self._step(
+            step,
+            calls,
+            None if external_lookup is None else frozenset(calls),
+            pending=True,
+        )
         assert isinstance(snapshot, AsyncPydenoSnapshot)
         return snapshot
 
@@ -645,14 +657,26 @@ class AsyncPydenoSession:
         raise error from None
 
     async def _step(
-        self, step: Any, calls: dict[str, Any]
+        self,
+        step: Any,
+        calls: dict[str, Any],
+        declared: frozenset[str] | None,
+        *,
+        pending: bool = False,
     ) -> AsyncPydenoSnapshot | PydenoComplete:
         agent = self._agent
         assert agent is not None
         while isinstance(step, ToolCall):
             unpacked = _unpack(step)
             if unpacked is not None:
-                return AsyncPydenoSnapshot(self, step, unpacked[0], unpacked[1], calls)
+                if pending or declared is None or unpacked[0] in declared:
+                    return AsyncPydenoSnapshot(
+                        self, step, unpacked[0], unpacked[1], calls, declared
+                    )
+                # Not a function this feed declared (a stub left by an earlier feed, or a
+                # name passed straight to the dispatcher): refused, as `feed_run` does.
+                step = await agent.resume(step, error=_not_available(unpacked[0]))
+                continue
             step = await agent.resume(step, error=_not_available(None))
         self._printer.callback = None
         return PydenoComplete(self._finish(step))
@@ -667,7 +691,7 @@ class AsyncPydenoSession:
         except BaseException:
             self._printer.callback = None
             raise
-        return await self._step(step, snapshot._lookup)  # noqa: SLF001
+        return await self._step(step, snapshot._lookup, snapshot._declared)  # noqa: SLF001
 
     def __repr__(self) -> str:
         state = (

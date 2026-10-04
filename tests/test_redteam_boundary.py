@@ -206,6 +206,35 @@ class TestFrontDoor:
                     await snap.resume(error="no")  # type: ignore[arg-type]
                 assert (await snap.resume(value=6)).output == 6
 
+    def test_snapshots_only_for_declared_functions(self) -> None:
+        code = (
+            "const seen = [];"
+            "for (const f of [() => leftover(), () => __pydeno_external('drop_db', 1), () => read(2)])"
+            " { try { seen.push(await f()) } catch (e) { seen.push(e.name) } }"
+            "seen"
+        )
+        with Pydeno(min_processes=1, sandbox=MODE) as pool, pool.checkout() as s:
+            s.feed_run("1", external_lookup={"leftover": lambda: 1})
+            snap = s.feed_start(code, external_lookup={"read": lambda x: x})
+            assert snap.function_name == "read" and snap.args == (2,)
+            done = snap.resume(value="ok")
+            assert done.output == ["ReferenceError", "ReferenceError", "ok"]
+            snap = s.feed_start(
+                "await read(1); let r; try { r = await other(2) } catch (e) { r = e.name }\nr",
+                external_lookup={"read": print, "other": print},
+            )
+            state = snap.dump()
+            with pool.checkout() as s2:
+                # Restored without external_lookup: the names are not known, nothing is refused.
+                snap = s2.load_snapshot(state)
+                assert snap.function_name == "read"
+                assert snap.resume(value=1).function_name == "other"
+            with pool.checkout() as s3:
+                # Restored with external_lookup: only those names are surfaced.
+                snap = s3.load_snapshot(state, external_lookup={"read": print})
+                assert snap.function_name == "read"
+                assert snap.resume(value=1).output == "ReferenceError"
+
     def test_dumps_can_be_bound_to_a_tenant(self) -> None:
         with Pydeno(min_processes=1, sandbox=MODE) as pool:
             with pool.checkout() as s:
