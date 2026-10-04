@@ -18,12 +18,35 @@ use std::collections::HashMap;
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PySlice, PyString};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{
+    PyBool, PyDict, PyFloat, PyInt, PyList, PyModule, PySet, PySlice, PyString, PyType,
+};
 
 pyo3::create_exception!(_pydeno, WireNativeError, PyException);
 
 const SAFE_INT: i64 = 1 << 53;
 const MAX_HASH_REPEATS: usize = 16;
+
+// Imported once per process, not once per frame: every result the parent reads builds a decoder,
+// and two imports cost more than decoding a small value.
+static DATETIME: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static BASE64: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+
+/// `datetime.datetime`.
+pub(crate) fn datetime_type(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    Ok(DATETIME
+        .import(py, "datetime", "datetime")?
+        .clone()
+        .into_any())
+}
+
+fn base64_module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
+    Ok(BASE64
+        .get_or_try_init(py, || py.import("base64").map(Bound::unbind))?
+        .bind(py)
+        .clone())
+}
 
 pub(crate) fn fail<T>(message: impl Into<String>) -> PyResult<T> {
     Err(WireNativeError::new_err(message.into()))
@@ -65,8 +88,8 @@ impl<'py> Decoder<'py> {
             undefined: super::python::get_js_undefined(py)?
                 .into_bound(py)
                 .into_any(),
-            base64: py.import("base64")?,
-            datetime: py.import("datetime")?.getattr("datetime")?,
+            base64: base64_module(py)?,
+            datetime: datetime_type(py)?,
         })
     }
 

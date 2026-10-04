@@ -380,7 +380,8 @@ def check_source(
             if nxt is not None and nxt[1] == "(":
                 add(
                     "eval",
-                    "eval() compiles strings at run time; it works, but is hard to review.",
+                    "eval() compiles strings at run time: hard to review, and an EvalError "
+                    "in a runtime started with strict_eval=True.",
                     off,
                     "info",
                 )
@@ -394,7 +395,8 @@ def check_source(
             ):
                 add(
                     "eval",
-                    "new Function(...) compiles strings at run time; it works, but is hard to review.",
+                    "new Function(...) compiles strings at run time: hard to review, and an "
+                    "EvalError in a runtime started with strict_eval=True.",
                     off,
                     "info",
                 )

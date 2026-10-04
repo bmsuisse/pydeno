@@ -64,6 +64,10 @@ their limits are in `docs/guides/advanced/isolation.md`.
   holding the deadline paused or freezing the caller. Use `redact_host_errors=True` if your
   host functions raise exceptions whose text must not reach the guest.
 - Validate the arguments of every host function and tool you bind.
+- Bind session state to its owner: `AgentSandbox.dump(key, associated_data=...)`, and the same
+  `associated_data=` on `PydenoSession.dump` / `load_session` / `load_snapshot`, with a tenant id and
+  a counter you keep (or use `SessionPool`, which does both). A signature alone proves the state is
+  yours, not whose it is or that it is the newest.
 - Restore snapshots only from sources you trust and authenticate: pydeno does not verify snapshot
   bytes unless you do (`pydeno.verify_snapshot`).
 

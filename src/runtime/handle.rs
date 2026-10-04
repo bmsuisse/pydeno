@@ -596,8 +596,10 @@ impl RuntimeHandle {
             return Ok(());
         };
 
-        self.termination.ensure_reason("Terminated by host request");
-        if !self.termination.request() {
+        if !self
+            .termination
+            .request_with_reason("Terminated by host request")
+        {
             // Someone else is already terminating; wait for them, bounded by
             // the same grace so a second caller cannot hang on a wedged thread.
             let started = Instant::now();

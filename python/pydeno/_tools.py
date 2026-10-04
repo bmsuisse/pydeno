@@ -268,10 +268,18 @@ class ToolBridge:
 
         # Kept (host-side only) so `detach` can revoke them.
         if self._namespace is None:
-            for name, shim in wrapped.items():
-                self._tokens.setdefault(runtime, []).append(
-                    runtime.bind_function(name, shim)
-                )
+            # One bind per tool, so make the set all-or-nothing: if a later name is refused, revoke
+            # the ones this call already exposed before re-raising. (A namespace is a single
+            # `bind_object`, which validates every member before installing any.)
+            added: list[int] = []
+            try:
+                for name, shim in wrapped.items():
+                    added.append(runtime.bind_function(name, shim))
+            except BaseException:
+                for token in added:
+                    runtime.revoke_op(token)
+                raise
+            self._tokens.setdefault(runtime, []).extend(added)
         else:
             tokens = runtime.bind_object(self._namespace, wrapped)
             self._tokens.setdefault(runtime, []).extend(tokens.values())

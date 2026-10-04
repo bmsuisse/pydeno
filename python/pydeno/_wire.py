@@ -26,12 +26,17 @@ import select
 import struct
 import threading
 import time
-from typing import Any
 
 from ._pydeno import WireNativeError as _NativeError
 from ._pydeno import _wire_decode_values as _native_decode
 from ._pydeno import _wire_dumps as _native_dumps
 from ._pydeno import _wire_loads_decoded as _native_loads
+
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any
 
 # Same order of magnitude as Monty's 256 MiB frame cap, scaled down because
 # pydeno's value limits (`max_serialization_bytes`) are smaller.
@@ -74,6 +79,9 @@ def _reject_constant(name: str) -> Any:
     raise WireError(f"non-finite JSON constant {name}")
 
 
+_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+
+
 class Enc:
     """Marks a value inside a message that must be written in its wire (tagged) form.
 
@@ -102,7 +110,11 @@ def loads(data: bytes) -> dict[str, Any]:
     if data.count(b"[") + data.count(b"{") > MAX_NODES:
         raise WireError("frame has too many nested values")
     try:
-        message = json.loads(data, parse_constant=_reject_constant)
+        # What `json.loads(data, parse_constant=...)` does, minus building a new decoder for
+        # every frame (that alone is more than half its cost on a small frame).
+        message = _DECODER.decode(
+            data.decode(json.detect_encoding(data), "surrogatepass")
+        )
     except WireError:
         raise
     except (ValueError, RecursionError, MemoryError):
@@ -172,7 +184,15 @@ class FrameWriter:
         with self._lock:
             if self._fd < 0:
                 raise BrokenPipeError(errno.EPIPE, "the connection is closed")
-            view = memoryview(frame)
+            try:
+                written = os.write(self._fd, frame)
+            except BlockingIOError:
+                if self._stall is None:
+                    raise
+                written = 0
+            if written == len(frame):
+                return  # the usual case: the whole frame in one write
+            view = memoryview(frame)[written:]
             blocked_until: float | None = None
             while view:
                 try:
@@ -202,21 +222,32 @@ class FrameReader:
         self._fd = fd
         self._max = max_frame
         self._buf = bytearray()
+        # Registered on first use (a reader without deadlines needs none), then kept.
+        self._poller: Any = None
 
     def invalidate(self) -> None:
         """Make every later `read` fail with EBADF rather than read a reused descriptor."""
         self._fd = -1
 
-    def _fill(self, deadline: float | None) -> bool:
-        """Read more bytes. Returns False on EOF; raises `TimeoutError` at the deadline."""
+    def _chunk(self, deadline: float | None) -> bytes:
+        """One read of up to 64 KiB (empty at EOF); raises `TimeoutError` at the deadline."""
         fd = self._fd
         if fd < 0:
             raise OSError(errno.EBADF, "the connection is closed")
         if deadline is not None:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not _wait(fd, write=False, timeout=remaining):
+            poller = self._poller
+            if poller is None:
+                # `poll`, not `select`: see `_wait`.
+                poller = self._poller = select.poll()
+                poller.register(fd, select.POLLIN)
+            if remaining <= 0 or not poller.poll(remaining * 1000.0):
                 raise TimeoutError
-        chunk = os.read(fd, 1 << 16)
+        return os.read(fd, 1 << 16)
+
+    def _fill(self, deadline: float | None) -> bool:
+        """Read more bytes. Returns False on EOF; raises `TimeoutError` at the deadline."""
+        chunk = self._chunk(deadline)
         if not chunk:
             return False
         self._buf += chunk
@@ -224,6 +255,21 @@ class FrameReader:
 
     def read(self, deadline: float | None = None) -> bytes | None:
         """Next frame payload, or None on a clean EOF between frames."""
+        if not self._buf:
+            # The common case: nothing buffered, and one read returns exactly one whole frame,
+            # which is taken straight from the chunk without a trip through the buffer.
+            chunk = self._chunk(deadline)
+            if not chunk:
+                return None
+            if len(chunk) >= _HEADER.size:
+                (length,) = _HEADER.unpack_from(chunk)
+                if length > self._max:
+                    raise WireError(
+                        f"frame of {length} bytes exceeds the {self._max} byte cap"
+                    )
+                if len(chunk) == _HEADER.size + length:
+                    return chunk[_HEADER.size :]
+            self._buf += chunk
         while len(self._buf) < _HEADER.size:
             if not self._fill(deadline):
                 if self._buf:

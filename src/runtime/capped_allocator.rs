@@ -9,25 +9,62 @@
 //!
 //! The budget is *live* bytes: `free` returns what `allocate` took, so a guest
 //! that drops its buffers can allocate again.
+//!
+//! V8 does not route *resizable* `ArrayBuffer`s (nor growable
+//! `SharedArrayBuffer`s) through this allocator: their backing stores come from
+//! its page allocator. The bridge JS in `ops.rs` charges those to the same
+//! [`Budget`] through `op_pydeno_buffer_reserve` / `op_pydeno_buffer_release`,
+//! which is why the budget is shared (`Arc`) rather than owned by the allocator.
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use deno_core::v8;
 
 // ponytail: 16 covers every typed-array element size V8 hands the allocator; raise if it ever asks for more.
 const ALIGN: usize = 16;
 
-struct Budget {
+/// A live-byte budget with a hard cap, shared by the allocator and the bridge.
+pub struct Budget {
     live: AtomicUsize,
     cap: usize,
+    /// Set right before the allocator refuses a backing store. V8 then collects garbage and, as
+    /// the last resort of that same allocation attempt, invokes the near-heap-limit callback;
+    /// the callback takes this flag to tell "the budget said no" (a catchable RangeError for the
+    /// guest, the heap is fine) from a heap that really is at its limit (terminate).
+    refused: AtomicBool,
+    /// Set when the callback consumes a refusal. V8 makes one more attempt right after that
+    /// last-resort collection; if it is refused too it must not flag again, or the flag outlives
+    /// the allocation and a later, genuine heap overflow is taken for a refusal (the callback
+    /// hands V8 its limit back unchanged and V8 aborts the process).
+    after_callback: AtomicBool,
 }
 
 impl Budget {
+    pub fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            cap,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the allocator has just refused a backing store; cleared by the read.
+    pub fn take_refusal(&self) -> bool {
+        let refused = self.refused.swap(false, Ordering::AcqRel);
+        if refused {
+            self.after_callback.store(true, Ordering::Release);
+        }
+        refused
+    }
+
     /// Reserve `len` bytes, or `false` if that would exceed the cap.
-    fn reserve(&self, len: usize) -> bool {
+    pub fn reserve(&self, len: usize) -> bool {
         self.live
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                 live.checked_add(len).filter(|total| *total <= self.cap)
@@ -35,7 +72,7 @@ impl Budget {
             .is_ok()
     }
 
-    fn release(&self, len: usize) {
+    pub fn release(&self, len: usize) {
         // Saturating: a stray double release must not wrap `live` past `cap`
         // and refuse every later allocation.
         let _ = self
@@ -51,11 +88,56 @@ fn layout(len: usize) -> Option<Layout> {
     Layout::from_size_align(len.max(1), ALIGN).ok()
 }
 
+/// The refusal-path hook: given the budget, release what collected resizable buffers held.
+pub type Sweeper = Box<dyn Fn(&Budget)>;
+
+thread_local! {
+    /// What the runtime on this thread wants run before a reservation is refused: the bridge's
+    /// sweep of resizable buffers V8 has collected, whose bytes the budget still holds. V8 calls
+    /// the allocator on the isolate thread, and when it gets `null` back it collects garbage and
+    /// asks again, so the handles of dropped resizable buffers are empty by the retry; without
+    /// this hook a fixed-length allocation could fail on bytes nobody holds any more.
+    static SWEEPER: RefCell<Option<Sweeper>> = const { RefCell::new(None) };
+}
+
+/// Install the refusal-path sweeper for the runtime on this thread (one runtime per thread).
+pub fn set_thread_sweeper(sweeper: Sweeper) {
+    SWEEPER.with(|slot| *slot.borrow_mut() = Some(sweeper));
+}
+
+/// Reserve `len`, sweeping once and retrying before refusing.
+fn reserve_or_sweep(budget: &Budget, len: usize) -> bool {
+    // A stale flag from an earlier refusal is cleared by the next request, so it can only be
+    // read by the callback V8 invokes within the refused allocation itself.
+    budget.refused.store(false, Ordering::Release);
+    // The attempt V8 makes right after the callback took a refusal: whatever it decides, it must
+    // not flag (see `after_callback`).
+    let follows_callback = budget.after_callback.swap(false, Ordering::AcqRel);
+    if budget.reserve(len) {
+        return true;
+    }
+    // `try_borrow`: the sweeper is never installed re-entrantly, but a refusal must not panic.
+    SWEEPER.with(|slot| {
+        if let Ok(slot) = slot.try_borrow() {
+            if let Some(sweeper) = slot.as_ref() {
+                sweeper(budget);
+            }
+        }
+    });
+    if budget.reserve(len) {
+        return true;
+    }
+    if !follows_callback {
+        budget.refused.store(true, Ordering::Release);
+    }
+    false
+}
+
 fn take(budget: &Budget, len: usize, zeroed: bool) -> *mut c_void {
     let Some(layout) = layout(len) else {
         return ptr::null_mut();
     };
-    if !budget.reserve(len) {
+    if !reserve_or_sweep(budget, len) {
         return ptr::null_mut();
     }
     // SAFETY: `layout` has a non-zero size.
@@ -103,14 +185,10 @@ static VTABLE: v8::RustAllocatorVtable<Budget> = v8::RustAllocatorVtable {
     drop: drop_budget,
 };
 
-/// An allocator that refuses to hold more than `cap_bytes` live.
-pub fn new(cap_bytes: usize) -> v8::UniqueRef<v8::Allocator> {
-    let budget = std::sync::Arc::new(Budget {
-        live: AtomicUsize::new(0),
-        cap: cap_bytes,
-    });
+/// An allocator that charges every backing store it hands out to `budget`.
+pub fn new(budget: Arc<Budget>) -> v8::UniqueRef<v8::Allocator> {
     // SAFETY: the handle is an `Arc<Budget>` raw pointer and `VTABLE` matches `Budget`.
-    unsafe { v8::new_rust_allocator(std::sync::Arc::into_raw(budget), &VTABLE) }
+    unsafe { v8::new_rust_allocator(Arc::into_raw(budget), &VTABLE) }
 }
 
 #[cfg(test)]
@@ -122,6 +200,8 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(0),
             cap: 100,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         assert!(b.reserve(60));
         assert!(!b.reserve(41));
@@ -135,6 +215,8 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(0),
             cap: 4096,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         let first = take(&b, 4096, true);
         assert!(!first.is_null());
@@ -156,6 +238,8 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(0),
             cap: 100,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         unsafe { free(&b, ptr::null_mut(), 50) };
         b.release(10);
@@ -172,7 +256,28 @@ mod tests {
         let b = Budget {
             live: AtomicUsize::new(1),
             cap: usize::MAX,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
         };
         assert!(!b.reserve(usize::MAX));
+    }
+
+    #[test]
+    fn the_attempt_after_the_callback_does_not_leave_a_refusal_behind() {
+        let b = Budget {
+            live: AtomicUsize::new(0),
+            cap: 100,
+            refused: AtomicBool::new(false),
+            after_callback: AtomicBool::new(false),
+        };
+        // V8: refused attempt, (GC, retries), last-resort callback, one final attempt.
+        assert!(take(&b, 200, false).is_null());
+        assert!(b.take_refusal());
+        assert!(take(&b, 200, false).is_null());
+        // A later genuine heap overflow must not find a stale refusal.
+        assert!(!b.take_refusal());
+        // The next refused allocation is flagged again.
+        assert!(take(&b, 200, false).is_null());
+        assert!(b.take_refusal());
     }
 }

@@ -22,7 +22,7 @@ use pyo3::types::{
     PyString, PyTuple, PyType,
 };
 
-use super::wire::{fail, Decoder, WireNativeError};
+use super::wire::{datetime_type, fail, Decoder, WireNativeError};
 
 const SAFE_INT: i64 = 1 << 53;
 /// The parser accepts a few levels more than the value limit so the *decoder* reports an
@@ -877,7 +877,7 @@ pub fn _wire_dumps<'py>(
         py,
         buf: Vec::with_capacity(256),
         enc_type: enc_type.clone(),
-        datetime: py.import("datetime")?.getattr("datetime")?,
+        datetime: datetime_type(py)?,
         max_depth,
         max_frame,
     };

@@ -64,3 +64,28 @@ pyproject.toml      # Python project configuration
 
 - See [Architecture](architecture.md) for implementation details
 - Check existing [issues](https://github.com/bmsuisse/pydeno/issues) or open a new one
+
+## Release artifact checks
+
+The `Publish to PyPI` workflow validates the artifacts built in that run before publishing:
+
+- Linux wheels on native x86-64 and ARM64, for CPython 3.10–3.14. Each job records the installed
+  wheel's SHA-256 and requires successful collection, a complete JUnit report, at least 700 tests,
+  zero skips, and no more than the 10 documented expected failures.
+- The hostile-guest metric battery on CPython 3.12 for both architectures. The gate checks the
+  reported metric is exactly zero; the metric script's exit status alone does not prove this.
+- The full suite inside a root Linux container on both architectures, including tests that need
+  to exercise privilege dropping. Three additional container profiles test unavailable Landlock,
+  unavailable seccomp, and neither layer, using the isolation and escape suites. Each containment
+  job requires at least 500 selected tests. Containers share the runner's kernel; this does not
+  establish coverage of every supported kernel or production security policy.
+
+Collection logs, JUnit reports, wheel hashes and container pytest logs are retained as workflow
+artifacts, including on failure. The container runner bounds collection to 180 seconds. It never
+uses a Python source overlay in release jobs.
+
+A manual workflow run or a pull request changing this workflow or its report/container helpers
+exercises these gates without publishing. Only the `release: published` event can reach the
+publishing job, after all required jobs succeed. macOS and Windows artifacts are built here;
+these added release gates specifically cover Linux. Their broader platform tests remain in the
+`Platforms` workflow.

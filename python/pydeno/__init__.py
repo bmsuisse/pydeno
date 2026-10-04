@@ -8,7 +8,6 @@ import contextvars
 import sys
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from ._pydeno import (
     InspectorConfig,
@@ -29,7 +28,27 @@ from ._pydeno import (
     undefined,
 )
 
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+
 if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
+    from typing import Any, TypeVar, overload
+
+    from ._aio_front import AsyncPydeno, AsyncPydenoSession, AsyncPydenoSnapshot
+    from ._front import (
+        Pydeno,
+        PydenoComplete,
+        PydenoCrashedError,
+        PydenoError,
+        PydenoLimits,
+        PydenoRuntimeError,
+        PydenoSession,
+        PydenoSnapshot,
+        PydenoSyntaxError,
+        PydenoTimeoutError,
+        ToolThreadLimitError,
+    )
     from ._agent import (
         AgentSandbox,
         Done,
@@ -66,11 +85,34 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
     from ._sandbox_pool import AsyncSandboxPool, SandboxPool
     from ._status import Layer, SandboxStatus, sandbox_status
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
+    from .tools.http_fetch import (
+        AsyncHttpFetch,
+        HttpFetch,
+        HttpFetchBlocked,
+        HttpFetchError,
+        HttpFetchFailed,
+        HttpFetchTimeout,
+        http_fetch,
+    )
 
 # Everything below is imported on first use. `import pydeno` is then just the native module, which
 # keeps start-up small for plain `Runtime` users and for the isolation worker (which has no use for
 # the parent-side machinery: subprocess, tempfile, asyncio, ...).
 _LAZY = {
+    "Pydeno": "_front",
+    "PydenoSession": "_front",
+    "PydenoSnapshot": "_front",
+    "PydenoComplete": "_front",
+    "PydenoLimits": "_front",
+    "PydenoError": "_front",
+    "PydenoRuntimeError": "_front",
+    "PydenoSyntaxError": "_front",
+    "PydenoCrashedError": "_front",
+    "PydenoTimeoutError": "_front",
+    "ToolThreadLimitError": "_front",
+    "AsyncPydeno": "_aio_front",
+    "AsyncPydenoSession": "_aio_front",
+    "AsyncPydenoSnapshot": "_aio_front",
     "AgentSandbox": "_agent",
     "ToolCall": "_agent",
     "Done": "_agent",
@@ -112,6 +154,13 @@ _LAZY = {
     "Layer": "_status",
     "SandboxStatus": "_status",
     "sandbox_status": "_status",
+    "http_fetch": "tools.http_fetch",
+    "HttpFetch": "tools.http_fetch",
+    "AsyncHttpFetch": "tools.http_fetch",
+    "HttpFetchError": "tools.http_fetch",
+    "HttpFetchBlocked": "tools.http_fetch",
+    "HttpFetchTimeout": "tools.http_fetch",
+    "HttpFetchFailed": "tools.http_fetch",
 }
 
 
@@ -130,7 +179,12 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY))
 
 
-F = TypeVar("F", bound=Callable[..., Any])
+if TYPE_CHECKING:
+    F = TypeVar("F", bound=Callable[..., Any])
+else:
+
+    def overload(func: object) -> object:  # only type checkers read the overloads
+        return func
 
 
 @overload
@@ -164,7 +218,7 @@ def _runtime_bind(
         return _register
     if not callable(func):
         raise TypeError("runtime.bind expects a callable or to be used as a decorator")
-    return _register(cast(F, func))
+    return _register(func)  # type: ignore[arg-type]
 
 
 class _RuntimeSlot:
@@ -391,6 +445,20 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
 
 
 __all__ = [
+    "Pydeno",
+    "AsyncPydeno",
+    "PydenoSession",
+    "AsyncPydenoSession",
+    "PydenoSnapshot",
+    "AsyncPydenoSnapshot",
+    "PydenoComplete",
+    "PydenoLimits",
+    "PydenoError",
+    "PydenoRuntimeError",
+    "PydenoSyntaxError",
+    "PydenoCrashedError",
+    "PydenoTimeoutError",
+    "ToolThreadLimitError",
     "classify_error",
     "ErrorInfo",
     "check_source",
@@ -455,4 +523,11 @@ __all__ = [
     "ToolError",
     "ToolBudgetError",
     "ToolNotFoundError",
+    "http_fetch",
+    "HttpFetch",
+    "AsyncHttpFetch",
+    "HttpFetchError",
+    "HttpFetchBlocked",
+    "HttpFetchTimeout",
+    "HttpFetchFailed",
 ]

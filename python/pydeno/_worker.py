@@ -12,10 +12,25 @@ Protocol: see `pydeno/_wire.py`; the command set is in
 
 from __future__ import annotations
 
+# ruff: noqa: E402 - the Seatbelt precompile below has to start before the other imports
+
 # Everything this process will ever import is imported here, before the OS sandbox
 # goes up: afterwards the filesystem is gone, so a lazy import (including the ones
 # the Rust core does on first use of a feature) would fail. The extra imports below
 # are exactly those lazy ones.
+from . import _sandbox
+
+# First, so the Seatbelt profile compiles on another thread while the imports below run.
+_sandbox.precompile_seatbelt()
+
+import sys
+
+# Never `ssl`: this process makes no network connections (the sandbox forbids them), and asyncio
+# imports `ssl` only if it can (`try: import ssl / except ImportError: ssl = None`), so marking it
+# unimportable skips loading OpenSSL, about 2-3 ms of start-up. After the sandbox is up the import
+# would fail anyway, for want of a filesystem.
+sys.modules.setdefault("ssl", None)  # type: ignore[arg-type]
+
 import asyncio
 import base64  # noqa: F401
 import builtins
@@ -29,15 +44,13 @@ import json  # noqa: F401
 import os
 import queue
 import re
-import sys
 import threading
 import time
 import weakref  # noqa: F401
 from collections.abc import Callable
-from typing import Any
 
 from . import _awaitable  # noqa: F401
-from . import _sandbox, _wire
+from . import _wire
 from ._pydeno import (
     JavaScriptError,
     Runtime,
@@ -47,6 +60,12 @@ from ._pydeno import (
     RuntimeTimeout,
     _set_v8_flags,
 )
+
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any
 
 PROTOCOL_VERSION = 1
 _MEMORY_POLL_SECONDS = 0.02
@@ -188,7 +207,20 @@ class _Worker:
     def __init__(self, in_fd: int, out_fd: int) -> None:
         self._reader = _wire.FrameReader(in_fd)
         self._writer = _wire.FrameWriter(out_fd)
-        self._commands: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        # Who reads the parent's frames. Between commands the main thread does, itself: a command
+        # then reaches the runtime without a hop through another thread. While a command runs the
+        # main thread is inside the runtime, so when the guest is waiting for host calls the
+        # helper thread (`_read_loop`) reads instead: the replies, and anything else, which it
+        # queues for afterwards. Exactly one of them reads at a time (`_helper_reading` and
+        # `_in_command`, both under `_io`). A command with no host call in flight has nothing to
+        # read, and the helper sleeps through it; a parent that dies meanwhile is caught by
+        # `_watch` instead.
+        self._io = threading.Condition(
+            threading.Lock()
+        )  # never re-entered: no RLock needed
+        self._in_command = False
+        self._helper_reading = False
+        self._queued: queue.SimpleQueue[dict[str, Any]] = queue.SimpleQueue()
         self._pending: dict[int, concurrent.futures.Future[Any]] = {}
         self._pending_lock = threading.Lock()
         self._call_ids = itertools.count(1)
@@ -196,27 +228,57 @@ class _Worker:
 
     # -- transport ---------------------------------------------------------
 
-    def _read_loop(self) -> None:
-        """Demultiplex the parent's frames: replies wake stubs, the rest queue up."""
+    def _read_frame(self) -> dict[str, Any] | None:
+        """One frame from the parent, a reply already delivered (None), or the process ends:
+        a parent that is gone or broke protocol leaves nothing here worth keeping alive."""
         try:
-            while True:
-                payload = self._reader.read()
-                if payload is None:
-                    break
-                message = _wire.loads(payload)
-                if message["t"] == "reply":
-                    try:
-                        self._resolve(message)
-                    except Exception:  # noqa: BLE001
-                        # One bad reply must never end this thread: it is the only reader, so
-                        # every later reply, and so every later command, would wait forever.
-                        continue
-                else:
-                    self._commands.put(message)
+            payload = self._reader.read()
+            if payload is None:
+                os._exit(0)
+            message = _wire.loads(payload)
         except (_wire.WireError, OSError):
+            os._exit(0)
+        if message["t"] != "reply":
+            return message
+        try:
+            self._resolve(message)
+        except Exception:  # noqa: BLE001, S110
+            # One bad reply must never stop the reading: every later reply, and so every later
+            # command, would wait forever.
             pass
-        # The parent is gone or broke protocol: nothing here is worth keeping alive.
-        os._exit(0)
+        return None
+
+    def _read_loop(self) -> None:
+        """The helper's half of the reading (see `__init__`): while a command runs and waits for
+        the host. Every call it waits for gets a reply (or the parent kills us), so the read it
+        starts always ends."""
+        io = self._io
+        while True:
+            with io:
+                while not (self._in_command and self._pending):
+                    io.wait()
+                self._helper_reading = True
+            try:
+                message = self._read_frame()
+                if message is not None:
+                    self._queued.put(message)
+            finally:
+                with io:
+                    self._helper_reading = False
+                    io.notify_all()
+
+    def _next_command(self) -> dict[str, Any]:
+        """The main thread's half: a command the helper queued, else read one directly."""
+        io = self._io
+        while True:
+            with io:
+                while self._helper_reading and self._queued.empty():
+                    io.wait()
+                if not self._queued.empty():
+                    return self._queued.get_nowait()
+            message = self._read_frame()
+            if message is not None:
+                return message
 
     def _resolve(self, message: dict[str, Any]) -> None:
         with self._pending_lock:
@@ -247,6 +309,10 @@ class _Worker:
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
         with self._pending_lock:
             self._pending[cid] = future
+        # Inside a command this wakes the helper to read the reply (see `__init__`); outside
+        # one the main thread is the reader and gets it.
+        with self._io:
+            self._io.notify_all()
         try:
             self._writer.send(
                 {
@@ -405,7 +471,7 @@ class _Worker:
             if breaches:
                 raise RuntimeError(
                     f"sandbox self-test failed: the worker could still {breaches} "
-                    f"(applied: {applied})"
+                    f"(applied: {applied}){_sandbox.seatbelt_note()}"
                 )
         if mode == "require":
             # "require" means every layer this platform has, not "at least one": a kernel that
@@ -414,7 +480,7 @@ class _Worker:
             if missing:
                 raise RuntimeError(
                     f"an OS sandbox is required but {sorted(missing)} could not be applied "
-                    f"here (applied: {applied})"
+                    f"here (applied: {applied}){_sandbox.seatbelt_note()}"
                 )
             if (
                 sys.platform.startswith("linux")
@@ -426,15 +492,27 @@ class _Worker:
                     "drop its privileges"
                 )
         max_memory = options.get("max_memory")
-        if isinstance(max_memory, int) and max_memory > 0:
-            threading.Thread(
-                target=_watch_memory,
-                args=(max_memory, read_rss),
-                name="pydeno-worker-memory",
-                daemon=True,
-            ).start()
+        threading.Thread(
+            target=_watch,
+            args=(
+                max_memory if isinstance(max_memory, int) and max_memory > 0 else None,
+                read_rss,
+                os.getppid(),
+            ),
+            name="pydeno-worker-watch",
+            daemon=True,
+        ).start()
 
         kwargs = {k: config[k] for k in _CONFIG_KEYS if config.get(k) is not None}
+        # Never let the engine echo console output into this process's own stdout/stderr: both
+        # point at the parent's capture file, which sits under RLIMIT_FSIZE (1 MiB), and
+        # deno_core's `op_print` unwraps the flush of a failed write, so one `console.log` of a
+        # megabyte would abort the worker (SIGABRT) instead of raising. Nobody reads that echo
+        # anyway: the parent sees console output through `on_console` (the stub below), and the
+        # capture file only ever yields the last line of a crash. `enable_console=True` therefore
+        # keeps its documented meaning for the callback (it still fires) and stops at this
+        # process boundary.
+        kwargs["enable_console"] = False
         console_hid = options.get("console_hid")
         if isinstance(console_hid, int):
             kwargs["on_console"] = self._console_stub(console_hid)
@@ -485,11 +563,21 @@ class _Worker:
         threading.Thread(
             target=self._read_loop, name="pydeno-worker-reader", daemon=True
         ).start()
+        io = self._io
         while True:
-            message = self._commands.get()
-            if message is None or message["t"] == "close":
+            message = self._next_command()
+            if message["t"] == "close":
                 break
-            self._run_command(message)
+            with io:
+                self._in_command = True
+                # Replies still owed from before: the helper reads them now.
+                if self._pending:
+                    io.notify_all()
+            try:
+                self._run_command(message)
+            finally:
+                with io:
+                    self._in_command = False
         try:
             self._rt().close()
         except BaseException:  # noqa: BLE001, S110
@@ -497,16 +585,23 @@ class _Worker:
         os._exit(0)
 
 
-def _watch_memory(limit: int, read_rss: Callable[[], int | None]) -> None:
-    """Exit with a dedicated code the moment this process goes over its budget.
+def _watch(limit: int | None, read_rss: Callable[[], int | None], parent: int) -> None:
+    """Exit the moment this process goes over its memory budget (with a dedicated code), or the
+    moment its parent is gone.
 
-    Sampled every 20ms from inside, so it reacts faster than the parent's poll and
-    keeps working if the parent is slow; the parent's check remains as a backstop.
+    Memory is sampled every 20ms from inside, so this reacts faster than the parent's poll and
+    keeps working if the parent is slow; the parent's check remains as a backstop. The parent
+    check is what ends a guest's endless loop after a `kill -9` of the parent: nothing reads the
+    pipe (and so sees it close) while a command runs with no host call in flight. An orphan is
+    re-parented, so its parent pid changes.
     """
     while True:
-        rss = read_rss()
-        if rss is not None and rss > limit:
-            os._exit(_sandbox.MEMORY_EXIT_CODE)
+        if os.getppid() != parent:
+            os._exit(0)
+        if limit is not None:
+            rss = read_rss()
+            if rss is not None and rss > limit:
+                os._exit(_sandbox.MEMORY_EXIT_CODE)
         time.sleep(_MEMORY_POLL_SECONDS)
 
 

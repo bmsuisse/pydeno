@@ -28,6 +28,11 @@ _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 collect_ignore = (
     [
         "test_agent_sandbox.py",
+        "test_frame_buffer_bounds.py",
+        "test_isolated_limit_values.py",
+        "test_limit_values_review.py",
+        "test_module_timeout_recovery.py",
+        "test_timeout_error_prototype.py",
         "test_bridge_poisoning.py",
         "test_default_runtime_isolation.py",
         "test_idle_cpu.py",
@@ -56,6 +61,7 @@ collect_ignore = (
         "test_aio_isolated_runtime.py",
         "test_aio_agent.py",
         "test_session_pool.py",
+        "test_strict_eval.py",
         "test_sandbox_pool.py",
         "test_agent_execution_result.py",
         "test_agent_journal_recovery.py",
@@ -68,6 +74,19 @@ collect_ignore = (
         "test_aio_agent_recovery.py",
         "test_aio_agent_schema_tools.py",
         "test_agent_replay_public_errors.py",
+        "test_cli.py",
+        "test_http_fetch_agent.py",
+        "test_front_door.py",
+        "test_front_door_async.py",
+        "test_front_door_probes.py",
+        "test_front_door_review.py",
+        "test_front_door_isolation.py",
+        "test_front_door_budgets.py",
+        "test_front_door_refusals.py",
+        "test_redteam_boundary.py",
+        "test_front_door_worker_death.py",
+        "test_result_conversion_bounds.py",
+        "test_isolated_guest_surface.py",
     ]
     if sys.platform == "win32"
     else []
