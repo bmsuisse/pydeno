@@ -153,6 +153,9 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     # kernel version would help pick an exploit, but V8's x86_64 build calls it while starting and
     # aborts (`Check failed: 0 == uname(&uname_buffer)`) if it is refused. The aarch64 build does not,
     # which is why this was found on an x86_64 CI runner and not in an aarch64 container.
+    # memfd_create + write holds memory in an anonymous file that never shows in the worker's RSS:
+    # 200 memfds of 1 MiB (the RLIMIT_FSIZE) kept ~208 MiB hidden from the memory limit.
+    "memfd_create": (319, 279),
     "sysinfo": (99, 179),
     "getpriority": (140, 141),
     "ioprio_get": (252, 31),
@@ -908,6 +911,12 @@ def attest() -> list[str]:
     """
     breaches: list[str] = []
     ppid = os.getppid()
+    if ppid <= 1:
+        # Reparented to init (or the parent is gone): the "parent" probes below would aim at pid 1, or,
+        # worse, at -1 (every process) if a denied getppid returned an error. Refuse to start.
+        raise RuntimeError(
+            "the worker was orphaned before its sandbox self-test could run"
+        )
 
     def check(
         name: str,

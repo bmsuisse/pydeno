@@ -179,7 +179,6 @@ class TestWhatTheWorkerNeeds:
         "writev",
         "readv",
         "madvise",
-        "memfd_create",
     ]
 
     def test_each_is_allowed(self, arch: str, prog: list) -> None:
@@ -523,3 +522,9 @@ def test_uname_stays_open_because_v8_on_x86_64_needs_it(arch: str, prog: list) -
     # V8's x86_64 build aborts at startup (`Check failed: 0 == uname(...)`) if this is refused.
     nr = _by_name(arch)["uname"]
     assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ALLOW
+
+
+def test_memfd_create_is_denied(arch: str, prog: list) -> None:
+    # hidden memory: an anonymous file the worker's RSS never shows
+    nr = _by_name(arch)["memfd_create"]
+    assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ERRNO | EPERM
