@@ -67,6 +67,7 @@ collect_ignore = (
         "test_agent_journal_recovery.py",
         "test_agent_schema_tools.py",
         "test_status.py",
+        "test_linux_resource_probes.py",
         "test_errors_taxonomy.py",
         "test_preflight.py",
         "test_seatbelt_profile.py",

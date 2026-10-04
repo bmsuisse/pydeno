@@ -71,6 +71,23 @@ their limits are in `docs/guides/advanced/isolation.md`.
 - Restore snapshots only from sources you trust and authenticate: pydeno does not verify snapshot
   bytes unless you do (`pydeno.verify_snapshot`).
 
+## Linux resource visibility
+
+The supervisor must be able to read the worker's `/proc/<pid>/stat` and `statm` after the
+worker drops privileges. A `hidepid=2` procfs mount can hide a worker that changed from root
+to `nobody`, or even a same-UID worker after it clears its dumpable flag. Successfully reading
+an ordinary same-UID child does not prove these limits work.
+`sandbox_status()` therefore hardens its resource-probe child like a worker and waits for that
+step before measuring it. Missing memory, CPU or thread counters make `resource_probes.applied`
+and `complete` false. Both isolated runtimes refuse startup under `sandbox="require"`, and
+warn under `auto`, if an enabled counter is unreadable.
+
+For the supervisor's procfs mount, use `hidepid=0`, or deliberately configure procfs visibility
+for the service (for example an authorized `gid=` exemption). Verify the resulting deployment
+with `sandbox_status()` and `sandbox="require"`; do not assume root or a container label alone
+grants access. This is a startup check, not a promise that later procfs or credential changes
+are harmless.
+
 ## Deploying it: the outer boundary
 
 The in-process layers contain a V8 bug to the worker; they do not stop an attacker who chains it

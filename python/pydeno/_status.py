@@ -9,7 +9,7 @@ worker does before it creates its isolate, and nothing more:
 1. in a forked child, run the real `harden_process()` + `_sandbox.apply()` + the startup self-test
    `_sandbox.attest()` (the child is confined, the caller never is: a sandbox cannot be lifted, so
    everything that applies one happens in a process that exits straight afterwards);
-2. in a second forked child that just sleeps, read its resident memory, CPU time and thread count
+2. in a second forked child hardened like a worker, read its resident memory, CPU time and thread count
    the way the supervisor reads a worker's (`/proc` on Linux, `proc_pidinfo` on macOS), because a
    limit that cannot be measured never fires;
 3. in the caller, ask the kernel for its Landlock ABI version (a version query changes nothing).
@@ -255,31 +255,54 @@ def _libc_prctl_get(option: int) -> int | None:
 
 
 def _measure_resource_probes(deadline: float) -> tuple[dict[str, Any], str]:
-    """Fork a child that idles, and read it the way the supervisor reads a worker."""
+    """Measure a hardened child: same-uid visibility does not prove a worker is readable."""
+    fds: list[int] = []
     try:
         r, w = os.pipe()
+        fds.extend((r, w))
+        ready_r, ready_w = os.pipe()
+        fds.extend((ready_r, ready_w))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             pid = os.fork()
     except OSError as exc:
+        for fd in fds:
+            os.close(fd)
         return {}, f"could not start a probe child: {exc}"
     if pid == 0:  # child: wait until the parent closes the pipe, then leave
         try:
             os.close(w)
+            os.close(ready_r)
+            # In particular, a root worker becomes nobody. hidepid=2 can hide that worker
+            # even when an ordinary fork with the caller's uid is readable.
+            _sandbox.harden_process()
+            os.write(ready_w, b"1")
+            os.close(ready_w)
             select.select([r], [], [], deadline)
         finally:
             os._exit(0)
     os.close(r)
+    os.close(ready_w)
+    ready = False
     try:
-        # Give the child a moment to exist as a process in its own right; reads work right away.
+        # Never race the privilege drop, and never wait indefinitely if hardening stalls.
+        if not select.select([ready_r], [], [], deadline)[0]:
+            return (
+                {},
+                "resource probe child did not finish hardening before the deadline",
+            )
+        if os.read(ready_r, 1) != b"1":
+            return {}, "resource probe child exited before finishing hardening"
+        ready = True
         result = {
             "rss": _sandbox.rss_bytes(pid),
             "cpu": _sandbox.cpu_seconds(pid),
             "threads": _sandbox.thread_count(pid),
         }
     finally:
+        os.close(ready_r)
         os.close(w)  # the child's select returns; it exits
-        _reap(pid, killed=False)
+        _reap(pid, killed=not ready)
     return result, ""
 
 
@@ -501,13 +524,13 @@ def _sandbox_status() -> SandboxStatus:
     elif unreadable:
         resource_probes = Layer(
             False,
-            f"cannot read a child's {', '.join(unreadable)} via {source}: "
+            f"cannot read a hardened child's {', '.join(unreadable)} via {source}: "
             "max_memory, the CPU cap and the thread cap would never fire",
         )
     else:
         resource_probes = Layer(
             True,
-            f"a child's memory, CPU time and thread count are readable via {source}",
+            f"a hardened child's memory, CPU time and thread count are readable via {source}",
         )
 
     # --- verdict -----------------------------------------------------------------------------
