@@ -472,3 +472,23 @@ start.
 `SharedArrayBuffer`, `Atomics`, `WeakRef` and `FinalizationRegistry` are removed from the guest by
 default: shared memory and atomics are what high-resolution timers
 are built from, and weak references make garbage collection observable.
+
+### Opt-in: without the newest language features
+
+```python
+IsolatedRuntime(config, v8_flags=["--no-js-shipping"])
+```
+
+This switches off, in the engine (syntax included, not just the globals), the language features
+V8 shipped most recently: `Temporal`, `Float16Array`, explicit resource management (`using`,
+`DisposableStack`, `AsyncDisposableStack`, `SuppressedError`), `Promise.try`, `RegExp.escape`,
+`Math.sumPrecise`, `Error.isError`, `Uint8Array.fromBase64` / `toBase64`, and regular-expression
+modifiers. Older features (iterator helpers, `Set` methods, `Object.groupBy`, `findLast`...) stay.
+Newer engine code has had the least scrutiny, and none of the vendored libraries needs any
+of it (`tests/test_isolated_libraries.py` runs each one with this flag). It is blunt: code that
+uses one of those features fails. `--no-harmony-shipping` has the same effect.
+
+The flags for the individual features (`--no-harmony-temporal`, `--no-js-float16array`,
+`--no-js-explicit-resource-management`, ...) do not work: the engine's own start-up switches those
+features back on after `v8_flags` are applied, so `IsolatedRuntime` refuses them with a `ValueError`
+instead of reporting a restriction that never applied.

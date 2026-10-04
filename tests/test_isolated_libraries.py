@@ -197,6 +197,17 @@ def test_library_result_matches_the_in_process_runtime(name: str) -> None:
         assert _run(rt, files, expr) == in_process
 
 
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_library_works_without_the_newest_language_features(name: str) -> None:
+    """The documented opt-in `v8_flags=["--no-js-shipping"]` (no `Temporal`, `Float16Array`,
+    explicit resource management, `Promise.try`, `RegExp.escape`, ...; see the isolation guide)
+    leaves every vendored library working."""
+    files, expr, expected = CASES[name]
+    with IsolatedRuntime(_config(), v8_flags=["--no-js-shipping"]) as rt:
+        assert rt.eval("typeof Temporal") == "undefined"
+        assert _run(rt, files, expr) == expected
+
+
 @pytest.mark.parametrize("name", STRICT_CASES)
 def test_library_works_with_strict_eval(name: str) -> None:
     """No code generation from strings in the guest, and the library computes the same."""
