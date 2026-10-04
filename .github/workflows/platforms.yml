@@ -22,6 +22,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Debug info is never read in CI; leaving it out makes builds faster and the Rust cache smaller.
+  RUSTFLAGS: "-C debuginfo=0"
+
 concurrency:
   group: platforms-${{ github.ref }}
   cancel-in-progress: true

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import os
 import signal
-import sys
 
 import pytest
 
 from pydeno import AsyncPydeno, Pydeno, PydenoCrashedError
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX worker signals")
 _EXPECTED = os.environ.get("PYDENO_EXPECT_SANDBOX")
 MODE = "require" if _EXPECTED in (None, "landlock+seccomp", "seatbelt") else "auto"
 
