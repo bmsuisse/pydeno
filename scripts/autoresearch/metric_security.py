@@ -197,6 +197,76 @@ def os_sandbox_is_complete_on_this_host() -> bool:
     return not sandbox_status().complete
 
 
+# --- slice B (resources) ---------------------------------------------------------------------------------------
+# Limits must be enforceable values and must hold end to end. Probes that run guest code under a limit run in a
+# subprocess with a hard wall-clock cap, so a limit that fails cannot hang the battery.
+import math as _math  # noqa: E402
+import subprocess as _subprocess  # noqa: E402
+
+
+def _accepted(make) -> bool:  # type: ignore[no-untyped-def]
+    """True if a limit value that disables the limit was accepted (the attack succeeded)."""
+    try:
+        obj = make()
+    except (ValueError, TypeError):
+        return False
+    close = getattr(obj, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    return True
+
+
+def _capped_run(code: str, cap: float) -> float | None:
+    """Run `code` in a fresh interpreter; its wall time, or None if it hit `cap` (killed)."""
+    t = time.monotonic()
+    try:
+        _subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=cap, check=False)
+    except _subprocess.TimeoutExpired:
+        return None
+    return time.monotonic() - t
+
+
+@probe
+def non_finite_limits_are_refused() -> bool:
+    from pydeno import AgentSandbox, AsyncIsolatedRuntime
+    from pydeno._isolated import _session_options
+
+    nan, inf = _math.nan, _math.inf
+    makers = [
+        lambda: _session_options(request_timeout=nan),
+        lambda: _session_options(max_host_wait=inf),
+        lambda: _session_options(timeout_grace=nan),
+        lambda: _session_options(write_stall_timeout=nan),
+        lambda: _session_options(max_host_calls=nan),
+        lambda: _session_options(max_inflight_host_calls=nan),
+        lambda: AsyncIsolatedRuntime(max_memory=nan, prewarm=False),
+        lambda: AsyncIsolatedRuntime(request_timeout=nan, prewarm=False),
+        lambda: AgentSandbox({}, timeout=nan, sandbox="require"),
+    ]
+    return any(_accepted(m) for m in makers)
+
+
+@probe
+def console_flood_does_not_stretch_the_hard_deadline() -> bool:
+    # A 3 s hard deadline with a console handler that takes 1 ms per call: console output is not a tool
+    # call, so the time the host spends on it must count against the guest, not pause its deadline.
+    code = (
+        "import time\n"
+        "from pydeno import IsolatedRuntime, RuntimeConfig\n"
+        "cfg = RuntimeConfig(on_console=lambda level, args: time.sleep(0.001))\n"
+        "with IsolatedRuntime(cfg, request_timeout=3, sandbox='require') as rt:\n"
+        "    try:\n"
+        "        rt.eval(\"for (;;) console.log('x')\")\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
+    took = _capped_run(code, 30)
+    return took is None or took > 3 * 2 + 3  # deadline, plus start-up and slack
+
+
 def main() -> None:
     violations = []
     for name, fn in PROBES.items():
