@@ -91,7 +91,7 @@ jobs:
           PY=.venv/bin/python
           [ -x "$PY" ] || PY=.venv/Scripts/python.exe
           "$PY" -m pytest tests/ -v -p no:randomly --strict-markers --strict-config \
-            --junitxml=junit.xml
+            --maxfail=40 -rf --tb=short --junitxml=junit.xml
 
       - name: Summarise
         if: always()
