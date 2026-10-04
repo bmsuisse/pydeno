@@ -75,7 +75,8 @@ their limits are in `docs/guides/advanced/isolation.md`.
 
 The supervisor must be able to read the worker's `/proc/<pid>/stat` and `statm` after the
 worker drops privileges. A `hidepid=2` procfs mount can hide a worker that changed from root
-to `nobody`; successfully reading an ordinary same-uid child does not prove these limits work.
+to `nobody`, or even a same-UID worker after it clears its dumpable flag. Successfully reading
+an ordinary same-UID child does not prove these limits work.
 `sandbox_status()` therefore hardens its resource-probe child like a worker and waits for that
 step before measuring it. Missing memory, CPU or thread counters make `resource_probes.applied`
 and `complete` false. Both isolated runtimes refuse startup under `sandbox="require"`, and
@@ -153,7 +154,3 @@ open, and what security costs in speed) is in [`docs/security-report.md`](docs/s
   kernel's own tables.
 - `scripts/linux_matrix.sh` and the `linux-matrix` CI job: the same suites in many distro images, on
   x86_64 and aarch64, and under simulated kernels that lack Landlock or seccomp.
-
-On Linux with `hidepid=2`, even a non-root supervisor with the same UID can lose access to
-the worker’s `/proc` counters after the worker clears its dumpable flag. The resource probe
-hardens its child like a worker so this visibility restriction is detected too.
