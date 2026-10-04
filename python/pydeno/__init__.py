@@ -42,10 +42,20 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         typescript_stubs,
     )
     from ._aio import AsyncIsolatedRuntime
+    from ._aio_agent import AsyncAgentSandbox
     from ._isolated import IsolatedRuntime, WorkerCrashed
     from ._result import ExecutionResult, ResultTooLarge
     from ._schema import SchemaTool
     from ._polyfills import WEB_POLYFILLS
+    from ._pool import (
+        InMemoryJournalStore,
+        JournalStore,
+        JournalTooLarge,
+        PoolFull,
+        SessionBusy,
+        SessionPool,
+        StaleJournal,
+    )
     from ._snapshot_auth import (
         SnapshotAuthenticationError,
         sign_snapshot,
@@ -70,6 +80,14 @@ _LAZY = {
     "ResultTooLarge": "_result",
     "SchemaTool": "_schema",
     "AsyncIsolatedRuntime": "_aio",
+    "AsyncAgentSandbox": "_aio_agent",
+    "SessionPool": "_pool",
+    "JournalStore": "_pool",
+    "InMemoryJournalStore": "_pool",
+    "SessionBusy": "_pool",
+    "PoolFull": "_pool",
+    "StaleJournal": "_pool",
+    "JournalTooLarge": "_pool",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
     "WEB_POLYFILLS": "_polyfills",
@@ -360,6 +378,14 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
 
 __all__ = [
     "AsyncIsolatedRuntime",
+    "AsyncAgentSandbox",
+    "SessionPool",
+    "JournalStore",
+    "InMemoryJournalStore",
+    "SessionBusy",
+    "PoolFull",
+    "StaleJournal",
+    "JournalTooLarge",
     "eval",
     "eval_async",
     "get_default_runtime",
