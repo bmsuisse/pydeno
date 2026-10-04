@@ -12,10 +12,25 @@ Protocol: see `pydeno/_wire.py`; the command set is in
 
 from __future__ import annotations
 
+# ruff: noqa: E402 - the Seatbelt precompile below has to start before the other imports
+
 # Everything this process will ever import is imported here, before the OS sandbox
 # goes up: afterwards the filesystem is gone, so a lazy import (including the ones
 # the Rust core does on first use of a feature) would fail. The extra imports below
 # are exactly those lazy ones.
+from . import _sandbox
+
+# First, so the Seatbelt profile compiles on another thread while the imports below run.
+_sandbox.precompile_seatbelt()
+
+import sys
+
+# Never `ssl`: this process makes no network connections (the sandbox forbids them), and asyncio
+# imports `ssl` only if it can (`try: import ssl / except ImportError: ssl = None`), so marking it
+# unimportable skips loading OpenSSL, about 2-3 ms of start-up. After the sandbox is up the import
+# would fail anyway, for want of a filesystem.
+sys.modules.setdefault("ssl", None)  # type: ignore[arg-type]
+
 import asyncio
 import base64  # noqa: F401
 import builtins
@@ -29,15 +44,13 @@ import json  # noqa: F401
 import os
 import queue
 import re
-import sys
 import threading
 import time
 import weakref  # noqa: F401
 from collections.abc import Callable
-from typing import Any
 
 from . import _awaitable  # noqa: F401
-from . import _sandbox, _wire
+from . import _wire
 from ._pydeno import (
     JavaScriptError,
     Runtime,
@@ -47,6 +60,12 @@ from ._pydeno import (
     RuntimeTimeout,
     _set_v8_flags,
 )
+
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any
 
 PROTOCOL_VERSION = 1
 _MEMORY_POLL_SECONDS = 0.02

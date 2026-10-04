@@ -26,12 +26,17 @@ import select
 import struct
 import threading
 import time
-from typing import Any
 
 from ._pydeno import WireNativeError as _NativeError
 from ._pydeno import _wire_decode_values as _native_decode
 from ._pydeno import _wire_dumps as _native_dumps
 from ._pydeno import _wire_loads_decoded as _native_loads
+
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from typing import Any
 
 # Same order of magnitude as Monty's 256 MiB frame cap, scaled down because
 # pydeno's value limits (`max_serialization_bytes`) are smaller.

@@ -8,7 +8,6 @@ import contextvars
 import sys
 import threading
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from ._pydeno import (
     InspectorConfig,
@@ -29,7 +28,13 @@ from ._pydeno import (
     undefined,
 )
 
+# `typing.TYPE_CHECKING` without importing `typing`: the worker imports this module and does not
+# otherwise need `typing` (about 2 ms of its start-up on 3.14; older asyncio imports it anyway).
+TYPE_CHECKING = False
+
 if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
+    from typing import Any, TypeVar, overload
+
     from ._agent import (
         AgentSandbox,
         Done,
@@ -130,7 +135,12 @@ def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY))
 
 
-F = TypeVar("F", bound=Callable[..., Any])
+if TYPE_CHECKING:
+    F = TypeVar("F", bound=Callable[..., Any])
+else:
+
+    def overload(func: object) -> object:  # only type checkers read the overloads
+        return func
 
 
 @overload
@@ -164,7 +174,7 @@ def _runtime_bind(
         return _register
     if not callable(func):
         raise TypeError("runtime.bind expects a callable or to be used as a decorator")
-    return _register(cast(F, func))
+    return _register(func)  # type: ignore[arg-type]
 
 
 class _RuntimeSlot:
