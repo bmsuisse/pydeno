@@ -34,6 +34,7 @@ from typing import Any
 from . import _aio
 from ._agent import (
     _CATALOG_CALL,
+    _JOURNAL_TOOLS,
     _MAX_ABANDONED_CALLS,
     _MISSING,
     _SESSION_IDS,
@@ -48,6 +49,7 @@ from ._agent import (
     ToolNotDiscoveredError,
     _ConsoleSink,
     _open_journal,
+    _call_limit,
     _prelude,
     _prepared_prelude,
     _public,
@@ -405,6 +407,7 @@ class AsyncAgentSandbox(_SessionBase):
                     list(self._tools),
                     self._namespace,
                     self._catalog_ns if self._catalog else None,
+                    _call_limit(core.rt),
                 )
             )
         except BaseException:
@@ -658,7 +661,11 @@ class AsyncAgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
-        session = cls(entries, **arguments, **options)
+        token = _JOURNAL_TOOLS.set(frozenset(journal["config"]["tools"]))
+        try:
+            session = cls(entries, **arguments, **options)
+        finally:
+            _JOURNAL_TOOLS.reset(token)
         try:
             await session._open()
             await session._replay(journal["records"])

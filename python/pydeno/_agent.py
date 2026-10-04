@@ -113,7 +113,8 @@ _JOURNAL_FORMAT = 1
 # Distinct from the snapshot magic, so a signed snapshot can never be loaded as a journal, nor the
 # other way round, even under the same key.
 _MAGIC = b"pydeno-agent2\x00"
-_MAX_ASSOCIATED_DATA = 1024
+# Room for `SessionPool`'s "owner:session_id:counter" with two 256-character ids of 4-byte UTF-8.
+_MAX_ASSOCIATED_DATA = 4096
 _MAC_LEN = hashlib.sha256().digest_size
 # Top-level declarations, recognised only at the start of a line (no parser: a convenience, not a
 # guarantee). Their bindings are copied to `globalThis` when a run ends; see `_wrap`.
@@ -123,6 +124,8 @@ _DECLARATION = re.compile(
     re.MULTILINE | re.ASCII,  # JavaScript identifiers are narrower than Unicode "\w"
 )
 _SETTLE = "__pydeno_agent_settle"
+# Installed by the prelude: does a source compile as a run? (see `_prelude`, `_front._compile_check`)
+_COMPILES = "__pydeno_agent_compiles"
 # On a runtime prepared ahead of time: the worker's clock-freezing script as a function of the
 # instant, compiled before any session exists and called (then deleted) before the first run's
 # code. No guest code runs between the two.
@@ -1150,6 +1153,7 @@ class _SessionBase:
                 )
             entries[_SEARCH] = _search_tool(catalog)
             entries[_DESCRIBE] = _describe_tool(catalog, catalog_ns)
+        _check_global_names(entries, namespace, catalog_ns if catalog else None)
         owned = _OWNED_OPTIONS & runtime_options.keys()
         if owned:
             raise TypeError(
@@ -1546,6 +1550,18 @@ class _SessionBase:
             records = records[: self._checkpoint] + (
                 [self._lost] if self._lost is not None else []
             )
+        return self._config(), list(records)
+
+    def _spent_journal(self, reason: str) -> tuple[dict[str, Any], list[list[Any]]]:
+        """The journal of a session whose state is dropped (its journal outgrew the cap) but whose
+        spent tool budget must not be: the configuration and one ``lost`` record charging every
+        tool call the session made. Loading it gives a session with no state and that budget
+        spent (`SessionPool` stores it instead of the journal that was too large)."""
+        assert _SAFE_ERROR_NAME.fullmatch(reason)
+        spent = min(self._core.calls_made, _MAX_LOST_CALLS)
+        return self._config(), [["lost", spent, reason]]
+
+    def _config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
             "clock_ms": self._clock_ms,
             "random_seed": self._random_seed,
@@ -1561,7 +1577,7 @@ class _SessionBase:
             config["max_result_bytes"] = self._max_result_bytes
         if self._catalog:
             config["catalog"] = list(self._catalog)
-        return config, list(records)
+        return config
 
     @staticmethod
     def _load_arguments(
@@ -1913,7 +1929,7 @@ def preinstall(
 def _prepared_prelude(rt: Any, names: list[str], namespace: str | None) -> str:
     """The session prelude, plus (for a worker started without a frozen clock) the freezing
     script as a function, for the adopting session to call with its own instant."""
-    script = _prelude(list(names), namespace, None)
+    script = _prelude(list(names), namespace, None, _call_limit(rt))
     if "clock_ms" in rt._options:  # noqa: SLF001
         return script
     from ._worker import _FROZEN_CLOCK_JS  # noqa: PLC0415
@@ -2085,6 +2101,7 @@ class AgentSandbox(_SessionBase):
                 list(self._tools),
                 self._namespace,
                 self._catalog_ns if self._catalog else None,
+                _call_limit(core.rt),
             )
         )
 
@@ -2248,6 +2265,12 @@ class AgentSandbox(_SessionBase):
                 value = self._check_result(call, await self._run_tool(run, call))
             except Exception as exc:  # noqa: BLE001 - the guest sees the failure
                 value, error = _MISSING, exc
+            except BaseException as exc:
+                # Not an answer (SystemExit, a cancellation, ...): the call cannot be journaled as
+                # one, and a run that went on without it could not be replayed. Stop the run the
+                # way a crash does: the worker is killed and the run is lost, with what it spent.
+                self._stop_run(run, exc)
+                raise
             with run.state:
                 if not run.active:
                     raise RuntimeError("the run has ended")
@@ -2255,6 +2278,20 @@ class AgentSandbox(_SessionBase):
         if sent is not None:
             raise sent
         return sent_value
+
+    def _stop_run(self, run: _InlineRun, exc: BaseException) -> None:
+        """A tool raised something that is not an `Exception`: end the run as lost."""
+        with run.state:
+            if not run.active:
+                return
+            run.active = False
+        rt = self._core.rt
+        name = type(exc).__name__
+        rt._kill_reason = (  # noqa: SLF001 - reported by the pump as the worker's death
+            f"a tool raised {name if _SAFE_ERROR_NAME.fullmatch(name) else 'BaseException'}, "
+            "which is not an answer; the run was stopped"
+        )
+        rt._kill()  # noqa: SLF001
 
     async def _run_tool(self, run: _InlineRun, call: ToolCall) -> Any:
         """On the session's loop. Each call gets a fresh copy of the caller's context, so what
@@ -2386,7 +2423,11 @@ class AgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
-        session = cls(entries, **arguments, **options)
+        token = _JOURNAL_TOOLS.set(frozenset(journal["config"]["tools"]))
+        try:
+            session = cls(entries, **arguments, **options)
+        finally:
+            _JOURNAL_TOOLS.reset(token)
         try:
             session._replay(journal["records"])
         except (ValueError, TypeError, OverflowError) as exc:
@@ -2532,8 +2573,20 @@ def _open_journal(
     return _parse(_open(bytes(blob), key, associated_data))
 
 
+def _call_limit(rt: Any) -> int | None:
+    """How many tool calls the session's wrappers let be in flight at once: one below the
+    runtime's ``max_inflight_host_calls`` (room for a console call), None without a cap."""
+    cap = getattr(rt, "_max_inflight", None)
+    if not isinstance(cap, int) or isinstance(cap, bool):
+        return None
+    return max(1, cap - 1)
+
+
 def _prelude(
-    names: list[str], namespace: str | None, catalog_ns: str | None = None
+    names: list[str],
+    namespace: str | None,
+    catalog_ns: str | None = None,
+    call_limit: int | None = None,
 ) -> str:
     """Installed once, before any guest code: wraps each tool so the session knows which calls are
     in flight, and defines the settle step every run ends with.
@@ -2543,11 +2596,17 @@ def _prelude(
     not `await`, or one still running when `Promise.all` rejected). Intrinsics are captured first,
     so a guest that later replaces `Promise` or `Set` methods only breaks its own runs.
 
+    The wrappers also hold back calls past `call_limit` (see `_call_limit`) and issue them, in
+    order, as earlier ones settle. Without that, a burst of concurrent calls (a `Promise.all` over
+    a long list) ran into the runtime's in-flight cap, which refuses calls depending on how fast
+    the host happens to answer: nothing records that, so a replay of the journal diverged.
+
     With a catalog, `catalog_ns` becomes a Proxy whose unknown properties are functions calling
     the one hidden catalog dispatcher with their own name. The host decides what such a call may
     reach (`_Core.on_catalog_call`); the proxy only spells it `tools.name(args)`. No catalog name
     appears here, so this script is the same size whatever the catalog holds."""
     holder = f"globalThis[{json.dumps(namespace)}]" if namespace else "globalThis"
+    limit = "Infinity" if call_limit is None else str(int(call_limit))
     return f"""(() => {{
   "use strict";
   const call = Function.prototype.call.bind.bind(Function.prototype.call);
@@ -2560,10 +2619,28 @@ def _prelude(
   const forEach = call(Set.prototype.forEach);
   const size = call(Object.getOwnPropertyDescriptor(Set.prototype, "size").get);
   const push = call(Array.prototype.push);
+  const shift = call(Array.prototype.shift);
   const allSettled = Promise.allSettled.bind(Promise);
+  const NewPromise = Promise;
   const inflight = new Set();
+  const limit = {limit};
+  const waiting = [];
+  let active = 0;
+  const release = () => {{
+    active--;
+    if (waiting.length && active < limit) shift(waiting)();
+  }};
+  const issue = (raw, args) => {{
+    active++;
+    let p;
+    try {{ p = apply(raw, undefined, args); }} catch (e) {{ release(); throw e; }}
+    then(p, release, release);
+    return p;
+  }};
   const track = (raw, name) => ({{ [name](...args) {{
-    const p = apply(raw, undefined, args);
+    const p = active < limit ? issue(raw, args) : new NewPromise((resolve, reject) => {{
+      push(waiting, () => {{ try {{ resolve(issue(raw, args)); }} catch (e) {{ reject(e); }} }});
+    }});
     add(inflight, p);
     const done = () => {{ remove(inflight, p); }};
     then(p, done, done);
@@ -2586,6 +2663,23 @@ def _prelude(
       }},
     }});
   }}
+  // Whether a feed's source compiles, for the front door to tell a feed that does not parse from
+  // one that threw a SyntaxError of its own. Captured intrinsics only: a guest that replaced
+  // `Object.getPrototypeOf` or `SyntaxError[Symbol.hasInstance]` can neither steer the answer nor
+  // run code (and change its state outside the journal) while the host asks.
+  const AsyncFunction = Object.getPrototypeOf(async function () {{}}).constructor;
+  const construct = Reflect.construct;
+  const isInstance = call(Function.prototype[Symbol.hasInstance]);
+  const SyntaxErrorType = SyntaxError;
+  Object.defineProperty(globalThis, "{_COMPILES}", {{
+    value: (source) => {{
+      try {{ construct(AsyncFunction, [source]); return true; }}
+      catch (e) {{ return !isInstance(SyntaxErrorType, e); }}
+    }},
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  }});
   Object.defineProperty(globalThis, "{_SETTLE}", {{
     value: async () => {{
       while (size(inflight)) {{
@@ -2669,6 +2763,55 @@ def _normalize_tools(
             )
         checked[name] = tool
     return checked
+
+
+# Prefixes of the session's and the bridge's own globals (`__pydeno_agent_settle`, the front door's
+# `__pydeno_external`, `__host_op_async__`, ...): a tool may not take one of these names.
+_RESERVED_PREFIXES = ("__pydeno", "__host_op")
+_FRONT_DISPATCHER = "__pydeno_external"
+# The tool names of the journal a session is being loaded from (set by `load` while it builds the
+# session), so that a `Pydeno` journal, whose one tool is the front door's dispatcher, still loads
+# into a plain `AgentSandbox`.
+_JOURNAL_TOOLS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "pydeno_agent_journal_tools", default=frozenset()
+)
+# Every global a fresh guest has. A tool installed as a bare global under one of these names would
+# replace it (silently breaking the session's prelude, `console` capture or the guest's own code,
+# or being silently unreachable); under a namespace (`tools.JSON`) the names are harmless.
+_GUEST_GLOBALS = frozenset(
+    "AggregateError Array ArrayBuffer AsyncDisposableStack Atomics BigInt BigInt64Array "
+    "BigUint64Array Boolean DataView Date DisposableStack Error EvalError FinalizationRegistry "
+    "Float16Array Float32Array Float64Array Function Infinity Int16Array Int32Array Int8Array Intl "
+    "Iterator JSON Map Math NaN Number Object Promise Proxy RangeError ReadableStream ReferenceError "
+    "Reflect RegExp Set SharedArrayBuffer String SuppressedError Symbol SyntaxError Temporal "
+    "TypeError URIError Uint16Array Uint32Array Uint8Array Uint8ClampedArray WeakMap WeakRef "
+    "WeakSet WebAssembly console decodeURI decodeURIComponent encodeURI encodeURIComponent escape "
+    "eval globalThis isFinite isNaN parseFloat parseInt queueMicrotask undefined unescape".split()
+)
+
+
+def _check_global_names(
+    tools: Mapping[str, Any], namespace: str | None, catalog_ns: str | None
+) -> None:
+    """Refuse tool and namespace names that would take the place of a global the guest or the
+    session needs (see `_GUEST_GLOBALS`, `_RESERVED_PREFIXES`)."""
+    for name, tool in tools.items():
+        if (
+            name.startswith(_RESERVED_PREFIXES)
+            and not getattr(tool, "_pydeno_internal", False)
+            # A front-door journal loaded into a plain session names the front's dispatcher.
+            and not (name == _FRONT_DISPATCHER and name in _JOURNAL_TOOLS.get())
+        ):
+            raise ValueError(f"tool name {name!r} is reserved for pydeno's own globals")
+        if namespace is None and name in _GUEST_GLOBALS:
+            raise ValueError(
+                f"tool name {name!r} would replace the guest's global {name!r}; rename the tool "
+                "or install the tools on a namespace (namespace='tools')"
+            )
+    for ns in {namespace, catalog_ns} - {None}:
+        assert ns is not None
+        if ns in _GUEST_GLOBALS or ns.startswith(_RESERVED_PREFIXES):
+            raise ValueError(f"namespace {ns!r} would replace a global the guest needs")
 
 
 def _normalize_catalog(

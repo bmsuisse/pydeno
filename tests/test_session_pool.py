@@ -9,6 +9,7 @@ per-session serialisation or rejection; cancellation while running and while pau
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import time
@@ -265,9 +266,40 @@ class TestLimits:
             with pytest.raises(JournalTooLarge, match="state was dropped"):
                 await p.release("alice", "s1")
             assert sb.is_closed()
-            assert await store.get("pydeno:session:alice:s1:journal") is None
+            # What is stored now is a journal without state that only charges the spent budget.
+            stored = await store.get("pydeno:session:alice:s1:journal")
+            assert (
+                stored is not None
+                and b'"lost"' in stored
+                and b"globalThis" not in stored
+            )
             async with p.session("alice", "s1") as fresh:
                 assert await fresh.run("return typeof n") == "undefined"
+                assert fresh.lost_runs == 1
+
+    async def test_over_cap_journal_keeps_the_spent_tool_budget(self) -> None:
+        # Every tool answer is journaled, so a guest can push its own journal over the cap; that
+        # must not hand it a fresh tool budget for the same session.
+        store = InMemoryJournalStore()
+        ran: list[int] = []
+
+        def big(i: int) -> str:
+            ran.append(i)
+            return "x" * 5000
+
+        async with SessionPool(
+            store, KEY, {"big": big}, max_tool_calls=3, max_journal_bytes=8000
+        ) as p:
+            for _ in range(3):
+                sb = await p.get("alice", "s1")
+                await sb.execute(
+                    "for (let i = 0; i < 9; i++) { try { await big(i) } catch { break } }"
+                )
+                with contextlib.suppress(JournalTooLarge):
+                    await p.release("alice", "s1")
+            assert len(ran) == 3
+            async with p.session("alice", "s1") as again:
+                assert again.calls_remaining == 0
 
     async def test_journals_are_written_with_the_ttl(self) -> None:
         store = InMemoryJournalStore()

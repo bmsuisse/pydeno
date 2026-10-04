@@ -32,7 +32,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
-from ._agent import DEFAULT_MAX_JOURNAL_BYTES, JournalError
+from ._agent import DEFAULT_MAX_JOURNAL_BYTES, JournalError, _seal_journal
 from ._aio_agent import AsyncAgentSandbox
 
 __all__ = [
@@ -134,6 +134,7 @@ class InMemoryJournalStore(JournalStore):
 
 class _Entry:
     __slots__ = (
+        "barrier",
         "counter",
         "gone",
         "last_used",
@@ -153,6 +154,9 @@ class _Entry:
         self.last_used = time.monotonic()
         self.waiters = 0
         self.gone = False  # evicted or dropped: a waiter that wakes up must start over
+        # Held by `drop` while it works: a `get` waits on it instead of restoring (from a store
+        # `drop` is busy emptying) a session that is being dropped.
+        self.barrier = False
 
     def idle(self) -> bool:
         return not self.lock.locked() and self.waiters == 0
@@ -339,12 +343,23 @@ class SessionPool:
         on a fresh worker. If the journal outgrew
         ``max_journal_bytes``, the session's live and stored state is dropped and
         `JournalTooLarge` is raised. The lease ends either way. A session that was dropped while
-        leased is released without effect."""
+        leased is released without effect, unless it has been leased again since: this ends
+        whatever lease the session has, so prefer ``async with pool.session(...)``, which releases
+        only its own."""
+        await self._release(owner, session_id, None)
+
+    async def _release(
+        self, owner: str, session_id: str, leased: AsyncAgentSandbox | None
+    ) -> None:
+        """`release`; with `leased`, only if the session is still the one that lease got (a
+        session dropped while leased may have been leased afresh by someone else since)."""
         _check_id(owner, "owner")
         _check_id(session_id, "session_id")
         entry = self._entries.get((owner, session_id))
-        if entry is None:
+        if entry is None or entry.barrier:
             return  # dropped (or the pool closed) while leased: nothing to persist
+        if leased is not None and entry.sandbox is not leased:
+            return  # dropped while leased, and leased again since: not ours to release
         if not entry.lock.locked():
             raise RuntimeError(f"session {owner}:{session_id} is not leased")
         try:
@@ -370,10 +385,11 @@ class SessionPool:
                 self._key, associated_data=_bound(owner, session_id, counter)
             )
         except JournalError as exc:
-            await self._drop_state(entry, sandbox)
+            await self._drop_state(entry, sandbox, counter)
             raise JournalTooLarge(
                 f"session {owner}:{session_id} outgrew max_journal_bytes="
-                f"{self._max_journal_bytes}; its state was dropped ({exc})"
+                f"{self._max_journal_bytes}; its state was dropped, its spent tool budget "
+                f"kept ({exc})"
             ) from None
         await self._store.set(
             self._journal_key(owner, session_id),
@@ -390,24 +406,37 @@ class SessionPool:
     async def drop(self, owner: str, session_id: str) -> None:
         """Forget the session: close its worker (even if leased: a run in progress is killed),
         delete its stored journal and advance its counter, so no earlier journal of it can be
-        loaded again. A later `get` starts a fresh session."""
+        loaded again. A later `get` starts a fresh session (with a fresh tool budget)."""
         self._check_open()
         _check_id(owner, "owner")
         _check_id(session_id, "session_id")
-        entry = self._entries.get((owner, session_id))
-        counter = await self._stored_counter(owner, session_id)
+        k = (owner, session_id)
+        # Before the first await: a barrier entry takes the session's place, so a `get` arriving
+        # while the store is being emptied waits for it instead of restoring the old journal.
+        barrier = _Entry(owner, session_id)
+        barrier.barrier = True
+        await barrier.lock.acquire()  # uncontended: never suspends
+        entry = self._entries.get(k)
+        self._entries[k] = barrier
+        sandbox = None
         if entry is not None:
-            counter = max(counter, entry.counter)
-            self._forget(entry)
-            if entry.sandbox is not None:
-                sandbox, entry.sandbox = entry.sandbox, None
+            entry.gone = True
+            sandbox, entry.sandbox = entry.sandbox, None
+        try:
+            counter = await self._stored_counter(owner, session_id)
+            if entry is not None:
+                counter = max(counter, entry.counter)
+            if sandbox is not None:
                 await sandbox.close()
-        await self._store.delete(self._journal_key(owner, session_id))
-        await self._store.set(
-            self._counter_key(owner, session_id),
-            str(counter + 1).encode(),
-            ttl=self._counter_ttl,
-        )
+            await self._store.delete(self._journal_key(owner, session_id))
+            await self._store.set(
+                self._counter_key(owner, session_id),
+                str(counter + 1).encode(),
+                ttl=self._counter_ttl,
+            )
+        finally:
+            self._forget(barrier)
+            barrier.lock.release()
 
     @contextlib.asynccontextmanager
     async def session(
@@ -420,7 +449,7 @@ class SessionPool:
         try:
             yield sandbox
         finally:
-            await self.release(owner, session_id)
+            await self._release(owner, session_id, sandbox)
 
     async def evict_idle(self) -> int:
         """One eviction sweep (the background task runs this every ``eviction_interval``):
@@ -579,20 +608,34 @@ class SessionPool:
         entry.counter = counter
         return sandbox
 
-    async def _drop_state(self, entry: _Entry, sandbox: AsyncAgentSandbox) -> None:
-        """The journal is over its cap: close the session, delete the stored journal and advance
-        the counter (so the last stored, smaller journal cannot be loaded either)."""
+    async def _drop_state(
+        self, entry: _Entry, sandbox: AsyncAgentSandbox, counter: int
+    ) -> None:
+        """The journal is over its cap: close the session and store, under the next counter (so
+        no earlier journal loads again), a journal with no state that charges every tool call
+        the session made. The next `get` restores a fresh session with that budget spent: a
+        guest that grows its own journal (every tool answer is in it) cannot win back its
+        budget that way."""
         entry.sandbox = None
         owner, session_id = entry.owner, entry.session_id
         self._forget(entry)
-        if sandbox is not None:
+        config, records = sandbox._spent_journal("JournalTooLarge")  # noqa: SLF001
+        blob = _seal_journal(
+            config, records, self._key, _bound(owner, session_id, counter)
+        )
+        with contextlib.suppress(Exception):
             await sandbox.close()
-        await self._store.delete(self._journal_key(owner, session_id))
+        await self._store.set(
+            self._journal_key(owner, session_id),
+            _ENVELOPE + _COUNTER.pack(counter) + blob,
+            ttl=self._ttl,
+        )
         await self._store.set(
             self._counter_key(owner, session_id),
-            str(entry.counter + 1).encode(),
+            str(counter).encode(),
             ttl=self._counter_ttl,
         )
+        entry.counter = counter
 
     def _forget(self, entry: _Entry) -> None:
         entry.gone = True
