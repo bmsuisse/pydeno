@@ -57,33 +57,43 @@ def test_status_reports_unreadable_uid_dropped_worker(monkeypatch, metric):
         ("thread_count", "thread cap"),
     ],
 )
+@pytest.mark.parametrize(
+    "mode", [pytest.param("require", marks=pytest.mark.full_sandbox), "auto"]
+)
 def test_sync_missing_resource_counter_refuses_require_and_warns_auto(
-    monkeypatch, metric, label
+    monkeypatch, metric, label, mode
 ):
     monkeypatch.setattr(_sandbox, metric, lambda pid: None)
-    with pytest.raises(WorkerCrashed, match=label):
-        IsolatedRuntime(sandbox="require", prewarm=False)
-    with pytest.warns(RuntimeWarning, match=label):
-        with IsolatedRuntime(sandbox="auto", prewarm=False) as runtime:
-            assert runtime.eval("1 + 1") == 2
+    if mode == "require":
+        with pytest.raises(WorkerCrashed, match=label):
+            IsolatedRuntime(sandbox=mode, prewarm=False)
+    else:
+        with pytest.warns(RuntimeWarning, match=label):
+            with IsolatedRuntime(sandbox=mode, prewarm=False) as runtime:
+                assert runtime.eval("1 + 1") == 2
 
 
 @pytest.mark.parametrize(
     "index, label", [(0, "max_memory"), (1, "CPU cap"), (2, "thread cap")]
 )
+@pytest.mark.parametrize(
+    "mode", [pytest.param("require", marks=pytest.mark.full_sandbox), "auto"]
+)
 async def test_async_missing_resource_counter_refuses_require_and_warns_auto(
-    monkeypatch, index, label
+    monkeypatch, index, label, mode
 ):
     sample = [1, 0.0, 1]
     sample[index] = None
     monkeypatch.setattr(
         _aio, "_sample_many", lambda pids: [tuple(sample) for _ in pids]
     )
-    with pytest.raises(WorkerCrashed, match=label):
-        await AsyncIsolatedRuntime.create(sandbox="require", prewarm=False)
-    with pytest.warns(RuntimeWarning, match=label):
-        async with AsyncIsolatedRuntime(sandbox="auto", prewarm=False) as runtime:
-            assert await runtime.eval("1 + 1") == 2
+    if mode == "require":
+        with pytest.raises(WorkerCrashed, match=label):
+            await AsyncIsolatedRuntime.create(sandbox=mode, prewarm=False)
+    else:
+        with pytest.warns(RuntimeWarning, match=label):
+            async with AsyncIsolatedRuntime(sandbox=mode, prewarm=False) as runtime:
+                assert await runtime.eval("1 + 1") == 2
 
 
 @pytest.mark.parametrize("mode", ["exit", "hang"])

@@ -153,3 +153,7 @@ open, and what security costs in speed) is in [`docs/security-report.md`](docs/s
   kernel's own tables.
 - `scripts/linux_matrix.sh` and the `linux-matrix` CI job: the same suites in many distro images, on
   x86_64 and aarch64, and under simulated kernels that lack Landlock or seccomp.
+
+On Linux with `hidepid=2`, even a non-root supervisor with the same UID can lose access to
+the worker’s `/proc` counters after the worker clears its dumpable flag. The resource probe
+hardens its child like a worker so this visibility restriction is detected too.
