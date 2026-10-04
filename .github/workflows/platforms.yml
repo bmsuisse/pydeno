@@ -15,6 +15,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]  # sub-PRs into an integration branch do not run CI; the PR to main does
     paths: [".github/workflows/platforms.yml"]
   workflow_dispatch:
 

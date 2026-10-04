@@ -64,11 +64,11 @@ you have today.
 
 ## 0.7.x to the next release: the `Pydeno` front door
 
-**Two things change behaviour: `python -m pydeno`** (the CLI rows below) **and the restrictions
-from the 0.8 red team** (the second table; three rows are marked **BREAKING**). `Pydeno` /
-`AsyncPydeno` and their sessions, snapshots, limits and errors are new names; every other existing
-class keeps its behaviour, and the docs now lead with `Pydeno` and file the building blocks under
-"Advanced".
+**Three things change behaviour: `python -m pydeno`** (the CLI rows below), **the limit fixes**
+(the last rows of the first table) **and the restrictions from the 0.8 red team** (the second table;
+three rows are marked **BREAKING**). `Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits
+and errors are new names; otherwise every existing class keeps its behaviour, and the docs now lead
+with `Pydeno` and file the building blocks under "Advanced".
 
 | Change | Affects | Who notices | What to change |
 |---|---|---|---|
@@ -84,6 +84,10 @@ class keeps its behaviour, and the docs now lead with `Pydeno` and file the buil
 | The result prints as JSON (`"text"` with quotes, `{"a": 1}`); it used to print Python's `str()` of it | the CLI | Scripts that parse the output | Parse it as JSON, or pass `--raw` for a plain string |
 | A JavaScript error exits with code 1 and `pydeno: js_error: ...` on stderr; a timeout exits 3, a missing sandbox 4, another failure 5, a result with no JSON form 6 (all used to exit 1) | the CLI | Scripts that match on the old `JavaScript Error:` text or treat every failure the same | See the exit codes in [Command line](cli.md) |
 | The code runs in a separate worker with `--jitless` V8 (no WebAssembly), a 30 s default deadline and a 1 GiB memory cap; the old CLI had no deadline | the CLI | Code that ran long, used a lot of memory or used WebAssembly from the CLI | `--timeout`, `--max-memory`; for WebAssembly use the API (`IsolatedRuntime(jitless=False)`) |
+| Limit values are validated: NaN, infinity, durations of zero or below (where 0 is not meaningful) or above about 70 years, and counts outside their range raise `ValueError`; a bool, a string, `None` where a value is required, or a float for a count raises `TypeError` (`max_memory` must be an int between 1 and 2**53 - 1) | `IsolatedRuntime`, `AsyncIsolatedRuntime`, pool constructors and `checkout()`, `AgentSandbox`/`AsyncAgentSandbox`, `SessionPool` (and `get(timeout=)`), `PydenoLimits`, per-call `timeout=` | Code passing such values (NaN and infinity silently disabled the limit before); code that caught `ValueError` for a wrong *type* (`OutputCapture(1.5)`, `AgentSandbox(max_tool_calls=True)`, ...) now gets `TypeError`; a `Decimal` used as a *count* (it was accepted by comparison) | Pass `None` to remove a limit; use an int (or numpy int) for byte and call counts; real numbers (`Fraction`, `Decimal`, numpy floats) still work as seconds |
+| Console output pauses the hard deadline only within an allowance of one hard deadline per command (it used to pause it like a tool call, up to `max_host_wait`); console time during an in-flight tool call is covered by the tool's pause | runtimes with `on_console` / `capture_console`, agent sessions, `Pydeno` feeds | A host with a slow `on_console` or `print_callback` and a very chatty guest: the run now ends by about twice its deadline instead of running up to `max_host_wait` | Make the console handler fast (buffer it), or raise the deadline |
+| Console calls are no longer refused by `max_inflight_host_calls` (they still count toward `max_host_calls`) | runtimes with a small in-flight cap and console routing | Nobody, unless they relied on console output being dropped while tools were in flight | Nothing |
+| `Pydeno` / `AsyncPydeno` without a `print_callback` write at most 1 MiB of console output per feed to stdout/stderr, then one `[truncated]` line | the front door's default printer | Feeds that print more than 1 MiB and read it from the host's stdout | Pass a `print_callback` (it is not capped) |
 
 Restrictions and fixes from the 0.8 red team (host boundary and state). The first three can change
 behaviour you have today:

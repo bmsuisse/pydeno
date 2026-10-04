@@ -59,7 +59,8 @@ from ._isolated import (
     IsolatedRuntime,
     _checked_console,
     _clock_ms,
-    _seconds,
+    _limit_int,
+    _limit_seconds,
     _strict_eval_requested,
 )
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
@@ -1124,12 +1125,7 @@ class _SessionBase:
         who = type(self).__name__
         entries = _normalize_tools(tools)
         catalog = _normalize_catalog(tools_catalog)
-        if max_tool_calls is not None and (
-            not isinstance(max_tool_calls, int)
-            or isinstance(max_tool_calls, bool)
-            or max_tool_calls < 0
-        ):
-            raise ValueError("max_tool_calls must be a non-negative int or None")
+        max_tool_calls = _limit_int("max_tool_calls", max_tool_calls, minimum=0)
         if namespace is not None:
             ToolBridge._check_name(namespace, what="namespace")  # noqa: SLF001
         check_limit("max_output_bytes", max_output_bytes)
@@ -1183,8 +1179,7 @@ class _SessionBase:
             raise ValueError("clock must be a datetime, epoch seconds, or None (now)")
         if random_seed is None:
             random_seed = secrets.randbelow(2**31)
-        if not isinstance(max_journal_bytes, int) or max_journal_bytes <= 0:
-            raise ValueError("max_journal_bytes must be a positive int")
+        max_journal_bytes = check_limit("max_journal_bytes", max_journal_bytes)
 
         self._tools = entries
         self._catalog = catalog
@@ -1317,8 +1312,8 @@ class _SessionBase:
         runtime._handlers[hid] = (_checked_console(sink), False)  # noqa: SLF001
         runtime._apply_session(  # noqa: SLF001
             {
-                "_request_timeout": _seconds(timeout),
-                "_max_host_wait": _seconds(max_pause),
+                "_request_timeout": _limit_seconds("timeout", timeout),
+                "_max_host_wait": _limit_seconds("max_pause", max_pause),
             }
         )
         self._redact = bool(runtime._redact)  # noqa: SLF001
@@ -2079,7 +2074,7 @@ class AgentSandbox(_SessionBase):
             self._core = _Core(
                 rt,
                 next(_SESSION_IDS),
-                max_tool_calls,
+                self._max_tool_calls,
                 console=sink,
                 max_output_bytes=max_output_bytes,
                 max_result_bytes=max_result_bytes,
