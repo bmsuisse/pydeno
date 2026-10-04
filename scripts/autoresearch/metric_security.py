@@ -13,6 +13,7 @@ The battery grows: when review or red-teaming finds a new class of attack, add a
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -248,6 +249,107 @@ def churning_tiny_resizable_buffers_does_not_grow_the_host() -> bool:
     return False
 
 
+_TOUCHED_TINY_RESIZABLES = """
+(() => {
+  const keep = [];
+  for (let i = 0; i < %(n)d; i++) {
+    try {
+      const b = new ArrayBuffer(1, {maxByteLength: 1});
+      new Uint8Array(b)[0] = 1;  // commit the page
+      keep.push(b);
+    } catch (e) { return [e.name, i]; }
+  }
+  return ["none", keep.length];
+})()
+"""
+_TINY_RESIZABLES_IN_PROCESS = """
+import json, sys
+from pydeno import Runtime, RuntimeConfig
+with Runtime(RuntimeConfig(max_buffer_bytes=32 * 2**20)) as rt:
+    print(json.dumps(rt.eval(sys.argv[1])))
+"""
+
+
+@probe
+def tiny_resizable_buffers_are_charged_by_committed_pages() -> bool:
+    """V8 commits a resizable backing store in whole pages, so a one-byte resizable buffer costs a
+    page of RSS. Charging `byteLength` lets 40,000 of them (40 KB charged) commit hundreds of MB
+    under a 32 MiB cap. The cap must refuse them long before: at 4 KiB pages a 32 MiB cap holds
+    about 8,000, at 16 KiB about 2,000."""
+    import subprocess
+
+    code = _TOUCHED_TINY_RESIZABLES % {"n": 40_000}
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=10.0, max_buffer_bytes=32 * 2**20),
+        sandbox="require",
+        request_timeout=30,
+        max_memory=512 * 2**20,
+    ) as rt:
+        try:
+            name, count = rt.eval(code)
+        except Exception:  # noqa: BLE001
+            return True  # the memory kill, not the cap
+        if name != "RangeError" or count > 10_000:
+            return True
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c", _TINY_RESIZABLES_IN_PROCESS, code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        name, count = json.loads(out.stdout.strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        return True
+    return name != "RangeError" or count > 10_000
+
+
+_REFUSED_ALLOCATION_THEN_WORK = (
+    "try { new ArrayBuffer(%(over)d) } catch (e) { globalThis.__refused = e.name }; 0"
+)
+
+
+@probe
+def a_refused_allocation_does_not_leave_the_runtime_terminated() -> bool:
+    """With `max_heap_size` set, a refused ArrayBuffer allocation must stay what it is to the
+    guest (a RangeError) and leave the runtime usable: the next command must run."""
+    cap = 32 * 2**20
+    code = _REFUSED_ALLOCATION_THEN_WORK % {"over": cap + 1}
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=TIMEOUT, max_buffer_bytes=cap, max_heap_size=256 * 2**20),
+        sandbox="require",
+        request_timeout=10,
+    ) as rt:
+        try:
+            rt.eval(code)
+            if rt.eval("[globalThis.__refused, 1 + 1]") != ["RangeError", 2]:
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+    with Runtime(RuntimeConfig(max_buffer_bytes=cap, max_heap_size=256 * 2**20)) as rt:
+        try:
+            rt.eval(code)
+            if rt.eval("[globalThis.__refused, 1 + 1]") != ["RangeError", 2]:
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+        # Genuine heap exhaustion must still end in a termination, every time.
+        for _ in range(3):
+            try:
+                rt.eval("const a = []; for (;;) a.push(new Array(100000).fill(1))")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                if "Terminated" not in type(exc).__name__ and "Heap" not in str(exc):
+                    return True
+            # A terminated isolate is reusable from the next command on.
+            try:
+                if rt.eval("2 + 2") != 4:
+                    return True
+            except Exception:  # noqa: BLE001
+                return True
+    return False
+
+
 @probe
 def huge_result_is_refused_without_killing_the_parent() -> bool:
     with iso() as rt:
@@ -437,13 +539,24 @@ def captured_console_output_carries_no_terminal_escapes() -> bool:
     (`_clean`), it must not be able to carry escape or control sequences into that terminal."""
     with iso(capture_console=True) as rt:
         result = rt.execute(
-            "console.log('\\x1b[2J\\x1b]0;x\\x07', 'a\\rb', 'tab\\tok', 'bidi\\u202e\\u2066\\u200f\\u061c'); "
+            "console.log('\\x1b[2J\\x1b]0;x\\x07', 'a\\rb', 'tab\\tok', 'bidi\\u202e\\u2066\\u200f\\u061c', "
+            "'invisible\\u200b\\u200c\\u200d\\u2028\\u2029\\ufeff\\u180e\\ufff9\\u00ad\\u034f\\ufe0f\\u2060', "
+            "'tags\\u{e0001}\\u{e0041}\\u{e007f}\\u{e0100}', 'visible \\u00e9\\u4e2d\\u{1f600} ok'); "
             "console.error('\\x9b1m'); 1"
         )
     text = result.stdout + result.stderr
-    # Unicode bidirectional controls reorder what a terminal shows (a spoofed line), like ESC.
-    hostile = r"[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]"
-    return bool(re.search(hostile, text)) or "tab\tok" not in text
+    # Unicode bidirectional controls reorder what a terminal shows (a spoofed line), like ESC;
+    # invisible format characters and TAG characters carry text a reader never sees (a payload for
+    # whatever model reads the output).
+    hostile = (
+        r"[\x00-\x08\x0b-\x1f\x7f-\x9f­͏؜᠎​-‏ -‮⁠-⁩"
+        r"︀-️﻿￹-￻\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
+    )
+    return (
+        bool(re.search(hostile, text))
+        or "tab\tok" not in text
+        or "visible é中\U0001f600 ok" not in text
+    )
 
 
 # --- the host bridge: a guest must not interfere with a later host bind ----------------------------------
