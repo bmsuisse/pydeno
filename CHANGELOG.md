@@ -18,6 +18,11 @@
   parent and worker always run the same code; the sandbox module no longer imports `ctypes.util` and
   `platform` (`sandbox_init` and `proc_pidinfo` are looked up in the already loaded libSystem,
   `os.uname()` replaces `platform.machine()`). A worker for a custom `python=` is started as before.
+- Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
+  creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
+  and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s
+  ~8 ms; same profile, same self-test, falls back to `sandbox_init`); the worker never loads `ssl` (asyncio
+  imports it only optionally, and the worker has no network) and, on Python 3.14, never imports `typing`.
 
 ## 0.7.0 — 2026-10-04
 
