@@ -19,7 +19,9 @@ def main(root: str = "strix_runs") -> int:
     counts: collections.Counter[str] = collections.Counter()
     runs = sorted(pathlib.Path(root).glob("*/vulnerabilities.json"))
     if not runs:
-        print("strix: no vulnerabilities.json found (the scan did not finish or found nothing)")
+        print(
+            "strix: no vulnerabilities.json found (the scan did not finish or found nothing)"
+        )
         return 0
     for report in runs:
         for item in json.loads(report.read_text()):
