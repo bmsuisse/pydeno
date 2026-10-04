@@ -146,10 +146,7 @@ def _pool(name: str) -> ThreadPoolExecutor:
 
 def _sample_many(pids: list[int]) -> list[_Sample]:
     """Runs on the metrics thread: one batch of blocking reads, never on the loop."""
-    return [
-        (_sandbox.rss_bytes(p), _sandbox.cpu_seconds(p), _sandbox.thread_count(p))
-        for p in pids
-    ]
+    return [_sandbox.usage(p) for p in pids]  # (rss, cpu, threads) from one read each
 
 
 # ---------------------------------------------------------------------------
@@ -1362,9 +1359,9 @@ class AsyncIsolatedRuntime:
         assert self._sup is not None
         self._cmd = pump
         self._gen += 1
-        # The CPU baseline. IsolatedRuntime reads it right before sending; here it is the latest
-        # reading (the previous command's final check, or an idle sample at most
-        # `_IDLE_CHECK_SECONDS` old), which costs no thread hop. It can only be *older*, so the
+        # The CPU baseline: the latest reading (the previous command's final check, or an idle
+        # sample at most `_IDLE_CHECK_SECONDS` old), as in IsolatedRuntime, which costs no thread
+        # hop. It can only be *older*, so the
         # command is charged for at most that much extra (idle, and itself capped) CPU: stricter,
         # never looser.
         if self._last_cpu is not None:

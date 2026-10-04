@@ -202,6 +202,8 @@ class FrameReader:
         self._fd = fd
         self._max = max_frame
         self._buf = bytearray()
+        # Registered on first use (a reader without deadlines needs none), then kept.
+        self._poller: Any = None
 
     def invalidate(self) -> None:
         """Make every later `read` fail with EBADF rather than read a reused descriptor."""
@@ -214,7 +216,12 @@ class FrameReader:
             raise OSError(errno.EBADF, "the connection is closed")
         if deadline is not None:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not _wait(fd, write=False, timeout=remaining):
+            poller = self._poller
+            if poller is None:
+                # `poll`, not `select`: see `_wait`.
+                poller = self._poller = select.poll()
+                poller.register(fd, select.POLLIN)
+            if remaining <= 0 or not poller.poll(remaining * 1000.0):
                 raise TimeoutError
         chunk = os.read(fd, 1 << 16)
         if not chunk:
