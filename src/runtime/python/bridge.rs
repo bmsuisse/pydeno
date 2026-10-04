@@ -173,8 +173,16 @@ where
         tokio::pin!(scoped_future);
 
         let result = tokio::select! {
-            res = &mut scoped_future => res,
-            _ = &mut cancel_rx => return,
+            res = &mut scoped_future => Some(res),
+            _ = &mut cancel_rx => None,
+        };
+        let Some(result) = result else {
+            // Cancelled: the value may already be on its way (the runtime finishes the job
+            // either way), and nobody will read it, so wait for it and release its handles.
+            if let Ok(value) = scoped_future.await {
+                handle.release_unowned_handles(&value);
+            }
+            return;
         };
 
         Python::attach(|py| {

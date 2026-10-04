@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import random
+import time
 
 import pytest
 
@@ -108,3 +110,41 @@ async def test_result_of_an_abandoned_eval_async_is_released() -> None:
         await asyncio.sleep(0.2)
         await rt.eval_async("later()")
         assert handles(rt) == (0, 0)
+
+
+async def _settled(rt: Runtime, seconds: float = 1.0) -> tuple[int, int]:
+    """Handle counts once releases already on their way have landed (or `seconds` passed)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + seconds
+    while True:
+        gc.collect()
+        await rt.eval_async(
+            "0"
+        )  # one round trip: earlier release commands are processed
+        counts = handles(rt)
+        if counts == (0, 0) or loop.time() > end:
+            return counts
+        await asyncio.sleep(0.005)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_eval_async_at_any_moment_releases_its_result() -> None:
+    # Cancel each call after a random delay around its latency, so some are cancelled while the
+    # value is already on its way to Python: that value must be released too.
+    code = "Promise.resolve({f: () => 1, s: new ReadableStream()})"
+    with Runtime() as rt:
+        start = time.perf_counter()
+        for _ in range(20):
+            await rt.eval_async(code)
+        latency = (time.perf_counter() - start) / 20
+        assert await _settled(rt) == (0, 0)
+        loop = asyncio.get_running_loop()
+        for i in range(2000):
+            task = asyncio.ensure_future(rt.eval_async(code))
+            loop.call_later(random.uniform(0, 2 * latency), task.cancel)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            task = None
+            assert await _settled(rt) == (0, 0), f"iteration {i} left handles behind"
