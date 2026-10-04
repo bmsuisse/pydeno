@@ -17,6 +17,7 @@ _CHILD = textwrap.dedent(
     """
     import ctypes, os, sys
     from pydeno import _sandbox
+    {precompile}
     assert _sandbox._apply_seatbelt()
     libc = ctypes.CDLL(None, use_errno=True)
     mib = (ctypes.c_int * 3)(1, 49, os.getppid())  # CTL_KERN, KERN_PROCARGS2, parent
@@ -39,9 +40,17 @@ _MIDDLE = textwrap.dedent(
 )
 
 
-def test_worker_cannot_read_the_parents_environment() -> None:
+# Both ways the profile can be applied: compiled by `sandbox_init` itself, or compiled ahead of
+# time on the worker's background thread (what a real worker does).
+@pytest.mark.parametrize(
+    "precompile",
+    ["pass", "_sandbox.precompile_seatbelt()"],
+    ids=["init", "precompiled"],
+)
+def test_worker_cannot_read_the_parents_environment(precompile: str) -> None:
+    child = _CHILD.replace("{precompile}", precompile)
     out = subprocess.run(
-        [sys.executable, "-c", _MIDDLE.format(child=_CHILD)],
+        [sys.executable, "-c", _MIDDLE.format(child=child)],
         env={"SECRET_MARKER": "hunter2", "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,

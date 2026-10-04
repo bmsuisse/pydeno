@@ -79,7 +79,72 @@ _SEATBELT_PROFILE = """
 # before the profile is applied), and `kill(pid, 0)` still tells a running pid from an absent one.
 
 
+# Compiling the SBPL text is almost all of what `sandbox_init` costs (about 8 ms; applying the
+# compiled profile takes under 0.1 ms). `precompile_seatbelt()` does the compiling on a thread
+# while the worker is still importing (ctypes releases the GIL for the call, so it really runs
+# alongside), and `_apply_seatbelt` then only applies the result. The profile is the same text,
+# compiled by the same library `sandbox_init` uses for it; the self-test (`attest`) checks the
+# outcome either way, and any failure on this path falls back to `sandbox_init`.
+_SANDBOX_LIB = "/usr/lib/libsandbox.1.dylib"
+_precompiled: list[tuple[int, Callable[..., int], Callable[..., object]]] = []
+_precompile_thread: threading.Thread | None = None
+
+
+def _compile_seatbelt() -> None:
+    try:
+        lib = ctypes.CDLL(_SANDBOX_LIB)
+        compile_string = lib.sandbox_compile_string
+        sandbox_apply = lib.sandbox_apply
+        free_profile = lib.sandbox_free_profile
+    except (OSError, AttributeError):
+        return
+    compile_string.restype = ctypes.c_void_p
+    compile_string.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    sandbox_apply.restype = ctypes.c_int
+    sandbox_apply.argtypes = [ctypes.c_void_p]
+    free_profile.restype = None
+    free_profile.argtypes = [ctypes.c_void_p]
+    err = ctypes.c_char_p()
+    profile = compile_string(_SEATBELT_PROFILE.encode(), None, ctypes.byref(err))
+    if profile:
+        _precompiled.append((profile, sandbox_apply, free_profile))
+
+
+def precompile_seatbelt() -> None:
+    """Start compiling the Seatbelt profile in the background (macOS; a no-op elsewhere).
+
+    Only for a process that will call `apply()` soon: the worker calls it before its imports.
+    """
+    global _precompile_thread  # noqa: PLW0603
+    if sys.platform != "darwin" or _precompile_thread is not None:
+        return
+    _precompile_thread = threading.Thread(
+        target=_compile_seatbelt, name="pydeno-seatbelt-compile", daemon=True
+    )
+    _precompile_thread.start()
+
+
+def _apply_precompiled_seatbelt() -> bool:
+    thread = _precompile_thread
+    if thread is None:
+        return False
+    thread.join()
+    if not _precompiled:
+        return False
+    profile, sandbox_apply, free_profile = _precompiled.pop()
+    try:
+        return sandbox_apply(profile) == 0
+    finally:
+        free_profile(profile)
+
+
 def _apply_seatbelt() -> bool:
+    if _apply_precompiled_seatbelt():
+        return True
     # `sandbox_init` lives in libsystem_sandbox, which libSystem re-exports, so it is already
     # loaded in every process. Looking it up there saves `ctypes.util` (and `shutil`, which it
     # imports): about 4 ms of worker start-up, for a library search that always found the same one.
