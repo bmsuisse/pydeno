@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import _sandbox, _wire
+from ._limits import limit_int, limit_seconds
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_RESULT_BYTES,
@@ -353,6 +354,10 @@ def _seconds(value: float | int | timedelta | None) -> float | None:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
+_limit_seconds = limit_seconds
+_limit_int = limit_int
+
+
 # The options that only the parent enforces: none of them reaches the worker, so a worker started
 # ahead of time (`SandboxPool`) can be given them when it is handed out.
 SESSION_OPTIONS = (
@@ -379,31 +384,33 @@ def _session_options(
     """The parent-side options, validated and normalised, as the runtime attributes that hold
     them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
     an option set at checkout means exactly what it means in the constructor."""
-    if max_host_calls is not None and max_host_calls < 0:
-        raise ValueError("max_host_calls must be non-negative")
+    max_host_calls = _limit_int("max_host_calls", max_host_calls, minimum=0)
     max_inflight = (
         DEFAULT_MAX_INFLIGHT_HOST_CALLS
         if max_inflight_host_calls is _DEFAULT
-        else max_inflight_host_calls
+        else _limit_int("max_inflight_host_calls", max_inflight_host_calls, minimum=1)
     )
-    if max_inflight is not None and max_inflight < 1:
-        raise ValueError("max_inflight_host_calls must be at least 1")
+    grace = _limit_seconds("timeout_grace", timeout_grace, allow_zero=True)
+    if grace is None:
+        raise TypeError("timeout_grace must be a number of seconds")
     return {
         "_request_timeout": (
-            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
+            _DEFAULT
+            if request_timeout is _DEFAULT
+            else _limit_seconds("request_timeout", request_timeout)
         ),
-        "_grace": float(timeout_grace),
+        "_grace": grace,
         "_max_host_calls": max_host_calls,
         "_max_host_wait": (
             DEFAULT_MAX_HOST_WAIT
             if max_host_wait is _DEFAULT
-            else _seconds(max_host_wait)
+            else _limit_seconds("max_host_wait", max_host_wait)
         ),
         "_max_inflight": max_inflight,
         "_stall": (
             DEFAULT_WRITE_STALL_TIMEOUT
             if write_stall_timeout is _DEFAULT
-            else _seconds(write_stall_timeout)
+            else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
     }
@@ -421,6 +428,12 @@ class _Pump:
       always keeping one asynchronous call in flight;
     - a cap on the **CPU the worker burns**, which is the one thing a guest cannot hide:
       computing costs CPU whether or not a callback is outstanding.
+
+    Console output is not a tool call: it is the guest's own work, but the host's handling of it
+    (a slow terminal, a log shipper) is not. So console time pauses the deadline only up to an
+    allowance of one hard deadline per command: one slow write does not kill a run, and a flood
+    of them can at most double it (it used to stretch it up to `max_host_wait`). Console time
+    while a tool call is outstanding is covered by that call's pause and not charged twice.
     """
 
     __slots__ = (
@@ -433,6 +446,9 @@ class _Pump:
         "_outstanding",
         "_paused_at",
         "_paused_total",
+        "_console_at",
+        "_console_left",
+        "_resumed_at",
         "_lock",
     )
 
@@ -456,6 +472,9 @@ class _Pump:
         self._outstanding = 0
         self._paused_at = 0.0
         self._paused_total = 0.0
+        self._console_at = 0.0  # when the console call in progress began (0: none)
+        self._console_left = hard_timeout  # the console allowance still unspent
+        self._resumed_at = 0.0  # when the last tool pause ended
         self._lock = threading.Lock()
 
     @property
@@ -473,16 +492,37 @@ class _Pump:
         with self._lock:
             self._outstanding -= 1
             if self._outstanding == 0:
-                paused = time.monotonic() - self._paused_at
+                now = self._resumed_at = time.monotonic()
+                paused = now - self._paused_at
                 self._paused_total += paused
                 if self.deadline is not None:
                     self.deadline += paused
+
+    def begin_console(self) -> None:
+        with self._lock:
+            self._console_at = time.monotonic()
+
+    def end_console(self) -> None:
+        with self._lock:
+            grant = self._console_grant(time.monotonic())
+            if self.deadline is not None and grant:
+                self.deadline += grant
+                self._console_left -= grant  # type: ignore[operator]
+            self._console_at = 0.0
+
+    def _console_grant(self, now: float) -> float:
+        """How much of the console call in progress pauses the deadline (lock held)."""
+        if not self._console_at or self._console_left is None or self._outstanding:
+            return 0.0
+        spent = now - max(self._console_at, self._resumed_at)
+        return max(0.0, min(spent, self._console_left))
 
     def expired(self) -> bool:
         with self._lock:
             if self.deadline is None or self._outstanding:
                 return False
-            return time.monotonic() > self.deadline
+            now = time.monotonic()
+            return now > self.deadline + self._console_grant(now)
 
     def waited_too_long(self) -> bool:
         """Has the guest spent more than `max_host_wait` waiting on host callbacks?"""
@@ -521,9 +561,14 @@ class IsolatedRuntime:
             callbacks in total. The hard deadline does not run while a callback does, which a
             guest could exploit by always keeping one asynchronous call in flight; this bounds it.
             The worker's CPU use is also capped at twice the hard deadline per command, which
-            callbacks cannot pause. `None` removes the wait cap.
+            callbacks cannot pause. `None` removes the wait cap. Console output is not a
+            callback in this sense: handling it pauses the hard deadline for at most one hard
+            deadline in total per command (a flood of slow console writes at most doubles a run),
+            and it does not count toward this wait cap. Console output while a tool call is in
+            flight is covered by that call's pause.
         max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);
-            further ones are answered with an error instead of being run.
+            further ones are answered with an error instead of being run. Console calls are
+            synchronous and never refused by it (they still count toward `max_host_calls`).
         write_stall_timeout: If the worker stops reading its input and the pipe stays full this
             long (seconds, default 10), the worker is killed rather than letting the host block
             forever. `None` waits indefinitely.
@@ -608,12 +653,9 @@ class IsolatedRuntime:
         )
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
-        if max_host_calls is not None and max_host_calls < 0:
-            raise ValueError("max_host_calls must be non-negative")
+        max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
-        if max_memory is not None and max_memory <= 0:
-            raise ValueError("max_memory must be a positive integer")
         if os.name != "posix":
             raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
         config = config or RuntimeConfig()
@@ -632,7 +674,7 @@ class IsolatedRuntime:
             # survives. (No default heap cap: with one, V8 turns an over-cap allocation into a
             # fatal "heap limit exceeded" instead of that RangeError.)
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
-        self._soft_timeout = _seconds(config.timeout)
+        self._soft_timeout = _limit_seconds("RuntimeConfig.timeout", config.timeout)
         self._max_memory = max_memory
         self._host_calls = 0
         # `_request_timeout` has three states: unset (soft timeout + grace, else a default
@@ -1237,6 +1279,18 @@ class IsolatedRuntime:
         # All the arguments under one budget: decoding each on its own would multiply the limit
         # by the argument count.
         decoded = args  # `loads_decoded` already decoded them, under one shared budget
+        if hid == self._options.get("console_hid"):
+            # Console output is the guest's own work, not a tool call: it pauses the deadline
+            # only within the command's console allowance (see `_Pump`), not up to
+            # `max_host_wait`. It is synchronous (the worker waits for it), so it is never one of
+            # the calls in flight, and the in-flight cap does not refuse it; `max_host_calls`
+            # still counts it (above).
+            pump.begin_console()
+            try:
+                self._run_sync_handler(handler, decoded, cid, None)
+            finally:
+                pump.end_console()
+            return
         if self._max_inflight is not None and (
             pump.outstanding >= self._max_inflight
             or self._async_inflight >= self._max_inflight
@@ -1271,6 +1325,15 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
+        self._run_sync_handler(handler, decoded, cid, pump)
+
+    def _run_sync_handler(
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump | None,
+    ) -> None:
         try:
             self._guard.in_host_call = True
             try:
@@ -1326,7 +1389,7 @@ class IsolatedRuntime:
         self, code: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate JavaScript, awaiting promises. Async host functions run on this loop."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
@@ -1375,7 +1438,7 @@ class IsolatedRuntime:
         """`eval_async` (promises are awaited) returning an `ExecutionResult`; see `execute`."""
         capture = OutputCapture(max_output_bytes)
         check_limit("max_result_bytes", max_result_bytes)
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
@@ -1559,7 +1622,7 @@ class IsolatedRuntime:
         self, specifier: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate a module, awaiting top-level await; async host callbacks run on this loop."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()

@@ -4,6 +4,7 @@ name: Security
 # what to do about a finding: docs/contributing/supply-chain.md.
 on:
   pull_request:
+    branches: [main]  # sub-PRs into an integration branch do not run CI; the PR to main does
     paths:
       - "Cargo.toml"
       - "Cargo.lock"

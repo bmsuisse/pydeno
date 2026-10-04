@@ -71,8 +71,9 @@ from ._isolated import (
     _clock_ms,
     _error_reply,
     _is_token,
+    _limit_int,
+    _limit_seconds,
     _revoked_handler,
-    _seconds,
     _session_options,
     _start_worker,
     _strict_eval_setting,
@@ -675,12 +676,9 @@ class AsyncIsolatedRuntime:
         )
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
-        if max_host_calls is not None and max_host_calls < 0:
-            raise ValueError("max_host_calls must be non-negative")
+        max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
-        if max_memory is not None and max_memory <= 0:
-            raise ValueError("max_memory must be a positive integer")
         if os.name != "posix":
             raise NotImplementedError(
                 "AsyncIsolatedRuntime currently supports POSIX only"
@@ -697,7 +695,7 @@ class AsyncIsolatedRuntime:
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # See IsolatedRuntime: a catchable RangeError instead of an RSS kill.
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
-        self._soft_timeout = _seconds(config.timeout)
+        self._soft_timeout = _limit_seconds("RuntimeConfig.timeout", config.timeout)
         self._max_memory = max_memory
         self._host_calls = 0
         self._request_timeout: float | None | Any
@@ -1469,9 +1467,18 @@ class AsyncIsolatedRuntime:
                 f"guest made more than max_host_calls={self._max_host_calls} host calls"
             )
         handler, is_async = entry
-        if self._max_inflight is not None and (
-            pump.outstanding >= self._max_inflight
-            or self._async_inflight >= self._max_inflight
+        # Console output is the guest's own work, not a tool call: it pauses the deadline only
+        # within the command's console allowance (see `_Pump`). It is synchronous (the worker waits
+        # for it), so it is never one of the calls in flight and the in-flight cap does not refuse
+        # it; `max_host_calls` still counts it (above).
+        console = hid == self._options.get("console_hid")
+        if (
+            not console
+            and self._max_inflight is not None
+            and (
+                pump.outstanding >= self._max_inflight
+                or self._async_inflight >= self._max_inflight
+            )
         ):
             await self._send_reply(
                 {
@@ -1483,9 +1490,12 @@ class AsyncIsolatedRuntime:
                 None,
             )
             return
-        pump.begin_call()
+        if console:
+            pump.begin_console()
+        else:
+            pump.begin_call()
         loop = asyncio.get_running_loop()
-        if is_async:
+        if is_async and not console:
             self._async_inflight += 1
             # `create_task` copies the current context, which is the caller's: the handler sees
             # the caller's contextvars.
@@ -1506,8 +1516,12 @@ class AsyncIsolatedRuntime:
             self._redact,
             self._serial,
         )
-        frame = await self._await_or_death(fut)
-        await self._send_reply(frame, pump)
+        try:
+            frame = await self._await_or_death(fut)
+            await self._send_reply(frame, None if console else pump)
+        finally:
+            if console:
+                pump.end_console()
 
     async def _async_call(
         self, handler: Callable[..., Any], args: list[Any], cid: int, pump: _Pump
@@ -1571,7 +1585,7 @@ class AsyncIsolatedRuntime:
     ) -> Any:
         """Evaluate JavaScript in the worker, awaiting a promise result. Host functions (sync or
         async) run while it waits, with the caller's contextvars."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         return await self._request(
@@ -1584,7 +1598,7 @@ class AsyncIsolatedRuntime:
         self, specifier: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate a module (awaiting top-level await) and return its namespace as a dict."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         return await self._request(

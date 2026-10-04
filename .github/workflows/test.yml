@@ -9,6 +9,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]  # sub-PRs into an integration branch do not run CI; the PR to main does
 
 permissions:
   contents: read
