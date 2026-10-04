@@ -87,6 +87,8 @@ collect_ignore = (
         "test_front_door_refusals.py",
         "test_redteam_boundary.py",
         "test_front_door_worker_death.py",
+        "test_wire_frames.py",
+        "test_worker_startup.py",
         "test_result_conversion_bounds.py",
         "test_isolated_guest_surface.py",
     ]
