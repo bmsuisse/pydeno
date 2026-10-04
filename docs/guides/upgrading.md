@@ -68,7 +68,7 @@ you have today.
 | `python -m pydeno` runs code in `IsolatedRuntime(sandbox="require")`; it used the in-process `Runtime` | the CLI | Scripts that ran `python -m pydeno` on a machine without the complete OS sandbox: they now exit with code 4 | Pass `--sandbox auto`, or `--no-sandbox` for code you trust; `pydeno.sandbox_status()` shows what is missing |
 | A positional argument is JavaScript to evaluate; it used to be a file name | the CLI | `python -m pydeno script.js` now evaluates the text `script.js` (a `ReferenceError`, exit code 1) | `python -m pydeno -f script.js` |
 | The result prints as JSON (`"text"` with quotes, `{"a": 1}`); it used to print Python's `str()` of it | the CLI | Scripts that parse the output | Parse it as JSON, or pass `--raw` for a plain string |
-| A JavaScript error exits with code 1 and `pydeno: js_error: ...` on stderr; a timeout exits 3, a missing sandbox 4, another failure 5 (all used to exit 1) | the CLI | Scripts that match on the old `JavaScript Error:` text or treat every failure the same | See the exit codes in [Command line](cli.md) |
+| A JavaScript error exits with code 1 and `pydeno: js_error: ...` on stderr; a timeout exits 3, a missing sandbox 4, another failure 5, a result with no JSON form 6 (all used to exit 1) | the CLI | Scripts that match on the old `JavaScript Error:` text or treat every failure the same | See the exit codes in [Command line](cli.md) |
 | The code runs in a separate worker with `--jitless` V8 (no WebAssembly), a 30 s default deadline and a 1 GiB memory cap; the old CLI had no deadline | the CLI | Code that ran long, used a lot of memory or used WebAssembly from the CLI | `--timeout`, `--max-memory`; for WebAssembly use the API (`IsolatedRuntime(jitless=False)`) |
 
 ## Safe to bump?

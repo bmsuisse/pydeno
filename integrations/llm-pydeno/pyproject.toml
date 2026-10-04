@@ -9,6 +9,7 @@ description = "llm plugin: a sandboxed JavaScript interpreter for models, backed
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
 maintainers = [{ name = "BMSuisse", email = "dominik.peter@bmsuisse.ch" }]
 keywords = ["llm", "llm-plugin", "javascript", "sandbox", "v8"]
 classifiers = [

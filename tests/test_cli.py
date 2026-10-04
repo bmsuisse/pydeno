@@ -25,7 +25,7 @@ def run(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str
         [sys.executable, "-m", "pydeno", *args],
         input=stdin if stdin is not None else "",
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=120,
     )
 
@@ -129,6 +129,12 @@ def test_usage_errors_exit_2(tmp_path) -> None:
     assert "cannot read" in missing.stderr
     assert run("--timeout", "0", "1").returncode == _cli.EXIT_USAGE
     assert run("--max-memory", "lots", "1").returncode == _cli.EXIT_USAGE
+    for timeout in ("inf", "1e309", "nan", "-1", str(_cli.MAX_TIMEOUT + 1)):
+        proc = run("--timeout", timeout, "1")
+        assert proc.returncode == _cli.EXIT_USAGE, (timeout, proc.stderr)
+    for size in ("99999999999999999999T", "2T", "5ib", "5x", "1.5G", "0"):
+        proc = run("--max-memory", size, "1")
+        assert proc.returncode == _cli.EXIT_USAGE, (size, proc.stderr)
     assert run("--sandbox", "off", "1").returncode == _cli.EXIT_USAGE
     assert run("--no-sandbox", "--sandbox", "auto", "1").returncode == _cli.EXIT_USAGE
 
@@ -188,7 +194,10 @@ def test_parse_size(text: str, expected: int) -> None:
     assert _cli.parse_size(text) == expected
 
 
-@pytest.mark.parametrize("text", ["", "0", "-1M", "1.5G", "M", "10X"])
+@pytest.mark.parametrize(
+    "text",
+    ["", "0", "-1M", "1.5G", "M", "10X", "5ib", "5i", "5kk", "2T", "99999999999T"],
+)
 def test_parse_size_refuses(text: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         _cli.parse_size(text)
@@ -200,6 +209,238 @@ def test_cli_module_imports_nothing_heavy() -> None:
         "import sys, pydeno._cli; "
         "print(sorted(m for m in ('pydeno._isolated', 'pydeno._agent', 'asyncio') "
         "if m in sys.modules))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "[]"
+
+
+# ---------------------------------------------------------------- bounded input (C1)
+
+_MAXRSS = (
+    "import resource, subprocess, sys; "
+    "p = subprocess.run([sys.executable, '-m', 'pydeno', *sys.argv[1:]], "
+    "stdin=subprocess.DEVNULL, capture_output=True, timeout=60); "
+    "sys.stderr.write(p.stderr.decode('utf-8', 'replace')); "
+    "rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss; "
+    "print(p.returncode, rss * (1 if sys.platform == 'darwin' else 1024))"
+)
+
+
+def _rss_of_cli(*args: str) -> tuple[int, int, str]:
+    """Exit code and peak RSS (bytes) of the CLI, measured in a wrapper process of its own."""
+    out = subprocess.run(
+        [sys.executable, "-c", _MAXRSS, *args],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    code, rss = out.stdout.split()
+    return int(code), int(rss), out.stderr
+
+
+def test_input_limit_matches_the_wire_frame_cap() -> None:
+    from pydeno import _wire
+
+    assert _cli.MAX_CODE_BYTES == _wire.MAX_FRAME_BYTES
+
+
+def test_endless_file_is_refused_with_bounded_memory() -> None:
+    code, rss, err = _rss_of_cli("-f", "/dev/zero")
+    assert code == _cli.EXIT_USAGE
+    assert "larger than" in err
+    assert rss < 200 * 1024 * 1024, rss
+
+
+def test_endless_stdin_is_refused_with_bounded_memory() -> None:
+    wrapper = _MAXRSS.replace(
+        "stdin=subprocess.DEVNULL", "stdin=open('/dev/zero', 'rb')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", wrapper, "-"], capture_output=True, text=True, timeout=90
+    )
+    code, rss = (int(x) for x in out.stdout.split())
+    assert code == _cli.EXIT_USAGE
+    assert "larger than" in out.stderr
+    assert rss < 200 * 1024 * 1024, rss
+
+
+def test_oversized_file_and_stdin_exit_2(tmp_path) -> None:
+    big = tmp_path / "big.js"
+    big.write_bytes(b"1;" + b" " * (17 * 1024 * 1024))
+    proc = run("-f", str(big))
+    assert proc.returncode == _cli.EXIT_USAGE
+    assert "larger than" in proc.stderr
+    proc = run(stdin="1;" + " " * (17 * 1024 * 1024))
+    assert proc.returncode == _cli.EXIT_USAGE
+    assert "larger than" in proc.stderr
+
+
+def test_input_that_is_not_utf8_exits_2(tmp_path) -> None:
+    bad = tmp_path / "bad.js"
+    bad.write_bytes(b"'\xff'")
+    proc = run("-f", str(bad))
+    assert proc.returncode == _cli.EXIT_USAGE
+    assert "UTF-8" in proc.stderr
+
+
+# ---------------------------------------------------------------- terminal escapes (C2)
+
+# OSC 52 (clipboard write), CSI clear-screen, a C1 CSI, DEL, carriage return, bidi overrides,
+# zero-width and BOM characters, and a tag character.
+HOSTILE = "\x1b]52;c;ZXZpbA==\x07\x1b[2J\x9b31m\x7f\r\u202eevil\u202c\u200b\u2066\ufeff\U000e0041"
+_JS_HOSTILE = json.dumps(HOSTILE)
+_FORBIDDEN = [
+    "\x1b",
+    "\x07",
+    "\x9b",
+    "\x7f",
+    "\r",
+    "\u202e",
+    "\u202c",
+    "\u200b",
+    "\u2066",
+    "\ufeff",
+    "\U000e0041",
+]
+
+
+def _assert_inert(text: str) -> None:
+    for ch in _FORBIDDEN:
+        assert ch not in text, (repr(ch), repr(text))
+
+
+@full_sandbox
+@pytest.mark.parametrize("mode", ["--json", "--raw"])
+def test_console_output_is_inert(mode: str) -> None:
+    proc = run(
+        mode,
+        f"console.log({_JS_HOSTILE}); console.warn({_JS_HOSTILE}); "
+        f"console.error({_JS_HOSTILE}); 1",
+    )
+    assert proc.returncode == 0, proc.stderr
+    _assert_inert(proc.stdout)
+    _assert_inert(proc.stderr)
+    assert "evil" in proc.stdout and "evil" in proc.stderr
+    assert "\n" in proc.stdout  # line structure kept
+
+
+@full_sandbox
+def test_raw_result_is_inert() -> None:
+    proc = run("--raw", _JS_HOSTILE)
+    assert proc.returncode == 0, proc.stderr
+    _assert_inert(proc.stdout)
+    assert "evil" in proc.stdout
+
+
+@full_sandbox
+def test_json_result_is_inert_and_lossless() -> None:
+    proc = run(f"({{text: {_JS_HOSTILE}, [{_JS_HOSTILE}]: 1}})")
+    assert proc.returncode == 0, proc.stderr
+    _assert_inert(proc.stdout)
+    assert json.loads(proc.stdout) == {"text": HOSTILE, HOSTILE: 1}
+
+
+@full_sandbox
+def test_error_text_is_inert() -> None:
+    proc = run(f"throw new Error({_JS_HOSTILE})")
+    assert proc.returncode == _cli.EXIT_JS_ERROR
+    _assert_inert(proc.stderr)
+
+
+def test_escape_helpers_unit() -> None:
+    assert _cli.inert_text("a\nb\tc") == "a\nb\tc"
+    _assert_inert(_cli.inert_text(HOSTILE))
+    encoded = _cli.to_json(HOSTILE)
+    _assert_inert(encoded)
+    assert json.loads(encoded) == HOSTILE
+    assert _cli.to_json("é ü 中") == '"é ü 中"'  # ordinary text stays readable
+
+
+# ---------------------------------------------------------------- results (L3)
+
+
+@full_sandbox
+@pytest.mark.parametrize(
+    "code",
+    [
+        "const a = {}; a.self = a; a",
+        "new Map([[1, 2]])",
+        "Symbol('x')",
+        "new Error('e')",
+        "(() => 1)",
+        "new Date(NaN)",
+        "Promise.resolve(new Set([new Map()]))",
+    ],
+)
+def test_unconvertible_result_exits_6(code: str) -> None:
+    proc = run(code)
+    assert proc.returncode == _cli.EXIT_RESULT, proc.stderr
+    assert proc.stdout == ""
+    assert "result" in proc.stderr
+
+
+@full_sandbox
+def test_large_integers_print_as_strings() -> None:
+    proc = run("[2n ** 100n, 2n, 9007199254740991n, -(2n ** 60n), 1.5]")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "1267650600228229401496703205376",
+        2,
+        9007199254740991,
+        "-1152921504606846976",
+        1.5,
+    ]
+
+
+# ---------------------------------------------------------------- the real default (no mocks)
+
+
+def _spy(monkeypatch) -> list[str]:
+    from pydeno import _isolated
+
+    seen: list[str] = []
+    real = _isolated.IsolatedRuntime
+
+    class Spy(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            seen.append(self.sandbox)
+
+    monkeypatch.setattr(_isolated, "IsolatedRuntime", Spy)
+    return seen
+
+
+@full_sandbox
+def test_default_run_applies_the_complete_os_sandbox(monkeypatch, capsys) -> None:
+    seen = _spy(monkeypatch)
+    assert _cli.main(["6 * 7"]) == 0
+    assert capsys.readouterr().out == "42\n"
+    expected = "seatbelt" if sys.platform == "darwin" else "landlock+seccomp"
+    assert seen == [expected]
+
+
+def test_no_sandbox_run_really_has_none(monkeypatch, capsys) -> None:
+    seen = _spy(monkeypatch)
+    assert _cli.main(["--no-sandbox", "1"]) == 0
+    assert seen == ["none"]
+    assert "WITHOUT the OS sandbox" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- what is imported when (L4)
+
+
+def test_usage_errors_start_no_worker_machinery() -> None:
+    code = (
+        "import sys\n"
+        "from pydeno import _cli\n"
+        "try:\n"
+        "    _cli.main(['--timeout', 'inf', '1'])\n"
+        "except SystemExit as e:\n"
+        "    assert e.code == 2, e.code\n"
+        "print(sorted(m for m in ('pydeno._isolated', 'pydeno._agent', 'pydeno._wire', "
+        "'asyncio') if m in sys.modules))\n"
     )
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True

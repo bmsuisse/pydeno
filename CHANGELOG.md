@@ -8,12 +8,23 @@
   argument, `-c`, `-f FILE` or stdin and prints the result as JSON (`--raw` for plain strings). Runs in
   `IsolatedRuntime(sandbox="require")`; `--timeout` (default 30 s), `--max-memory`, `--sandbox auto`,
   `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
-  unavailable, 5 other runtime failure; the error and its `classify_error` kind go to stderr. See
+  unavailable, 5 other runtime failure, 6 result has no JSON form; the error and its `classify_error`
+  kind go to stderr. Input is read up to 16 MiB (bounded, so `-f /dev/zero` cannot fill memory),
+  guest output is stripped of terminal control and bidi characters, and integers past 2^53 - 1
+  print as JSON strings. See
   [`docs/guides/cli.md`](docs/guides/cli.md).
 - **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
   (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
   code in an `AgentSandbox` session that keeps its state between calls and returns the
   `ExecutionResult` fields with output and result caps.
+
+### Fixed
+
+- `IsolatedRuntime` and `AsyncIsolatedRuntime` raise `ValueError` for a `max_memory` (or a
+  `RuntimeConfig` limit) above 2^53 - 1. Such a value used to reach the worker as a tagged object
+  and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be
+  interpreted as an integer"); `max_memory=2**62` was enough, since it derives
+  `max_buffer_bytes = 2**60`.
 
 ### Changed
 

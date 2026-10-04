@@ -95,3 +95,39 @@ def test_chain_runs_javascript_and_keeps_state() -> None:
     assert too_big["error_type"] == "ResultTooLarge"
     assert noisy["truncated"] is True
     assert noisy["stdout"].endswith("[truncated]\n")
+
+
+def test_dropping_toolboxes_reclaims_their_workers() -> None:
+    import gc
+    import time
+
+    procs = []
+    for _ in range(3):
+        toolbox = plugin.PyDeno()
+        (tool,) = toolbox.tools()
+        assert tool.implementation(code="return 1")["result"] == 1
+        procs.append(toolbox._session._sandbox._core.rt._proc)
+        del toolbox, tool
+    gc.collect()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(p.poll() is None for p in procs):
+        time.sleep(0.05)
+    assert all(p.poll() is not None for p in procs)
+
+
+def test_options_from_an_llm_tool_spec() -> None:
+    """A `-T 'PyDeno({...})'` spec builds the toolbox from JSON keyword arguments."""
+    from llm.utils import instantiate_from_spec
+
+    toolbox = instantiate_from_spec(
+        {"PyDeno": plugin.PyDeno},
+        'PyDeno({"timeout": 3, "max_output_bytes": 100, "fresh_session_per_call": true})',
+    )
+    try:
+        session = toolbox._session
+        assert (session.timeout, session.max_output_bytes) == (3.0, 100)
+        (tool,) = toolbox.tools()
+        tool.implementation(code="globalThis.kept = 1")
+        assert tool.implementation(code="return typeof kept")["result"] == "undefined"
+    finally:
+        toolbox._close()

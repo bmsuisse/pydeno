@@ -8,6 +8,14 @@ with no filesystem, network, processes or `require`. The session keeps its state
 This is a separate package: installing `pydeno` does not install `llm`, and this plugin is the only
 thing that depends on both.
 
+> **Warning: one toolbox per conversation and user.** A `PyDeno` instance is one JavaScript global
+> scope for as long as it lives. Everything a call defines (variables, functions, `globalThis`
+> properties, data a model pasted in) is visible to every later call on the same instance. Never
+> share one instance between users or conversations (for example as a module-level object in a
+> server). Create one per conversation, or pass `fresh_session_per_call=True` to keep nothing
+> between calls. Each `llm` command builds its own instance from `-T` (and `llm chat` keeps that
+> one for the whole chat).
+
 ## Install
 
 The package is not on PyPI yet. From a checkout of the pydeno repository:
@@ -37,6 +45,11 @@ llm -T 'PyDeno({"timeout": 5, "max_memory_mb": 128})' '...'
 | `max_output_bytes` | 16384 | Cap on each of `stdout` and `stderr` per call; past it the stream ends with `[truncated]` |
 | `max_result_bytes` | 65536 | Cap on the returned value as JSON; a larger one is a failed call (the session goes on) |
 | `sandbox` | `"require"` | `"require"` refuses to run without the complete OS sandbox; `"auto"` applies what the platform offers |
+| `fresh_session_per_call` | `false` | Start every call in a new worker and stop it afterwards: no state is kept, at the cost of one worker start per call |
+
+Calls on one instance run one at a time, even from several threads. A dropped instance stops its
+worker process when Python collects it (`llm.Toolbox` has no close hook); `toolbox._close()` stops
+it at once.
 
 From Python:
 

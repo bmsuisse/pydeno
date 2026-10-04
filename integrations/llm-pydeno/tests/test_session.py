@@ -5,8 +5,12 @@ Every test starts a real sandboxed worker (``sandbox="require"`` by default).
 
 from __future__ import annotations
 
+import gc
 import json
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -151,3 +155,79 @@ def test_importing_the_session_does_not_need_llm() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, env=env
     )
     assert out.stdout.strip() == "ok", out.stderr
+
+
+# ---------------------------------------------------------------- lifetime and sharing
+
+
+def _worker(session: JavaScriptSession):
+    """The session's worker process (internal: AgentSandbox -> its runtime -> the Popen)."""
+    return session._sandbox._core.rt._proc
+
+
+def _wait_exited(proc, seconds: float = 10.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_dropping_a_session_reclaims_its_worker() -> None:
+    procs = []
+    for _ in range(3):
+        s = JavaScriptSession()
+        assert s.run("return 1")["result"] == 1
+        procs.append(_worker(s))
+        del s
+    gc.collect()
+    assert all(_wait_exited(p) for p in procs)
+
+
+def test_default_session_runs_under_the_complete_os_sandbox(
+    session: JavaScriptSession,
+) -> None:
+    assert session.run("return 1")["result"] == 1
+    expected = "seatbelt" if sys.platform == "darwin" else "landlock+seccomp"
+    assert session._sandbox._core.rt.sandbox == expected
+
+
+def test_close_reclaims_the_worker() -> None:
+    s = JavaScriptSession()
+    s.run("return 1")
+    proc = _worker(s)
+    s.close()
+    assert _wait_exited(proc)
+
+
+def test_a_shared_session_serialises_calls_and_shares_state() -> None:
+    """One session is one JavaScript global scope: concurrent callers run one at a time, and each
+    sees what the others left behind (why the README says never to share one across users)."""
+    s = JavaScriptSession()
+    try:
+        code = "globalThis.n = (globalThis.n || 0) + 1; return n"
+        with ThreadPoolExecutor(8) as pool:
+            outs = list(pool.map(lambda _: s.run(code), range(16)))
+        assert all(o["status"] == "Succeeded" for o in outs), outs
+        assert sorted(o["result"] for o in outs) == list(range(1, 17))
+    finally:
+        s.close()
+
+
+def test_fresh_session_per_call_keeps_nothing() -> None:
+    s = JavaScriptSession(fresh_session_per_call=True)
+    try:
+        assert s.run("globalThis.secret = 'a'; return 1")["result"] == 1
+        assert s.run("return typeof secret")["result"] == "undefined"
+        assert s._sandbox is None  # no worker held between calls
+    finally:
+        s.close()
+
+
+def test_the_package_ships_its_license() -> None:
+    root = Path(__file__).resolve().parent.parent
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'license = "MIT"' in pyproject
+    assert 'license-files = ["LICENSE"]' in pyproject
+    assert "MIT License" in (root / "LICENSE").read_text(encoding="utf-8")

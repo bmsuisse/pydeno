@@ -27,7 +27,13 @@ __all__ = ["JavaScriptSession", "PyDeno", "register_tools"]
 
 
 class PyDeno(llm.Toolbox):
-    """A sandboxed JavaScript session (V8 in a worker process under the OS sandbox)."""
+    """A sandboxed JavaScript session (V8 in a worker process under the OS sandbox).
+
+    One instance is one JavaScript global scope for its whole life: use one instance per
+    conversation and user, never one shared between users, or pass
+    ``fresh_session_per_call=True``. A dropped instance stops its worker when it is collected
+    (`llm.Toolbox` has no close hook).
+    """
 
     def __init__(
         self,
@@ -36,6 +42,7 @@ class PyDeno(llm.Toolbox):
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         sandbox: str = "require",
+        fresh_session_per_call: bool = False,
     ) -> None:
         self._session = JavaScriptSession(
             timeout=timeout,
@@ -43,6 +50,7 @@ class PyDeno(llm.Toolbox):
             max_output_bytes=max_output_bytes,
             max_result_bytes=max_result_bytes,
             sandbox=sandbox,
+            fresh_session_per_call=fresh_session_per_call,
         )
 
     def run_javascript(self, code: str) -> dict[str, Any]:

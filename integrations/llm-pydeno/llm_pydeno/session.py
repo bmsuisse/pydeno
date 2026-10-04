@@ -47,6 +47,12 @@ class JavaScriptSession:
             ``error_type="ResultTooLarge"`` (the session goes on).
         sandbox: ``"require"`` (default) refuses to run without the complete OS sandbox;
             ``"auto"`` applies what the platform offers.
+        fresh_session_per_call: Start every call in a new worker and stop it afterwards, so
+            nothing is kept between calls (slower: one worker start per call).
+
+    One session is one JavaScript global scope. Calls from several threads are run one at a time,
+    and each sees what earlier calls left behind, so never share a session between users or
+    conversations. A session dropped without `close` stops its worker when it is collected.
     """
 
     def __init__(
@@ -57,6 +63,7 @@ class JavaScriptSession:
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         sandbox: str = "require",
+        fresh_session_per_call: bool = False,
     ) -> None:
         if not (isinstance(timeout, (int, float)) and timeout > 0):
             raise ValueError("timeout must be a positive number of seconds")
@@ -74,6 +81,7 @@ class JavaScriptSession:
         self.max_output_bytes = max_output_bytes
         self.max_result_bytes = max_result_bytes
         self.sandbox = sandbox
+        self.fresh_session_per_call = bool(fresh_session_per_call)
         self._sandbox: Any = None
         self._lock = threading.Lock()
 
@@ -102,7 +110,10 @@ class JavaScriptSession:
                 outcome = self._sandbox.execute(code).to_dict()
             except Exception as exc:  # noqa: BLE001 - a closed session raises here
                 outcome = _failed(exc)
-            if self._sandbox.is_closed():
+            if self.fresh_session_per_call:
+                self._sandbox.close()
+                self._sandbox = None
+            elif self._sandbox.is_closed():
                 self._sandbox = None
                 if outcome.get("error"):
                     outcome["error"] += RESET_NOTE

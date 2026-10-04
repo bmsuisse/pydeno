@@ -6,29 +6,38 @@ V8, a memory cap and a deadline), never in the in-process `Runtime`: a one-liner
 place untrusted code ends up. ``--no-sandbox`` keeps the worker process and its limits but drops
 the OS sandbox, and says so on stderr.
 
-Only the standard library is imported at module level; pydeno itself is imported inside `main`,
-after argument parsing, so ``pydeno --help`` and usage errors do not start anything.
+This module imports only the standard library at module level. Running it (``python -m pydeno``
+or the console script) still imports the `pydeno` package, which loads the native extension; what
+is deferred until the arguments are parsed and the input is read is the worker machinery
+(`IsolatedRuntime`, the wire, asyncio), so ``--help`` and usage errors start no worker process.
+
+Everything that reaches the terminal is made inert first: guest text (console output, a ``--raw``
+string, an error message) has control, escape and invisible formatting characters replaced with
+``?``, and JSON output escapes them as ``\\uXXXX`` (lossless). Input is read at most
+`MAX_CODE_BYTES` (the worker's frame cap) plus one byte, so ``-f /dev/zero`` cannot fill memory.
 
 Exit codes (see ``docs/guides/cli.md``):
 
 * 0: success
 * 1: the JavaScript threw or failed to compile
-* 2: usage error (bad arguments, unreadable file)
+* 2: usage error (bad arguments, unreadable, oversized or non-UTF-8 input)
 * 3: timeout (the deadline or the worker's CPU cap)
 * 4: the OS sandbox is unavailable here (``sandbox="require"`` refused to start)
 * 5: any other runtime failure (memory limit, worker crash, ...)
+* 6: the code ran but its result cannot be converted to JSON (a circular structure, a ``Map``,
+  ``Symbol``, ``Error`` or function, an invalid ``Date``)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
-from pathlib import Path
 from typing import Any
 
-__all__ = ["main", "parse_size"]
+__all__ = ["inert_text", "main", "parse_size", "to_json"]
 
 EXIT_OK = 0
 EXIT_JS_ERROR = 1
@@ -36,6 +45,7 @@ EXIT_USAGE = 2
 EXIT_TIMEOUT = 3
 EXIT_NO_SANDBOX = 4
 EXIT_RUNTIME = 5
+EXIT_RESULT = 6
 
 _KIND_EXIT = {
     "js_error": EXIT_JS_ERROR,
@@ -46,28 +56,89 @@ _KIND_EXIT = {
 }
 
 DEFAULT_TIMEOUT = 30.0
+MAX_TIMEOUT = 24 * 3600.0
+MAX_MEMORY = 1024**4  # 1 TiB: anything above is a typo, not a limit
+# The most code the worker accepts: one wire frame (`pydeno._wire.MAX_FRAME_BYTES`, kept equal by a
+# test; not imported, so reading the input does not load the wire).
+MAX_CODE_BYTES = 16 * 1024 * 1024
 
-_SIZE = re.compile(r"(\d+)\s*([kmgt]?)(i?b?)", re.IGNORECASE)
-_UNITS = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+_SIZE = re.compile(r"(\d+)\s*(?:([kmgt])(?:i?b)?|b)?", re.IGNORECASE)
+_UNITS = {None: 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+
+# Characters a terminal acts on, or that hide or reorder text: C0 controls except tab and newline,
+# DEL, C1 controls (U+009B is a one-character CSI), and the invisible or bidirectional formatting
+# characters (Arabic letter mark, zero-width and direction marks, embeddings and overrides, word
+# joiner and invisible operators, isolates, BOM, tag characters).
+_UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f؜​-‏‪-‮⁠-⁤⁦-⁩﻿\U000e0000-\U000e007f]")
+_MAX_SAFE_INT = 2**53 - 1
+# Host-side failures to convert the guest's result (the code itself ran). Matched on pydeno's own
+# message prefixes, never on a JavaScriptError, which is the guest's.
+_RESULT_ERROR = re.compile(
+    r"Evaluation failed: (?:Cannot serialize|Date value out of range)"
+    r"|JsFunction cannot cross the isolation boundary"
+)
 
 
 def parse_size(text: str) -> int:
-    """``"256M"`` -> 268435456. Units are binary (K, M, G, T; ``MB``/``MiB`` accepted too)."""
+    """``"256M"`` -> 268435456. Units are binary: K, M, G, T, optionally followed by ``B`` or
+    ``iB``; a bare number or ``B`` is bytes. At most `MAX_MEMORY`."""
     found = _SIZE.fullmatch(text.strip())
     if found is None or int(found.group(1)) <= 0:
         raise argparse.ArgumentTypeError(
-            f"invalid size {text!r} (use bytes or a K/M/G suffix, e.g. 256M)"
+            f"invalid size {text!r} (use bytes or a K/M/G/T suffix, e.g. 256M)"
         )
-    return int(found.group(1)) * _UNITS[found.group(2).lower()]
+    unit = found.group(2).lower() if found.group(2) else None
+    value = int(found.group(1)) * _UNITS[unit]
+    if value > MAX_MEMORY:
+        raise argparse.ArgumentTypeError(f"size {text!r} is over the maximum of 1T")
+    return value
 
 
-def _positive_float(text: str) -> float:
+def _timeout(text: str) -> float:
     try:
         value = float(text)
     except ValueError:
-        value = -1.0
-    if not value > 0:
-        raise argparse.ArgumentTypeError(f"must be a positive number, got {text!r}")
+        value = math.nan
+    if not (math.isfinite(value) and 0 < value <= MAX_TIMEOUT):
+        raise argparse.ArgumentTypeError(
+            f"must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}, got {text!r}"
+        )
+    return value
+
+
+def inert_text(text: str) -> str:
+    """``text`` with every character a terminal could act on (or hide text with) replaced by
+    ``?``. Tab and newline are kept."""
+    return _UNSAFE.sub("?", text)
+
+
+def _escape(found: re.Match[str]) -> str:
+    code = ord(found.group())
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    code -= 0x10000
+    return f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}"
+
+
+def to_json(value: Any) -> str:
+    """``value`` as JSON that is safe to print: non-ASCII text stays readable, but the characters
+    `inert_text` replaces are escaped as ``\\uXXXX``, so the output is still lossless."""
+    # Outside strings json.dumps emits only ASCII punctuation, digits and letters, so every match
+    # is inside a string, where a \u escape is valid.
+    return _UNSAFE.sub(_escape, json.dumps(value, ensure_ascii=False))
+
+
+def _large_ints_as_strings(value: Any) -> Any:
+    """Integers a JSON reader cannot hold exactly (past 2**53 - 1: a BigInt, or a Number that has
+    already lost precision) as decimal strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value) if abs(value) > _MAX_SAFE_INT else value
+    if isinstance(value, list):
+        return [_large_ints_as_strings(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _large_ints_as_strings(v) for k, v in value.items()}
     return value
 
 
@@ -81,7 +152,8 @@ def _parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "exit codes: 0 ok, 1 JavaScript error, 2 usage, 3 timeout, "
-            "4 OS sandbox unavailable, 5 other runtime failure"
+            "4 OS sandbox unavailable, 5 other runtime failure, "
+            "6 result cannot be converted to JSON"
         ),
     )
     parser.add_argument(
@@ -98,7 +170,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timeout",
-        type=_positive_float,
+        type=_timeout,
         default=DEFAULT_TIMEOUT,
         metavar="SECONDS",
         help=f"deadline for the evaluation (default {DEFAULT_TIMEOUT:g})",
@@ -108,7 +180,7 @@ def _parser() -> argparse.ArgumentParser:
         type=parse_size,
         default=None,
         metavar="SIZE",
-        help="kill the worker above this resident memory, e.g. 256M (default 1G)",
+        help="kill the worker above this resident memory, e.g. 256M (default 1G, at most 1T)",
     )
     sandbox = parser.add_mutually_exclusive_group()
     sandbox.add_argument(
@@ -142,23 +214,52 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _decode(data: bytes, where: str) -> str | None:
+    """Bounded input as text, or None (after saying why) when it is too large or not UTF-8."""
+    if len(data) > MAX_CODE_BYTES:
+        print(
+            f"pydeno: {where} is larger than {MAX_CODE_BYTES} bytes (16 MiB), "
+            "the most the worker accepts",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(f"pydeno: {where} is not valid UTF-8: {exc}", file=sys.stderr)
+        return None
+
+
 def _read_code(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str | None:
     given = [x for x in (args.code, args.command, args.file) if x is not None]
     if len(given) > 1:
         parser.error("give the code once: as CODE, with -c, or with -f")
+    code: str | None
     if args.command is not None:
         code = args.command
     elif args.file is not None:
+        where = inert_text(args.file)
         try:
-            code = Path(args.file).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            print(f"pydeno: cannot read {args.file}: {exc}", file=sys.stderr)
+            # Bounded: a FIFO or /dev/stdin is fine, an endless one stops at the cap.
+            with open(args.file, "rb") as source:
+                code = _decode(source.read(MAX_CODE_BYTES + 1), where)
+        except OSError as exc:
+            print(
+                f"pydeno: cannot read {where}: {inert_text(str(exc))}", file=sys.stderr
+            )
             return None
     elif args.code == "-" or (args.code is None and not sys.stdin.isatty()):
-        code = sys.stdin.read()
+        code = _decode(sys.stdin.buffer.read(MAX_CODE_BYTES + 1), "stdin")
     else:
         code = args.code
-    if not code or not code.strip():
+    if code is None:
+        return None
+    if len(code.encode("utf-8", "surrogatepass")) > MAX_CODE_BYTES:
+        print(
+            f"pydeno: the code is larger than {MAX_CODE_BYTES} bytes", file=sys.stderr
+        )
+        return None
+    if not code.strip():
         parser.error("no code given (pass CODE, -c, -f FILE, or pipe it on stdin)")
     return code
 
@@ -166,7 +267,7 @@ def _read_code(args: argparse.Namespace, parser: argparse.ArgumentParser) -> str
 def _print_console(level: str, values: list[Any]) -> None:
     from ._result import format_console_arg
 
-    line = " ".join(format_console_arg(v) for v in values)
+    line = inert_text(" ".join(format_console_arg(v) for v in values))
     stream = sys.stdout if level in ("log", "info", "debug") else sys.stderr
     print(line, file=stream, flush=True)
 
@@ -178,8 +279,16 @@ def _render(value: Any, raw: bool) -> str | None:
     if isinstance(value, JsUndefined):
         return None
     if raw and isinstance(value, str):
-        return value
-    return json.dumps(to_jsonable(value), ensure_ascii=False)
+        return inert_text(value)
+    return to_json(_large_ints_as_strings(to_jsonable(value)))
+
+
+def _unconvertible(detail: str) -> int:
+    print(
+        f"pydeno: the result cannot be converted to JSON: {inert_text(detail)}",
+        file=sys.stderr,
+    )
+    return EXIT_RESULT
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -194,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from ._errors import classify_error
     from ._isolated import IsolatedRuntime
-    from ._pydeno import RuntimeConfig
+    from ._pydeno import JavaScriptError, RuntimeConfig
 
     sandbox = "off" if args.no_sandbox else args.sandbox
     if sandbox == "off":
@@ -216,12 +325,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         value = asyncio.run(run())
-        text = _render(value, args.raw)
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # noqa: BLE001 - every failure becomes an exit code
+        if not isinstance(exc, JavaScriptError) and _RESULT_ERROR.match(str(exc)):
+            return _unconvertible(str(exc))
         info = classify_error(exc)
-        print(f"pydeno: {info.kind}: {exc}", file=sys.stderr)
+        print(f"pydeno: {info.kind}: {inert_text(str(exc))}", file=sys.stderr)
         if info.kind in ("sandbox_unavailable", "limits_unmeasurable"):
             print(
                 "pydeno: the OS sandbox cannot be applied here; see "
@@ -230,6 +340,10 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
         return _KIND_EXIT.get(info.kind, EXIT_RUNTIME)
+    try:
+        text = _render(value, args.raw)
+    except (TypeError, ValueError, RecursionError) as exc:
+        return _unconvertible(str(exc))
     if text is not None:
         print(text)
     return EXIT_OK
