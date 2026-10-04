@@ -391,13 +391,13 @@ def tool_error_text_reaches_the_guest_by_default() -> bool:
         raise _CStop("SECRET-base")
 
     seen = []
-    with AgentSandbox({"leak": leak, "leak_base": leak_base}, sandbox="require") as s:
-        for code in (
-            "try { await leak(1) } catch (e) { return e.name + e.message }",
-            "try { await leak_base(1) } catch (e) { return e.name + e.message }",
-        ):
-            r = s.execute(code)
-            seen.append(repr(r.result) + repr(r.error))
+    with AgentSandbox({"leak_base": leak_base}, sandbox="require") as s:
+        # A BaseException ends the run (and the worker); neither the guest nor the error says why.
+        r = s.execute("try { await leak_base(1) } catch (e) { return e.name + e.message }")
+        seen.append(repr(r.result) + repr(r.error))
+    with AgentSandbox({"leak": leak}, sandbox="require") as s:
+        r = s.execute("try { await leak(1) } catch (e) { return e.name + e.message }")
+        seen.append(repr(r.result) + repr(r.error))
         step = s.start("try { await leak(1) } catch (e) { return e.message }")
         if isinstance(step, ToolCall):
             step = s.resume(step, error=PermissionError("SECRET-approver"))
@@ -503,6 +503,48 @@ def front_invalid_answer_consumes_the_snapshot() -> bool:
         return False
 
     return _c_asyncio.run(go())
+
+
+@_c_probe
+def front_syntax_check_is_steered_by_the_guest() -> bool:
+    """The front door asks the worker whether a failed feed compiled, with JavaScript the guest can
+    reach (`Object.getPrototypeOf`). A guest could make a feed that ran (and called externals) be
+    reported as `PydenoSyntaxError` ("nothing of it ran"), or change its own state outside the
+    journal so that the dump no longer replays."""
+    from pydeno import Pydeno, PydenoError, PydenoSyntaxError
+
+    ran = []
+    with Pydeno(min_processes=1) as pool:
+        with pool.checkout() as s:
+            s.feed_run(
+                "const real = Object.getPrototypeOf;"
+                "Object.getPrototypeOf = function (o) {"
+                " globalThis.n = (globalThis.n || 0) + 1;"
+                " if (globalThis.lie) throw new SyntaxError('lie'); return real(o) }"
+            )
+            try:
+                s.feed_run("throw new SyntaxError('mine')")
+            except PydenoError:
+                pass
+            s.feed_run("globalThis.lie = true")
+            try:
+                s.feed_run(
+                    "await mark(1); throw new SyntaxError('after a side effect')",
+                    external_lookup={"mark": lambda x: ran.append(x)},
+                )
+            except PydenoSyntaxError:
+                if ran:
+                    return True
+            except PydenoError:
+                pass
+            s.feed_run("globalThis.lie = false")
+            state = s.dump()
+        with pool.checkout() as s2:
+            try:
+                s2.load_session(state)
+            except PydenoError:
+                return True
+    return False
 
 
 # 2. journals and state ----------------------------------------------------------------------------------------
@@ -785,6 +827,32 @@ def guest_bidi_controls_reach_host_messages() -> bool:
     with Pydeno(min_processes=1) as pool, pool.checkout() as sess, contextlib.redirect_stdout(out):
         sess.feed_run(f"console.log('a{_C_BIDI}\\x1b[31mb')")
     return any(c in out.getvalue() for c in _C_BIDI + "\x1b")
+
+
+@_c_probe
+def captured_console_carries_terminal_escapes() -> bool:
+    """`ExecutionResult.stdout`/`stderr` (and `Done`/`Failed`'s) are text pydeno collected for the
+    host to show or log; they passed escape sequences and bidi overrides through untouched."""
+    import asyncio
+
+    from pydeno import AgentSandbox, AsyncAgentSandbox, IsolatedRuntime
+
+    code = f"console.log('a\\x1b]0;owned\\x07{_C_BIDI}b'); console.error('\\x1b[2J'); return 1"
+    texts = []
+    with AgentSandbox({}, sandbox="require") as s:
+        r = s.execute(code)
+        texts += [r.stdout, r.stderr]
+    with IsolatedRuntime(sandbox="require", capture_console=True) as rt:
+        r = rt.execute(code.replace("return 1", "1"))
+        texts += [r.stdout, r.stderr]
+
+    async def go() -> list[str]:
+        async with AsyncAgentSandbox({}, sandbox="require") as s:
+            r = await s.execute(code)
+            return [r.stdout, r.stderr]
+
+    texts += asyncio.run(go())
+    return any(c in text for text in texts for c in _C_BIDI + "\x1b\x07")
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--slice-c-probe":
