@@ -139,6 +139,10 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Bridge frames and `ext:` paths visible in stack traces | **Partly fixed** (strict mode); path filtering open. |
 | A huge source ignores `timeout=` while V8 parses it (plain `Runtime`; bounded by the frame cap in `IsolatedRuntime`) | **Open.** |
 | Prototype pollution persists across evals in one runtime | **By design.** One runtime per trust unit. |
+| Typed arrays (other than `Uint8Array`) and boxed strings, as results or host-call arguments, were expanded into one key per element before the size budget was charged: hundreds of MB and several times past `timeout=` | **Fixed** (0.8, issue #75 slice A). Charged up front. |
+| `v8_flags` that deno_core's own start-up overrides (`--no-harmony-temporal` and five others) were reported as applied while doing nothing | **Fixed.** Refused at start-up. These features cannot be switched off with deno_core 0.412. |
+| Numbers outside int64 were clamped (`2**63` came back as `2**63 - 1`) | **Fixed.** They stay floats. |
+| Sparse-array natives (`sort`, `reverse`, `join`, `indexOf`, `lastIndexOf`, `copyWithin`, `toSorted`, `flat` on length `2**32-1`) ignore V8 termination | **Open, known.** Unbounded in plain `Runtime`; `IsolatedRuntime`'s hard deadline kills the worker (probe `slice_a_native_builtin_outlives_the_hard_deadline`). |
 
 ### Round 3: review of the new code
 

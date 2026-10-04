@@ -64,6 +64,19 @@ Nothing changes for existing code except `python -m pydeno` (see Changed); see
 
 ### Security
 
+- **Large indexed values are charged before they are expanded.** A typed array other than
+  `Uint8Array`, or a boxed `String`, returned as a result or passed to a host function, was expanded
+  into one key per element in a single native call before the serialization budget (or the host-call
+  argument cap) was checked. A 16 MB value took hundreds of megabytes and ran several times past
+  `timeout=`. Such values are now refused at once with the usual size error; small ones convert as
+  before.
+- **`v8_flags` that cannot take effect are refused.** deno_core's start-up switches on `Temporal`,
+  `Float16Array`, explicit resource management, source-phase and deferred imports and the native
+  `queueMicrotask` after the worker's flags, so a flag such as `--no-harmony-temporal` was undone
+  while `IsolatedRuntime.v8_flags` listed it. It now raises at start-up. Upgrade note: code that
+  passed one of these flags gets an error instead of a silent no-op; remove the flag.
+- Numbers outside the 64-bit integer range now come back as floats (`2**63` used to return
+  `2**63 - 1`).
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
   `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
