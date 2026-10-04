@@ -1,0 +1,10 @@
+# Checked-out bytes must match the repo on every OS: tests pin vendored bundles by size and hash,
+# and Windows autocrlf would otherwise rewrite them.
+* text=auto eol=lf
+*.png binary
+*.gif binary
+*.jpg binary
+*.gz binary
+*.zip binary
+*.bin binary
+*.glb binary
