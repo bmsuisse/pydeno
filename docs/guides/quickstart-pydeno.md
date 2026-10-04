@@ -51,6 +51,7 @@ The same names, mapped onto pydeno's building blocks (`SandboxPool` underneath, 
 | Monty | pydeno | What differs |
 |---|---|---|
 | `Monty()` / `AsyncMonty()` | `Pydeno()` / `AsyncPydeno()` | Workers are single-use, so there is no `max_processes`, `max_checkouts_per_worker` or `checkout_timeout`: an empty pool starts a worker on the spot (a cold start, never an error, never a wait). `min_processes` is the number kept ready. `Pydeno()` starts its first worker in the constructor; `AsyncPydeno` on `async with` |
+| Speed, warm pool (checkout / with first feed / next feed) | the same calls | pydeno 0.11 / 1.35 / 0.4 ms; Monty about 0.04 / 0.04 to 0.15 / 0.01 ms on the same machine. A pydeno checkout does no worker round trip (the session's setup is pre-installed on each pooled worker); the per-feed floor is the worker's async evaluation. Monty reuses workers, pydeno never does (see [Performance](#performance)) |
 | `pool.checkout(script_name=, limits=)` | `pool.checkout(script_name=, limits=)` | No type checking, `os_policy` or `print_flush_interval` (see below) |
 | `MontySession` / `AsyncMontySession` | `PydenoSession` / `AsyncPydenoSession` | `session_id` is always `None` (as for Monty's local workers) |
 | `session.feed_run(code, inputs=, external_lookup=, print_callback=)` | the same | JavaScript: a feed's result is its trailing expression (or what it `return`s); a top-level assignment (`x = 1`) has none, as in Monty. Feeds may `await`. A name must be in `external_lookup` to be callable (JavaScript cannot intercept undefined names), and external calls return promises: `await fetch(1)`. `inputs` are plain data (None, bool, int, float, str, list, dict) |
@@ -129,23 +130,47 @@ Pydeno(limits={"max_memory": None})     # remove a limit
 ## Performance
 
 `benches_py/alternatives_bench.py` on an Apple-silicon laptop (macOS, Python 3.14, medians with p95
-in brackets, milliseconds, warm pools, a machine that was not idle):
+in brackets, milliseconds, warm pools, a machine that was not idle, so numbers vary by about 20%
+between runs):
 
-| | `SandboxPool` (raw) | `Pydeno` | Monty |
-|---|---|---|---|
-| checkout | 0.044 (0.061) | 2.65 (3.70) | |
-| checkout + first `feed_run("1 + 1")` | 1.58 (1.95) | 4.07 (5.68) | 0.04 (23.7) |
-| one more `feed_run("1 + 1")` | 0.09 (0.14) | 0.50 (0.60) | 0.01 (0.02) |
-| checkout + 10 feeds + exit | 4.62 (7.67) | 10.3 (11.5) | 0.18 (0.83) |
-| session exit | | 0.42 (0.55) | |
+| | `SandboxPool` (raw) | `Pydeno` | `AsyncPydeno` | Monty |
+|---|---|---|---|---|
+| checkout | 0.044 (0.07) | 0.11 (0.61) | 0.10 (0.61) | |
+| checkout + first `feed_run("1 + 1")` | 1.8 (2.5) | 1.35 (1.7) | 1.45 (2.6) | 0.04 to 0.15 (24) |
+| one more `feed_run("1 + 1")` | 0.10 to 0.26 | 0.38 to 0.46 | 0.53 | 0.01 to 0.02 |
+| checkout + 10 feeds + exit | 4.6 to 8.3 | 5.9 to 6.2 | 11.2 | 0.18 to 0.27 |
+| session exit | | 0.05 | | |
 
-What the front door adds over a raw pool checkout is the agent session (`AgentSandbox`) that
-gives it journals, replay, budgets and console capture: a binding and the session prelude (two
-round trips to the worker, which also freeze the clock at checkout), and per feed the session's run
-wrapper. The front door's own work per feed (preparing the code, finding its trailing expression)
-is about 8 µs for a small feed. A session's exit SIGKILLs its worker at once and leaves the reaping
-to one background thread per pool. Monty is faster still: its workers are reused between sessions
-(pydeno's are single-use, by design) and run an interpreter rather than V8.
+How `Pydeno` gets there:
+
+- **Nothing session-independent happens at checkout.** A pooled worker arrives with the session's
+  dispatcher bound, the session prelude installed, the clock-freezing script compiled and its first
+  runs done, all on the pool's background filler. A checkout adopts it and applies the session's
+  limits and console routing in Python, with no round trip to the worker. The clock is still
+  frozen at checkout: the session freezes it at the start of its first feed's script, before any
+  guest code.
+- **Feeds run on your thread.** `feed_run` drives the worker from the calling thread and answers
+  each external call there as it arrives, with no loop thread and no hand-offs.
+- **The refill waits.** Replacing a checked-out worker starts 50 ms after the checkout (at once if
+  the pool is empty), because starting a process stalls the parent for about a millisecond, which
+  would otherwise land on the session's first feed. This is why a `Pydeno` checkout plus its first
+  feed is faster than a raw `SandboxPool` checkout plus one `eval`.
+- **Exit kills the worker at once.** A background thread per pool reaps it.
+
+What limits it:
+
+- **The per-feed floor is the worker's async evaluation (about 0.3 ms).** A feed may `await`, so it
+  is evaluated as an async command, and the worker starts a fresh event loop for every async
+  command (`asyncio.run` in `_worker.py`). A plain `eval` takes about 0.1 ms; the front door's own
+  Python costs about 0.05 ms per feed. A persistent event loop in the worker would close most of
+  that gap.
+- **The first command after a worker has sat idle is slower** (0.3 to 1 ms on macOS) whatever
+  sends it.
+- Monty is faster again: its workers are reused between sessions (pydeno's are single-use, by
+  design) and it runs an interpreter rather than V8.
+
+`min_processes=2` is deliberate. One worker serves the next checkout while its replacement starts
+in the background. Each worker holds about 30 to 40 MB. Raise it for bursts of concurrent checkouts.
 
 Run `python benches_py/alternatives_bench.py pydeno-front` for numbers on your machine.
 

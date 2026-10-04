@@ -297,7 +297,7 @@ than 0.4.5).
 
 | | |
 |---|---|
-| `Pydeno`: check out a session and run `feed_run("1 + 1")` from a warm pool | **~4 ms**; another feed ~0.5 ms; exit ~0.4 ms (see the [front-door guide](docs/guides/quickstart-pydeno.md#performance)) |
+| `Pydeno`: check out a session from a warm pool | **~0.1 ms**; with its first `feed_run("1 + 1")` ~1.4 ms; another feed ~0.4 ms; exit ~0.05 ms (see the [front-door guide](docs/guides/quickstart-pydeno.md#performance)) |
 | Create an `IsolatedRuntime` and evaluate | **~15 ms** with the spare worker used soon after it starts, ~30-45 ms after it has sat idle, ~70-105 ms without |
 | Move a 2 MB structured result across the boundary | **~18 ms** each way (native codec) |
 | `import pydeno` | **~19 ms** (the isolation stack loads on first use) |

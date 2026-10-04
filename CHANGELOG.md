@@ -16,6 +16,10 @@
   `SandboxPool`. `benches_py/alternatives_bench.py pydeno-front` measures it.
 - `AgentSandbox(runtime=...)` / `AsyncAgentSandbox(runtime=...)`: run a session on an already-built
   runtime (a pool checkout); its seed (and frozen clock, if any) become the session's.
+- Faster sessions: a `Pydeno` worker arrives with the session's setup pre-installed (checkout does no
+  worker round trip, about 0.1 ms), and `AgentSandbox.run()` / `execute()` (and `feed_run`) drive the
+  worker from the calling thread, answering tool calls there, with no loop thread and no hand-offs.
+  Journals are unchanged: a dump from either path replays on the other.
 
 Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 

@@ -73,6 +73,7 @@ building blocks under "Advanced".
 | New: `Pydeno`, `AsyncPydeno`, `PydenoSession`, `AsyncPydenoSession`, `PydenoSnapshot`, `AsyncPydenoSnapshot`, `PydenoComplete`, `PydenoLimits` and the `PydenoError` family | new | Adopters | See the [front-door guide](quickstart-pydeno.md); a Monty user can keep their code's shape |
 | `AgentSandbox` / `AsyncAgentSandbox` accept `runtime=` (an already-built, fresh runtime, such as a pool checkout) | new, opt-in | Nobody unless passed | Nothing |
 | `classify_error()` sees through a `PydenoError` to the pydeno exception it wraps | new | Nobody | Nothing |
+| `AgentSandbox.run()` / `execute()` drive the worker from the calling thread (tool calls are answered there, in the order the guest made them, as before); the session's loop thread starts only when `start`/`resume` or an async tool needs it | `AgentSandbox` | Nobody, unless they relied on a loop thread existing per session. While a tool runs, the CPU cap and `max_pause` are checked when it returns rather than during it (memory is still watched) | Nothing |
 | `SandboxPool` builds its runtimes through an overridable core (`_core_type`, private) | internal | Nobody | Nothing |
 
 ## Safe to bump?
