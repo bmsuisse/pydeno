@@ -47,7 +47,7 @@ from ._agent import (
     ReplayDivergence,
     Step,
     ToolCall,
-    _check_tools,
+    _normalize_tools as _check_tools,
     _decode,
     _encode,
     _error_class,
