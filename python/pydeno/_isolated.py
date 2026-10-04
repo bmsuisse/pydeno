@@ -89,6 +89,8 @@ _CONFIG_KEYS = (
 _UNSUPPORTED_CONFIG = ("inspector", "snapshot")
 
 _MAX_REMOTE_MESSAGE = 64 * 1024
+# The largest integer the wire carries as a plain JSON number (see `_wire`).
+_MAX_WIRE_INT = 2**53 - 1
 _POLL_SECONDS = 0.1
 _RSS_EVERY_SECONDS = 0.05
 _STDERR_TAIL_BYTES = 2048
@@ -214,6 +216,20 @@ def _checked_console(fn: Callable[..., Any]) -> Callable[..., Any]:
         return fn(*args)
 
     return call
+
+
+def _check_wire_limits(config: RuntimeConfig, max_memory: int | None) -> None:
+    """Refuse limits the worker cannot receive: the wire carries integers past 2**53 - 1 as a
+    tagged object, which the worker's `RuntimeConfig` cannot take, so they would otherwise surface
+    as a startup crash ("'dict' object cannot be interpreted as an integer")."""
+    if max_memory is not None and max_memory > _MAX_WIRE_INT:
+        raise ValueError(
+            f"max_memory must be at most {_MAX_WIRE_INT} bytes (2**53 - 1)"
+        )
+    for key in _CONFIG_KEYS:
+        value = getattr(config, key)
+        if isinstance(value, int) and value > _MAX_WIRE_INT:
+            raise ValueError(f"{key} must be at most {_MAX_WIRE_INT} (2**53 - 1)")
 
 
 class _Default:
@@ -505,6 +521,7 @@ class IsolatedRuntime:
                     f"RuntimeConfig.{attr} is not supported by IsolatedRuntime yet"
                 )
 
+        _check_wire_limits(config, max_memory)
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # ArrayBuffer storage is outside the V8 heap, so `max_heap_size` cannot bound it, and

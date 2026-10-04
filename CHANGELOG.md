@@ -4,6 +4,18 @@
 
 ### Added
 
+- **`pydeno` command** (`[project.scripts]`, same as `python -m pydeno`): evaluates JavaScript from an
+  argument, `-c`, `-f FILE` or stdin and prints the result as JSON (`--raw` for plain strings). Runs in
+  `IsolatedRuntime(sandbox="require")`; `--timeout` (default 30 s), `--max-memory`, `--sandbox auto`,
+  `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
+  unavailable, 5 other runtime failure, 6 result has no JSON form; the error and its `classify_error`
+  kind go to stderr. Input is read up to 16 MiB (bounded, so `-f /dev/zero` cannot fill memory),
+  guest output is stripped of control, format and other invisible characters, and integers past
+  2^53 - 1 print as JSON strings. See [`docs/guides/cli.md`](docs/guides/cli.md).
+- **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
+  (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
+  code in an `AgentSandbox` session that keeps its state between calls and returns the
+  `ExecutionResult` fields with output and result caps.
 - **`Pydeno` / `AsyncPydeno`: one front door, shaped like Monty.** `with Pydeno() as pool:`,
   `with pool.checkout(limits=...) as session:`, `session.feed_run(code, inputs=, external_lookup=,
   print_callback=)` (the feed's trailing expression is its result; state persists), `feed_start` with a
@@ -34,7 +46,8 @@
   reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
   size and dependency difference. See `docs/guides/advanced/inspector.md`.
 
-Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+Nothing changes for existing code except `python -m pydeno` (see Changed); see
+[`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
 
@@ -80,12 +93,20 @@ Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/
 
 ### Fixed
 
+- `IsolatedRuntime` and `AsyncIsolatedRuntime` raise `ValueError` for a `max_memory` (or a
+  `RuntimeConfig` limit) above 2^53 - 1. Such a value used to reach the worker as a tagged object
+  and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be
+  interpreted as an integer"); `max_memory=2**62` was enough, since it derives
+  `max_buffer_bytes = 2**60`.
 - Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
   the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
   even when the guest's error was still being read at that point.
 
 ### Changed
 
+- **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
+  positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
+  [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 - Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
   creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
   and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s
