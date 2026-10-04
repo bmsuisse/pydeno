@@ -504,6 +504,15 @@ class _Worker:
         ).start()
 
         kwargs = {k: config[k] for k in _CONFIG_KEYS if config.get(k) is not None}
+        # Never let the engine echo console output into this process's own stdout/stderr: both
+        # point at the parent's capture file, which sits under RLIMIT_FSIZE (1 MiB), and
+        # deno_core's `op_print` unwraps the flush of a failed write, so one `console.log` of a
+        # megabyte would abort the worker (SIGABRT) instead of raising. Nobody reads that echo
+        # anyway: the parent sees console output through `on_console` (the stub below), and the
+        # capture file only ever yields the last line of a crash. `enable_console=True` therefore
+        # keeps its documented meaning for the callback (it still fires) and stops at this
+        # process boundary.
+        kwargs["enable_console"] = False
         console_hid = options.get("console_hid")
         if isinstance(console_hid, int):
             kwargs["on_console"] = self._console_stub(console_hid)
