@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Refuse isolated worker startup when the supervisor lacks signal authority, in every sandbox
+  mode. `sandbox_status().termination` reports a hardened-child termination probe; refusal is
+  classified as non-retryable `sandbox_unavailable` (#71).
+
 - Bound the async parent's queued frame count as well as payload bytes (#65). Empty or tiny
   frames from a compromised worker now trigger backpressure while the consumer is idle.
 
@@ -62,11 +66,39 @@
   reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
   size and dependency difference. See `docs/guides/advanced/inspector.md`.
 
-Nothing changes for existing code except `python -m pydeno` (see Changed) and the limit fixes under
-Security; see
+Nothing changes for existing code except `python -m pydeno` (see Changed), the limit fixes
+and the red-team restrictions under Security; see
 [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
+
+- **0.8 red team, host boundary and state** (#75 slice C; probes in `scripts/autoresearch/metric_security.py`,
+  tests in `tests/test_redteam_boundary.py`, details in `docs/security-report.md`):
+  - `SessionPool`: a restored session keeps the tool budget it has already spent, also after its
+    journal outgrew `max_journal_bytes` (a journal without state that charges the spent calls is
+    stored instead), when calls on one session overlap, and when a release fails (the session then
+    stays live until a release succeeds). `get` checks a live session against the stored counter
+    and `release` refuses (`StaleJournal`) to store over a newer journal; this catches one pool
+    picking up a session another released, not overlapping leases in two pools, so sessions must
+    be routed to one pool. `close()` stores every unsaved session (leased ones as after a crash),
+    warns about any it cannot store, and wakes waiting `get`s. Ids must be valid UTF-8.
+    **Behaviour change.**
+  - Agent sessions queue concurrent tool calls past `max_inflight_host_calls - 1` and issue them in
+    order; they were refused depending on timing, which the journal did not record.
+  - A tool raising a `BaseException` during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run
+    like a crash (recorded as lost); the journal stays loadable.
+  - Tool names that would replace a guest global (bare-global tools), and names starting with
+    `__pydeno` / `__host_op`, are refused. **Behaviour change.**
+  - `SessionPool.drop()` holds the session's place while it works and wins against an overlapping
+    `get` or `release`; `pool.session()` releases only its own lease; journal associated data may be
+    up to 4096 bytes, so every valid pool id persists.
+  - Front door: the syntax check after a failed feed uses captured intrinsics; `dump` / `load_session` /
+    `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot; `feed_start`
+    surfaces snapshots only for the feed's declared functions.
+  - Captured console output, error messages and the default printer use one filter with the CLI's
+    set: control characters, bidirectional controls, line separators and invisible format characters
+    (zero-width joiners and spaces, variation selectors, soft hyphen, BOM, Unicode tags, ...) become
+    `?`. **Behaviour change** for output that contained them.
 
 - **Large indexed values are checked before they are expanded.** A typed array other than
   `Uint8Array`, or a boxed `String` (also behind a Proxy), returned as a result or stream chunk or

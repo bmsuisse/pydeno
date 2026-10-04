@@ -64,8 +64,43 @@ their limits are in `docs/guides/advanced/isolation.md`.
   holding the deadline paused or freezing the caller. Use `redact_host_errors=True` if your
   host functions raise exceptions whose text must not reach the guest.
 - Validate the arguments of every host function and tool you bind.
+- Bind session state to its owner: `AgentSandbox.dump(key, associated_data=...)`, and the same
+  `associated_data=` on `PydenoSession.dump` / `load_session` / `load_snapshot`, with a tenant id and
+  a counter you keep (or use `SessionPool`, which does both). A signature alone proves the state is
+  yours, not whose it is or that it is the newest.
 - Restore snapshots only from sources you trust and authenticate: pydeno does not verify snapshot
   bytes unless you do (`pydeno.verify_snapshot`).
+
+## Linux resource visibility
+
+The supervisor must be able to read the worker's `/proc/<pid>/stat` and `statm` after the
+worker drops privileges. A `hidepid=2` procfs mount can hide a worker that changed from root
+to `nobody`, or even a same-UID worker after it clears its dumpable flag. Successfully reading
+an ordinary same-UID child does not prove these limits work.
+`sandbox_status()` therefore hardens its resource-probe child like a worker and waits for that
+step before measuring it. Missing memory, CPU or thread counters make `resource_probes.applied`
+and `complete` false. Both isolated runtimes refuse startup under `sandbox="require"`, and
+warn under `auto`, if an enabled counter is unreadable.
+
+For the supervisor's procfs mount, use `hidepid=0`, or deliberately configure procfs visibility
+for the service (for example an authorized `gid=` exemption). Verify the resulting deployment
+with `sandbox_status()` and `sandbox="require"`; do not assume root or a container label alone
+grants access. This is a startup check, not a promise that later procfs or credential changes
+are harmless.
+
+## Supervisor termination authority
+
+Both isolated runtimes check signal permission against the actual worker after startup
+hardening, before accepting guest commands or handing the worker to a pool. If permission is
+missing, startup refuses in every sandbox mode with a non-retryable `sandbox_unavailable`
+error. The still-trusted worker receives a close command and is reaped.
+
+`sandbox_status().termination` additionally tests SIGKILL against a disposable hardened child.
+Missing authority makes `complete` false. These are startup checks: the supervisor must retain
+its signal permissions throughout each worker's lifetime. Signal zero on the actual worker
+checks current permission; it is not a proof against later credential changes or a host policy
+that distinguishes individual signal numbers. Validate custom host policies with the status
+probe and deployment tests as well.
 
 ## Deploying it: the outer boundary
 

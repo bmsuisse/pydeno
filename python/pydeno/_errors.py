@@ -210,7 +210,8 @@ _CLOSED = re.compile(
 )
 # The worker reports why it would not start (its text, but only ever a refusal: no retry helps).
 _SANDBOX_REFUSED = re.compile(
-    r"worker failed to start: (?:an OS sandbox is required but|sandbox self-test failed)"
+    r"worker failed to start: (?:an OS sandbox is required but|sandbox self-test failed|"
+    r"supervisor termination authority is unavailable)"
 )
 _CPU = re.compile(
     rf"worker used more than {_NUM}s of CPU in one command and was killed"

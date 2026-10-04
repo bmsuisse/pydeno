@@ -13,6 +13,7 @@ on:
       - ".github/workflows/workflow.yaml"
       - "scripts/linux_matrix.sh"
       - "scripts/check_test_report.py"
+      - "scripts/collect_guard.py"
 
 permissions:
   contents: read
@@ -164,7 +165,7 @@ jobs:
         if: matrix.python == '3.12'
         shell: bash
         run: |
-          .wheel-venv/bin/python scripts/autoresearch/metric_security.py | tee security-metric.log
+          .wheel-venv/bin/python scripts/autoresearch/metric_security.py 2>&1 | tee security-metric.log
           # The metric tool deliberately exits zero even when it reports violations.
           # Require exactly one metric line and a zero value, not merely exit status.
           test "$(grep '^METRIC:' security-metric.log)" = 'METRIC: 0'
