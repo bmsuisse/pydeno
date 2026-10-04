@@ -37,11 +37,14 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         JournalError,
         ReplayDivergence,
         ToolCall,
+        ToolNotDiscoveredError,
         describe_tools,
         typescript_stubs,
     )
     from ._aio import AsyncIsolatedRuntime
     from ._isolated import IsolatedRuntime, WorkerCrashed
+    from ._result import ExecutionResult, ResultTooLarge
+    from ._schema import SchemaTool
     from ._polyfills import WEB_POLYFILLS
     from ._snapshot_auth import (
         SnapshotAuthenticationError,
@@ -62,6 +65,10 @@ _LAZY = {
     "JournalError": "_agent",
     "describe_tools": "_agent",
     "typescript_stubs": "_agent",
+    "ToolNotDiscoveredError": "_agent",
+    "ExecutionResult": "_result",
+    "ResultTooLarge": "_result",
+    "SchemaTool": "_schema",
     "AsyncIsolatedRuntime": "_aio",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
@@ -370,6 +377,10 @@ __all__ = [
     "JournalError",
     "describe_tools",
     "typescript_stubs",
+    "ExecutionResult",
+    "ResultTooLarge",
+    "SchemaTool",
+    "ToolNotDiscoveredError",
     "WEB_POLYFILLS",
     "WorkerCrashed",
     "SnapshotAuthenticationError",
