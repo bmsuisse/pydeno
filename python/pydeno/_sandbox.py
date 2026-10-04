@@ -46,6 +46,7 @@ MEMORY_EXIT_CODE = 78
 _SEATBELT_PROFILE = """
 (version 1)
 (deny default)
+(allow sysctl-read (sysctl-name "hw.pagesize_compat"))
 (allow signal (target self))
 (deny process-info*)
 (allow process-info-pidinfo (target self))
@@ -63,8 +64,11 @@ _SEATBELT_PROFILE = """
 # `(deny default)` does NOT cover; each was found by asking from inside the sandbox, not assumed:
 #  * `process-info*`: KERN_PROCARGS2 on the parent returns its argv and *environment* (any
 #    same-user process's, in fact), which undoes `env={}`. `(deny default)` alone does not stop it,
-#    and neither does narrowing `sysctl-read`, so there is no `sysctl-read` allowance at all: the
-#    worker runs without one.
+#    and neither does narrowing `sysctl-read` to a prefix, so the only `sysctl-read` allowance is the
+#    one name below.
+#  * `sysctl-read hw.pagesize_compat` (the page size, nothing else): V8's allocator asks for it when
+#    the process has not already cached it. Python 3.13+ happens to, 3.10 to 3.12 do not, and
+#    without this name the worker aborts at start ("LowLevelAlloc arithmetic overflow") on those.
 #  * `iokit-get-properties`, `SYS_gethostuuid`: the machine's permanent hardware identifier.
 #  * `SYS_getpriority`/`getpgid`/`getsid`/`getfsstat`/`fstatfs`, `host_statistics*`: they list every
 #    host process, the mounted volumes and free disk space, and system-wide CPU and memory
@@ -149,6 +153,9 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     # kernel version would help pick an exploit, but V8's x86_64 build calls it while starting and
     # aborts (`Check failed: 0 == uname(&uname_buffer)`) if it is refused. The aarch64 build does not,
     # which is why this was found on an x86_64 CI runner and not in an aarch64 container.
+    # memfd_create + write holds memory in an anonymous file that never shows in the worker's RSS:
+    # 200 memfds of 1 MiB (the RLIMIT_FSIZE) kept ~208 MiB hidden from the memory limit.
+    "memfd_create": (319, 279),
     "sysinfo": (99, 179),
     "getpriority": (140, 141),
     "ioprio_get": (252, 31),
@@ -904,6 +911,12 @@ def attest() -> list[str]:
     """
     breaches: list[str] = []
     ppid = os.getppid()
+    if ppid <= 1:
+        # Reparented to init (or the parent is gone): the "parent" probes below would aim at pid 1, or,
+        # worse, at -1 (every process) if a denied getppid returned an error. Refuse to start.
+        raise RuntimeError(
+            "the worker was orphaned before its sandbox self-test could run"
+        )
 
     def check(
         name: str,

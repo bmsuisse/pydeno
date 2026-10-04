@@ -183,6 +183,17 @@ trusted. Ordinary JavaScript errors and soft timeouts leave it usable.
 
 Not supported yet: streams, snapshots, the inspector, function handles, Windows.
 
+### One result instead of an exception
+
+`execute(code)` (and `await execute_async(code)`) evaluates like `eval` but returns an
+`ExecutionResult(status, stdout, stderr, result, error, error_type, truncated)` and never raises
+for the run's own failure, a crash or a timeout included. Create the runtime with
+`capture_console=True` (or an `on_console`) to collect `console.*` into `stdout`/`stderr`; each
+stream is capped at `max_output_bytes` (default 64 KiB) and ends with a `[truncated]` line past
+it. A result larger than `max_result_bytes` (default 1 MiB of JSON) is a `Failed` result with
+`error_type="ResultTooLarge"`. See [Agent sessions](../agent-sessions.md#results-and-console-output)
+for the exact rules.
+
 ## Trust model
 
 Copied from Monty: the worker starts with an **empty environment**, every frame it sends is
@@ -303,6 +314,14 @@ a runaway `setInterval` is cut off), `TextEncoder`/`TextDecoder`, `btoa`/`atob`,
 `FileReader`, `EventTarget`, `AbortController` and `structuredClone` (each one a library in the
 tests needed). It never defines `window` or
 `document`, which would push libraries onto DOM code paths.
+
+!!! warning "Do not write your own `setTimeout`"
+    A library that loops on `setTimeout` / `requestAnimationFrame` needs a timer that honours the
+    delay. A shim such as `setTimeout = (fn) => queueMicrotask(fn)` ignores the delay, so such a
+    loop re-queues itself on the microtask queue forever and starves the isolate until the deadline
+    (ECharts server-side rendering is an example). Use `WEB_POLYFILLS`: its timers run on virtual
+    time and a runaway `setInterval` is cut off. Libraries that animate also usually have an option
+    to switch it off (`animation: false`).
 
 ## Start-up cost
 

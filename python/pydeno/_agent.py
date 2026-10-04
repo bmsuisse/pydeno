@@ -3,10 +3,14 @@
 What pydantic/monty offers an agent that writes Python, for an agent that writes JavaScript, built
 only on `IsolatedRuntime`'s public API:
 
-- **Tools** from a plain ``name -> callable`` mapping, checked like `ToolBridge` names, with one
-  call budget for the whole session.
+- **Tools** from a plain ``name -> callable`` mapping, or described by JSON Schema
+  (`SchemaTool`, one object argument), checked like `ToolBridge` names, with one call budget for
+  the whole session. A lazy catalog (``tools_catalog=``) declares only ``search_tools`` and
+  ``describe_tool``; the host decides which catalog tools the guest has found and may call.
 - **Prompt helpers**: `describe_tools()` (a block for the system prompt) and `typescript_stubs()`
   (a ``.d.ts`` the model can be shown, and its code checked against).
+- **Results**: `execute()` (and every `Done`/`Failed`) gives an `ExecutionResult` with the run's
+  console output and a JSON result, both bounded, and a stable `error_type`.
 - **Session state**: one worker per session, so globals and functions survive between runs.
 - **Pause/resume** (Monty's ``FunctionSnapshot``): `start()` stops at every tool call and hands it
   to the caller, who answers with `resume()`; `run()` answers them with the real tools.
@@ -14,6 +18,7 @@ only on `IsolatedRuntime`'s public API:
   persisted as a signed journal of its inputs (code and tool results) plus a hash of every outcome.
   `AgentSandbox.load()` replays it on a fresh worker with the same frozen clock and random seed,
   substituting the recorded tool results, and raises `ReplayDivergence` if any outcome differs.
+  After a run kills the worker, `dump()` returns the journal as of the last good run.
 
 Everything the guest sends (tool names it calls, their arguments, its results) is untrusted data.
 The tools run with the host's full authority; validate their arguments.
@@ -25,6 +30,7 @@ import asyncio
 import base64
 import collections
 import collections.abc
+import dataclasses
 import hashlib
 import hmac
 import inspect
@@ -43,20 +49,43 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ._isolated import IsolatedRuntime
+from ._isolated import _CONFIG_KEYS, IsolatedRuntime
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
+from ._result import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_RESULT_BYTES,
+    ExecutionResult,
+    OutputCapture,
+    ResultTooLarge,
+    bounded_result,
+    check_limit,
+    error_type,
+    failed_result,
+    to_jsonable,
+)
+from ._schema import (
+    _JS_RESERVED,
+    SchemaTool,
+    _union,
+    as_schema_tool,
+    schema_declarations,
+)
 from ._snapshot_auth import _engine_version
 from ._snapshot_auth import _key as _checked_key
-from ._tools import ToolBridge, ToolBudgetError
+from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
 
 __all__ = [
     "AgentSandbox",
     "Done",
+    "ExecutionResult",
     "Failed",
     "JournalError",
     "ReplayDivergence",
+    "ResultTooLarge",
+    "SchemaTool",
     "Step",
     "ToolCall",
+    "ToolNotDiscoveredError",
     "describe_tools",
     "typescript_stubs",
 ]
@@ -85,15 +114,20 @@ _DECLARATION = re.compile(
 _SETTLE = "__pydeno_agent_settle"
 _PERSIST = "__pydeno_agent_persist"
 _SAFE_ERROR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
-# JavaScript words that cannot be a parameter name in a `.d.ts`; Python allows several of them.
-_JS_RESERVED = frozenset(
-    "break case catch class const continue debugger default delete do else enum export extends "
-    "false finally for function if import in instanceof new null return super switch this throw "
-    "true try typeof var void while with yield let static implements interface package private "
-    "protected public await arguments eval".split()
-)
 # Owned by the session because replay depends on them, or because the pause model needs them.
-_OWNED_OPTIONS = frozenset({"clock", "random_seed", "request_timeout", "max_host_wait"})
+_OWNED_OPTIONS = frozenset(
+    {"clock", "random_seed", "request_timeout", "max_host_wait", "capture_console"}
+)
+# The lazy catalog: the two tools declared up front, and the hidden host function every catalog
+# tool is called through (one capability for the whole catalog, whatever its size).
+_SEARCH = "search_tools"
+_DESCRIBE = "describe_tool"
+_CATALOG_CALL = "__pydeno_agent_catalog"
+_MAX_SEARCH_RESULTS = 50
+_DEFAULT_SEARCH_RESULTS = 10
+_MAX_QUERY_CHARS = 1000
+_SUMMARY_CHARS = 200
+_MAX_LOST_CALLS = 2**53
 
 
 # ---------------------------------------------------------------------------
@@ -117,17 +151,69 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class Done:
-    """The run finished; `value` is its result (`pydeno.undefined` when it had none)."""
+    """The run finished; `value` is its result (`pydeno.undefined` when it had none).
+
+    `stdout`/`stderr` are the run's console output (``log``/``info``/``debug`` and
+    ``warn``/``error``/``trace``), each capped at the session's ``max_output_bytes``;
+    `truncated` says one was cut. They are not part of equality: ``Done(3) == step`` compares
+    the value only."""
 
     value: Any
+    stdout: str = field(default="", compare=False)
+    stderr: str = field(default="", compare=False)
+    truncated: bool = field(default=False, compare=False)
+
+    status = "Succeeded"
+    error_type = None
+
+    @property
+    def result(self) -> Any:
+        """`value` as plain JSON data (see `ExecutionResult.result`)."""
+        return to_jsonable(self.value)
+
+    def to_result(
+        self, *, max_error_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    ) -> ExecutionResult:
+        """This step as an `ExecutionResult` (`max_error_bytes` is for `Failed`'s message)."""
+        del max_error_bytes
+        return ExecutionResult(
+            status="Succeeded",
+            stdout=self.stdout,
+            stderr=self.stderr,
+            result=self.result,
+            truncated=self.truncated,
+        )
 
 
 @dataclass(frozen=True)
 class Failed:
-    """The run failed. A JavaScript error leaves the session usable; a crash, a hard timeout or
-    a memory kill closes it (`AgentSandbox.is_closed()`)."""
+    """The run failed. A JavaScript error (and a result over ``max_result_bytes``) leaves the
+    session usable; a crash, a hard timeout or a memory kill closes it
+    (`AgentSandbox.is_closed()`). Carries the run's console output like `Done`."""
 
     error: BaseException
+    stdout: str = field(default="", compare=False)
+    stderr: str = field(default="", compare=False)
+    truncated: bool = field(default=False, compare=False)
+
+    status = "Failed"
+    result = None
+
+    @property
+    def error_type(self) -> str:
+        """A stable name for the failure (see `ExecutionResult.error_type`)."""
+        return error_type(self.error)
+
+    def to_result(
+        self, *, max_error_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    ) -> ExecutionResult:
+        return failed_result(
+            self.error,
+            stdout=self.stdout,
+            stderr=self.stderr,
+            truncated=self.truncated,
+            max_error_bytes=max_error_bytes,
+        )
 
 
 Step = ToolCall | Done | Failed
@@ -139,6 +225,22 @@ class ReplayDivergence(RuntimeError):
 
 class JournalError(ValueError):
     """A journal is too large, malformed, or not authentic (tampered or wrongly keyed)."""
+
+
+class ToolNotDiscoveredError(ToolError):
+    """The guest called a catalog tool it has not found yet (or one that does not exist).
+
+    With ``tools_catalog=``, only ``search_tools(query)`` and ``describe_tool(name)`` are declared
+    up front; a catalog tool becomes callable once one of them has returned it to the guest. The
+    guest sees an Error with this ``name`` and a message telling it to search first (never
+    redacted: pydeno wrote it, and it holds nothing of the host's)."""
+
+
+def _public(exc: Exception) -> Exception:
+    """Mark an error written by pydeno itself (no host data in it) as shown to the guest even
+    with ``redact_host_errors``: the catalog tools' usage errors are guidance for the model."""
+    exc._pydeno_public = True  # type: ignore[attr-defined]
+    return exc
 
 
 _SESSION_IDS = itertools.count(1)
@@ -259,19 +361,6 @@ def _error_class(name: str) -> type[Exception]:
 # ---------------------------------------------------------------------------
 # prompt helpers
 # ---------------------------------------------------------------------------
-
-
-def _union(parts: list[str]) -> str:
-    seen: list[str] = []
-    for part in parts:
-        if part not in seen:
-            seen.append(part)
-    if "unknown" in seen:
-        return "unknown"
-    # `null` last reads the way people write it: `string | null`.
-    if "null" in seen:
-        seen = [p for p in seen if p != "null"] + ["null"]
-    return " | ".join(seen)
 
 
 def _array(element: str) -> str:
@@ -471,10 +560,6 @@ def _spec(name: str, func: Callable[..., Any]) -> _ToolSpec:
     return _ToolSpec(name, tuple(params), returns, doc, tuple(required_kw))
 
 
-def _specs(tools: Mapping[str, Callable[..., Any]]) -> list[_ToolSpec]:
-    return [_spec(name, func) for name, func in tools.items()]
-
-
 _PREAMBLE = """\
 You can run JavaScript in a sandbox. Write the code as the body of an async function:
 call tools with `await` and `return` the final result. Top-level `const`, `let`, `var`,
@@ -485,11 +570,59 @@ fails throws an Error whose `name` is the failure's type.
 """
 
 
+def _schema_placeholder(schema: Any, name: str) -> str:
+    if not isinstance(schema, Mapping):
+        return "null"
+    if "const" in schema:
+        return json.dumps(schema["const"])
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return json.dumps(enum[0])
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        kind = next((k for k in kind if k != "null"), "null")
+    return {
+        "string": json.dumps(name),
+        "integer": "1",
+        "number": "1",
+        "boolean": "true",
+        "array": "[]",
+        "object": "{}",
+        "null": "null",
+    }.get(kind, "null")  # type: ignore[arg-type]
+
+
+def _schema_example(tool: SchemaTool, prefix: str) -> str:
+    props = tool.input_schema.get("properties")
+    required = tool.input_schema.get("required")
+    fields = []
+    if isinstance(props, Mapping) and isinstance(required, list):
+        for key in required:
+            if isinstance(key, str) and re.fullmatch(r"[A-Za-z_$][\w$]*", key):
+                fields.append(f"{key}: {_schema_placeholder(props.get(key), key)}")
+    args = "{ " + ", ".join(fields) + " }" if fields else "{}"
+    return f"const result = await {prefix}{tool.name}({args});"
+
+
+_CATALOG_GUIDE = """\
+More tools are in a catalog and are not declared here. Find them with `search_tools(query)`
+(returns `[{{name, description}}]`), read one with `describe_tool(name)` (returns its JSON
+Schemas and a TypeScript declaration), then call it as `await {ns}.<name>({{...}})` with ONE
+object argument. A tool you have not found with `search_tools` or `describe_tool` in this
+session throws a `ToolNotDiscoveredError`: search first."""
+
+
 def describe_tools(
-    tools: Mapping[str, Callable[..., Any]], *, namespace: str | None = None
+    tools: Mapping[str, Any] | collections.abc.Sequence[Any],
+    *,
+    namespace: str | None = None,
 ) -> str:
     """A block for an LLM's system prompt: how code runs, then each tool's signature, docstring
-    and an example call. The signatures are the ones `typescript_stubs` declares."""
+    and an example call. The signatures are the ones `typescript_stubs` declares.
+
+    `tools` maps names to callables (described from their signatures) or to `SchemaTool`s
+    (described from their JSON Schemas); a sequence of `SchemaTool`s works too."""
+    entries = _normalize_tools(tools)
     prefix = f"{namespace}." if namespace else ""
     where = f"on the `{namespace}` object" if namespace else "as global functions"
     lines = [
@@ -497,11 +630,22 @@ def describe_tools(
         f"These tools are available {where}; each returns a Promise.",
         "",
     ]
-    for spec in _specs(tools):
-        lines.append(prefix + spec.signature())
-        for doc_line in spec.doc.splitlines():
+    decls, functions = schema_declarations(
+        [t for t in entries.values() if isinstance(t, SchemaTool)], declare=False
+    )
+    if decls:
+        lines += ["Types used by the tools below:", *decls, ""]
+    for name, tool in entries.items():
+        if isinstance(tool, SchemaTool):
+            lines.append(prefix + functions[name][1])
+            doc, example = tool.description, _schema_example(tool, prefix)
+        else:
+            spec = _spec(name, tool)
+            lines.append(prefix + spec.signature())
+            doc, example = spec.doc, spec.example(prefix)
+        for doc_line in doc.splitlines():
             lines.append(f"    {doc_line}".rstrip())
-        lines.append(f"    Example: {spec.example(prefix)}")
+        lines.append(f"    Example: {example}")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -518,21 +662,46 @@ def _jsdoc(doc: str, indent: str) -> list[str]:
 
 
 def typescript_stubs(
-    tools: Mapping[str, Callable[..., Any]], *, namespace: str | None = None
+    tools: Mapping[str, Any] | collections.abc.Sequence[Any],
+    *,
+    namespace: str | None = None,
 ) -> str:
-    """A `.d.ts` declaring the tools, from their Python signatures, annotations and docstrings.
+    """A `.d.ts` declaring the tools.
 
-    `int`/`float` become `number`, `str` `string`, `bool` `boolean`, `bytes` `Uint8Array`,
-    `list[T]` `T[]`, `dict[str, T]` `Record<string, T>`, `X | None` `X | null`; a parameter with a
-    default is optional; anything else is `unknown`. Every tool returns a `Promise`."""
+    A callable is declared from its Python signature, annotations and docstring: `int`/`float`
+    become `number`, `str` `string`, `bool` `boolean`, `bytes` `Uint8Array`, `list[T]` `T[]`,
+    `dict[str, T]` `Record<string, T>`, `X | None` `X | null`; a parameter with a default is
+    optional; anything else is `unknown`.
+
+    A `SchemaTool` is declared from its JSON Schemas as a function of ONE object argument:
+    objects (required and optional properties, ``additionalProperties`` index signatures),
+    arrays and tuples, ``enum``/``const`` literals, ``anyOf``/``oneOf`` unions, ``allOf``
+    intersections, ``nullable``/``type: [..., "null"]``, and ``$ref`` to ``$defs`` (nested and
+    recursive ones too) as named ``interface``/``type`` declarations. Its ``output_schema`` is
+    the resolved type (``unknown`` without one). Every tool returns a `Promise`."""
+    entries = _normalize_tools(tools)
     out = ["// Tools provided by the host. Every call returns a Promise.", ""]
     indent = "  " if namespace else ""
+    decls, functions = schema_declarations(
+        [t for t in entries.values() if isinstance(t, SchemaTool)],
+        declare=not namespace,
+        indent=indent,
+    )
     if namespace:
         out.append(f"declare namespace {namespace} {{")
-    for spec in _specs(tools):
-        out.extend(_jsdoc(spec.doc, indent))
-        keyword = "function" if namespace else "declare function"
-        out.append(f"{indent}{keyword} {spec.signature()};")
+    if decls:
+        out.extend(decls)
+        out.append("")
+    keyword = "function" if namespace else "declare function"
+    for name, tool in entries.items():
+        if isinstance(tool, SchemaTool):
+            doc_lines, signature = functions[name]
+            out.extend(doc_lines)
+        else:
+            spec = _spec(name, tool)
+            out.extend(_jsdoc(spec.doc, indent))
+            signature = spec.signature()
+        out.append(f"{indent}{keyword} {signature};")
     if namespace:
         out.append("}")
     return "\n".join(out) + "\n"
@@ -554,16 +723,49 @@ class _Run:
         self.pending: dict[int, asyncio.Future[Any]] = {}
 
 
+class _ConsoleSink:
+    """The session's `on_console`: the capture of the run in flight, then the caller's own
+    `on_console` (if the `RuntimeConfig` they passed had one)."""
+
+    __slots__ = ("capture", "user")
+
+    def __init__(self, user: Callable[..., Any] | None) -> None:
+        self.capture: OutputCapture | None = None
+        self.user = user
+
+    def __call__(self, level: str, args: list[Any]) -> None:
+        capture = self.capture
+        if capture is not None:
+            capture(level, args)
+        if self.user is not None:
+            self.user(level, args)
+
+
 class _Core:
     """Everything the loop thread touches. It never refers to the `AgentSandbox`, so a session
     the caller drops can be collected, and its finalizer can shut this down."""
 
     def __init__(
-        self, rt: IsolatedRuntime, session_id: int, max_tool_calls: int | None
+        self,
+        rt: IsolatedRuntime,
+        session_id: int,
+        max_tool_calls: int | None,
+        *,
+        console: _ConsoleSink,
+        max_output_bytes: int,
+        max_result_bytes: int,
+        catalog: frozenset[str] = frozenset(),
     ) -> None:
         self.rt = rt
         self.session_id = session_id
         self.max_tool_calls = max_tool_calls
+        self.console = console
+        self.max_output_bytes = max_output_bytes
+        self.max_result_bytes = max_result_bytes
+        self.catalog = catalog
+        # Catalog tools a `search_tools`/`describe_tool` answer has shown the guest. Added on the
+        # caller's thread before that answer is delivered, read on the loop thread.
+        self.discovered: set[str] = set()
         self.calls_made = 0
         self.ids = itertools.count(1)
         self.cond = threading.Condition()
@@ -621,11 +823,43 @@ class _Core:
                 self.cond.notify_all()
         return await future
 
+    async def on_catalog_call(self, name: Any, args: list[Any]) -> Any:
+        """A catalog tool, called through the one hidden dispatcher. Refused, without charging
+        the budget, unless it is a catalog tool the guest has already found."""
+        if (
+            not isinstance(name, str)
+            or name not in self.catalog
+            or name not in self.discovered
+        ):
+            shown = name if isinstance(name, str) and len(name) <= 64 else "?"
+            raise _public(
+                ToolNotDiscoveredError(
+                    f"no tool {shown!r} has been found in this session: call "
+                    "search_tools(query) to find tools and describe_tool(name) to see how "
+                    "to call one, then call it"
+                )
+            )
+        return await self.on_tool_call(name, args)
+
     async def execute(self, run: _Run, code: str) -> None:
+        capture = OutputCapture(self.max_output_bytes)
+        self.console.capture = capture
         try:
-            final: Step = Done(await self.rt.eval_async(_wrap(code)))
+            value = await self.rt.eval_async(_wrap(code))
+            # Over the cap, the run fails but the session goes on (the value is dropped here).
+            bounded_result(value, self.max_result_bytes)
+            final: Step = Done(value)
         except BaseException as exc:  # noqa: BLE001 - every failure is the run's outcome
             final = Failed(exc)
+        finally:
+            # Every console call of the command was answered before its result arrived.
+            self.console.capture = None
+        final = dataclasses.replace(
+            final,
+            stdout=capture.stdout,
+            stderr=capture.stderr,
+            truncated=capture.truncated,
+        )
         with self.cond:
             run.final = final
             # Calls still unanswered now belong to nobody: drop them from what the caller will
@@ -727,13 +961,23 @@ class AgentSandbox:
     """A stateful, pausable JavaScript session for an AI agent, in an `IsolatedRuntime`.
 
     Args:
-        tools: ``name -> callable`` (sync or async). Names follow `ToolBridge`'s rules. The guest
-            calls them with positional arguments and gets a Promise.
+        tools: ``name -> callable`` (sync or async), called with the guest's positional
+            arguments; or ``name -> SchemaTool`` (or a mapping with its keys, or a list of
+            them), a tool described by JSON Schema that takes ONE object argument and whose
+            callable gets it as a ``dict``. Names follow `ToolBridge`'s rules. Every call
+            returns a Promise in the guest.
         max_tool_calls: Total tool calls the guest may make over the session's life (across
             every `start`, `resume` and `run`); further calls throw a ``ToolBudgetError`` in the
-            guest. ``None``: unlimited.
+            guest. ``None``: unlimited. For a budget per tool, count inside the tool (see
+            ``docs/guides/agent-sessions.md``).
         namespace: Install the tools on this global object (``tools.search(...)``) instead of
             as bare globals.
+        tools_catalog: Many more `SchemaTool`s, declared lazily: only ``search_tools(query,
+            limit?)`` and ``describe_tool(name)`` are added to the declared tools, whatever the
+            catalog's size, and a catalog tool is called as ``<namespace or "tools">.<name>(args)``
+            once one of those two has returned it to the guest. Calling one before throws a
+            `ToolNotDiscoveredError` telling the guest to search first. Catalog calls are tool
+            calls like any other (`ToolCall` steps, the same budget).
         clock: The guest's frozen clock (a `datetime`, naive meaning UTC, or epoch seconds).
             Default: the moment the session is created. It never advances, and a loaded session
             gets the recorded one, which is what makes replay deterministic.
@@ -744,25 +988,36 @@ class AgentSandbox:
             session nobody resumes does not hold a worker forever. Exceeding it closes the session.
         max_journal_bytes: Cap on the recorded journal. Past it the session keeps working, but
             `dump()` raises `JournalError`.
+        max_output_bytes: Cap on each of a run's `stdout` and `stderr` (console output, carried
+            by `Done`/`Failed` and `execute()`), in UTF-8 bytes; past it the stream ends with a
+            ``[truncated]`` line. Default 64 KiB.
+        max_result_bytes: Cap on a run's result as compact JSON. A larger result makes the run
+            `Failed` with ``error_type == "ResultTooLarge"``; the session stays usable. Default
+            1 MiB. Recorded in the journal (it decides outcomes, so replay needs the same one).
         **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
             ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
-            count the time paused at a tool call.
+            count the time paused at a tool call. ``config.on_console`` still gets every console
+            call (each one is a host call, counted by ``max_host_calls``).
     """
 
     def __init__(
         self,
-        tools: Mapping[str, Callable[..., Any]],
+        tools: Mapping[str, Any] | collections.abc.Sequence[Any],
         *,
         max_tool_calls: int | None = None,
         namespace: str | None = None,
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
         timeout: float | None = DEFAULT_TIMEOUT,
         max_pause: float | None = DEFAULT_MAX_PAUSE,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         **runtime_options: Any,
     ) -> None:
-        self._tools = _check_tools(tools)
+        entries = _normalize_tools(tools)
+        catalog = _normalize_catalog(tools_catalog)
         if max_tool_calls is not None and (
             not isinstance(max_tool_calls, int)
             or isinstance(max_tool_calls, bool)
@@ -771,14 +1026,40 @@ class AgentSandbox:
             raise ValueError("max_tool_calls must be a non-negative int or None")
         if namespace is not None:
             ToolBridge._check_name(namespace, what="namespace")  # noqa: SLF001
+        check_limit("max_output_bytes", max_output_bytes)
+        check_limit("max_result_bytes", max_result_bytes)
+        catalog_ns = namespace or "tools"
+        if catalog:
+            reserved = {_SEARCH, _DESCRIBE} & entries.keys()
+            if reserved:
+                raise ValueError(
+                    f"with tools_catalog=, {sorted(reserved)} are the session's own tools; "
+                    "rename yours"
+                )
+            overlap = sorted(entries.keys() & catalog.keys())
+            if overlap:
+                raise ValueError(
+                    f"tools {overlap} are both declared and in the catalog"
+                )
+            if namespace is None and catalog_ns in entries:
+                raise ValueError(
+                    f"catalog tools are called as {catalog_ns}.<name>(...), and a tool named "
+                    f"{catalog_ns!r} would hide them; rename it or pass namespace="
+                )
+            entries[_SEARCH] = _search_tool(catalog)
+            entries[_DESCRIBE] = _describe_tool(catalog, catalog_ns)
         owned = _OWNED_OPTIONS & runtime_options.keys()
         if owned:
             raise TypeError(
                 f"AgentSandbox sets {sorted(owned)} itself (use clock=, random_seed=, "
                 "timeout=, max_pause=)"
             )
-        config = runtime_options.get("config")
-        if isinstance(config, RuntimeConfig) and config.timeout is not None:
+        config = runtime_options.pop("config", None)
+        if config is None:
+            config = RuntimeConfig()
+        if not isinstance(config, RuntimeConfig):
+            raise TypeError("config must be a pydeno.RuntimeConfig")
+        if config.timeout is not None:
             raise ValueError(
                 "RuntimeConfig.timeout is not supported by AgentSandbox: it would count the time "
                 "a run is paused at a tool call. Use AgentSandbox(timeout=...)."
@@ -798,21 +1079,40 @@ class AgentSandbox:
         if not isinstance(max_journal_bytes, int) or max_journal_bytes <= 0:
             raise ValueError("max_journal_bytes must be a positive int")
 
+        self._tools = entries
+        self._catalog = catalog
+        self._catalog_ns = catalog_ns
         self._namespace = namespace
         self._max_tool_calls = max_tool_calls
         self._redact = bool(runtime_options.get("redact_host_errors", True))
         self._clock_ms = clock_ms
         self._random_seed = random_seed
         self._max_journal_bytes = max_journal_bytes
-        self._redact = bool(runtime_options.get("redact_host_errors", True))
+        self._max_output_bytes = max_output_bytes
+        self._max_result_bytes = max_result_bytes
         self._lock = threading.Lock()
         self._records: list[list[Any]] | None = []
         self._journal_size = 0
+        # The journal as of the last run that ended with the worker alive: its length, and the
+        # tool calls made by then. A run that kills the worker is cut off here by `dump()`.
+        self._checkpoint = 0
+        self._checkpoint_calls = 0
+        self._lost: list[Any] | None = None
+        self._lost_runs = 0
         self._dead = False
         self._paused: ToolCall | None = None
         self._run: _Run | None = None
 
+        # Console output is collected per run; the caller's own `on_console` still sees it all.
+        sink = _ConsoleSink(config.on_console)
+        rt_config = RuntimeConfig(
+            **{key: getattr(config, key) for key in _CONFIG_KEYS},
+            on_console=sink,
+            inspector=config.inspector,
+            snapshot=config.snapshot,
+        )
         rt = IsolatedRuntime(
+            rt_config,
             clock=clock_ms / 1000,
             random_seed=random_seed,
             request_timeout=timeout,
@@ -820,7 +1120,15 @@ class AgentSandbox:
             **runtime_options,
         )
         try:
-            self._core = _Core(rt, next(_SESSION_IDS), max_tool_calls)
+            self._core = _Core(
+                rt,
+                next(_SESSION_IDS),
+                max_tool_calls,
+                console=sink,
+                max_output_bytes=max_output_bytes,
+                max_result_bytes=max_result_bytes,
+                catalog=frozenset(catalog),
+            )
         except BaseException:
             rt.close()
             raise
@@ -847,7 +1155,19 @@ class AgentSandbox:
                 core.rt.bind_function(name, shim)
         elif shims:
             core.rt.bind_object(self._namespace, shims)
-        core.rt.eval(_prelude(list(self._tools), self._namespace))
+        if self._catalog:
+
+            async def catalog_call(name: Any = None, *args: Any) -> Any:
+                return await core.on_catalog_call(name, list(args))
+
+            core.rt.bind_function(_CATALOG_CALL, catalog_call)
+        core.rt.eval(
+            _prelude(
+                list(self._tools),
+                self._namespace,
+                self._catalog_ns if self._catalog else None,
+            )
+        )
 
     # -- introspection -------------------------------------------------------
 
@@ -880,16 +1200,47 @@ class AgentSandbox:
         """The tool call the session is paused at, if any (also after `load`)."""
         return self._paused
 
+    @property
+    def catalog_names(self) -> tuple[str, ...]:
+        """The names in ``tools_catalog`` (not declared to the guest up front)."""
+        return tuple(self._catalog)
+
+    @property
+    def discovered_tools(self) -> frozenset[str]:
+        """Catalog tools the guest has found, and so may call."""
+        return frozenset(self._core.discovered)
+
+    @property
+    def lost_runs(self) -> int:
+        """Runs this session's history dropped because the worker died during them (see
+        `dump`), including ones recorded in the journal it was loaded from."""
+        return self._lost_runs
+
     def is_closed(self) -> bool:
         return self._core.closed or self._dead
 
     def describe_tools(self) -> str:
-        """See the module-level `describe_tools`."""
-        return describe_tools(self._tools, namespace=self._namespace)
+        """See the module-level `describe_tools`. With a catalog, the declared part is the same
+        whatever the catalog's size: its tools are not listed."""
+        text = describe_tools(self._tools, namespace=self._namespace)
+        if self._catalog:
+            text += "\n" + _CATALOG_GUIDE.format(ns=self._catalog_ns) + "\n"
+        return text
 
     def typescript_stubs(self) -> str:
-        """See the module-level `typescript_stubs`."""
-        return typescript_stubs(self._tools, namespace=self._namespace)
+        """See the module-level `typescript_stubs`. Catalog tools are not declared (the guest
+        reads one's declaration with `describe_tool`)."""
+        text = typescript_stubs(self._tools, namespace=self._namespace)
+        if self._catalog:
+            text += (
+                "\n"
+                + "\n".join(
+                    "// " + line
+                    for line in _CATALOG_GUIDE.format(ns=self._catalog_ns).splitlines()
+                )
+                + "\n"
+            )
+        return text
 
     # -- running -------------------------------------------------------------
 
@@ -939,6 +1290,23 @@ class AgentSandbox:
         """`start` the code and answer every tool call with the real tool; return the result, or
         raise what the run failed with. A tool that raises is reported to the guest, which may
         catch it. Tool calls are answered one at a time, in the order the guest made them."""
+        step = self._drive(code)
+        if isinstance(step, Failed):
+            raise step.error
+        return step.value
+
+    def execute(self, code: str) -> ExecutionResult:
+        """`run` the code, but return an `ExecutionResult` instead of raising.
+
+        ``{status, stdout, stderr, result, error, error_type, truncated}``: the run's console
+        output (each stream capped at ``max_output_bytes``), its result as JSON data (capped at
+        ``max_result_bytes``: over it, ``status="Failed"``, ``error_type="ResultTooLarge"``),
+        and for a failure a stable `error_type` (the guest's error ``name``, or the host's
+        exception class). A run that kills the worker is a ``Failed`` result too; calling this
+        on a closed session (or while paused) still raises, as `run` does."""
+        return self._drive(code).to_result(max_error_bytes=self._max_output_bytes)
+
+    def _drive(self, code: str) -> Done | Failed:
         self._enter()
         try:
             step = self._start(code)
@@ -951,13 +1319,28 @@ class AgentSandbox:
                     step = self._resume(step, result, None)
         finally:
             self._lock.release()
-        if isinstance(step, Failed):
-            raise step.error
-        return step.value
+        return step
+
+    def call(self, step: ToolCall) -> Any:
+        """Run the real tool for a `ToolCall` (what `run` does for each one) and return its
+        result, or raise what it raised; answer the guest with `resume`. For a driver of
+        `start`/`resume` that wants some calls (``search_tools``, say) handled as usual."""
+        if not isinstance(step, ToolCall) or step.name not in self._tools.keys() | set(
+            self._catalog
+        ):
+            raise TypeError("call() takes a ToolCall from this session")
+        if threading.current_thread() is self._core.thread:
+            raise RuntimeError(
+                "an AgentSandbox cannot be driven from one of its own tools"
+            )
+        return self._call_tool(step)
 
     def _call_tool(self, call: ToolCall) -> Any:
-        tool = self._tools[call.name]
-        result = tool(*call.args)
+        tool = self._tools.get(call.name) or self._catalog[call.name]
+        if isinstance(tool, SchemaTool):
+            result = tool.callable(_schema_argument(call))
+        else:
+            result = tool(*call.args)
         if inspect.isawaitable(result):
 
             async def wait() -> Any:
@@ -1016,14 +1399,23 @@ class AgentSandbox:
             if not isinstance(error, Exception):
                 raise TypeError("error must be an Exception instance")
             name = type(error).__name__
-            message = "host function failed" if self._redact else str(error)
+            public = getattr(error, "_pydeno_public", False) is True
+            message = (
+                "host function failed" if self._redact and not public else str(error)
+            )
             record = ["ans", "e", name, message]
             sent: BaseException = _error_class(name)(message)
+            # Redaction was decided just above (and recorded); the runtime must not redo it.
+            sent._pydeno_public = True  # type: ignore[attr-defined]
         else:
             # A TypeError here is the caller's to fix; nothing has been answered yet.
             encoded = _encode(value)
             record = ["ans", "v", encoded]
             sent_value = _decode(encoded)  # exactly what a replay will send
+            if self._catalog and step.name in (_SEARCH, _DESCRIBE):
+                # Before the answer is delivered, so the guest can call what it just found. From
+                # the answer itself (live and on replay alike), not from who produced it.
+                self._core.discovered.update(_found(sent_value, self._catalog))
         self._record(record)
         run = self._run
         assert run is not None
@@ -1046,9 +1438,20 @@ class AgentSandbox:
             self._paused = None
             if self._core.rt.is_closed():
                 # The worker is gone (crash, hard timeout, memory kill, `max_pause`): nothing
-                # more can run, so give back the thread now rather than at `close()`.
+                # more can run, so give back the thread now rather than at `close()`. `dump()`
+                # cuts this run off at the last checkpoint, keeping what it spent of the budget.
                 self._dead = True
+                self._lost = [
+                    "lost",
+                    min(
+                        self._core.calls_made - self._checkpoint_calls, _MAX_LOST_CALLS
+                    ),
+                    _lost_reason(step),
+                ]
                 self._core.shutdown()
+            elif self._records is not None:
+                self._checkpoint = len(self._records)
+                self._checkpoint_calls = self._core.calls_made
         return step
 
     def _record(self, record: list[Any]) -> None:
@@ -1072,32 +1475,41 @@ class AgentSandbox:
         `associated_data` (for example a tenant or session id) is folded into the signature but not
         stored: `load` must be given the same bytes, so a journal cannot be loaded as another tenant's.
         A journal alone cannot stop *rollback* (loading an older dump of the same session restores
-        its spent tool budget): keep a counter in your own store and put it in `associated_data`."""
+        its spent tool budget): keep a counter in your own store and put it in `associated_data`.
+
+        After the worker died (a crash, a hard timeout, a memory kill, ``max_pause``) the journal
+        is the one as of the last run that ended with the worker alive: the run that killed it
+        is left out (it is never replayed) and marked by a ``lost`` record, which also carries
+        the tool calls it made, so a loaded session has spent them too (dying cannot refund the
+        budget). `load` restores the state after the last good run. Tool calls that run made
+        did run, with their side effects; a loaded session does not know about them."""
         self._enter()
         try:
-            if self._dead:
-                raise JournalError(
-                    "the session's worker is gone; its last run cannot be replayed (dump after "
-                    "each step you want to be able to return to)"
-                )
             if self._records is None:
                 raise JournalError(
                     f"the journal grew past max_journal_bytes={self._max_journal_bytes}"
                 )
+            records = self._records
+            if self._dead:
+                assert self._lost is not None
+                records = records[: self._checkpoint] + [self._lost]
+            config: dict[str, Any] = {
+                "clock_ms": self._clock_ms,
+                "random_seed": self._random_seed,
+                "max_tool_calls": self._max_tool_calls,
+                "namespace": self._namespace,
+                "tools": list(self._tools),
+                "release": _engine_version().decode(errors="replace"),
+                "redact": self._redact,
+            }
+            # Only when they differ from what a journal without them means, so a session that
+            # uses neither writes exactly the journal it always did.
+            if self._max_result_bytes != DEFAULT_MAX_RESULT_BYTES:
+                config["max_result_bytes"] = self._max_result_bytes
+            if self._catalog:
+                config["catalog"] = list(self._catalog)
             payload = json.dumps(
-                {
-                    "format": _JOURNAL_FORMAT,
-                    "config": {
-                        "clock_ms": self._clock_ms,
-                        "random_seed": self._random_seed,
-                        "max_tool_calls": self._max_tool_calls,
-                        "namespace": self._namespace,
-                        "tools": list(self._tools),
-                        "release": _engine_version().decode(errors="replace"),
-                        "redact": self._redact,
-                    },
-                    "records": self._records,
-                },
+                {"format": _JOURNAL_FORMAT, "config": config, "records": records},
                 separators=(",", ":"),
                 ensure_ascii=True,
             ).encode()
@@ -1110,18 +1522,19 @@ class AgentSandbox:
         cls,
         blob: bytes,
         key: bytes,
-        tools: Mapping[str, Callable[..., Any]],
+        tools: Mapping[str, Any] | collections.abc.Sequence[Any],
         *,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         associated_data: bytes = b"",
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
         **options: Any,
     ) -> AgentSandbox:
         """Rebuild a session from `dump()` output by replaying it on a fresh worker.
 
         The MAC is checked before anything runs. Recorded tool answers are replayed; the real
         tools are never called. If the session was dumped while paused at a tool call, the
-        returned session is paused at the same call (`pending`). Pass the same tools (by name)
-        and the same runtime options as the original. Raises `JournalError` for a blob that is
+        returned session is paused at the same call (`pending`). Pass the same tools and
+        ``tools_catalog`` (by name) and the same runtime options as the original. Raises `JournalError` for a blob that is
         not authentic or not well-formed, and `ReplayDivergence` (closing the new session) if
         the guest does not behave exactly as recorded."""
         if not isinstance(blob, (bytes, bytearray)):
@@ -1141,21 +1554,36 @@ class AgentSandbox:
             raise JournalError(
                 "the journal was recorded with a different redact_host_errors setting"
             )
-        tools = _check_tools(tools)
-        if list(tools) != config["tools"]:
+        entries = _normalize_tools(tools)
+        catalog = _normalize_catalog(tools_catalog)
+        names = list(entries) + ([_SEARCH, _DESCRIBE] if catalog else [])
+        if names != config["tools"]:
             raise JournalError(
-                f"the journal was recorded with tools {config['tools']}, not {list(tools)}"
+                f"the journal was recorded with tools {config['tools']}, not {names}"
             )
-        for owned in ("clock", "random_seed", "max_tool_calls", "namespace"):
+        if list(catalog) != config.get("catalog", []):
+            raise JournalError(
+                "the journal was recorded with a different tools_catalog "
+                f"({len(config.get('catalog', []))} tools, not {len(catalog)})"
+            )
+        for owned in (
+            "clock",
+            "random_seed",
+            "max_tool_calls",
+            "namespace",
+            "max_result_bytes",
+        ):
             if owned in options:
                 raise TypeError(f"{owned} comes from the journal")
         session = cls(
-            tools,
+            entries,
             max_tool_calls=config["max_tool_calls"],
             namespace=config["namespace"],
+            tools_catalog=catalog or None,
             clock=config["clock_ms"] / 1000,
             random_seed=config["random_seed"],
             max_journal_bytes=max_journal_bytes,
+            max_result_bytes=config.get("max_result_bytes", DEFAULT_MAX_RESULT_BYTES),
             **options,
         )
         try:
@@ -1174,6 +1602,20 @@ class AgentSandbox:
         pending: tuple[str, Any] | None = None
         for index, record in enumerate(records):
             op = record[0]
+            if op == "lost":
+                # A run the worker died in, left out of the journal: only what it spent of the
+                # tool budget is carried over.
+                if pending is not None or isinstance(step, ToolCall):
+                    raise JournalError(
+                        f"record {index}: a lost run in the middle of another one"
+                    )
+                self._core.calls_made += record[1]
+                self._lost_runs += 1
+                self._record(record)
+                if self._records is not None:
+                    self._checkpoint = len(self._records)
+                    self._checkpoint_calls = self._core.calls_made
+                continue
             if op == "run":
                 if pending is not None or isinstance(step, ToolCall):
                     raise JournalError(
@@ -1238,19 +1680,28 @@ class AgentSandbox:
         return f"AgentSandbox(tools={list(self._tools)!r}, {state}, calls={self.calls_made})"
 
 
-def _prelude(names: list[str], namespace: str | None) -> str:
+def _prelude(
+    names: list[str], namespace: str | None, catalog_ns: str | None = None
+) -> str:
     """Installed once, before any guest code: wraps each tool so the session knows which calls are
     in flight, and defines the settle step every run ends with.
 
     Why: a worker that finishes a command while one of its tool calls is unanswered breaks when
     that answer arrives later, so a run must not end with a call in flight (a call the code did
     not `await`, or one still running when `Promise.all` rejected). Intrinsics are captured first,
-    so a guest that later replaces `Promise` or `Set` methods only breaks its own runs."""
+    so a guest that later replaces `Promise` or `Set` methods only breaks its own runs.
+
+    With a catalog, `catalog_ns` becomes a Proxy whose unknown properties are functions calling
+    the one hidden catalog dispatcher with their own name. The host decides what such a call may
+    reach (`_Core.on_catalog_call`); the proxy only spells it `tools.name(args)`. No catalog name
+    appears here, so this script is the same size whatever the catalog holds."""
     holder = f"globalThis[{json.dumps(namespace)}]" if namespace else "globalThis"
     return f"""(() => {{
   "use strict";
   const call = Function.prototype.call.bind.bind(Function.prototype.call);
   const apply = Reflect.apply;
+  const has = Reflect.has;
+  const get = Reflect.get;
   const then = call(Promise.prototype.then);
   const add = call(Set.prototype.add);
   const remove = call(Set.prototype.delete);
@@ -1259,16 +1710,29 @@ def _prelude(names: list[str], namespace: str | None) -> str:
   const push = call(Array.prototype.push);
   const allSettled = Promise.allSettled.bind(Promise);
   const inflight = new Set();
+  const track = (raw, name) => ({{ [name](...args) {{
+    const p = apply(raw, undefined, args);
+    add(inflight, p);
+    const done = () => {{ remove(inflight, p); }};
+    then(p, done, done);
+    return p;
+  }} }})[name];
   const holder = {holder};
   for (const name of {json.dumps(names)}) {{
-    const raw = holder[name];
-    holder[name] = {{ [name](...args) {{
-      const p = apply(raw, undefined, args);
-      add(inflight, p);
-      const done = () => {{ remove(inflight, p); }};
-      then(p, done, done);
-      return p;
-    }} }}[name];
+    holder[name] = track(holder[name], name);
+  }}
+  const catalogNs = {json.dumps(catalog_ns)};
+  if (catalogNs !== null) {{
+    const dispatch = track(globalThis["{_CATALOG_CALL}"], "{_CATALOG_CALL}");
+    try {{ delete globalThis["{_CATALOG_CALL}"]; }} catch {{}}
+    let target = globalThis[catalogNs];
+    if (typeof target !== "object" || target === null) target = {{}};
+    globalThis[catalogNs] = new Proxy(target, {{
+      get(t, key, receiver) {{
+        if (typeof key !== "string" || key === "then" || has(t, key)) return get(t, key, receiver);
+        return {{ [key](...args) {{ return dispatch(key, ...args); }} }}[key];
+      }},
+    }});
   }}
   Object.defineProperty(globalThis, "{_SETTLE}", {{
     value: async () => {{
@@ -1303,24 +1767,209 @@ def _wrap(code: str) -> str:
     )
 
 
-def _check_tools(
-    tools: Mapping[str, Callable[..., Any]],
-) -> dict[str, Callable[..., Any]]:
-    if not isinstance(tools, Mapping):
-        raise TypeError("tools must be a mapping of name -> callable")
-    checked: dict[str, Callable[..., Any]] = {}
-    for name, func in tools.items():
+# Inherited by every object, so a catalog tool with one of these names would be unreachable through
+# the proxy (it answers names the namespace object does not already have).
+_OBJECT_MEMBERS = frozenset(
+    {
+        "__defineGetter__",
+        "__defineSetter__",
+        "__lookupGetter__",
+        "__lookupSetter__",
+        "isPrototypeOf",
+        "propertyIsEnumerable",
+        "toLocaleString",
+        "then",
+    }
+)
+
+
+def _normalize_tools(
+    tools: Mapping[str, Any] | collections.abc.Sequence[Any],
+) -> dict[str, Any]:
+    """``name -> callable | SchemaTool``, checked. Accepts a mapping (values: callables,
+    `SchemaTool`s or mappings describing one) or a sequence of schema tools."""
+    if isinstance(tools, Mapping):
+        items: list[tuple[str | None, Any]] = list(tools.items())
+    elif isinstance(tools, collections.abc.Sequence) and not isinstance(
+        tools, (str, bytes)
+    ):
+        items = [(None, tool) for tool in tools]
+    else:
+        raise TypeError(
+            "tools must be a mapping of name -> callable or SchemaTool, or a list of SchemaTools"
+        )
+    checked: dict[str, Any] = {}
+    for name, tool in items:
+        if name is None or isinstance(tool, (SchemaTool, Mapping)):
+            schema = as_schema_tool(tool, name)
+            if schema.name in checked:
+                raise ValueError(f"tool {schema.name!r} is given twice")
+            checked[schema.name] = schema
+            continue
         ToolBridge._check_name(name, what="tool name")  # noqa: SLF001
-        if not callable(func):
+        if not callable(tool):
             raise TypeError(f"tool {name!r} is not callable")
-        required_kw = _spec(name, func).required_keyword_only
+        required_kw = _spec(name, tool).required_keyword_only
         if required_kw:
             raise ValueError(
                 f"tool {name!r} has required keyword-only parameters {list(required_kw)}, "
                 "which JavaScript cannot pass (it calls tools positionally)"
             )
-        checked[name] = func
+        checked[name] = tool
     return checked
+
+
+def _normalize_catalog(
+    catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None,
+) -> dict[str, SchemaTool]:
+    if catalog is None:
+        return {}
+    entries = _normalize_tools(catalog)
+    for name, tool in entries.items():
+        if not isinstance(tool, SchemaTool):
+            raise TypeError(
+                f"catalog tool {name!r} must be a SchemaTool (or a mapping describing one): "
+                "the catalog is searched by name and description and declared from its schema"
+            )
+        if name in _OBJECT_MEMBERS or name == _CATALOG_CALL:
+            raise ValueError(f"{name!r} cannot be a catalog tool name")
+    return entries  # type: ignore[return-value]
+
+
+def _search_tool(catalog: Mapping[str, SchemaTool]) -> Callable[..., Any]:
+    def search_tools(
+        query: str, limit: int = _DEFAULT_SEARCH_RESULTS
+    ) -> list[dict[str, str]]:
+        """Search the tool catalog by keywords. Returns up to `limit` (at most 50) matches as
+        `{name, description}`, best first. Found tools become callable in this session."""
+        if not isinstance(query, str):
+            raise _public(
+                TypeError("search_tools(query, limit?): query must be a string")
+            )
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= _MAX_SEARCH_RESULTS
+        ):
+            raise _public(
+                TypeError(
+                    f"search_tools(query, limit?): limit must be an integer from 1 to "
+                    f"{_MAX_SEARCH_RESULTS}"
+                )
+            )
+        terms = list(
+            dict.fromkeys(re.findall(r"[a-z0-9]+", query[:_MAX_QUERY_CHARS].lower()))
+        )[:32]
+        scored: list[tuple[int, str]] = []
+        for name, tool in catalog.items():
+            lowered = name.lower()
+            words = set(re.findall(r"[a-z0-9]+", lowered.replace("_", " ")))
+            description = tool.description.lower()
+            score = 0
+            for term in terms:
+                if term in words:
+                    score += 4
+                elif term in lowered:
+                    score += 2
+                if term in description:
+                    score += 1
+            if score or not terms:
+                scored.append((score, name))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [
+            {"name": name, "description": catalog[name].description[:_SUMMARY_CHARS]}
+            for _, name in scored[:limit]
+        ]
+
+    return search_tools
+
+
+def _describe_tool(catalog: Mapping[str, SchemaTool], ns: str) -> Callable[..., Any]:
+    def describe_tool(name: str) -> dict[str, Any]:
+        """Describe one catalog tool: `{name, description, input_schema, output_schema,
+        typescript, usage}`. The tool becomes callable in this session."""
+        tool = catalog.get(name) if isinstance(name, str) else None
+        if tool is None:
+            raise _public(
+                ToolNotFoundError(
+                    "no such tool in the catalog; search_tools(query) lists the ones that exist"
+                )
+            )
+        decls, functions = schema_declarations([tool], declare=False, indent="  ")
+        doc, signature = functions[tool.name]
+        typescript = "\n".join(
+            [
+                f"declare namespace {ns} {{",
+                *decls,
+                *([""] if decls else []),
+                *doc,
+                f"  function {signature};",
+                "}",
+            ]
+        )
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": json.loads(json.dumps(tool.input_schema)),
+            "output_schema": None
+            if tool.output_schema is None
+            else json.loads(json.dumps(tool.output_schema)),
+            "typescript": typescript,
+            "usage": f"const result = await {ns}.{tool.name}({{ ... }});",
+        }
+
+    return describe_tool
+
+
+def _found(answer: Any, catalog: Mapping[str, SchemaTool]) -> set[str]:
+    """Catalog names in a `search_tools`/`describe_tool` answer as the guest receives it."""
+    items = answer if isinstance(answer, list) else [answer]
+    return {
+        item["name"]
+        for item in items[:_MAX_SEARCH_RESULTS]
+        if isinstance(item, dict)
+        and isinstance(item.get("name"), str)
+        and item["name"] in catalog
+    }
+
+
+def _plain(value: Any, depth: int = 0) -> Any:
+    """Guest data as a schema tool's callable gets it: `undefined` object properties dropped,
+    other `undefined`s as `None`, sets as lists."""
+    if depth > 200:
+        raise ValueError("arguments are nested too deeply")
+    if isinstance(value, dict):
+        return {
+            k: _plain(v, depth + 1)
+            for k, v in value.items()
+            if not isinstance(v, JsUndefined)
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_plain(v, depth + 1) for v in value]
+    if isinstance(value, JsUndefined):
+        return None
+    return value
+
+
+def _schema_argument(call: ToolCall) -> dict[str, Any]:
+    args = call.args
+    if len(args) == 1 and isinstance(args[0], dict):
+        return _plain(args[0])
+    if not args or (
+        len(args) == 1 and (args[0] is None or isinstance(args[0], JsUndefined))
+    ):
+        return {}
+    raise _public(
+        TypeError(
+            f"{call.name} takes one object argument, like {call.name}({{field: value}}); got "
+            + (f"{len(args)} arguments" if len(args) > 1 else type(args[0]).__name__)
+        )
+    )
+
+
+def _lost_reason(step: Step) -> str:
+    name = step.error_type if isinstance(step, Failed) else "WorkerCrashed"
+    return name if _SAFE_ERROR_NAME.fullmatch(name) else "Error"
 
 
 # ---------------------------------------------------------------------------
@@ -1401,12 +2050,26 @@ def _parse(payload: bytes) -> dict[str, Any]:
     names = config.get("tools")
     if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
         raise bad("tools")
+    result_cap = config.get("max_result_bytes", DEFAULT_MAX_RESULT_BYTES)
+    if not plain_int(result_cap) or result_cap <= 0:
+        raise bad("max_result_bytes")
+    catalog = config.get("catalog", [])
+    if not isinstance(catalog, list) or not all(isinstance(n, str) for n in catalog):
+        raise bad("catalog")
     for record in records:
         ok = (
             isinstance(record, list)
             and record
             and (
                 (record[0] == "run" and len(record) == 2 and isinstance(record[1], str))
+                or (
+                    record[0] == "lost"
+                    and len(record) == 3
+                    and plain_int(record[1])
+                    and 0 <= record[1] <= _MAX_LOST_CALLS
+                    and isinstance(record[2], str)
+                    and _SAFE_ERROR_NAME.fullmatch(record[2]) is not None
+                )
                 or (
                     record[0] == "obs"
                     and len(record) == 3

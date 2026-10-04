@@ -9,8 +9,10 @@ tools from that code, to keep what it computed between turns, to stop at a tool 
 
 | Monty | `AgentSandbox` |
 |---|---|
-| external functions | `tools={"name": callable}` (sync or async), one call budget per session |
-| type-checking stubs, `TOOL_DESCRIPTION` | `typescript_stubs()`, `describe_tools()` |
+| external functions | `tools={"name": callable}` (sync or async), or tools described by JSON Schema; one call budget per session |
+| type-checking stubs, `TOOL_DESCRIPTION` | `typescript_stubs()`, `describe_tools()` (from signatures or schemas) |
+| - | `tools_catalog=`: hundreds of tools, only `search_tools`/`describe_tool` declared |
+| result with captured output | `execute(code)` → `ExecutionResult(status, stdout, stderr, result, error, error_type, truncated)` |
 | session state between feeds | globals and functions persist between `run()`/`start()` calls |
 | `feed_start` → `FunctionSnapshot` → `resume` | `start()` → `ToolCall` → `resume()` |
 | `dump()` / `load_snapshot()` | `dump(key)` / `AgentSandbox.load(blob, key, tools)` by deterministic **replay** (see the limits below) |
@@ -37,7 +39,44 @@ with AgentSandbox({"query_rows": query_rows, "analyze_sentiment": analyze_sentim
 ```
 
 `run()` returns the code's result or raises what it failed with (a `JavaScriptError` for a bug in
-the model's code, which you can hand back to the model as a retry prompt).
+the model's code, which you can hand back to the model as a retry prompt). `execute()` runs the
+same way but returns one bounded result instead of raising; see below.
+
+## Results and console output
+
+```python
+result = session.execute(code)
+result.status      # "Succeeded" or "Failed"
+result.stdout      # console.log / info / debug, one line per call, in call order
+result.stderr      # console.warn / error / trace
+result.result      # the returned value as JSON data (None when the run failed)
+result.error       # "TypeError: x is not a function", or None
+result.error_type  # "TypeError", "ReferenceError", "ToolBudgetError", "RuntimeTimeout", ...
+result.truncated   # some console output was cut
+result.to_dict()   # plain JSON, e.g. for a tool result or an API response
+```
+
+The same shape comes from every step: `Done` and `Failed` carry `stdout`, `stderr` and
+`truncated` (the output of the whole run, across its pauses) plus `status`, `result` and
+`error_type`, and `step.to_result()` builds the `ExecutionResult`. `IsolatedRuntime.execute(code)`
+and `execute_async(code)` return it too (pass `capture_console=True` when creating the runtime to
+collect console output; every `console.*` call is then a host call).
+
+- **Bounded output.** `stdout` and `stderr` are each capped at `max_output_bytes` (default 64 KiB,
+  UTF-8, never splitting a character). Past the cap the stream ends with a `[truncated]` line,
+  `truncated` is set, and further calls are dropped without being formatted.
+- **Bounded result.** `result` is the value as compact JSON data: `undefined` becomes `null`,
+  bytes become base64 text, dates ISO 8601 text, sets lists, `NaN`/`Infinity` `null`. If that is
+  larger than `max_result_bytes` (default 1 MiB), the run is `Failed` with
+  `error_type == "ResultTooLarge"`, and the session stays usable (`run()` raises
+  `pydeno.ResultTooLarge`). The cap decides outcomes, so it is recorded in the journal.
+- **Stable `error_type`.** For an error the guest threw it is the JavaScript `name` (`TypeError`,
+  `SyntaxError`, a tool's `ToolBudgetError`, or a name the guest's code chose). For a failure on the
+  host's side it is the pydeno exception class (`RuntimeTimeout`, `WorkerCrashed`,
+  `ResultTooLarge`). A guest error that claims one of those host-side names is reported as
+  `Error`, so `error_type` never says "the worker timed out" because the guest said so.
+- `execute()` still raises for misuse (non-string code, a paused or closed session).
+- `Done(3) == step` compares the value only; the output fields are not part of equality.
 
 ## How the model's code runs
 
@@ -100,6 +139,119 @@ declare function query_rows(sql: string, params?: Record<string, unknown> | null
 Every tool returns `Promise<...>`. Both helpers also exist as module-level functions that take the
 tools mapping, so you can build a prompt without starting a worker.
 
+## Tools described by JSON Schema
+
+A host with tools described by JSON Schema (MCP style) rather than Python signatures passes them as
+`SchemaTool`s, or as plain mappings with the same keys (`inputSchema`/`outputSchema`, the MCP
+spellings, work too), in a list or as values of the tools mapping, mixed with plain callables:
+
+```python
+from pydeno import AgentSandbox, SchemaTool
+
+def get_weather(args: dict) -> dict:
+    city = args.get("city")
+    if not isinstance(city, str) or len(city) > 100:      # validate: it is untrusted guest data
+        raise ValueError("city must be a short string")
+    return {"city": city, "temp": 21.5}
+
+weather = SchemaTool(
+    name="get_weather",
+    description="Current weather for a city.",
+    input_schema={"type": "object", "properties": {"city": {"type": "string"}},
+                  "required": ["city"]},
+    output_schema={"type": "object", "properties": {"temp": {"type": "number"}}},
+    callable=get_weather,
+)
+session = AgentSandbox([weather, {"name": "now", "description": "...", "callable": now}])
+```
+
+A schema tool takes **one object argument**: the guest writes
+`await get_weather({city: "Paris"})` and the callable receives `{"city": "Paris"}` (properties set
+to `undefined` are dropped; no argument means `{}`). Anything else throws a `TypeError` in the
+guest that says how to call the tool. `typescript_stubs()` declares it from the schemas:
+
+```ts
+/** Current weather for a city. */
+declare function get_weather(args: {
+  city: string;
+}): Promise<{
+  temp?: number;
+}>;
+```
+
+Objects (required and optional properties, `additionalProperties` as an index signature), arrays
+and `prefixItems` tuples, `enum`/`const` literals, `anyOf`/`oneOf` unions, `allOf`
+intersections, `nullable: true` and `type: [..., "null"]`, and `$ref` into `$defs` (nested and
+recursive) as named `interface`/`type` declarations, shared by all the tools. Without an
+`output_schema` the result is `Promise<unknown>`.
+
+**pydeno does not validate the arguments against the schema.** The schema tells the model what to
+send; the callable must check what it got, as for any tool (type, range, length, allowed values),
+before acting on it. A JSON Schema validator in the callable is a fine way to do that.
+
+## A lazy tool catalog
+
+Declaring a hundred tools in every prompt is expensive. With `tools_catalog=`, those tools are
+**not** declared: only `search_tools(query, limit?)` and `describe_tool(name)` are, so the declared
+surface (`describe_tools()`, `typescript_stubs()`, and the script installed in the guest) is the
+same size whether the catalog holds three tools or three thousand.
+
+```python
+session = AgentSandbox({"send_reply": send_reply}, tools_catalog=mcp_tools, max_tool_calls=50)
+```
+
+```js
+const hits = await search_tools("translate text");      // [{name, description}], best first
+const info = await describe_tool(hits[0].name);         // {name, description, input_schema,
+                                                         //  output_schema, typescript, usage}
+return await tools.translate_text({text: "hi", to: "de"});
+```
+
+- A catalog tool becomes callable once a `search_tools` or `describe_tool` answer has shown it to
+  the guest, and stays callable for the rest of the session (and after `load()`: discovery is
+  replayed from the recorded answers). Before that, `tools.anything(...)` throws a
+  `ToolNotDiscoveredError` whose message tells the model to search first. This message is never
+  redacted: pydeno wrote it, and it holds nothing of yours.
+- Catalog tools are called as `<namespace or "tools">.<name>(args)`, with one object argument.
+  The guest-side `tools` object is a proxy that turns every unknown name into a call to one hidden
+  host function; **what such a call may reach is decided in the host**, which checks that the name
+  is in the catalog and has been found. Replacing the proxy only fools the guest's own code.
+- Catalog calls, `search_tools` and `describe_tool` are tool calls like any other: `ToolCall`
+  steps when you drive the session with `start`/`resume`, and charged to `max_tool_calls`. A
+  refused (not yet found) call is not charged. A driver can run any call with the real tool via
+  `session.call(step)`; what an answer to `search_tools` names is what becomes callable, whoever
+  produced the answer.
+- Search is a plain keyword match over names and descriptions (names weigh more), up to `limit`
+  results (default 10, at most 50); descriptions in results are cut at 200 characters.
+- `load()` needs the same `tools_catalog` (by name) as the original session.
+
+## Budgets per tool
+
+`max_tool_calls` is one budget for the whole session. For a limit on one tool (at most three
+emails, say), count in the tool itself and raise when it is spent; the guest sees an Error whose
+`name` is your exception's class and can stop or adapt:
+
+```python
+from pydeno import ToolBudgetError
+
+def per_tool_budget(fn, limit):
+    used = 0
+    def guarded(*args):
+        nonlocal used
+        if used >= limit:
+            raise ToolBudgetError(f"{fn.__name__} may be called {limit} times per session")
+        used += 1
+        return fn(*args)
+    guarded.__name__, guarded.__doc__ = fn.__name__, fn.__doc__
+    return guarded
+
+session = AgentSandbox({"send_email": per_tool_budget(send_email, 3), ...})
+```
+
+The counter lives in your process, so it does not survive `load()` by itself; tools are not called
+during replay, so a restored session starts from zero unless you keep the count in your own store
+(next to the journal) and restore it.
+
 ## Pausing at tool calls
 
 `start(code)` runs until the code calls a tool, then hands you the call instead of running it:
@@ -159,7 +311,8 @@ during replay), and compares every outcome with the recorded hash.
   also records the pydeno release and the `redact_host_errors` setting and is refused, before any worker
   starts, if either differs. **A journal alone cannot prevent rollback:** loading an older dump of the
   same session restores the tool budget it had spent since. If that matters, keep a counter in your own
-  store and include it in `associated_data`.
+  store and include it in `associated_data`, or use
+  [`SessionPool`](advanced/async-agent-sessions.md#sessionpool), which does exactly that.
 - **Bounded.** `max_journal_bytes` (default 8 MiB) caps the journal. Past it the session keeps
   working, but `dump()` raises; `load()` refuses a blob larger than its own cap before checking it.
 - **Divergence is detected, not prevented.** The clock is frozen and `Math.random` seeded for every
@@ -172,8 +325,15 @@ during replay), and compares every outcome with the recorded hash.
 - **Cost.** Loading re-runs everything the session ever ran (minus the tools' own time). A session
   with long computations is slow to restore. Monty's snapshots restore in constant time; this does
   not.
-- **What cannot be dumped.** A session whose worker crashed, timed out or was killed cannot be
-  dumped (its last run cannot be replayed). Dump after each step you may want to return to.
+- **After a crash, the last good state.** When a run kills the worker (a crash, a hard timeout,
+  a memory kill, `max_pause`), `dump()` still works: it returns the journal as of the last run that
+  ended with the worker alive, and `load()` restores exactly that state. The run that died is never
+  replayed; it is marked in the journal by a `lost` record (and counted in `session.lost_runs`).
+  That record carries the tool calls the lost run made, so a loaded session has spent them too: a
+  crash cannot be used to win back tool budget. Those calls did run, with their side effects; the
+  restored session simply does not know their answers. A run that failed with a JavaScript error
+  or `ResultTooLarge` is a completed run and stays in the journal. Signing, `associated_data`, the
+  release check and `max_journal_bytes` apply unchanged.
 - **Tools' side effects are not replayed**, which is the point: a restored session does not send
   the email a second time. It also means the journal is the only record of what a tool returned;
   if the outside world changed since, the restored session still sees the old answers.
@@ -190,8 +350,13 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
 - **Errors are redacted** by default: the guest learns a failing tool's exception class, not its
   message. Use `redact_host_errors=False` only for tools whose errors carry nothing sensitive.
 - **The budget** (`max_tool_calls`) counts every call over the session's life, across `start`,
-  `resume` and `run`, and survives `load()`. A call over budget throws a `ToolBudgetError` in the
-  guest and never reaches you.
+  `resume` and `run`, and survives `load()` (also of a journal dumped after a crash). A call over
+  budget throws a `ToolBudgetError` in the guest and never reaches you.
+- **The catalog is enforced in the host.** A catalog tool is reachable only through one hidden
+  host function that refuses names that are not in the catalog or not yet found.
+- **Console output is a host call.** The session routes `console.*` to the parent to capture it,
+  so with `max_host_calls=` set, console calls count against it. Output is capped per run
+  (`max_output_bytes`); a `RuntimeConfig(on_console=...)` you pass still sees every call.
 - **One session per trust unit.** Everything in a session can see everything else in it. Do not
   share a session, or a journal, between users.
 - **Cleanup.** Each session owns one worker process and one thread. `close()` (or the `with` block)
@@ -201,20 +366,35 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
 ## API
 
 ```python
-AgentSandbox(tools, *, max_tool_calls=None, namespace=None, clock=None, random_seed=None,
-             timeout=30.0, max_pause=600.0, max_journal_bytes=8 MiB, **isolated_runtime_options)
+AgentSandbox(tools, *, max_tool_calls=None, namespace=None, tools_catalog=None, clock=None,
+             random_seed=None, timeout=30.0, max_pause=600.0, max_journal_bytes=8 MiB,
+             max_output_bytes=64 KiB, max_result_bytes=1 MiB, **isolated_runtime_options)
 
 session.run(code) -> Any
+session.execute(code) -> ExecutionResult
 session.start(code) -> ToolCall | Done | Failed
 session.resume(step, value) / session.resume(step, error=exc) -> ToolCall | Done | Failed
+session.call(step) -> Any                      # run the real tool for a ToolCall
 session.pending -> ToolCall | None
 session.dump(key, *, associated_data=b"") -> bytes
-AgentSandbox.load(blob, key, tools, *, max_journal_bytes=8 MiB, associated_data=b"", **isolated_runtime_options)
+AgentSandbox.load(blob, key, tools, *, max_journal_bytes=8 MiB, associated_data=b"",
+                  tools_catalog=None, **isolated_runtime_options)
 session.describe_tools() -> str
 session.typescript_stubs() -> str
 session.calls_made, session.calls_remaining, session.clock, session.random_seed
+session.catalog_names, session.discovered_tools, session.lost_runs
 session.close(), session.is_closed()
+
+Done(value, stdout, stderr, truncated) / Failed(error, stdout, stderr, truncated)
+    .status, .result, .error_type, .to_result() -> ExecutionResult
+ExecutionResult(status, stdout, stderr, result, error, error_type, truncated).to_dict()
+SchemaTool(name, description, input_schema, callable, output_schema=None)
+IsolatedRuntime(..., capture_console=False).execute(code) / await .execute_async(code)
 ```
 
 `namespace="tools"` installs the tools as `tools.query_rows(...)` instead of globals; the prompt
 helpers follow it.
+
+For an asyncio service, `AsyncAgentSandbox` is this class with coroutine methods and no thread per
+session, and `SessionPool` manages many of them per user: see
+[Async agent sessions and the session pool](advanced/async-agent-sessions.md).

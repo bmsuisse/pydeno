@@ -245,6 +245,37 @@ replays a journal), is future work. Today it raises `NotImplementedError`.
   `handle_call(wrap_validation_errors=False)`, `ToolsetTool`, `WrapperToolset`. It is tested
   against pydantic-ai 2.46, so pin a compatible range.
 
+## Tools described by JSON Schema
+
+Tools that come as JSON Schema with a callable (MCP style) rather than as Python functions can be
+handed to `JSCodeMode` directly, or turned into an ordinary pydantic-ai toolset:
+
+```python
+from pydeno import SchemaTool
+from pydeno.integrations.pydantic_ai import JSCodeMode, schema_toolset
+
+weather = SchemaTool(
+    name="get_weather",
+    description="Current weather for a city.",
+    input_schema={"type": "object", "properties": {"city": {"type": "string"}},
+                  "required": ["city"]},
+    output_schema={"type": "object", "properties": {"temp": {"type": "number"}}},
+    callable=lambda args: {"temp": lookup(args["city"])},
+)
+
+agent = Agent("openai:gpt-5", capabilities=[JSCodeMode(schema_tools=[weather])])
+# or: Agent(..., toolsets=[schema_toolset([weather])], capabilities=[JSCodeMode()])
+```
+
+Plain mappings with the same keys (`inputSchema`/`outputSchema` too) work in place of
+`SchemaTool`. Each callable gets the arguments object as one `dict`; the `output_schema` is the
+tool's return schema, so the snippet sees `Promise<{temp?: number}>`. pydantic-ai does **not**
+validate the arguments of such a tool against its schema (`Tool.from_schema` skips that), so
+validate them in the callable. For a per-tool call budget, count inside the tool and raise
+`ModelRetry` or `ToolFailed` when it is spent (see [Agent sessions](agent-sessions.md#budgets-per-tool)).
+For a catalog too large to declare, `AgentSandbox(tools_catalog=...)` declares only
+`search_tools`/`describe_tool` ([Agent sessions](agent-sessions.md#a-lazy-tool-catalog)).
+
 ## The schema converter
 
 `schema_tools_to_dts(tools, namespace="tools")` is the converter behind the tool description, and
