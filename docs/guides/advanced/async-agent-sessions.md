@@ -125,7 +125,9 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
 ```
 
 - **`await pool.get(owner, session_id)`** leases the session: the live one if there is one,
-  otherwise it is restored from the store by replay, otherwise a fresh session starts.
+  otherwise it is restored from the store by replay, otherwise a fresh session starts. If the
+  session's worker died and its journal is over `max_journal_bytes`, `get` stores the journal that
+  keeps the spent budget and raises `JournalTooLarge`; the next `get` starts from that.
 - **`await pool.release(owner, session_id)`** dumps the journal, stores it with the TTL and ends the
   lease. The session stays live (no replay on the next `get`) until it is evicted.
 - **`await pool.drop(owner, session_id)`** closes the session (killing a run in progress, even
@@ -133,8 +135,9 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
   made while `drop` is at work waits for it and then starts a fresh session. The fresh session has
   a fresh tool budget: `drop` is your decision to start over.
 - **`pool.session(owner, session_id)`** is `get` + `release` as an `async with` block. The release
-  also happens when the block raises: a JavaScript error leaves the session valid, and a session
-  whose worker died is not persisted. The block releases only its own lease: if the session was
+  also happens when the block raises: a JavaScript error leaves the session valid, and for a
+  session whose worker died it stores the last good journal plus a `lost` record charging what the
+  lost run spent. The block releases only its own lease: if the session was
   dropped and leased again by someone else meanwhile, leaving the block leaves that lease alone.
   A bare `release(owner, session_id)` ends whatever lease the session has, so prefer the block.
 - `tools` takes whatever `AgentSandbox` takes (callables, `SchemaTool`s, MCP-style mappings) or an
@@ -146,7 +149,10 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
   ids appear in error messages: do not put secrets in them.
 - A `release` that fails (for example while a run of the session is still in progress) leaves the
   session live: it is not evicted until a later `release` stores it, and `close()` tries once
-  more, so nothing it ran or spent is forgotten.
+  more (and warns, with a `RuntimeWarning`, about any session it cannot store). The same holds for
+  a session the host keeps using after its `release`.
+- `close()` stores every session not stored since it last ran, leased ones as after a crash (a run
+  in progress is killed and recorded as lost), and wakes waiting `get`s, which raise `RuntimeError`.
 - A journal that expires (`ttl`) is gone like a dropped one: the next `get` starts a fresh session
   with a fresh tool budget. Keep `ttl` at least as long as budgets must hold.
 
@@ -161,9 +167,10 @@ process that owns the store). Each pool keeps live sessions in memory, so a lock
 `release` does not make two pools one: what one pool runs is only in the store once it releases.
 The pool checks what it can: `get` compares a live session with the counter in the store and
 restores the stored journal when another pool stored a newer one, and `release` refuses to store
-over a newer journal (`StaleJournal`, the live copy is discarded). That catches sequential use of
-one session through two pools; two releases at the same moment can still both pass the check,
-because a store's `get`/`set` cannot compare-and-set. It costs one store read per `get` of a live
+over a newer journal (`StaleJournal`, the live copy is discarded). That only catches one pool
+picking a session up after the other released it. **Any overlapping leases of one session in two
+pools can together use more than its budget**: each lease runs on its own copy, and the second
+release is refused only after its calls ran. The checks cost one store read per `get` of a live
 session.
 
 ### Rollback protection

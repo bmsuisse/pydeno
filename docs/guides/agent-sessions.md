@@ -379,7 +379,7 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
   sequences, carriage returns; tab and newline stay), bidirectional controls, line and paragraph
   separators, and invisible format characters (zero-width spaces and joiners, variation selectors,
   soft hyphen, BOM, Unicode tag characters, ...) with `?`, the same set the CLI uses (emoji
-  sequences render as their parts), so guest output cannot drive or disguise what a terminal or log
+  sequences show as separate emoji with `?` between them), so guest output cannot drive or disguise what a terminal or log
   shows. Values are not changed: a result, a tool argument, or the text a `print_callback` of your
   own receives is exactly what the guest produced. Treat all of it as untrusted when you put it in
   a prompt, a page or a query.

@@ -71,9 +71,11 @@ restrictions under Security below; see
     journal outgrew `max_journal_bytes` (a journal without state that charges the spent calls is
     stored instead), when calls on one session overlap, and when a release fails (the session then
     stays live until a release succeeds). `get` checks a live session against the stored counter
-    and `release` refuses (`StaleJournal`) to store over a newer journal, so pools that share a
-    store do not each hand out a session's budget; sessions must still be routed to one pool.
-    Ids must be valid UTF-8. **Behaviour change.**
+    and `release` refuses (`StaleJournal`) to store over a newer journal; this catches one pool
+    picking up a session another released, not overlapping leases in two pools, so sessions must
+    be routed to one pool. `close()` stores every unsaved session (leased ones as after a crash),
+    warns about any it cannot store, and wakes waiting `get`s. Ids must be valid UTF-8.
+    **Behaviour change.**
   - Agent sessions queue concurrent tool calls past `max_inflight_host_calls - 1` and issue them in
     order; they were refused depending on timing, which the journal did not record.
   - A tool raising a `BaseException` during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run

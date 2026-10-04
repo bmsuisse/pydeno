@@ -29,6 +29,7 @@ import contextlib
 import re
 import struct
 import time
+import warnings
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
@@ -137,13 +138,17 @@ class _Entry:
         "barrier",
         "counter",
         "dirty",
+        "dropped",
         "gone",
         "last_used",
         "lock",
         "owner",
+        "persisting",
         "sandbox",
+        "saved_size",
         "session_id",
         "waiters",
+        "woken",
     )
 
     def __init__(self, owner: str, session_id: str) -> None:
@@ -154,19 +159,36 @@ class _Entry:
         self.counter = 0
         self.last_used = time.monotonic()
         self.waiters = 0
-        self.gone = False  # evicted or dropped: a waiter that wakes up must start over
+        # Evicted, dropped or the pool closed: a waiter that wakes up must start over. `woken`
+        # wakes the waiters at once (the lease holder of a replaced entry may never release it).
+        self.gone = False
+        self.woken = asyncio.Event()
+        # Set only by `drop`: nothing may be stored for this entry any more.
+        self.dropped = False
         # Held by `drop` while it works: a `get` waits on it instead of restoring (from a store
         # `drop` is busy emptying) a session that is being dropped.
         self.barrier = False
-        # Leased since its journal was last stored: eviction keeps it (closing it would forget
-        # what it ran and spent since) until a `release` stores it.
+        # Leased since its journal was last stored, or run since (`saved_size`): eviction keeps
+        # it (closing it would forget what it ran and spent) until a `release` stores it.
         self.dirty = False
+        self.saved_size = -1
+        self.persisting = False  # a `_persist` is in progress
+
+    def mark_gone(self) -> None:
+        self.gone = True
+        self.woken.set()
 
     def idle(self) -> bool:
         return not self.lock.locked() and self.waiters == 0
 
+    def unsaved(self) -> bool:
+        sandbox = self.sandbox
+        return self.dirty or (
+            sandbox is not None and sandbox._journal_size != self.saved_size  # noqa: SLF001
+        )
+
     def evictable(self) -> bool:
-        return self.idle() and not self.dirty
+        return self.idle() and not self.unsaved()
 
 
 class _Default:
@@ -308,6 +330,7 @@ class SessionPool:
         wait = self._acquire_timeout if timeout is _DEFAULT else timeout
         k = (owner, session_id)
         while True:
+            self._check_open()  # again after every await: close() may have run meanwhile
             entry = self._entries.get(k)
             if entry is None:
                 if await self._make_room(owner):
@@ -316,9 +339,11 @@ class SessionPool:
             self._entries.move_to_end(k)
             entry.waiters += 1
             try:
-                await _acquire(entry.lock, wait, owner, session_id)
+                acquired = await _acquire(entry, wait, owner, session_id)
             finally:
                 entry.waiters -= 1
+            if not acquired:  # dropped, evicted or closed while waiting: start over
+                continue
             if entry.gone:
                 entry.lock.release()
                 continue
@@ -329,7 +354,7 @@ class SessionPool:
                     self._forget(entry)
                 entry.lock.release()
                 raise
-            if not ready:  # dropped while it was being prepared: start over
+            if not ready:  # dropped or closed while it was being prepared: start over
                 entry.lock.release()
                 continue
             break
@@ -355,18 +380,21 @@ class SessionPool:
                 self._close_later(sandbox)
             elif sandbox.is_closed():
                 # Crashed, killed or timed out since its last lease. Store what it still holds
-                # (its last good state, and what a lost run spent), then restore from that.
-                entry.sandbox = None
-                self._close_later(sandbox)
+                # (its last good state, and what a lost run spent), then restore from that. The
+                # dead copy stays in the entry until that is stored, so a failure is retried.
                 await self._persist(entry, sandbox)
                 if entry.gone:
                     return False
+                if entry.sandbox is sandbox:
+                    entry.sandbox = None
+                    self._close_later(sandbox)
         if entry.sandbox is None:
             restored = await self._restore(entry)
             if entry.gone:
                 await _quiet_close(restored)
                 return False
             entry.sandbox = restored
+            entry.saved_size = restored._journal_size  # noqa: SLF001
         return True
 
     async def release(self, owner: str, session_id: str) -> None:
@@ -420,10 +448,17 @@ class SessionPool:
         stored one). A dump that fails because the journal is over its cap stores a journal
         without state that keeps the spent budget (`JournalTooLarge`). Any other failure leaves
         the session live and unevictable until a later `release` stores it."""
+        entry.persisting = True
+        try:
+            await self._persist_held(entry, sandbox)
+        finally:
+            entry.persisting = False
+
+    async def _persist_held(self, entry: _Entry, sandbox: AsyncAgentSandbox) -> None:
         owner, session_id = entry.owner, entry.session_id
         counter = entry.counter + 1
         stored = await self._stored_counter(owner, session_id)
-        if entry.gone:
+        if entry.dropped:
             return
         if stored > entry.counter:
             entry.sandbox = None
@@ -446,18 +481,20 @@ class SessionPool:
             ) from None
         if await self._write(entry, counter, blob):
             entry.dirty = False
+            entry.saved_size = sandbox._journal_size  # noqa: SLF001
 
     async def _write(self, entry: _Entry, counter: int, blob: bytes) -> bool:
         """Store a signed journal under `counter` and record the counter, unless the session is
-        dropped meanwhile (a journal that lands after the drop is deleted again)."""
+        dropped meanwhile (a journal that lands after the drop is deleted again). Closing the
+        pool or evicting the session does not stop a write: what it stores is the session's."""
         owner, session_id = entry.owner, entry.session_id
-        if entry.gone:
+        if entry.dropped:
             return False
         journal_key = self._journal_key(owner, session_id)
         await self._store.set(
             journal_key, _ENVELOPE + _COUNTER.pack(counter) + blob, ttl=self._ttl
         )
-        if entry.gone:
+        if entry.dropped:
             await self._store.delete(journal_key)
             return False
         await self._store.set(
@@ -466,7 +503,7 @@ class SessionPool:
             ttl=self._counter_ttl,
         )
         entry.counter = counter
-        if entry.gone:
+        if entry.dropped:
             await self._store.delete(journal_key)
             return False
         return True
@@ -488,7 +525,8 @@ class SessionPool:
         self._entries[k] = barrier
         sandbox = None
         if entry is not None:
-            entry.gone = True
+            entry.dropped = True
+            entry.mark_gone()  # wakes its waiters: they start over and wait for the barrier
             sandbox, entry.sandbox = entry.sandbox, None
         try:
             if (
@@ -513,8 +551,8 @@ class SessionPool:
         self, owner: str, session_id: str, *, timeout: float | None = _DEFAULT
     ) -> AsyncIterator[AsyncAgentSandbox]:
         """``async with pool.session(owner, sid) as sb:`` -- `get`, then `release` on exit
-        (also on an exception: a JavaScript error leaves the session valid, and a dead worker is
-        simply not persisted)."""
+        (also on an exception: a JavaScript error leaves the session valid; for a dead worker the
+        release stores its last good journal plus a ``lost`` record, as `release` does)."""
         sandbox = await self.get(owner, session_id, timeout=timeout)
         try:
             yield sandbox
@@ -564,31 +602,62 @@ class SessionPool:
 
     async def close(self) -> None:
         """Stop eviction and close every live session (leased ones too, killing a run in
-        progress). Journals already stored stay in the store. Idempotent."""
+        progress). Every session not stored since it last ran is stored first, leased ones as a
+        `release` after a crash would (the last good journal plus a ``lost`` record), so closing
+        the pool forgets nothing a session ran or spent; a session that cannot be stored is
+        reported with a `RuntimeWarning`. Waiting `get` calls raise `RuntimeError`. Journals
+        already stored stay in the store. Idempotent."""
         self._closed = True
         if self._sweeper is not None:
             self._sweeper.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._sweeper
             self._sweeper = None
-        # A session whose last release failed (so it is still unstored) gets one more try, so
-        # closing the pool does not forget what it ran and spent since its last stored journal.
-        for entry in list(self._entries.values()):
-            if entry.dirty and entry.idle() and entry.sandbox is not None:
-                async with entry.lock:
-                    with contextlib.suppress(Exception):
-                        await self._persist(entry, entry.sandbox)
         entries = list(self._entries.values())
+        for entry in entries:
+            entry.mark_gone()  # waiters wake (and find the pool closed); releases end at once
+        for entry in entries:
+            sandbox = entry.sandbox
+            if sandbox is not None and entry.lock.locked() and not entry.persisting:
+                # Leased: end any run now, so what it spent is final (and recorded as lost).
+                if sandbox._core.in_use():  # noqa: SLF001
+                    sandbox._abort("the SessionPool was closed")  # noqa: SLF001
+                await _quiet_close(sandbox)
+        failures: list[str] = []
+        for entry in entries:
+            if entry.persisting:
+                # A release is storing it right now: let it finish.
+                await entry.lock.acquire()
+                entry.lock.release()
+                continue
+            sandbox = entry.sandbox
+            if sandbox is None or entry.dropped or not entry.unsaved():
+                continue
+            try:
+                await self._persist(entry, sandbox)
+            except JournalTooLarge:
+                pass  # stored as a journal that keeps the spent budget
+            except Exception as exc:  # noqa: BLE001 - reported below
+                failures.append(
+                    f"{entry.owner}:{entry.session_id} ({type(exc).__name__})"
+                )
         self._entries.clear()
         sandboxes = []
         for entry in entries:
-            entry.gone = True
             if entry.sandbox is not None:
                 sandboxes.append(entry.sandbox)
                 entry.sandbox = None
         await asyncio.gather(
             *(s.close() for s in sandboxes), *self._closing, return_exceptions=True
         )
+        if failures:
+            warnings.warn(
+                f"SessionPool.close(): {len(failures)} session(s) could not be stored, so what "
+                f"they ran and spent since their last stored journal is lost: "
+                f"{', '.join(failures[:10])}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     async def __aenter__(self) -> SessionPool:
         self._check_open()
@@ -692,27 +761,28 @@ class SessionPool:
     ) -> None:
         """The journal is over its cap: store, under the next counter (so no earlier journal
         loads again), a journal with no state that charges every tool call the session made,
-        then close the session. The next `get` restores a fresh session with that budget spent.
+        then forget the session. The next `get` restores a fresh session with that budget spent.
         Everything is written while the lease is held and the session is still in the map, so a
-        `get` waiting for it sees the new journal, never the previous one."""
+        `get` waiting for it sees the new journal, never the previous one. If the write fails
+        (or is cancelled), the closed session stays in the entry, unsaved, and the next `get`,
+        `release` or `close()` tries again."""
         owner, session_id = entry.owner, entry.session_id
         with contextlib.suppress(Exception):
             await (
                 sandbox.close()
             )  # first: the spending is final once the worker is gone
+        entry.dirty = True
         config, records = sandbox._spent_journal("JournalTooLarge")  # noqa: SLF001
         blob = _seal_journal(
             config, records, self._key, _bound(owner, session_id, counter)
         )
-        try:
-            await self._write(entry, counter, blob)
-        finally:
-            entry.sandbox = None
-            entry.dirty = False
-            self._forget(entry)
+        await self._write(entry, counter, blob)
+        entry.sandbox = None
+        entry.dirty = False
+        self._forget(entry)
 
     def _forget(self, entry: _Entry) -> None:
-        entry.gone = True
+        entry.mark_gone()
         k = (entry.owner, entry.session_id)
         if self._entries.get(k) is entry:
             del self._entries[k]
@@ -787,19 +857,38 @@ def _bound(owner: str, session_id: str, counter: int) -> bytes:
 
 
 async def _acquire(
-    lock: asyncio.Lock, wait: float | None, owner: str, session_id: str
-) -> None:
+    entry: _Entry, wait: float | None, owner: str, session_id: str
+) -> bool:
+    """Take the entry's lease. False (lease not taken) if the entry is dropped, evicted or the
+    pool closed while waiting: the holder of a replaced entry may never release it."""
+    lock = entry.lock
     if not lock.locked():
         await lock.acquire()
-        return
+        return True
+    if entry.gone:
+        return False
     if wait is not None and wait <= 0:
         raise SessionBusy(f"session {owner}:{session_id} is leased")
+    acquiring = asyncio.ensure_future(lock.acquire())
+    woken = asyncio.ensure_future(entry.woken.wait())
     try:
-        await asyncio.wait_for(lock.acquire(), wait)
-    except asyncio.TimeoutError:
-        raise SessionBusy(
-            f"session {owner}:{session_id} stayed leased for {wait:g}s"
-        ) from None
+        await asyncio.wait(
+            {acquiring, woken}, timeout=wait, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        woken.cancel()
+        if not acquiring.done():
+            acquiring.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(acquiring, return_exceptions=True)
+    if acquiring.cancelled() or acquiring.exception() is not None:
+        if entry.gone:
+            return False
+        raise SessionBusy(f"session {owner}:{session_id} stayed leased for {wait:g}s")
+    if entry.gone:
+        lock.release()
+        return False
+    return True
 
 
 async def _quiet_close(sandbox: AsyncAgentSandbox) -> None:
