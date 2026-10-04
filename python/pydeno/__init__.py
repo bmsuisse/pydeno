@@ -40,6 +40,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         describe_tools,
         typescript_stubs,
     )
+    from ._aio import AsyncIsolatedRuntime
     from ._isolated import IsolatedRuntime, WorkerCrashed
     from ._polyfills import WEB_POLYFILLS
     from ._snapshot_auth import (
@@ -61,6 +62,7 @@ _LAZY = {
     "JournalError": "_agent",
     "describe_tools": "_agent",
     "typescript_stubs": "_agent",
+    "AsyncIsolatedRuntime": "_aio",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
     "WEB_POLYFILLS": "_polyfills",
@@ -350,6 +352,7 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
 
 
 __all__ = [
+    "AsyncIsolatedRuntime",
     "eval",
     "eval_async",
     "get_default_runtime",
