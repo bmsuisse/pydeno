@@ -917,8 +917,9 @@ class TestFailureAndCleanup:
             assert not s._core.thread.is_alive()  # noqa: SLF001 - released without close()
             with pytest.raises(RuntimeError, match="gone"):
                 s.run("return 1")
-            with pytest.raises(JournalError):
-                s.dump(KEY)
+            # The journal as of the last good run (none here): the crashed run is left out.
+            # (Loading it is covered in tests/test_agent_journal_recovery.py.)
+            assert s.dump(KEY).startswith(b"pydeno-agent2\x00")
             s.close()
         _assert_back_to_baseline(baseline, "3 crashes mid-pause")
 
