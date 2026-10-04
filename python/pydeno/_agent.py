@@ -60,7 +60,6 @@ from ._isolated import (
     _checked_console,
     _clock_ms,
     _limit_seconds,
-    _seconds,
 )
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
 from ._result import (

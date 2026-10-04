@@ -32,7 +32,9 @@ SECONDS = ["request_timeout", "max_host_wait", "write_stall_timeout"]
 
 @pytest.mark.parametrize("name", SECONDS)
 @pytest.mark.parametrize("value", [*NON_FINITE, 0, -1, -0.5, True, "3"])
-def test_deadline_values_must_be_positive_finite_numbers(name: str, value: object) -> None:
+def test_deadline_values_must_be_positive_finite_numbers(
+    name: str, value: object
+) -> None:
     with pytest.raises((ValueError, TypeError)):
         _session_options(**{name: value})
 
@@ -83,7 +85,9 @@ def test_runtimes_refuse_a_nan_deadline(cls: type) -> None:
         cls(request_timeout=math.nan, prewarm=False)
 
 
-@pytest.mark.parametrize("kw", [{"timeout": math.nan}, {"max_pause": math.inf}, {"timeout": -1}])
+@pytest.mark.parametrize(
+    "kw", [{"timeout": math.nan}, {"max_pause": math.inf}, {"timeout": -1}]
+)
 def test_agent_sandbox_refuses_non_finite_deadlines(kw: dict[str, float]) -> None:
     with pytest.raises((ValueError, TypeError)):
         AgentSandbox({}, **kw)

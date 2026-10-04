@@ -1190,7 +1190,11 @@ class IsolatedRuntime:
         self._run_sync_handler(handler, decoded, cid, pump)
 
     def _run_sync_handler(
-        self, handler: Callable[..., Any], decoded: list[Any], cid: int, pump: _Pump | None
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump | None,
     ) -> None:
         try:
             self._guard.in_host_call = True
