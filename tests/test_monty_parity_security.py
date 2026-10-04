@@ -165,11 +165,60 @@ class TestKnownOffHeapResiduals:
         with pytest.raises(JavaScriptError):
             rt.eval("new WebAssembly.Memory({initial: 65536})")
 
-    @pytest.mark.xfail(reason="resizable ArrayBuffers grow through the page allocator")
     def test_resizable_buffer_growth_is_budgeted(self) -> None:
+        """No longer a residual: the bridge charges resizable buffers to the same budget."""
         rt = _capped()
         with pytest.raises(JavaScriptError):
             rt.eval("new ArrayBuffer(8, {maxByteLength: 2 ** 33}).resize(2 ** 33)")
+
+
+# A refused buffer allocation must leave nothing behind for a later, genuine heap overflow.
+# V8 retries a refused allocation (GC, retry, GC, retry, last-resort GC, which calls the
+# near-heap-limit callback, then a final attempt), so the final attempt used to re-flag the
+# refusal after the callback had consumed it. The next real heap overflow then took that stale
+# flag for a refusal, handed V8 its limit back unchanged, and V8 aborted the process
+# (FatalProcessOutOfMemory) in a few percent of runs. Many rounds, in a subprocess, so an abort
+# fails the test instead of the suite.
+_REFUSAL_THEN_OVERFLOW = textwrap.dedent(
+    """
+    from pydeno import Runtime, RuntimeConfig
+    MIB = 1024 * 1024
+    outcomes = {{}}
+    for i in range({rounds}):
+        rt = Runtime(RuntimeConfig(max_heap_size=48 * MIB, max_buffer_bytes=8 * MIB))
+        # Twice: a second refusal must still be a catchable RangeError, not a termination.
+        refused = rt.eval(
+            "(() => {{ const out = []; for (let k = 0; k < 2; k++) {{"
+            " try {{ new ArrayBuffer(16 * 2 ** 20); out.push('allocated') }}"
+            " catch (e) {{ out.push(e.name) }} }} return out.join('+') }})()"
+        )
+        try:
+            rt.eval("const a = []; for (;;) a.push(new Array(1e5).fill(1.5))")
+            overflow = "returned"
+        except Exception as exc:
+            overflow = "heap" if "Heap limit exceeded" in str(exc) else type(exc).__name__
+        key = (refused, overflow)
+        outcomes[key] = outcomes.get(key, 0) + 1
+        try:
+            rt.close()
+        except Exception:
+            pass
+    print(sorted(outcomes.items()))
+    """
+)
+
+
+def test_a_refused_buffer_does_not_disarm_a_later_heap_overflow() -> None:
+    done = subprocess.run(
+        [sys.executable, "-c", _REFUSAL_THEN_OVERFLOW.format(rounds=300)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert done.returncode == 0, (done.returncode, done.stderr[-600:])
+    assert done.stdout.strip() == "[(('RangeError+RangeError', 'heap'), 300)]", (
+        done.stdout
+    )
 
 
 _SINKS = {

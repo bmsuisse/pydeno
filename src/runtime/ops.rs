@@ -24,7 +24,9 @@ use deno_error::JsErrorBox;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use pyo3_async_runtimes::TaskLocals;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 /// Execution mode for Python op handlers.
@@ -108,6 +110,204 @@ pub struct PythonOpEntry {
 /// Global asyncio task locals for all async ops in this runtime.
 #[derive(Clone)]
 pub struct GlobalTaskLocals(pub Option<TaskLocals>);
+
+/// The `max_buffer_bytes` budget the ArrayBuffer allocator charges to (`None`: no cap). The
+/// bridge charges resizable buffers to it, which V8 allocates past the embedder's allocator.
+#[derive(Clone, Default)]
+pub struct BufferBudget(pub Option<Arc<crate::runtime::capped_allocator::Budget>>);
+
+/// The resizable buffers the bridge has charged, by the id stored on each as a private symbol:
+/// a weak handle and the bytes it currently holds. Weak, so a buffer the guest dropped is found
+/// collected at the next sweep and gives its bytes back; the sweep runs when a charge would
+/// exceed the cap, after a forced GC, so churn through short-lived resizable buffers does not
+/// exhaust the budget inside one synchronous run.
+pub struct ResizableBuffers {
+    next_id: u64,
+    entries: HashMap<u64, TrackedBuffer>,
+    /// Table size at which the next cheap sweep (no GC: drop the entries whose handle V8 has
+    /// emptied) runs. Doubles with the live count, so the table never holds more than about
+    /// twice the live buffers, and tiny buffers that never touch the cap cannot grow it without
+    /// bound.
+    sweep_at: usize,
+}
+
+/// A charged buffer: V8's weak handle to it and the bytes it holds of the budget.
+type TrackedBuffer = (v8::Weak<v8::Object>, usize);
+
+/// The table as OpState holds it: shared with the allocator's refusal path (see
+/// `capped_allocator::set_thread_sweeper`), which runs on the same isolate thread.
+pub type SharedBuffers = Rc<RefCell<ResizableBuffers>>;
+
+/// First cheap sweep after this many entries.
+const SWEEP_START: usize = 1024;
+/// Hard bound on tracked resizable buffers. A guest keeping this many alive (each one also a
+/// JS object on its heap) is refused the next, with the same RangeError as an exhausted cap.
+const MAX_TRACKED: usize = 1 << 22;
+
+impl Default for ResizableBuffers {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            entries: HashMap::new(),
+            sweep_at: SWEEP_START,
+        }
+    }
+}
+
+impl ResizableBuffers {
+    /// Drop the entries whose buffer V8 has collected, giving their bytes back. No GC here:
+    /// callers that need one run it first. Cost is linear in the table, so it runs on a cap hit,
+    /// on a table that doubled, and when the allocator refuses a fixed-length buffer.
+    pub fn sweep(&mut self, budget: &crate::runtime::capped_allocator::Budget) {
+        self.entries.retain(|_, (handle, bytes)| {
+            if handle.is_empty() {
+                budget.release(*bytes);
+                false
+            } else {
+                true
+            }
+        });
+        self.sweep_at = (self.entries.len() * 2).max(SWEEP_START);
+    }
+}
+
+/// Private-symbol key for the id a charged buffer carries; invisible to JavaScript.
+const BUFFER_ID_KEY: &str = "pydeno.buffer#id";
+
+/// Whole non-negative byte counts only; anything else the bridge could be tricked into passing
+/// (`NaN`, a negative, a fraction) is refused rather than rounded.
+fn byte_count(raw: f64) -> Option<usize> {
+    (raw.is_finite() && raw >= 0.0 && raw.fract() == 0.0 && raw <= usize::MAX as f64)
+        .then_some(raw as usize)
+}
+
+extern "C" {
+    // POSIX; on every platform pydeno builds for. No crate needed for one call.
+    fn getpagesize() -> std::ffi::c_int;
+}
+
+/// The OS page size, read once.
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        // SAFETY: `getpagesize` takes no arguments and only reads a constant.
+        let size = unsafe { getpagesize() };
+        usize::try_from(size)
+            .ok()
+            .filter(|s| *s > 0)
+            .unwrap_or(4096)
+    })
+}
+
+/// What a resizable backing store of `bytes` really commits: V8 maps and commits it in whole
+/// pages, so a one-byte buffer holds a page of RSS. Charging the raw `byteLength` let 40,000
+/// one-byte buffers (40 KB charged) commit hundreds of MB. Zero stays zero (nothing committed).
+fn committed_pages(bytes: usize) -> usize {
+    if bytes == 0 {
+        return 0;
+    }
+    let page = page_size();
+    bytes.div_ceil(page).saturating_mul(page)
+}
+
+/// Set the bytes `buffer` (a resizable ArrayBuffer or growable SharedArrayBuffer) holds of the
+/// `max_buffer_bytes` budget: the growth is reserved (after a GC and sweep if the cap is hit),
+/// a shrink is released, zero forgets the buffer. `false` when the cap would be exceeded; `true`
+/// when there is no cap.
+#[op2(nofast, reentrant)]
+fn op_pydeno_buffer_charge<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: Rc<RefCell<OpState>>,
+    buffer: v8::Local<'s, v8::Value>,
+    bytes: f64,
+) -> bool {
+    let Some(budget) = state
+        .borrow()
+        .try_borrow::<BufferBudget>()
+        .and_then(|b| b.0.clone())
+    else {
+        return true;
+    };
+    let (Some(bytes), Ok(buffer)) = (byte_count(bytes), v8::Local::<v8::Object>::try_from(buffer))
+    else {
+        return false;
+    };
+    // The budget counts what the process commits, so every charge, release and table entry is
+    // in whole pages; the bridge keeps talking in byteLengths.
+    let bytes = committed_pages(bytes);
+    let Some(key_name) = v8::String::new(scope, BUFFER_ID_KEY) else {
+        return false;
+    };
+    let key = v8::Private::for_api(scope, Some(key_name));
+    let known = buffer
+        .get_private(scope, key)
+        .filter(|value| value.is_number())
+        .and_then(|value| value.number_value(scope))
+        .filter(|id| *id >= 1.0 && id.fract() == 0.0)
+        .map(|id| id as u64);
+
+    // The table is borrowed in short scopes only: a GC (`low_memory_notification`) must never
+    // run while it is held, and the allocator's refusal path borrows it too.
+    let Some(table) = state.borrow().try_borrow::<SharedBuffers>().cloned() else {
+        return false;
+    };
+    let known = known.filter(|id| table.borrow().entries.contains_key(id));
+    let id = match known {
+        Some(id) => id,
+        None => {
+            let mut full = {
+                let mut tracked = table.borrow_mut();
+                if tracked.entries.len() >= tracked.sweep_at {
+                    tracked.sweep(&budget);
+                }
+                tracked.entries.len() >= MAX_TRACKED
+            };
+            if full {
+                // Collect before refusing: the table may be full of buffers the guest dropped.
+                scope.low_memory_notification();
+                let mut tracked = table.borrow_mut();
+                tracked.sweep(&budget);
+                full = tracked.entries.len() >= MAX_TRACKED;
+            }
+            if full {
+                return false;
+            }
+            let id = {
+                let mut tracked = table.borrow_mut();
+                // Never reused: ids stay exact as doubles far past any count a runtime reaches.
+                tracked.next_id += 1;
+                tracked.next_id
+            };
+            let tag = v8::Number::new(scope, id as f64);
+            buffer.set_private(scope, key, tag.into());
+            let handle = v8::Weak::new(scope, buffer);
+            table.borrow_mut().entries.insert(id, (handle, 0));
+            id
+        }
+    };
+    let current = table.borrow().entries.get(&id).map_or(0, |entry| entry.1);
+    if bytes > current {
+        let growth = bytes - current;
+        if !budget.reserve(growth) {
+            // Over the cap: collect first. A resizable buffer the guest dropped still holds
+            // its bytes here until its handle is seen emptied.
+            scope.low_memory_notification();
+            table.borrow_mut().sweep(&budget);
+            if !budget.reserve(growth) {
+                return false;
+            }
+        }
+    } else {
+        budget.release(current - bytes);
+    }
+    let mut tracked = table.borrow_mut();
+    if bytes == 0 {
+        tracked.entries.remove(&id);
+    } else if let Some(entry) = tracked.entries.get_mut(&id) {
+        entry.1 = bytes;
+    }
+    true
+}
 
 impl Clone for PythonOpEntry {
     fn clone(&self) -> Self {
@@ -955,6 +1155,172 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     installGlobal(name, hostFunction(opId, mode));
   };
 
+  // `max_buffer_bytes` is enforced by the embedder's ArrayBuffer allocator, which V8 consults for
+  // fixed-length buffers only. A *resizable* ArrayBuffer (`new ArrayBuffer(n, {maxByteLength})`),
+  // a growable SharedArrayBuffer, and the copy `transfer()` makes of a resizable buffer come from
+  // V8's page allocator instead, so a guest could commit gigabytes under a cap of a few hundred
+  // megabytes and turn the promised catchable RangeError into the memory kill. Their *committed*
+  // bytes (`byteLength`, what `resize`/`grow` can touch) are charged to the same budget here, at
+  // the only places that size changes, through one op that keys each buffer by a private symbol
+  // and holds it weakly (ops.rs `op_pydeno_buffer_charge`): a dropped buffer gives its bytes back
+  // the next time the cap is hit. Fixed-length buffers, including the fixed copy
+  // `transferToFixedLength` makes, still go through the allocator and are never charged twice.
+  // Every length is converted to a number exactly once and V8 is handed that number, so the size
+  // charged is the size V8 commits: a `valueOf` that answers differently on a second call changes
+  // nothing.
+  {
+    const Charge = ops.op_pydeno_buffer_charge;
+    const ReflectConstruct = Reflect.construct;
+    const MathTrunc = Math.trunc;
+    const allocationFailed = () => new RangeErrorCtor("Array buffer allocation failed");
+
+    function guard(name, growName, isAB) {
+      const Native = globalThis[name];
+      if (typeof Native !== "function") {
+        return;
+      }
+      const Prototype = Native.prototype;
+      const ByteLength = uncurry(GetOwnPropertyDescriptor(Prototype, "byteLength").get);
+      const Resizable = uncurry(
+        GetOwnPropertyDescriptor(Prototype, isAB ? "resizable" : "growable").get
+      );
+      const NativeGrow = uncurry(Prototype[growName]);
+
+      // `buffer` is resizable; set its committed size to `newLength`, charging the growth first.
+      function grow(buffer, newLength) {
+        const n = +newLength;
+        const before = ByteLength(buffer);
+        const want = MathTrunc(n);
+        if (want > before) {
+          if (!Charge(buffer, want)) {
+            throw allocationFailed();
+          }
+          try {
+            NativeGrow(buffer, n);
+          } catch (err) {
+            Charge(buffer, before);
+            throw err;
+          }
+        } else {
+          NativeGrow(buffer, n); // a shrink, a no-op, or V8's own error for a bad length
+          Charge(buffer, ByteLength(buffer));
+        }
+      }
+
+      const Patched = function (length, options) {
+        if (new.target === undefined) {
+          throw new TypeErrorCtor("Constructor " + name + " requires 'new'");
+        }
+        const target = new.target === Patched ? Native : new.target;
+        // Read once; V8 gets exactly this value, not a second look at a guest getter.
+        const max =
+          options !== null && typeof options === "object" ? options.maxByteLength : undefined;
+        if (max === undefined) {
+          return ReflectConstruct(Native, [length], target); // fixed: the allocator charges it
+        }
+        // Born empty and grown to size: the bytes are charged before V8 commits them, and the
+        // result is the same zero-filled buffer (`length` over `maxByteLength` is still a
+        // RangeError, from the growth).
+        const buffer = ReflectConstruct(Native, [0, { __proto__: null, maxByteLength: max }], target);
+        grow(buffer, length);
+        return buffer;
+      };
+      // Same statics (`isView`, `Symbol.species`, `length`, `name`) and the same prototype object,
+      // so instances, subclasses and `instanceof` are unchanged; only the construction path differs.
+      const keys = OwnKeys(Native);
+      for (let index = 0; index < keys.length; index++) {
+        if (keys[index] !== "prototype") {
+          DefineProperty(Patched, keys[index], GetOwnPropertyDescriptor(Native, keys[index]));
+        }
+      }
+      DefineProperty(Patched, "prototype", {
+        __proto__: null,
+        value: Prototype,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+      });
+      DefineProperty(Prototype, "constructor", {
+        __proto__: null,
+        value: Patched,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+
+      const methods = {
+        __proto__: null,
+        [growName](newLength) {
+          if (!Resizable(this)) {
+            return NativeGrow(this, newLength); // V8 says what is wrong with it
+          }
+          grow(this, newLength);
+        },
+      };
+      if (isAB) {
+        // `transfer` keeps the source's resizability, so its copy of a resizable buffer is one
+        // more buffer the allocator never sees; `transferToFixedLength` hands the copy to the
+        // allocator. Either way the detached source gives its bytes back.
+        const NativeTransfer = uncurry(Prototype.transfer);
+        const NativeTransferFixed = uncurry(Prototype.transferToFixedLength);
+        const moved = (native, buffer, newLength, resizableCopy) => {
+          if (!Resizable(buffer)) {
+            return native(buffer, newLength); // fixed source: the allocator charges the copy
+          }
+          const n = newLength === undefined ? undefined : +newLength;
+          const before = ByteLength(buffer);
+          const want = n === undefined ? before : MathTrunc(n);
+          if (resizableCopy && want > before && !Charge(buffer, want)) {
+            throw allocationFailed(); // room for the copy's growth, before anything moves
+          }
+          let copy;
+          try {
+            copy = native(buffer, n);
+          } catch (err) {
+            Charge(buffer, before);
+            throw err;
+          }
+          Charge(buffer, 0); // detached
+          if (resizableCopy && !Charge(copy, ByteLength(copy))) {
+            // Unreachable (the source just gave back at least this much), kept as a guard.
+            NativeTransferFixed(copy, 0);
+            throw allocationFailed();
+          }
+          return copy;
+        };
+        methods.transfer = function transfer(newLength) {
+          return moved(NativeTransfer, this, newLength, true);
+        };
+        methods.transferToFixedLength = function transferToFixedLength(newLength) {
+          return moved(NativeTransferFixed, this, newLength, false);
+        };
+      }
+      const names = OwnKeys(methods);
+      for (let index = 0; index < names.length; index++) {
+        DefineProperty(Prototype, names[index], {
+          __proto__: null,
+          value: methods[names[index]],
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+
+      DefineProperty(globalThis, name, {
+        __proto__: null,
+        value: Patched,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+      // As much a built-in as the constructor it stands in for (the namespace check above).
+      markIntrinsic(Patched, 1);
+    }
+
+    guard("ArrayBuffer", "resize", true);
+    guard("SharedArrayBuffer", "grow", false);
+  }
+
   if (typeof globalThis.ReadableStream !== "function") {
     // Note: This minimal polyfill does not implement backpressure or BYOB readers.
     //
@@ -1115,6 +1481,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
             op_pydeno_stream_pull_py(),
             op_pydeno_stream_cancel_py(),
             op_pydeno_indexed_length(),
+            op_pydeno_buffer_charge(),
         ]),
         js_files: std::borrow::Cow::Owned(vec![ExtensionFileSource::new(
             "ext:pydeno/python_bridge.js",
