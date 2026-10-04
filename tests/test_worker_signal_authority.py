@@ -9,7 +9,9 @@ from pydeno import AsyncIsolatedRuntime, IsolatedRuntime, WorkerCrashed, classif
 from pydeno import _status
 
 
-@pytest.mark.parametrize("mode", ["off", "auto", "require"])
+@pytest.mark.parametrize(
+    "mode", ["off", "auto", pytest.param("require", marks=pytest.mark.full_sandbox)]
+)
 @pytest.mark.parametrize("asynchronous", [False, True])
 async def test_missing_signal_authority_refuses_and_reaps(
     monkeypatch, mode, asynchronous
@@ -122,3 +124,41 @@ def test_linux_without_kill_capability_refuses_before_guest_code():
         [sys.executable, "-c", program], capture_output=True, text=True, timeout=20
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_disappeared_worker_is_not_a_permission_refusal(
+    monkeypatch, asynchronous
+):
+    from types import SimpleNamespace
+
+    def gone(pid, sig):
+        raise ProcessLookupError("worker already exited")
+
+    monkeypatch.setattr(os, "kill", gone)
+    worker = SimpleNamespace(_proc=SimpleNamespace(pid=12345))
+    with pytest.raises(ProcessLookupError):
+        if asynchronous:
+            await AsyncIsolatedRuntime._check_termination_authority(worker)
+        else:
+            IsolatedRuntime._check_termination_authority(worker)
+
+
+def test_termination_refusal_does_not_recommend_auto():
+    from pydeno._front import _start_failure
+
+    error = _start_failure(
+        WorkerCrashed("supervisor termination authority is unavailable"), "require"
+    )
+    assert "sandbox='auto'" not in str(error)
+
+
+def test_failed_probe_hardening_reports_its_cause(monkeypatch):
+    note = "resource probe child exited before finishing hardening"
+    monkeypatch.setattr(
+        _status, "_measure_resource_probes", lambda deadline: ({}, note)
+    )
+    result = _status.sandbox_status()
+    assert result.termination.detail == note
+    assert any(note in warning for warning in result.warnings)
+    assert "startup refuses in all sandbox modes" in result.explain()

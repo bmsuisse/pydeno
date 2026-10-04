@@ -793,7 +793,7 @@ class IsolatedRuntime:
         # can run. Even sandbox='off' promises parent-enforced time and resource limits.
         try:
             os.kill(self._proc.pid, 0)
-        except OSError:
+        except PermissionError:
             # The trusted worker is still waiting for its first command. Let it exit through
             # the protocol: a kill fallback cannot be relied upon in this configuration.
             self.close()

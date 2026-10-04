@@ -107,6 +107,8 @@ class SandboxStatus:
             + (
                 "COMPLETE, sandbox='require' will start."
                 if self.complete
+                else "INCOMPLETE, worker startup refuses in all sandbox modes."
+                if not self.termination.applied
                 else "INCOMPLETE, sandbox='require' would refuse to start."
             ),
             f"  applied in probe: {self.applied}; required here: {sorted(self.required) or 'nothing known'}",
@@ -586,7 +588,7 @@ def _sandbox_status() -> SandboxStatus:
         )
     if not termination.applied:
         warns.append(
-            "supervisor termination authority is unavailable; worker startup refuses in all sandbox modes"
+            f"{termination.detail}; worker startup refuses in all sandbox modes"
         )
     if ran_probe and breaches:
         warns.append(

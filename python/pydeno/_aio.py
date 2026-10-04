@@ -927,7 +927,7 @@ class AsyncIsolatedRuntime:
     async def _check_termination_authority(self) -> None:
         try:
             os.kill(self._proc.pid, 0)
-        except OSError:
+        except PermissionError:
             # Startup already holds a start slot; close() would acquire it again. No guest
             # command has run, so the trusted worker can exit through the close protocol.
             try:

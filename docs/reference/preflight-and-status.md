@@ -16,19 +16,21 @@ if not status.complete:          # exactly what sandbox="require" would refuse
 ```
 
 It returns a frozen `SandboxStatus` with one `Layer(applied, detail)` per protection (`seatbelt`,
-`landlock`, `seccomp`, `empty_root`, `no_new_privs`, `privileges`, `resource_probes`, `self_test`),
+`landlock`, `seccomp`, `empty_root`, `no_new_privs`, `privileges`, `resource_probes`, `termination`, `self_test`),
 the `applied` string the worker would report, `complete`, `warnings` and `to_dict()`.
 
 How it works: it forks a throwaway child that runs the real `harden_process()`, `apply()` and the
 worker's startup self-test, so the answer is what a worker would get, while the calling process is
 never confined (a sandbox cannot be lifted, so it is only ever applied in a process that then exits).
-A second child lets it read a process's memory, CPU time and thread count the way the supervisor does,
+A second child is hardened like a worker, then the parent reads its memory, CPU time and thread count
+and tests SIGKILL permission,
 because a limit that cannot be measured never fires. It takes tens of milliseconds, never raises, kills
 and reaps anything that overruns a one-second deadline, and starts no isolate.
 
 `complete` is true when every layer `sandbox="require"` demands for this platform applied, the self-test
-found nothing the sandbox should have stopped, the resource probes work, and (Linux) the process is not
-root or can drop root. `empty_root` is a bonus layer: its absence is a warning, not a failure.
+found nothing the sandbox should have stopped, the resource probes work, termination authority is
+available, and (Linux) the process is not
+root or can drop root. Missing termination authority refuses startup in every sandbox mode. `empty_root` is a bonus layer: its absence is a warning, not a failure.
 
 ## `check_source()`: a readable early rejection, not a security boundary
 
