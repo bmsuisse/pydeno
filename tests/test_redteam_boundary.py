@@ -404,6 +404,15 @@ class TestHostText:
         assert r.stdout == "a?]0;owned????b\u200dc\n"
         assert r.stderr == "x\ty\nz\n"  # tab and newline stay
 
+    def test_invisible_text_is_cleaned_but_scripts_and_emoji_stay(self) -> None:
+        # A Unicode tag character (invisible to a reader, not to a language model), a soft hyphen
+        # and a line separator go; Hebrew, ZWNJ and an emoji with its variation selector stay.
+        with AgentSandbox({}, sandbox=MODE) as s:
+            r = s.execute(
+                "console.log('a\\u{e0041}\\u00ad\\u2028b \\u05d0\\u200c\\u2764\\ufe0f'); return 1"
+            )
+        assert r.stdout == "a???b \u05d0\u200c\u2764\ufe0f\n"
+
     def test_isolated_execute_is_cleaned(self) -> None:
         with IsolatedRuntime(sandbox=MODE, capture_console=True) as rt:
             r = rt.execute(f"console.log('{_HOSTILE}'); 1")

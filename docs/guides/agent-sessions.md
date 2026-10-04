@@ -373,8 +373,9 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
   anything else leaves the session paused at that call.)
 - **Text from the guest is cleaned where pydeno shows it to you.** `stdout`/`stderr` of a result,
   error messages and the front door's default printer replace C0/C1 control characters (escape
-  sequences, carriage returns; tab and newline stay), bidirectional overrides and isolates, and
-  zero-width spaces with `?`, so guest output cannot drive or disguise what a terminal or log
+  sequences, carriage returns; tab and newline stay), bidirectional overrides and isolates, line
+  and paragraph separators, and invisible characters (zero-width space, word joiner, soft hyphen,
+  BOM, Unicode tag characters) with `?`, so guest output cannot drive or disguise what a terminal or log
   shows. Values are not changed: a result, a tool argument, or the text a `print_callback` of your
   own receives is exactly what the guest produced. Treat all of it as untrusted when you put it in
   a prompt, a page or a query.

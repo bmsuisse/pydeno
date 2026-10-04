@@ -47,12 +47,15 @@ TRUNCATED_MARKER = "[truncated]"
 _STDOUT_LEVELS = frozenset({"log", "info", "debug"})
 # What guest text must not carry into captured output, an exception message, a log or a terminal:
 # C0 and C1 controls except tab and newline (escape sequences, carriage returns), bidirectional
-# overrides, embeddings and isolates (text that displays in another order than it reads), and the
-# invisible zero-width space, word joiner and byte-order mark. Each is replaced by "?". ZWJ/ZWNJ
-# stay: scripts and emoji need them.
+# overrides, embeddings and isolates (text that displays in another order than it reads), the
+# line and paragraph separators, and invisible characters that hide text from a reader but not
+# from a program or a language model: zero-width space, word joiner, invisible operators, soft
+# hyphen, byte-order mark and the Unicode tag characters. Each is replaced by "?". ZWJ/ZWNJ and
+# variation selectors stay: scripts and emoji need them. (The CLI applies a broader filter of its
+# own to what it prints, `pydeno._cli.inert_text`.)
 UNSAFE_TEXT = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u180e\u200b\u200e\u200f\u202a-\u202e"
-    "\u2060\u2066-\u2069\ufeff]"
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u061c\u180e\u200b\u200e\u200f"
+    "\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff\U000e0000-\U000e007f]"
 )
 _MAX_DEPTH = 200
 _GUEST_ERROR = re.compile(r"^(?:Uncaught )?([A-Za-z_$][A-Za-z0-9_$]{0,63})(?::|$)")

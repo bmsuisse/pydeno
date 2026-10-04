@@ -270,6 +270,9 @@ _C_CAP = 240.0
 _C_KEY = b"slice-c-journal-key-0123456789"
 _C_PROBES: dict[str, Probe] = {}
 _C_BIDI = "\u202e\u2066"
+# Invisible to a reader, not to a program or a language model: a Unicode tag character (the
+# ASCII-smuggling range) and a word joiner.
+_C_INVISIBLE = "\U000e0041\u2060"
 
 
 def _c_probe(fn: Probe) -> Probe:
@@ -986,7 +989,10 @@ def captured_console_carries_terminal_escapes() -> bool:
 
     from pydeno import AgentSandbox, AsyncAgentSandbox, IsolatedRuntime
 
-    code = f"console.log('a\\x1b]0;owned\\x07{_C_BIDI}b'); console.error('\\x1b[2J'); return 1"
+    code = (
+        f"console.log('a\\x1b]0;owned\\x07{_C_BIDI}{_C_INVISIBLE}b');"
+        " console.error('\\x1b[2J'); return 1"
+    )
     texts = []
     with AgentSandbox({}, sandbox="require") as s:
         r = s.execute(code)
@@ -1001,7 +1007,7 @@ def captured_console_carries_terminal_escapes() -> bool:
             return [r.stdout, r.stderr]
 
     texts += asyncio.run(go())
-    return any(c in text for text in texts for c in _C_BIDI + "\x1b\x07")
+    return any(c in text for text in texts for c in _C_BIDI + _C_INVISIBLE + "\x1b\x07")
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--slice-c-probe":

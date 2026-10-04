@@ -83,7 +83,8 @@ restrictions under Security below; see
     `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot; `feed_start`
     surfaces snapshots only for the feed's declared functions.
   - Captured console output, error messages and the default printer replace control characters,
-    bidirectional overrides and zero-width characters with `?`. **Behaviour change** for output that
+    bidirectional overrides, line separators and invisible characters (zero-width, soft hyphen, BOM,
+    Unicode tags) with `?`. **Behaviour change** for output that
     contained them.
 
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
