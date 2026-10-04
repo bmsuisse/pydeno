@@ -123,6 +123,8 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Escape sequences and native stack frames in crash messages | **Fixed.** |
 | A guest could kill the worker's only reply-reading thread by calling an async host function without awaiting it | **Fixed.** Found while building the agent-sessions layer. |
 | Decoder amplification: a 6 MB frame can become ~200 MB of Python objects | **Open.** Lower node budget planned. |
+| Non-finite limit values (NaN, infinity) were accepted and silently disabled the limit | **Fixed** (0.8). Validated at construction; probe `non_finite_limits_are_refused`. |
+| Console calls paused the hard deadline like tool calls, so a console flood stretched a run up to `max_host_wait` | **Fixed** (0.8). Console handling is charged to the guest; probe `console_flood_does_not_stretch_the_hard_deadline`. |
 
 ### Guest surface
 

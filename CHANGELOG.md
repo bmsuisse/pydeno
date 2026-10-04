@@ -28,10 +28,24 @@
   `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
   gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
 
-Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+Nothing changes for existing code, except the two limit fixes under Security; see
+[`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
 
+- **Limit values are validated.** `request_timeout`, `max_host_wait`, `write_stall_timeout` and per-call
+  `timeout=` must be `None` or a finite number of seconds above zero (or a `timedelta`); `timeout_grace`
+  a finite number `>= 0`; `max_memory` an `int >= 1`; `max_host_calls` an `int >= 0`;
+  `max_inflight_host_calls` an `int >= 1`. NaN or infinity was accepted before and turned the limit off
+  without saying so (every comparison with NaN is false); Python's `json` parses both, so they could come
+  from a config file. Applies to `IsolatedRuntime`, `AsyncIsolatedRuntime`, pool `checkout()`, and
+  `AgentSandbox`/`AsyncAgentSandbox` (including `runtime=`). *Upgrade note:* such values, and bools,
+  strings or floats for counts, now raise `ValueError`/`TypeError` at construction.
+- **Console output counts against the hard deadline.** The deadline pauses while the host runs a tool,
+  and console calls were treated the same way, so time spent handling a flood of `console.*` output
+  stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`. Console handling time is
+  now charged to the guest; tools still pause the deadline. *Upgrade note:* with a slow `on_console` /
+  `print_callback`, a chatty guest now times out at its deadline instead of running longer.
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
   `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
