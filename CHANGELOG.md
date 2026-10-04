@@ -27,6 +27,12 @@
   tool call, fails generically for the guest, is logged once per session for the host, and raises
   `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
   gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
+- **Cargo feature `inspector`** (on by default, so the published wheels are unchanged). It gates the DevTools
+  inspector server and its network crates (`hyper`, `hyper-util`, `fastwebsockets`, `http`, `http-body-util`,
+  tokio's `net`). A `--no-default-features` build keeps `InspectorConfig` as a type, but `Runtime` with an
+  inspector configured raises `RuntimeError` ("built without inspector support"). `pydeno._pydeno._INSPECTOR_AVAILABLE`
+  reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
+  size and dependency difference. See `docs/guides/advanced/inspector.md`.
 
 Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 

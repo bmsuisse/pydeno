@@ -297,6 +297,78 @@ jobs:
           path: wheels
       - run: scripts/linux_matrix.sh wheels python:3.13-slim default
 
+  # The DevTools inspector server is the cargo feature `inspector` (on by default). This builds the
+  # extension without it, runs the isolated-runtime suites and the feature test against that build,
+  # and prints what the feature costs: wheel/.so size and the dependency difference (#43).
+  minimal-build:
+    name: minimal build (no default features)
+    timeout-minutes: 60
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: minimal-build
+
+      # A plain venv, not `uv sync`: syncing would build and install the default-feature project.
+      - name: Tools
+        run: |
+          uv venv .min-venv
+          uv pip install --python .min-venv/bin/python maturin \
+            "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
+
+      - name: Build both wheels (release)
+        run: |
+          .min-venv/bin/maturin build --release --no-default-features \
+            -i .min-venv/bin/python --out dist-minimal
+          .min-venv/bin/maturin build --release \
+            -i .min-venv/bin/python --out dist-default
+
+      - name: Size and dependency difference
+        run: |
+          so_size() { unzip -p "$1" 'pydeno/_pydeno*.so' | wc -c | tr -d ' '; }
+          MIN_WHEEL=$(ls dist-minimal/*.whl); DEF_WHEEL=$(ls dist-default/*.whl)
+          MIN_SO=$(so_size "$MIN_WHEEL"); DEF_SO=$(so_size "$DEF_WHEEL")
+          {
+            echo "### Inspector feature cost"
+            echo
+            echo "| build | wheel bytes | _pydeno .so bytes |"
+            echo "|---|---|---|"
+            echo "| default | $(wc -c < "$DEF_WHEEL" | tr -d ' ') | $DEF_SO |"
+            echo "| --no-default-features | $(wc -c < "$MIN_WHEEL" | tr -d ' ') | $MIN_SO |"
+            echo
+            echo ".so difference: $((DEF_SO - MIN_SO)) bytes"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # `(*)` marks a repeat in cargo tree's output; strip it so each crate counts once.
+          cargo tree -e normal --prefix none -f '{p}' | sed 's/ (\*)$//' | sort -u > tree-default.txt
+          cargo tree -e normal --prefix none -f '{p}' --no-default-features \
+            | sed 's/ (\*)$//' | sort -u > tree-minimal.txt
+          {
+            echo
+            echo "Crates only in the default build ($(comm -23 tree-default.txt tree-minimal.txt | wc -l | tr -d ' ')):"
+            echo '```'
+            comm -23 tree-default.txt tree-minimal.txt
+            echo '```'
+            echo "Crates only in the minimal build: $(comm -13 tree-default.txt tree-minimal.txt | wc -l | tr -d ' ')"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the minimal wheel
+        run: |
+          uv pip install --python .min-venv/bin/python dist-minimal/*.whl
+          .min-venv/bin/python -c "from pydeno import _pydeno; assert _pydeno._INSPECTOR_AVAILABLE is False"
+
+      - name: Isolated-runtime suites against the minimal build
+        run: |
+          .min-venv/bin/python -m pytest -v -p no:randomly --strict-markers --strict-config \
+            tests/test_inspector_feature.py \
+            tests/test_isolated_*.py \
+            tests/test_aio_isolated_runtime.py
+
   cargo-test:
     name: cargo test
     runs-on: macos-latest
@@ -325,6 +397,9 @@ jobs:
 
       - name: cargo clippy
         run: cargo clippy --tests -- -D warnings
+
+      - name: cargo clippy (without the inspector feature)
+        run: cargo clippy --tests --no-default-features -- -D warnings
 
       # Pinned. `uv tool run ruff` resolves the newest release at job time, so
       # an unpinned lint step turns every upstream ruff release into a red
