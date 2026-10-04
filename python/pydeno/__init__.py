@@ -40,14 +40,17 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         describe_tools,
         typescript_stubs,
     )
+    from ._errors import ErrorInfo, classify_error
     from ._aio import AsyncIsolatedRuntime
     from ._isolated import IsolatedRuntime, WorkerCrashed
     from ._polyfills import WEB_POLYFILLS
+    from ._preflight import Finding, PreflightResult, check_source
     from ._snapshot_auth import (
         SnapshotAuthenticationError,
         sign_snapshot,
         verify_snapshot,
     )
+    from ._status import Layer, SandboxStatus, sandbox_status
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
 
 # Everything below is imported on first use. `import pydeno` is then just the native module, which
@@ -73,6 +76,14 @@ _LAZY = {
     "ToolBudgetError": "_tools",
     "ToolError": "_tools",
     "ToolNotFoundError": "_tools",
+    "ErrorInfo": "_errors",
+    "classify_error": "_errors",
+    "Finding": "_preflight",
+    "PreflightResult": "_preflight",
+    "check_source": "_preflight",
+    "Layer": "_status",
+    "SandboxStatus": "_status",
+    "sandbox_status": "_status",
 }
 
 
@@ -352,6 +363,14 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
 
 
 __all__ = [
+    "classify_error",
+    "ErrorInfo",
+    "check_source",
+    "PreflightResult",
+    "Finding",
+    "sandbox_status",
+    "SandboxStatus",
+    "Layer",
     "AsyncIsolatedRuntime",
     "eval",
     "eval_async",
