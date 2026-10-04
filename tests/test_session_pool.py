@@ -278,8 +278,7 @@ class TestLimits:
                 assert fresh.lost_runs == 1
 
     async def test_over_cap_journal_keeps_the_spent_tool_budget(self) -> None:
-        # Every tool answer is journaled, so a guest can push its own journal over the cap; that
-        # must not hand it a fresh tool budget for the same session.
+        # A session whose journal outgrows the cap is restored with the budget it already spent.
         store = InMemoryJournalStore()
         ran: list[int] = []
 

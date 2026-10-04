@@ -179,12 +179,12 @@ pydeno writes for the host. Every row has a probe in `scripts/autoresearch/metri
 
 | Finding | Status |
 |---|---|
-| `SessionPool`: a session whose journal outgrew `max_journal_bytes` restarted with a fresh tool budget | **Fixed.** The pool stores a journal without state that charges every spent call; the next `get` restores that budget. |
+| `SessionPool`: a restored session did not always keep the tool budget it had already spent (after an oversized journal, overlapping calls on one session, a failed release, or pools sharing a store) | **Fixed.** Budget-only journal for oversized ones, written under the lease; stored-counter checks on `get` and `release`; unstored sessions are not evicted. Pools sharing a store still need sticky routing (documented). |
 | Agent sessions (unreleased driving path): a tool raising a `BaseException` left a journal that `load()` refused | **Fixed.** Such a tool ends the run like a crash (worker killed, run recorded as lost with what it spent). |
 | Agent sessions: concurrent tool calls past `max_inflight_host_calls` were refused depending on timing, which the journal did not record, so such a journal could fail to replay | **Fixed.** The session's wrappers queue calls past the cap and issue them in order. |
 | Front door (unreleased): the syntax check after a failed feed depended on guest-replaceable built-ins and ran outside the journal | **Fixed.** The check uses intrinsics the prelude captured before guest code. |
-| `SessionPool`: a `get` concurrent with `drop()` could restore the session being dropped; a `session()` block could end a newer lease of a session dropped meanwhile | **Fixed.** A barrier holds the session's place during `drop`; `session()` releases only its own lease. |
-| `SessionPool` accepted 256-character non-ASCII ids that `release` then refused (associated data over 1024 bytes) | **Fixed.** Associated data may be 4096 bytes. |
+| `SessionPool`: `drop()` overlapping a `get` or a `release` could leave the dropped state in place; a `session()` block could end a newer lease of a session dropped meanwhile | **Fixed.** A barrier holds the session's place during `drop`; `session()` releases only its own lease. |
+| `SessionPool` accepted some ids that `release` then refused (long non-ASCII ids; ids that are not valid UTF-8) | **Fixed.** Associated data may be 4096 bytes; ids must be valid UTF-8. |
 | `Pydeno` dumps could not be bound to a tenant or a counter: any state a pool dumped loaded into any of its sessions, including an older dump of the same session (its external-call budget restored) | **Fixed (opt-in).** `dump` / `load_session` / `load_snapshot` take `associated_data=`; documented. |
 | Tool names equal to the session's or the guest's globals (`__pydeno_agent_settle`, `globalThis`, `JSON`, `console`, ...) were accepted and silently broke the session or the tool | **Fixed.** Refused for bare-global tools; reserved prefixes always. |
 | A front-door answer the session refuses (`resume(error="...")`) used up the snapshot, leaving the session paused forever | **Fixed.** Checked before the snapshot is used. |
@@ -192,7 +192,7 @@ pydeno writes for the host. Every row has a probe in `scripts/autoresearch/metri
 | Captured console output (`ExecutionResult.stdout`/`stderr`), error messages and the default printer passed bidi overrides and invisible characters (zero-width, Unicode tags) through, and captured output also escape sequences; the 0.7 CLI printed results and errors raw | **Fixed.** One shared filter (C0/C1 except tab and newline, bidi controls, separators, zero-width and tag characters, soft hyphen, BOM); the sandboxed CLI (#49) filters its output too, and a probe now guards it. Values and a custom `print_callback` stay raw (documented). |
 | The 0.7 CLI ran code in-process with no deadline | **Fixed by #49** (the CLI runs `IsolatedRuntime(sandbox="require")` with a deadline). |
 | Rollback of a stored journal by someone who can write both the journal and its counter | **Open, known** (documented since 0.7). |
-| A guest can still make its own journal fail to replay (a run that only fits `timeout` on a quiet machine) | **Documented.** Treat a failed restore as lost state and carry the spent budget over. |
+| A journal can still fail to replay for reasons outside the journal (a run that only fits `timeout` on a quiet machine) | **Documented.** `drop` then starts over with a fresh budget; carry the spent budget over yourself if that matters. |
 
 Tried and held: forged, truncated, bit-flipped and spliced journals, journals under another tenant's
 associated data or key, moved or rolled-back pool journals; resuming another session's call, a forged

@@ -67,25 +67,29 @@ restrictions under Security below; see
 
 - **0.8 red team, host boundary and state** (#75 slice C; probes in `scripts/autoresearch/metric_security.py`,
   tests in `tests/test_redteam_boundary.py`, details in `docs/security-report.md`):
-  - `SessionPool` keeps a session's spent tool budget when its journal outgrows `max_journal_bytes`
-    (it stores a stateless journal charging the spent calls; it used to start over with a fresh
-    budget). **Behaviour change.**
+  - `SessionPool`: a restored session keeps the tool budget it has already spent, also after its
+    journal outgrew `max_journal_bytes` (a journal without state that charges the spent calls is
+    stored instead), when calls on one session overlap, and when a release fails (the session then
+    stays live until a release succeeds). `get` checks a live session against the stored counter
+    and `release` refuses (`StaleJournal`) to store over a newer journal, so pools that share a
+    store do not each hand out a session's budget; sessions must still be routed to one pool.
+    Ids must be valid UTF-8. **Behaviour change.**
   - Agent sessions queue concurrent tool calls past `max_inflight_host_calls - 1` and issue them in
     order; they were refused depending on timing, which the journal did not record.
   - A tool raising a `BaseException` during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run
     like a crash (recorded as lost); the journal stays loadable.
   - Tool names that would replace a guest global (bare-global tools), and names starting with
     `__pydeno` / `__host_op`, are refused. **Behaviour change.**
-  - `SessionPool.drop()` holds the session's place while it works, so a concurrent `get` cannot
-    restore it; `pool.session()` releases only its own lease; journal associated data may be up to
-    4096 bytes, so every valid pool id persists.
+  - `SessionPool.drop()` holds the session's place while it works and wins against an overlapping
+    `get` or `release`; `pool.session()` releases only its own lease; journal associated data may be
+    up to 4096 bytes, so every valid pool id persists.
   - Front door: the syntax check after a failed feed uses captured intrinsics; `dump` / `load_session` /
     `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot; `feed_start`
     surfaces snapshots only for the feed's declared functions.
-  - Captured console output, error messages and the default printer replace control characters,
-    bidirectional overrides, line separators and invisible characters (zero-width, soft hyphen, BOM,
-    Unicode tags) with `?`. **Behaviour change** for output that
-    contained them.
+  - Captured console output, error messages and the default printer use one filter with the CLI's
+    set: control characters, bidirectional controls, line separators and invisible format characters
+    (zero-width joiners and spaces, variation selectors, soft hyphen, BOM, Unicode tags, ...) become
+    `?`. **Behaviour change** for output that contained them.
 
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;

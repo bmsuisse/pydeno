@@ -298,7 +298,8 @@ class SessionPool:
         Release it with `release` (or `drop`). While leased, another `get` of it waits up to
         `timeout` (default: the pool's ``acquire_timeout``) and then raises `SessionBusy`.
         Raises `StaleJournal` for a rolled-back journal, `JournalError` / `ReplayDivergence` for
-        one that cannot be restored (`drop` the session to start over), `PoolFull` when no room
+        one that cannot be restored (`drop` the session to start over: that also gives it a fresh
+        tool budget, so carry the spent one over yourself if it matters), `PoolFull` when no room
         can be made."""
         self._check_open()
         _check_id(owner, "owner")

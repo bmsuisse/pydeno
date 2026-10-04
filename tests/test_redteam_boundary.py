@@ -1,12 +1,12 @@
 """Regression tests for the slice C red-team findings (#75: host boundary and state).
 
-Each test is the failing-first reproduction of a finding (the same attacks are probes in
+Each test is the failing-first reproduction of a finding (the same cases are probes in
 `scripts/autoresearch/metric_security.py`, section "slice C"):
 
 * a tool raising a BaseException, and a burst of concurrent tool calls, left a journal that
   `dump()` returned and `load()` refused;
-* `SessionPool` gave a session a fresh tool budget after its journal outgrew the cap, accepted
-  ids it could not persist, and let a concurrent `get()` undo a `drop()`;
+* `SessionPool`: a restored session keeps the budget it already spent (oversized journals,
+  overlapping calls, pools sharing a store, failed releases); ids persist; `drop()` wins;
 * session-owned global names were accepted as tool names;
 * the front door's compile check ran guest-reachable JavaScript outside the journal;
 * a refused answer used up a front-door snapshot; front-door dumps could not be bound to a tenant;

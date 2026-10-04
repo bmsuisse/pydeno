@@ -141,9 +141,14 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
   `(owner, session_id) -> tools` function; `tools_catalog=` gives every session a lazy catalog, and
   discovery survives a restore. `max_tool_calls`, `namespace` and `max_result_bytes` apply to new
   sessions; a restored session takes them from its journal.
-- Owner and session ids are strings of up to 256 characters without `:` or control characters
-  (any 256 characters fit in the signature's associated data). The ids appear in error messages:
-  do not put secrets in them.
+- Owner and session ids are strings of up to 256 characters without `:` or control characters,
+  valid as UTF-8 (no lone surrogates); every such id fits in the signature's associated data. The
+  ids appear in error messages: do not put secrets in them.
+- A `release` that fails (for example while a run of the session is still in progress) leaves the
+  session live: it is not evicted until a later `release` stores it, and `close()` tries once
+  more, so nothing it ran or spent is forgotten.
+- A journal that expires (`ttl`) is gone like a dropped one: the next `get` starts a fresh session
+  with a fresh tool budget. Keep `ttl` at least as long as budgets must hold.
 
 ### Concurrency: serialised, or rejected with `SessionBusy`
 
@@ -151,8 +156,15 @@ A session has at most one lease. A second `get` of a leased session **waits** fo
 to `acquire_timeout` (default 30 s, per call `get(..., timeout=)`), then raises `SessionBusy`.
 `acquire_timeout=0` rejects at once instead of waiting. Different sessions run concurrently.
 
-This holds within one pool. Two processes sharing a store do not lock each other out: route each
-owner to one process (sticky sessions), or put a lock in front of the pool.
+This holds within one pool. **Route each session to one pool** (sticky sessions, or one
+process that owns the store). Each pool keeps live sessions in memory, so a lock around `get` and
+`release` does not make two pools one: what one pool runs is only in the store once it releases.
+The pool checks what it can: `get` compares a live session with the counter in the store and
+restores the stored journal when another pool stored a newer one, and `release` refuses to store
+over a newer journal (`StaleJournal`, the live copy is discarded). That catches sequential use of
+one session through two pools; two releases at the same moment can still both pass the check,
+because a store's `get`/`set` cannot compare-and-set. It costs one store read per `get` of a live
+session.
 
 ### Rollback protection
 

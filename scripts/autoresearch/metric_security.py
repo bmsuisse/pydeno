@@ -866,7 +866,7 @@ def async_tool_call_storm_makes_replay_diverge() -> bool:
 
 
 @_c_probe
-def tool_budget_bypassed_by_refused_or_concurrent_calls() -> bool:
+def tool_budget_exceeded_with_refused_or_concurrent_calls() -> bool:
     from pydeno import AgentSandbox
 
     ran = []
@@ -1032,10 +1032,8 @@ def front_invalid_answer_consumes_the_snapshot() -> bool:
 
 @_c_probe
 def front_syntax_check_is_steered_by_the_guest() -> bool:
-    """The front door asks the worker whether a failed feed compiled, with JavaScript the guest can
-    reach (`Object.getPrototypeOf`). A guest could make a feed that ran (and called externals) be
-    reported as `PydenoSyntaxError` ("nothing of it ran"), or change its own state outside the
-    journal so that the dump no longer replays."""
+    """The front door's check of whether a failed feed compiled must not depend on built-ins
+    the guest can replace, nor run outside the journal."""
     from pydeno import Pydeno, PydenoError, PydenoSyntaxError
 
     ran = []
@@ -1144,7 +1142,7 @@ def tampered_truncated_or_spliced_journal_loads() -> bool:
 
 
 @_c_probe
-def replay_calls_the_real_tool_or_crash_refunds_budget() -> bool:
+def replay_calls_the_real_tool_or_crash_changes_budget() -> bool:
     from pydeno import AgentSandbox
 
     ran = []
@@ -1227,9 +1225,9 @@ async def _c_pool_turns(pool, owner: str, sid: str, code: str, turns: int) -> No
 
 
 @_c_probe
-def pool_journal_too_large_refunds_the_tool_budget() -> bool:
-    """`SessionPool` started a fresh session, with a fresh budget, after a journal outgrew its cap;
-    the guest grows its own journal through tool answers, so it could reset its budget at will."""
+def pool_oversized_journal_restore_budget_mismatch() -> bool:
+    """After a journal outgrows `max_journal_bytes`, the restored session must keep the budget
+    the session had already spent."""
     from pydeno import InMemoryJournalStore, SessionPool
 
     ran = []

@@ -102,6 +102,8 @@ fails throws an Error whose `name` is the failure's type.
 - **Concurrent calls wait their turn.** At most `max_inflight_host_calls - 1` tool calls (63 by
   default) are in flight at once; further calls (a `Promise.all` over a long list) wait, in the order
   they were made, and go out as earlier ones settle (they used to be refused, depending on timing).
+  Tools must therefore not wait for each other: if more than that many calls are in flight and
+  each waits for a call still queued behind them, the run waits until `max_pause` or `timeout`.
 - **Tools are called positionally** (`query_rows("SELECT ...")`), since JavaScript has no keyword
   arguments. A tool with a *required* keyword-only parameter is refused when the session is made.
 - **Tool names.** Names follow `ToolBridge`'s rules (plain identifiers, not `constructor`,
@@ -370,20 +372,22 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
   `WorkerCrashed("a tool raised SystemExit, which is not an answer; ...")`, and `dump()` records it
   as lost with the calls it made, so the journal still loads. (`AsyncAgentSandbox.run()` lets the
   exception propagate to you instead: a cancellation kills the worker, as for any cancelled run;
-  anything else leaves the session paused at that call.)
+  anything else, `KeyboardInterrupt` included, reaches whoever awaits `run()` and leaves the
+  session paused at that call, so close it or answer the call yourself.)
 - **Text from the guest is cleaned where pydeno shows it to you.** `stdout`/`stderr` of a result,
   error messages and the front door's default printer replace C0/C1 control characters (escape
-  sequences, carriage returns; tab and newline stay), bidirectional overrides and isolates, line
-  and paragraph separators, and invisible characters (zero-width space, word joiner, soft hyphen,
-  BOM, Unicode tag characters) with `?`, so guest output cannot drive or disguise what a terminal or log
+  sequences, carriage returns; tab and newline stay), bidirectional controls, line and paragraph
+  separators, and invisible format characters (zero-width spaces and joiners, variation selectors,
+  soft hyphen, BOM, Unicode tag characters, ...) with `?`, the same set the CLI uses (emoji
+  sequences render as their parts), so guest output cannot drive or disguise what a terminal or log
   shows. Values are not changed: a result, a tool argument, or the text a `print_callback` of your
   own receives is exactly what the guest produced. Treat all of it as untrusted when you put it in
   a prompt, a page or a query.
 - **A journal that does not replay** (`ReplayDivergence`, or `JournalError` from an authentic
-  journal) means the session's state is lost, not that its spending is. A guest that wants its
-  session gone can still cause one (a run that only finishes within `timeout` on a quiet machine,
-  say). If you start such a session over, carry its spent tool budget over too rather than handing
-  out a fresh one ([`SessionPool`](advanced/async-agent-sessions.md#size-cap) does this for
+  journal) means the session's state is lost, not that its spending is. It can still happen for
+  reasons outside the journal (a run that only finishes within `timeout` on a quiet machine, say).
+  If you start such a session over, carry its spent tool budget over too rather than handing out a
+  fresh one ([`SessionPool`](advanced/async-agent-sessions.md#size-cap) does this for
   journals that outgrow their cap).
 - **The budget** (`max_tool_calls`) counts every call over the session's life, across `start`,
   `resume` and `run`, and survives `load()` (also of a journal dumped after a crash). A call over
