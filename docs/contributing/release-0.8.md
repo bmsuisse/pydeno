@@ -24,27 +24,35 @@ shape of Monty's (`Pydeno().checkout() ... session.feed_run(...)`), secure and f
 
 ## Checklist (merge order)
 
-Items already merged to `main` are not listed. Tick an item when its PR is merged **into this branch** and the
-local test suite plus the two metric scripts pass.
+Items already merged to `main` are not listed. An item is ticked when its PR is merged **into this branch**. The
+branch as a whole is validated (full suite plus the two metric scripts) before it is marked ready; the result is
+recorded in a comment on the PR.
 
-- [ ] #59 CI: trim duplicate runs, fix the report gate and cross-platform test blockers
-- [ ] #61 autoresearch skill, loop setup and metric scripts
-- [ ] #52 bridge: fail closed on a poisoned bind target; timeouts enforced when guest code customises `Error.prototype` (reviewed, 5 rounds)
+- [x] #59 CI: trim duplicate runs, fix the report gate and cross-platform test blockers
+- [x] #61 autoresearch skill, loop setup and metric scripts
+- [x] #52 bridge: fail closed on a poisoned bind target; timeouts enforced when guest code customises `Error.prototype` (reviewed, 5 rounds)
 - [ ] #64 runtime stays usable after a module evaluation times out (stacked on #52; review running)
 - [ ] #63 buffer accounting and console hardening (stacked on #52; re-review pending)
-- [ ] #53 warm-call overhead (reviewed clean)
-- [ ] #62 warm-call autoresearch loop (stacked on #53; reviewed clean). **Merge note:** it and #52 both rewrite the
+- [x] #53 warm-call overhead (reviewed clean)
+- [x] #62 warm-call autoresearch loop (stacked on #53; reviewed clean). **Merge note:** it and #52 both rewrite the
       watchdog loop in `src/runtime/runner/termination.rs`; keep `parked` set from the final next deadline (after
       #52's re-issue adjustment) and re-run the termination stress test
-- [ ] #55 cold start (reviewed clean)
-- [ ] #51 `http_fetch` (reviewed clean)
-- [ ] #57 front door `Pydeno` / `AsyncPydeno` (reviewed clean after 5 rounds)
+- [x] #55 cold start (reviewed clean)
+- [x] #51 `http_fetch` (reviewed clean)
+- [x] #57 front door `Pydeno` / `AsyncPydeno` (reviewed clean after 5 rounds)
 - [ ] #49 CLI and `llm` plugin (needs independent review)
 - [ ] #54 inspector cargo feature (CI pending)
 - [ ] #67 frame-queue bound and copy reduction (review running; overlaps #62)
+- [ ] #71 supervisor termination authority: refuse guest code if the hardened worker cannot be signalled (Codex owns; native Linux runs and independent review needed; exploit details stay private until fixed)
+- [ ] #56 / PR #69 Linux resource-probe visibility after worker privilege hardening (Codex)
 - [ ] #45 seccomp allow-list / kill-on-violation (needs native x86_64 and aarch64)
 - [ ] #60 persistent worker event loop (open)
 - [ ] #42 strict eval profile (open)
+
+## Documentation
+
+- [ ] New README focused on the Monty-shaped entry, AI code mode, the sandbox and the security model (this PR). Rules: every number is measured (release builds), every claim is true of this branch, no unmerged feature is promised.
+- [ ] Alternatives page updated with release-build numbers once the speed PRs are validated together.
 
 ## Release gates for 0.8.0
 

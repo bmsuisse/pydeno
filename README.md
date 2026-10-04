@@ -2,9 +2,9 @@
 
 # pydeno
 
-### Run AI-generated JavaScript from Python, securely, in a sandbox.
+### The JavaScript sandbox for AI agents' code mode: secure, fast, easy.
 
-Real V8 · supervised worker process · OS-level sandbox · your Python functions as the only way out
+Let a model write code, run it in a real V8 inside an OS-sandboxed worker, and get the result back, with the tools you choose as its only way out.
 
 [![Tests](https://github.com/bmsuisse/pydeno/actions/workflows/test.yml/badge.svg)][workflows-tests]
 [![PyPI](https://img.shields.io/pypi/v/pydeno.svg)][pydeno-pypi]
@@ -13,9 +13,10 @@ Real V8 · supervised worker process · OS-level sandbox · your Python function
 [![Docs](https://img.shields.io/badge/docs-bmsuisse.github.io%2Fpydeno-blue)][pydeno-docs]
 
 [**Quickstart**](#quickstart) ·
-[**How it is secure**](#how-it-is-secure) ·
-[**How it was tested**](#how-it-was-tested) ·
-[**Performance**](#performance) ·
+[**Code mode for agents**](#code-mode-for-ai-agents) ·
+[**Security**](#security) ·
+[**Speed**](#speed) ·
+[**How it compares**](#how-it-compares) ·
 [**Docs**](https://bmsuisse.github.io/pydeno/) ·
 [**Security policy**](SECURITY.md)
 
@@ -23,33 +24,32 @@ Real V8 · supervised worker process · OS-level sandbox · your Python function
 
 ---
 
-Agents increasingly answer questions by **writing code**: a data transform, a chart spec, a slide
-deck, a loop that calls your tools. That code is untrusted by construction. `pydeno` lets a Python
-program run it and get the result back, behind a boundary that holds even if the code is hostile.
+Agents increasingly answer by **writing code**: a data transform, a chart, a loop that calls your tools in
+parallel instead of one JSON call at a time. That code is untrusted by construction. `pydeno` runs it behind a
+boundary that holds even if the code is hostile, and gives it exactly the tools you pass in.
 
 ```python
 from pydeno import Pydeno
 
-with Pydeno() as pool, pool.checkout() as session:     # OS sandbox required, limits on, warm workers
+with Pydeno() as pool, pool.checkout() as session:        # OS sandbox required, limits on, warm worker
     session.feed_run("const prices = {A1: 3.5}")
-    session.feed_run("prices[sku] * await rate()",      # 7.0: state persists between feeds
+    session.feed_run("prices[sku] * await rate()",         # 7.0: state persists between feeds
                      inputs={"sku": "A1"}, external_lookup={"rate": lambda: 2})
-    session.feed_run("new Array(2 ** 32 - 1).fill(0)")  # PydenoCrashedError. Your process is fine.
+    session.feed_run("new Array(2 ** 32 - 1).fill(0)")     # PydenoCrashedError. Your process is fine.
 ```
 
-If you know [Monty][monty], you know `Pydeno`: the same `Pydeno` / `checkout` / `feed_run` /
-`feed_start` / `dump` shape, for JavaScript. See the [front-door guide](docs/guides/quickstart-pydeno.md).
-
-## Why pydeno
+If you know [Monty][monty], you already know `Pydeno`: the same `Pydeno` / `checkout` / `feed_run` /
+`feed_start` / `dump` shape, for JavaScript. Where Monty runs a Python subset, pydeno runs **real, modern
+JavaScript** (V8, the engine behind Chrome and Node), so model-written code behaves like JavaScript and real
+libraries (Vega, ECharts, three.js, d3, pptxgenjs) run unmodified.
 
 |  |  |
 |---|---|
-| 🧱 **Contained** | A V8 abort, a hang or a memory blow-up kills a disposable worker process, never yours. |
-| 🔒 **No ambient authority** | No filesystem, network, processes, environment, `Deno`, `process` or `require`. Whatever the guest can do beyond computing, you bound on purpose. |
-| 🧰 **Real JavaScript** | The engine behind Chrome and Node ([`deno_core`][deno_core] + [V8][v8]), so model-written code behaves like JavaScript and real libraries run. |
-| ⚡ **Fast** | A native Rust wire codec and a pre-started spare worker: as little as ~15 ms to create a runtime and evaluate, a 2 MB result in ~18 ms. |
-| 🧪 **Tested like an attacker would** | Assume-breach syscall sweeps against the real kernel, a verified seccomp filter, fuzzing and hostile-worker fakes, on 12 Linux distros and two CPU architectures. |
-| 🔌 **Tool-calling built in** | `bind_function` and `ToolBridge` give the model's code your Python tools, with call budgets and errors it can branch on. |
+| 🤖 **Built for agents** | One call runs a snippet and drives your tools; pause at every tool call for approvals; dump a session to a signed journal and resume it anywhere. |
+| 🔒 **Secure by default** | OS sandbox required (no silent downgrade), no filesystem, network, processes or environment, host errors redacted, every limit on, one worker per session. |
+| ⚡ **Fast by default** | Pre-started workers: a session checkout takes about a tenth of a millisecond; a warm `eval` about 30 microseconds. |
+| 🧱 **Contained** | A V8 abort, a hang or a memory blow-up kills a disposable worker, never your process. |
+| 🧪 **Attacked on purpose** | Hostile-guest probes, assume-breach syscall sweeps against the real kernel, and an independent review of every change that touches the boundary. |
 
 ## Quickstart
 
@@ -57,17 +57,14 @@ If you know [Monty][monty], you know `Pydeno`: the same `Pydeno` / `checkout` / 
 pip install pydeno     # or: uv pip install pydeno     (Python 3.10+, macOS or Linux)
 ```
 
-**Start here: `Pydeno`.** A pool of pre-started, OS-sandboxed workers; each session gets one, used
-once. Secure and fast by default, shaped like Monty:
-
 ```python
 from pydeno import Pydeno
 
 with Pydeno() as pool:
     with pool.checkout() as session:
         session.feed_run("const x = 20")
-        print(session.feed_run("x + 1"))                                    # 21
-        print(session.feed_run("await lookup(7)", external_lookup={"lookup": lambda i: i * 6}))  # 42
+        print(session.feed_run("x + 1"))                                                          # 21
+        print(session.feed_run("await lookup(7)", external_lookup={"lookup": lambda i: i * 6}))   # 42
 ```
 
 ```python
@@ -75,15 +72,109 @@ from pydeno import AsyncPydeno
 
 async with AsyncPydeno() as pool:
     async with pool.checkout() as session:
-        await session.feed_run("1 + 1")                                     # 2
+        await session.feed_run("1 + 1")                                                           # 2
 ```
 
-Defaults: `sandbox="require"` (no silent downgrade; `pydeno.sandbox_status()` explains a refusal),
-jitless V8, host errors redacted, 30 s per feed, 512 MiB, 1000 external calls per session, and a
-worker never serves two sessions. The [front-door guide](docs/guides/quickstart-pydeno.md) maps every
-Monty name and limit.
+Defaults: `sandbox="require"` (`pydeno.sandbox_status()` explains a refusal), jitless V8, host errors redacted,
+30 s per feed, 512 MiB, 1000 external calls per session, and a worker never serves two sessions. The
+[front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit.
 
-### Advanced: the building blocks
+## Code mode for AI agents
+
+Code mode lets the model write one program that calls your tools, instead of one tool call per turn. pydeno
+gives that program a safe place to run.
+
+```python
+from pydeno import Pydeno
+
+TOOLS = {"search_orders": search_orders, "get_customer": get_customer}      # your Python functions
+
+with Pydeno() as pool, pool.checkout(limits={"max_feed_duration_secs": 10, "max_memory": 256 * 2**20}) as s:
+    answer = s.feed_run(
+        model_written_javascript,       # e.g. loops over orders, calls get_customer in Promise.all, aggregates
+        external_lookup=TOOLS,          # the ONLY way out, with a total call budget
+        print_callback=lambda stream, text: log(stream, text),
+    )
+```
+
+- **Approval flows:** `feed_start` returns a snapshot at **every** tool call; inspect `snapshot.function_name` and
+  `snapshot.args`, then `resume(value)` or `resume(error=...)`. `dump()` it and continue in another process.
+- **Typed declarations for your prompt:** your tools become `tools.*` functions with TypeScript stubs; JSON-Schema
+  tools and a lazy tool catalog keep the prompt small even with hundreds of tools.
+- **Agent frameworks:** [`JSCodeMode`](docs/guides/pydantic-ai.md) is the JavaScript counterpart of pydantic-ai's
+  Monty-based code mode, and an allow-listed, SSRF-safe [`http_fetch`](docs/guides/http-fetch.md) tool is included.
+- **Results you can bound:** `execute()` returns an `ExecutionResult` (stdout, stderr, result, error) with ordered,
+  size-capped console output, so one runaway `console.log` cannot flood your logs or your context window.
+
+## Security
+
+pydeno assumes the code is hostile and the engine can have bugs. Each layer assumes the one above has failed.
+The threat model is in [`SECURITY.md`](SECURITY.md); the details are in [the isolation guide](docs/guides/advanced/isolation.md).
+
+| Layer | What it does |
+|---|---|
+| **Separate process** | Empty environment, own session. A V8 abort, hang or out-of-memory kills the worker; the parent raises a typed error. |
+| **OS sandbox, applied before the engine exists** | macOS: Seatbelt. Linux: Landlock, a private empty root (mount, network, IPC, UTS namespaces) and a seccomp-bpf filter. `sandbox="require"` refuses to start unless **every** layer applied; the worker proves its own confinement with a self-test first. |
+| **No privileges** | A worker started as root drops to `nobody` with an empty capability set; `no_new_privs` is set. |
+| **Smaller engine surface** | V8 runs `--jitless` by default. `SharedArrayBuffer`, `Atomics`, `WeakRef` and `FinalizationRegistry` are removed; there is no `Deno`, `process` or `require`. |
+| **Limits enforced from outside** | Wall-clock deadline, CPU cap, memory ceiling, buffer cap, host-call budgets, message and console size. The parent kills a worker that breaks a limit. |
+| **The worker is untrusted input** | Every frame goes through a strict native decoder with size, depth and node budgets. A worker that sends nonsense is killed. |
+| **Capability tokens, fail-closed binds** | A bound function is reachable only through an unguessable token. A guest that tampers with the scope before a bind makes the bind **fail**, never silently do nothing. |
+| **Tenant separation** | One worker per session, never reused; each session's tool threads are its own; thread-locals and contexts never cross sessions. |
+| **Signed, replayable sessions** | A journal is HMAC-signed, bound to its owner and release, and replays deterministically; a restored session cannot refund a spent tool budget. |
+
+**How we check it.**
+
+- A battery of **hostile-guest probes** (`scripts/autoresearch/metric_security.py`): poisoned prototypes, forged frames,
+  deadline bypasses, memory bombs, state leaking between commands, console escape injection. The goal is zero, and
+  every newly found attack class becomes a probe first.
+- **Independent review of every change** that touches the worker, wire, bridge, supervision, sandbox policy or
+  journals. Reviews have repeatedly found real defects, including in the fixes themselves, which is why they are
+  mandatory. The findings table, misses included, is the **[security report](docs/security-report.md)**.
+- **Assume-breach syscall sweeps** against the real kernel, a verified seccomp program, fuzzing, hostile-worker
+  fakes, and Linux on many distros and both CPU architectures (details below).
+
+**What we do not claim.** A V8 bug is *contained* in the worker, not prevented. V8 is a large engine we cannot
+audit end to end, which is why the layers around it exist; there has been no independent outside security review
+yet (it is planned before 1.0, see the [roadmap](docs/roadmap.md)). The in-process `Runtime` is **not** safe for
+hostile code: use `Pydeno` / `IsolatedRuntime`. Windows has no isolated worker. For multi-tenant use, put the
+whole process in a locked-down container or microVM ([deployment guidance](SECURITY.md)).
+Found a way out? Please report it privately, as described in [`SECURITY.md`](SECURITY.md).
+
+## Speed
+
+Measured on macOS arm64 with release builds, using paired A/B runs; reproduce with
+[`benches_py/alternatives_bench.py`](benches_py/alternatives_bench.py) and
+[`scripts/autoresearch/metric_speed.py`](scripts/autoresearch/metric_speed.py). Numbers vary with the machine.
+
+| | |
+|---|---|
+| A **warm call** on a live sandbox (`eval("1 + 1")`) | about **30 µs** |
+| **Check out a session** from the warm pool (`Pydeno().checkout()`) | about **0.1 ms**; a raw `SandboxPool` checkout about 0.04 ms |
+| Check out and run a first `feed_run` | about 1.5 ms |
+| A **cold start** (new sandboxed worker and first call) | about 50 ms; the pool hides it |
+| Move a 2 MB structured result across the boundary | about 18 ms each way (native codec) |
+
+Jitless V8 (the default) makes compute-heavy code roughly 1.5 to 8 times slower than with the JIT;
+`jitless=False` trades that back for a larger attack surface, and still runs behind the full OS sandbox.
+
+## How it compares
+
+| | pydeno | [Monty][monty] | A Deno subprocess wrapper |
+|---|---|---|---|
+| Language | Full modern JavaScript | A subset of Python | Full JavaScript |
+| Isolation | Process + OS sandbox + limits, self-tested at start | A small interpreter with no I/O except your functions | Deno's permission system only |
+| Limits enforced for you | Memory, CPU, time, buffers, calls, output | Yes | None |
+| Pausing, signed resumable sessions | Yes | Yes | No |
+| Start-up | Pool checkout about 0.1 ms; cold about 50 ms | Pool checkout microseconds | About 13 ms (measured) |
+| Trusted code base | Large (V8), contained | Small, auditable | Large (Deno), one barrier |
+
+Monty is the better choice when the model's code is mostly Python logic and you want the smallest trusted base;
+pydeno is the choice when you need JavaScript and its ecosystem. They combine well (see the showcase). The full,
+frank comparison, including what pydeno cannot do and measured numbers, is on the
+**[alternatives page](docs/alternatives.md)**.
+
+## Advanced: the building blocks
 
 `Pydeno` is built from these, which stay available unchanged.
 
@@ -100,9 +191,8 @@ with IsolatedRuntime(sandbox="require") as rt:
 ```
 
 The call that exceeds `max_calls` never reaches your Python function; the guest gets a catchable
-`ToolBudgetError`. A Python exception inside a tool reaches JavaScript as a real `Error` whose `name`
-is the exception's class, so the model's code can branch on it. Use `redact_host_errors=True` if
-exception text must not reach the guest.
+`ToolBudgetError`. A Python exception inside a tool reaches JavaScript as a real `Error` whose `name` is the
+exception's class, so the model's code can branch on it. Host errors are redacted by default.
 
 **Make the easy path the safe one** (the module-level helpers then use a sandboxed worker):
 
@@ -113,15 +203,18 @@ pydeno.configure_default_runtime(isolated=True, sandbox="require")
 pydeno.eval("1 + 1")
 ```
 
-**Run real libraries.** Many assume browser basics a bare isolate lacks. Opt in to a small,
-pure-JavaScript set (virtual-time timers, `TextEncoder`, `btoa`, `Blob`, `EventTarget`,
-`AbortController`, `structuredClone`) that never defines `window` or `document`:
+**Run real libraries.** Many assume browser basics a bare isolate lacks. Opt in to a small, pure-JavaScript set
+(virtual-time timers, `TextEncoder`, `btoa`, `Blob`, `EventTarget`, `AbortController`, `structuredClone`) that
+never defines `window` or `document`:
 
 ```python
 from pydeno import IsolatedRuntime, RuntimeConfig, WEB_POLYFILLS
 
 rt = IsolatedRuntime(RuntimeConfig(bootstrap=WEB_POLYFILLS))
 ```
+
+Async code: `AsyncPydeno`, `AsyncIsolatedRuntime` and `AsyncAgentSandbox` never block the event loop and use no
+thread per runtime.
 
 ## Showcase: Python and JavaScript, both sandboxed
 
@@ -215,29 +308,6 @@ The worker is a separate process with an empty environment, its own session, no 
 OS sandbox applied *before* the JavaScript engine exists. The parent enforces the deadline, memory
 and call budgets from outside and treats everything the worker sends as untrusted input.
 
-## How it is secure
-
-Defence in depth: each layer assumes the one above it has failed. The threat model is in
-[`SECURITY.md`](SECURITY.md) and the details in [the isolation guide](docs/guides/advanced/isolation.md).
-
-| Layer | What it does |
-|---|---|
-| **Separate process** | Empty environment, own session. A V8 abort, hang or out-of-memory kills the worker; the parent raises `WorkerCrashed` or `RuntimeTimeout`. |
-| **OS sandbox, before the engine exists** | macOS: Seatbelt. Linux: Landlock, a private empty root (mount, network, IPC and UTS namespaces) and a seccomp-bpf filter that denies new processes, network, mounts, kernel interfaces, filesystem changes and signals to other processes. Syscalls newer than the reviewed range answer `ENOSYS`. `sandbox="require"` refuses to start unless **every** layer applied. |
-| **No privileges** | A worker started as root drops to `nobody` with an empty capability set; `no_new_privs` is set. |
-| **Smaller engine surface** | V8 runs `--jitless` (no JIT, no WebAssembly). `SharedArrayBuffer`, `Atomics`, `WeakRef` and `FinalizationRegistry` are removed: they are what timers and garbage-collection probes are built from. |
-| **Limits enforced from outside** | Wall-clock deadline (default 60 s), CPU cap, memory ceiling (default 1 GiB), host-call budgets, an in-flight call cap and a write-stall limit. A guest that keeps calling your functions cannot hold the deadline open indefinitely. |
-| **The worker is untrusted** | Every frame it sends goes through a strict native decoder with size, depth, node and hash-collision budgets. No pickle, no `eval`. A worker that sends nonsense is killed. |
-| **Capability tokens** | A bound function is reachable only through an unguessable token, installed after the binding exists. |
-| **Determinism on request** | `clock=` freezes `Date`/`Intl`; `random_seed=` seeds `Math.random`. |
-
-**What it does not promise.** A V8 bug is *contained* to the worker, not prevented, and about 200
-syscalls the engine needs stay reachable. For multi-tenant use, run one runtime per trust unit and
-put the whole thing in a locked-down container or microVM (see the
-[deployment guidance](SECURITY.md)). Libraries that need WebAssembly, a DOM or a canvas do not work.
-The engine is only as current as the `deno_core` release it is built on; a weekly check tells
-maintainers when a newer V8 becomes available.
-
 ## Which runtime?
 
 | | `IsolatedRuntime` | `Runtime` (in-process) |
@@ -246,8 +316,8 @@ maintainers when a newer V8 becomes available.
 | **A hostile builtin can abort or hang your process** | No: it kills the worker | Yes (`new Array(2 ** 32 - 1).fill(0)`) |
 | **`timeout=` always enforced** | Yes (hard kill from outside) | Not for every builtin (e.g. sparse-array `sort`) |
 | **OS sandbox** | Yes | No |
-| **Start-up** | ~15-45 ms with the spare worker, ~70-105 ms without | microseconds |
-| **A host tool call** | Crosses a process boundary (~70 µs per call) | ~12-17 µs ([`BENCHMARKS.md`](BENCHMARKS.md)) |
+| **Start-up** | pool checkout ~0.1 ms, cold ~50 ms | microseconds |
+| **A host tool call** | Crosses a process boundary | In process, ~12-17 µs ([`BENCHMARKS.md`](BENCHMARKS.md)) |
 
 ## How it was tested
 
@@ -287,25 +357,6 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
   let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
   Read it in the **[security report](docs/security-report.md)**.
-
-## Performance
-
-Measured on macOS arm64 (Apple M2) with a release build, on a machine that was not idle, so
-ranges are shown. Reproduce with `benches_py/isolated_report.py` and the Criterion and
-pytest-benchmark suites ([`BENCHMARKS.md`](BENCHMARKS.md), which also shows 0.5.0 is no slower
-than 0.4.5).
-
-| | |
-|---|---|
-| `Pydeno`: check out a session from a warm pool | **~0.1 ms**; with its first `feed_run("1 + 1")` ~1.4 ms; another feed ~0.4 ms; exit ~0.05 ms (see the [front-door guide](docs/guides/quickstart-pydeno.md#performance)) |
-| Create an `IsolatedRuntime` and evaluate | **~15 ms** with the spare worker used soon after it starts, ~30-45 ms after it has sat idle, ~70-105 ms without |
-| Move a 2 MB structured result across the boundary | **~18 ms** each way (native codec) |
-| `import pydeno` | **~19 ms** (the isolation stack loads on first use) |
-| Release extension size | **43 MB**, nearly all of it V8 and its built-in Intl data |
-| In-process `Runtime`: a complete host tool call | **~12-17 µs**; a bare `eval` ~6-10 µs |
-
-Jitless V8 (the default for `IsolatedRuntime`) makes compute-heavy code roughly 1.5 to 2 times
-slower than with the JIT; `jitless=False` trades that back for a larger attack surface.
 
 ## Integrations
 
