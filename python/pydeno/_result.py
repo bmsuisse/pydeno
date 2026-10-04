@@ -45,6 +45,11 @@ DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 TRUNCATED_MARKER = "[truncated]"
 
 _STDOUT_LEVELS = frozenset({"log", "info", "debug"})
+# Console text is the guest's to choose and a host prints or logs it: no control or escape
+# characters (an ANSI sequence can clear a terminal, retitle it or hide a line; a carriage return
+# overwrites one). Newlines and tabs stay, so multi-line output keeps its shape. The same rule the
+# worker's error text follows (`_isolated._CONTROL`).
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _MAX_DEPTH = 200
 _GUEST_ERROR = re.compile(r"^(?:Uncaught )?([A-Za-z_$][A-Za-z0-9_$]{0,63})(?::|$)")
 _EVAL_PREFIX = "Evaluation failed: "
@@ -172,7 +177,7 @@ class OutputCapture:
             return  # full: do not even format it
         if not isinstance(args, (list, tuple)):
             args = [args]
-        line = " ".join(format_console_arg(a) for a in args) + "\n"
+        line = _CONTROL.sub("?", " ".join(format_console_arg(a) for a in args)) + "\n"
         with self._lock:
             if stream.cut:
                 return
