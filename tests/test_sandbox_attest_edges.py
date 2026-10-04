@@ -44,29 +44,31 @@ def test_a_parent_with_a_huge_environment_is_still_seen_as_readable() -> None:
 
 
 def test_a_probe_that_succeeds_then_fails_its_cleanup_is_still_a_breach() -> None:
-    from pydeno import _sandbox
+    # The container shell can exec pytest, making its parent PID 1. Attestation correctly
+    # refuses that as orphaned; run this unsandboxed probe in a child with a live test parent.
+    code = textwrap.dedent(
+        """
+        import os
+        from pydeno import _sandbox
 
-    # Make the file the write probe creates impossible to remove afterwards: it cannot be
-    # unlinked from a directory we then lose, so simulate by breaking `os.unlink` for the probe.
-    import os
-
-    real_unlink = os.unlink
-
-    def broken(*args: object, **kwargs: object) -> None:
-        raise PermissionError("cleanup refused")
-
-    os.unlink = broken  # type: ignore[assignment]
-    try:
-        breaches = _sandbox.attest()
-    finally:
-        os.unlink = real_unlink
-        import glob
-
-        for leftover in glob.glob("/tmp/.pydeno-attest-*"):
-            real_unlink(leftover)
-    # An unsandboxed test process can write, so the write probe succeeded; the failed cleanup
-    # must not turn that into "refused".
-    assert "write-file" in breaches
+        real_unlink = os.unlink
+        def broken(*args, **kwargs):
+            raise PermissionError("cleanup refused")
+        os.unlink = broken
+        try:
+            breaches = _sandbox.attest()
+        finally:
+            os.unlink = real_unlink
+            path = f"/tmp/.pydeno-attest-{os.getpid()}"
+            if os.path.exists(path):
+                real_unlink(path)
+        assert "write-file" in breaches, breaches
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
 
 
 @pytest.mark.linux_only

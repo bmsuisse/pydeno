@@ -150,7 +150,7 @@ jobs:
           # whose ABI tag matches this venv's interpreter.
           PYTAG=$(.wheel-venv/bin/python -c \
             'import sys; print("cp%d%d" % sys.version_info[:2])')
-          WHEEL=$(ls dist/*-${PYTAG}-${PYTAG}-*.whl)
+          WHEEL=$(ls dist/*-"${PYTAG}"-"${PYTAG}"-*.whl)
           echo "Installing $WHEEL into a $PYTAG venv"
           uv pip install --python .wheel-venv/bin/python "$WHEEL"
           # Matches the `testing` dependency group in pyproject.toml -- the
