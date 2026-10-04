@@ -181,19 +181,33 @@ What limits it:
 - **An external function that never returns keeps its session's thread.** Its run is ended,
   your thread released and the session is over, so it cannot start another: one session leaves
   at most one wedged thread behind. Threads are capped **per pool**: `Pydeno(max_tool_threads=128)`
-  (the default) counts the threads its sessions hold, two per `PydenoSession` that has called an
-  external (its loop and its tool thread), one per `AsyncPydenoSession`; a session's threads end
-  with it, also when it is dropped without `close()`. Past the cap, an external call that needs a
-  new thread is refused **in that pool only**: the guest sees its call fail exactly like a tool
-  raising a redacted `RuntimeError` (`host function failed`, nothing about the host), the host gets
-  a log record (logger `pydeno`) and, if the feed then fails, `ToolThreadLimitError` (a
-  `PydenoError`). A process-wide ceiling (`pydeno._agent.MAX_TOOL_THREADS`, 512) stays behind every
-  pool as the last resort; a fork()ed child starts from zero. Give your externals their own
-  timeouts.
-- **`AsyncAgentSandbox` (the older class) still runs plain tools on a thread pool shared by every
-  session in the process** (32 threads, or your `handler_executor`): tools that block there can
-  starve other sessions' tools. `AsyncPydeno` does not have this limit (each session has its own
-  tool thread); pass a `handler_executor` per tenant if you use `AsyncAgentSandbox` directly.
+  (the default) counts, exactly:
+  - a `PydenoSession`'s tool thread, from the first external call that needs it (a `feed_run`
+    call, or `resume_auto`);
+  - a `PydenoSession`'s loop thread, from the first external it serves in a `feed_run` (it is
+    started uncounted by `feed_start`/`resume`, where no external runs on it);
+  - an `AsyncPydenoSession`'s tool thread, from its first plain external.
+
+  A session's threads end with it, also when it is dropped without `close()`. Past the cap, an
+  external call that needs a thread is refused: the guest sees its call fail exactly like a tool
+  raising a redacted `RuntimeError` (`host function failed`, nothing about the host), the call is
+  journaled and charged like any failed tool call (so `dump()` / `load_session()` round-trip and
+  `max_suspensions` holds), the host gets one log record per session (logger `pydeno`; the rest are
+  counted and reported when the session closes) and, if the feed then fails,
+  `ToolThreadLimitError` (a `PydenoError`). A process-wide ceiling (`pydeno._agent.MAX_TOOL_THREADS`,
+  512) stays behind every pool, and a pool's cap is clamped to it. **Caps are upper bounds, not
+  reservations:** pools draw from the shared ceiling first come, first served, so when the open
+  pools' caps add up to more than the ceiling (`Pydeno()` warns), a pool can be refused before
+  reaching its own cap while others hold the threads. A fork()ed child starts from zero. Give your
+  externals their own timeouts.
+- **Console output (`print_callback`)** runs on the session's own thread too: in a `PydenoSession`
+  on your thread (the feed's own), in an `AsyncPydenoSession` on a console thread of the session's
+  (started at its first console call, uncounted: one per session), so one tenant's slow sink holds
+  up only its own session.
+- **`AsyncAgentSandbox` (the older class) still runs plain tools and its console sink on a thread
+  pool shared by every session in the process** (32 threads, or your `handler_executor`): tools or
+  sinks that block there can starve other sessions. `AsyncPydeno` does not have this limit; pass a
+  `handler_executor` per tenant if you use `AsyncAgentSandbox` directly.
 - **The first command after a worker has sat idle is slower** (0.3 to 1 ms on macOS) whatever
   sends it.
 - Monty is faster again: its workers are reused between sessions (pydeno's are single-use, by

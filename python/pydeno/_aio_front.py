@@ -30,6 +30,8 @@ from ._agent import (
     Failed,
     ToolCall,
     _log,
+    _UNBOUNDED_LIMIT,
+    _ThreadBudget,
     _ThreadsExhausted,
     _ToolThread,
     _unavailable,
@@ -47,6 +49,8 @@ from ._front import (
     PydenoLimits,
     ToolThreadLimitError,
     _check_lookup,
+    _close_pool,
+    _open_pool,
     _tool_budget,
     _check_pool_arguments,
     _compile_check,
@@ -73,6 +77,8 @@ from ._isolated import WorkerCrashed
 from ._sandbox_pool import AsyncSandboxPool
 
 __all__ = ["AsyncPydeno", "AsyncPydenoSession", "AsyncPydenoSnapshot"]
+
+_CONSOLE_THREADS = _ThreadBudget(_UNBOUNDED_LIMIT, "console sinks")
 
 
 class _Pool(AsyncSandboxPool):
@@ -133,6 +139,8 @@ class AsyncPydeno:
             await self._pool.start()
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
+        _open_pool(self._budget)
+        weakref.finalize(self, _close_pool, self._budget)
         return self
 
     async def __aenter__(self) -> AsyncPydeno:
@@ -144,6 +152,7 @@ class AsyncPydeno:
     async def close(self) -> None:
         """Kill the workers still waiting in the pool. Idempotent."""
         await self._pool.close()
+        _close_pool(self._budget)
 
     def checkout(
         self, *, script_name: str = "main.js", limits: PydenoLimits | None = None
@@ -337,7 +346,15 @@ class AsyncPydenoSession:
         self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}", pool._budget)  # noqa: SLF001
         self._refused: BaseException | None = None
         # A session dropped without close() must not keep its tool thread (or its budget).
+        self._refusals = 0
+        # The session's console sink runs here, not on the process-wide handler pool: one
+        # tenant's slow `print_callback` holds up only its own session. Bounded by construction
+        # (one per session), so it does not count against the tool-thread budget.
+        self._console = _ToolThread(
+            f"pydeno-front-console-{self._sid}", _CONSOLE_THREADS
+        )
         weakref.finalize(self, self._tools.close)
+        weakref.finalize(self, self._console.close)
 
     async def __aenter__(self) -> AsyncPydenoSession:
         if self._entered:
@@ -346,6 +363,7 @@ class AsyncPydenoSession:
             )
         self._entered = True
         self._agent = await self._pool._agent(self._limits, self._printer)  # noqa: SLF001
+        self._agent._core.rt._handler_executor = self._console  # noqa: SLF001
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -358,6 +376,13 @@ class AsyncPydenoSession:
                 "an external function cannot close the session that called it"
             )
         self._tools.close()
+        self._console.close()
+        if self._refusals > 1:
+            _log.warning(
+                "pydeno: session %d: %d tool calls were refused in all",
+                self._sid,
+                self._refusals,
+            )
         agent, self._agent = self._agent, None
         if agent is not None:
             # SIGKILL at once: a worker that will never run again need not exit cleanly.
@@ -511,6 +536,7 @@ class AsyncPydenoSession:
                 else "this state was dumped between feeds; use load_session"
             )
         new._core.console.user = self._printer  # noqa: SLF001
+        new._core.rt._handler_executor = self._console  # noqa: SLF001
         self._agent = new
         assert old is not None
         await old.close()
@@ -573,7 +599,13 @@ class AsyncPydenoSession:
                     submitted = self._tools.submit(context.run, fn, *args)
                 except _ThreadsExhausted as exc:
                     self._refused = exc
-                    _log.warning("pydeno: a tool call was refused: %s", exc)
+                    self._refusals += 1
+                    if self._refusals == 1:  # once per session; the rest are counted
+                        _log.warning(
+                            "pydeno: session %d: a tool call was refused: %s",
+                            self._sid,
+                            exc,
+                        )
                     return _MISSING, _unavailable()
                 result = await asyncio.wrap_future(submitted)
                 if inspect.isawaitable(result):

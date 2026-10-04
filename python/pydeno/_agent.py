@@ -826,40 +826,50 @@ class _Core:
         # not wait for either, since the tool may never return.
         self.tool_busy = False
         self._loop_budget: _ThreadBudget | None = None
-        # The last tool call refused for want of a thread (host-side detail), if any.
+        # The last tool call refused for want of a thread (host-side detail), if any, and how
+        # many were (logged once, then counted).
         self.refused: BaseException | None = None
+        self.refusals = 0
 
-    def ensure_loop(self, *, for_tools: bool = False) -> asyncio.AbstractEventLoop:
-        """The session's loop, started on first use. Started for a tool call (`for_tools`), its
-        thread counts against the session's thread budget like its tool thread does (a tool can
-        wedge it); raises `_ThreadsExhausted` if that budget is spent."""
+    def ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """The session's loop, started on first use. It is counted against the session's
+        thread budget only once it serves a tool (`count_loop`, from `_run_tool`), so that a
+        refusal happens inside the call's own bookkeeping (journaled and charged like any failed
+        tool call) and never before it."""
         with self._loop_lock:
             if self.loop is None:
                 if self.closed:
                     raise RuntimeError("the session is closed")
-                budget = self.tools.budget if for_tools else None
-                if budget is not None:
-                    budget.acquire()
+                loop = asyncio.new_event_loop()
+                self.thread = threading.Thread(
+                    target=self._serve, name="pydeno-agent-loop", daemon=True
+                )
+                self.loop = loop
                 try:
-                    loop = asyncio.new_event_loop()
-                    self.thread = threading.Thread(
-                        target=self._serve, name="pydeno-agent-loop", daemon=True
-                    )
-                    self.loop = loop
-                    self._loop_budget = budget
                     self.thread.start()
                 except BaseException:
                     self.loop = None
-                    if budget is not None:
-                        budget.release()
                     raise
             return self.loop
 
+    def count_loop(self) -> None:
+        """On the loop thread, before its first tool: charge the loop thread to the session's
+        budget (a tool can wedge it). Raises `_ThreadsExhausted` if the budget is spent."""
+        if self._loop_budget is None:
+            budget = self.tools.budget
+            budget.acquire()
+            self._loop_budget = budget
+
     def note_refusal(self, exc: BaseException) -> None:
-        """A tool call refused for want of a thread: tell the host (the guest is told nothing
-        but that the call failed)."""
+        """A tool call refused for want of a thread: tell the host once per session (the rest
+        are counted and reported when it closes); the guest is told nothing but that the call
+        failed. The record holds only host-side text."""
         self.refused = exc
-        _log.warning("pydeno: a tool call was refused: %s", exc)
+        self.refusals += 1
+        if self.refusals == 1:
+            _log.warning(
+                "pydeno: session %d: a tool call was refused: %s", self.session_id, exc
+            )
 
     def charge(self, name: str) -> None:
         """One tool call against the session's budget (refused past it)."""
@@ -1032,6 +1042,12 @@ class _Core:
                 return
             self.closed = True
             self.cond.notify_all()
+        if self.refusals > 1:
+            _log.warning(
+                "pydeno: session %d: %d tool calls were refused in all",
+                self.session_id,
+                self.refusals,
+            )
         try:
             self.rt.close()
         except Exception:  # noqa: BLE001, S110 - closing must not fail half-way
@@ -1654,6 +1670,10 @@ def _unavailable() -> RuntimeError:
     return exc
 
 
+#: A thread budget that never refuses (threads bounded by construction, e.g. a console sink).
+_UNBOUNDED_LIMIT = 2**62
+
+
 class _ThreadBudget:
     """A cap on the session threads (tool threads, and loop threads started for tools) alive at
     once, for one pool (`Pydeno(max_tool_threads=...)`), chained to the process-wide ceiling.
@@ -1786,13 +1806,7 @@ class _LazyLoop:
         self._core = core
 
     def __getattr__(self, name: str) -> Any:
-        core = self._core
-        try:
-            loop = core.ensure_loop(for_tools=True)
-        except _ThreadsExhausted as exc:
-            core.note_refusal(exc)
-            raise _unavailable() from None
-        return getattr(loop, name)
+        return getattr(self._core.ensure_loop(), name)
 
 
 class _Slot:
@@ -2252,6 +2266,11 @@ class AgentSandbox(_SessionBase):
         else:
             fn, args = self._check_call(call)
         context = run.context.copy()
+        try:
+            core.count_loop()
+        except _ThreadsExhausted as exc:
+            core.note_refusal(exc)
+            raise _unavailable() from None
         core.tool_busy = True
         try:
             if inspect.iscoroutinefunction(fn):

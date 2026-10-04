@@ -45,6 +45,7 @@ import secrets
 import signal
 import sys
 import threading
+import warnings
 import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -1055,7 +1056,41 @@ def _tool_budget(max_tool_threads: int) -> _ThreadBudget:
         or max_tool_threads < 1
     ):
         raise ValueError("max_tool_threads must be a positive int")
+    ceiling = _PROCESS_THREADS.limit
+    if max_tool_threads > ceiling:
+        warnings.warn(
+            f"max_tool_threads={max_tool_threads} is above the process ceiling ({ceiling}); "
+            f"clamped to {ceiling}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        max_tool_threads = ceiling
     return _ThreadBudget(max_tool_threads, "this pool", parent=_PROCESS_THREADS)
+
+
+# The open pools' budgets (to warn when their caps add up to more than the process ceiling).
+_OPEN_POOLS: set[_ThreadBudget] = set()
+_OPEN_POOLS_LOCK = threading.Lock()
+
+
+def _open_pool(budget: _ThreadBudget) -> None:
+    ceiling = _PROCESS_THREADS.limit
+    with _OPEN_POOLS_LOCK:
+        _OPEN_POOLS.add(budget)
+        total = sum(b.limit for b in _OPEN_POOLS)
+    if total > ceiling:
+        warnings.warn(
+            f"the open pools' max_tool_threads add up to {total}, above the process ceiling "
+            f"({ceiling}): a pool's cap is an upper bound, not a reservation, so a pool may be "
+            "refused before reaching its own cap while others hold the threads",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+
+
+def _close_pool(budget: _ThreadBudget) -> None:
+    with _OPEN_POOLS_LOCK:
+        _OPEN_POOLS.discard(budget)
 
 
 def _check_pool_arguments(
@@ -1116,10 +1151,11 @@ class Pydeno:
             (default 128). A session gets its own threads at its first external call: two for
             a `PydenoSession` (its loop and its tool thread), one for an `AsyncPydenoSession`;
             they end with the session, except that a tool that never returns keeps its thread
-            after its run is killed. Past the
-            cap, an external call that needs a new thread is refused (`ToolThreadLimitError` for
-            the host, a generic failure for the guest), in this pool only. A process-wide
-            ceiling (`pydeno._agent.MAX_TOOL_THREADS`, 512) stays as the last resort.
+            after its run is killed. Past the cap, an external call that needs a thread is
+            refused (journaled and charged like a failed tool call; a generic failure for the
+            guest; `ToolThreadLimitError` for the host). Clamped to the process ceiling
+            (`pydeno._agent.MAX_TOOL_THREADS`, 512), which every pool draws from: a cap is an
+            upper bound, not a reservation (a warning says so when open pools' caps exceed it).
 
     The first worker starts in the constructor (a platform that cannot sandbox fails here, not
     at the first checkout) and the rest in the background, so the first checkout is fast. Use
@@ -1143,6 +1179,8 @@ class Pydeno:
         self._sandbox = sandbox
         self._reaper = _Reaper()
         weakref.finalize(self, self._reaper.stop)  # a pool dropped without close()
+        _open_pool(self._budget)
+        weakref.finalize(self, _close_pool, self._budget)
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
@@ -1163,6 +1201,7 @@ class Pydeno:
         """Kill the workers still waiting in the pool, and stop its threads. Idempotent."""
         self._pool.close()
         self._reaper.stop()
+        _close_pool(self._budget)
 
     def checkout(
         self, *, script_name: str = "main.js", limits: PydenoLimits | None = None
