@@ -503,6 +503,10 @@ class AsyncAgentSandbox(_SessionBase):
         return await self._call_tool(step)
 
     async def _call_tool(self, call: ToolCall) -> Any:
+        if self._dead:
+            # A host-call frame the dead worker had already buffered can still arrive after another
+            # task noticed the death. Its tool was never part of the recorded run: do not run it.
+            raise WorkerCrashed("the worker died while the run was in progress")
         fn, args = self._check_call(call)
         if inspect.iscoroutinefunction(fn):
             result = await fn(*args)

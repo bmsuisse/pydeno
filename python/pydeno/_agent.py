@@ -1770,12 +1770,11 @@ def _replay_plan(
                 if input_[1] == "v":
                     step = yield ("ans", step, _decode(input_[2]), None)
                 else:
-                    step = yield (
-                        "ans",
-                        step,
-                        _MISSING,
-                        _error_class(input_[2])(input_[3]),
-                    )
+                    # The recorded message is already the redacted one (or a public one): the
+                    # replay must not redact it a second time, or it diverges from the live run.
+                    recorded = _error_class(input_[2])(input_[3])
+                    recorded._pydeno_public = True  # type: ignore[attr-defined]
+                    step = yield ("ans", step, _MISSING, recorded)
             assert step is not None
             got_kind, got_digest = _outcome(step)
             if (got_kind, got_digest) != (record[1], record[2]):
