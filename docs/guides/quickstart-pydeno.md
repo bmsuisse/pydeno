@@ -51,7 +51,7 @@ The same names, mapped onto pydeno's building blocks (`SandboxPool` underneath, 
 | Monty | pydeno | What differs |
 |---|---|---|
 | `Monty()` / `AsyncMonty()` | `Pydeno()` / `AsyncPydeno()` | Workers are single-use, so there is no `max_processes`, `max_checkouts_per_worker` or `checkout_timeout`: an empty pool starts a worker on the spot (a cold start, never an error, never a wait). `min_processes` is the number kept ready. `Pydeno()` starts its first worker in the constructor; `AsyncPydeno` on `async with` |
-| Speed, warm pool (checkout / with first feed / next feed) | the same calls | pydeno 0.11 / 1.35 / 0.4 ms; Monty about 0.04 / 0.04 to 0.15 / 0.01 ms on the same machine. A pydeno checkout does no worker round trip (the session's setup is pre-installed on each pooled worker); the per-feed floor is the worker's async evaluation. Monty reuses workers, pydeno never does (see [Performance](#performance)) |
+| Speed, warm pool (checkout / with first feed / next feed) | the same calls | pydeno 0.11 / about 1.5 / 0.4 ms (the first feed also freezes the clock in a round trip of its own); Monty about 0.04 / 0.04 to 0.15 / 0.01 ms on the same machine. A pydeno checkout does no worker round trip (the session's setup is pre-installed on each pooled worker); the per-feed floor is the worker's async evaluation. Monty reuses workers, pydeno never does (see [Performance](#performance)) |
 | `pool.checkout(script_name=, limits=)` | `pool.checkout(script_name=, limits=)` | No type checking, `os_policy` or `print_flush_interval` (see below) |
 | `MontySession` / `AsyncMontySession` | `PydenoSession` / `AsyncPydenoSession` | `session_id` is always `None` (as for Monty's local workers) |
 | `session.feed_run(code, inputs=, external_lookup=, print_callback=)` | the same | JavaScript: a feed's result is its trailing expression (or what it `return`s); a top-level assignment (`x = 1`) has none, as in Monty. Feeds may `await`. A name must be in `external_lookup` to be callable (JavaScript cannot intercept undefined names), and external calls return promises: `await fetch(1)`. `inputs` are plain data (None, bool, int, float, str, list, dict) |
@@ -131,12 +131,14 @@ Pydeno(limits={"max_memory": None})     # remove a limit
 
 `benches_py/alternatives_bench.py` on an Apple-silicon laptop (macOS, Python 3.14, medians with p95
 in brackets, milliseconds, warm pools, a machine that was not idle, so numbers vary by about 20%
-between runs):
+between runs). Since the security review's fixes the first feed also sends the clock freeze as a
+command of its own (one round trip); every other feed costs what it did (measured A/B on one
+machine: a feed is about 0.12 ms over the worker's own `eval_async` before and after):
 
 | | `SandboxPool` (raw) | `Pydeno` | `AsyncPydeno` | Monty |
 |---|---|---|---|---|
 | checkout | 0.044 (0.07) | 0.11 (0.61) | 0.10 (0.61) | |
-| checkout + first `feed_run("1 + 1")` | 1.8 (2.5) | 1.35 (1.7) | 1.45 (2.6) | 0.04 to 0.15 (24) |
+| checkout + first `feed_run("1 + 1")` | 1.8 (2.5) | 1.35 (1.7) + one plain `eval` round trip (about 0.1 to 0.3 ms) for the clock freeze | 1.45 (2.6) + the same | 0.04 to 0.15 (24) |
 | one more `feed_run("1 + 1")` | 0.10 to 0.26 | 0.38 to 0.46 | 0.53 | 0.01 to 0.02 |
 | checkout + 10 feeds + exit | 4.6 to 8.3 | 5.9 to 6.2 | 11.2 | 0.18 to 0.27 |
 | session exit | | 0.05 | | |
@@ -146,11 +148,15 @@ How `Pydeno` gets there:
 - **Nothing session-independent happens at checkout.** A pooled worker arrives with the session's
   dispatcher bound, the session prelude installed, the clock-freezing script compiled and its first
   runs done, all on the pool's background filler. A checkout adopts it and applies the session's
-  limits and console routing in Python, with no round trip to the worker. The clock is still
-  frozen at checkout: the session freezes it at the start of its first feed's script, before any
-  guest code.
-- **Feeds run on your thread.** `feed_run` drives the worker from the calling thread and answers
-  each external call there as it arrives, with no loop thread and no hand-offs.
+  limits and console routing in Python, with no round trip to the worker. The clock is frozen
+  to the checkout's instant by a command of its own sent just before the first feed (one round
+  trip, on the first feed only), so it holds even when that feed fails before any of it runs.
+- **Feeds are driven from your thread.** `feed_run` runs the worker's command loop on the calling
+  thread, which enforces every limit the whole time. External calls are answered on a shared tool
+  thread, in the order the guest made them, in a copy of your context. A feed that calls nothing
+  touches no other thread. An external that outlives `max_host_wait_secs` (or a guest that burns
+  the CPU cap meanwhile) gets the worker killed and your thread released within about 0.1 s; the
+  external is left to finish on its thread and its answer is discarded.
 - **The refill waits.** Replacing a checked-out worker starts 50 ms after the checkout (at once if
   the pool is empty), because starting a process stalls the parent for about a millisecond, which
   would otherwise land on the session's first feed. This is why a `Pydeno` checkout plus its first
