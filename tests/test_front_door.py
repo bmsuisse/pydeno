@@ -929,9 +929,12 @@ class TestRunsOnTheCallersThread:
 
         var.set("caller")
         with AgentSandbox({"tool": tool}, sandbox=MODE) as sb:
+            assert sb.run("return 1") == 1
+            assert sb._core.thread is None  # noqa: SLF001 - no tool called: no thread
             assert sb.run("return await tool(1) + await tool(2)") == 5
             assert seen == ["caller", "caller"]
-            assert sb._core.thread is None  # noqa: SLF001
+            # The session's own threads, started by its first tool call.
+            assert sb._core.thread is not None  # noqa: SLF001
             # start/resume still work on the same session (the loop starts on demand)
             step = sb.start("return await tool(5)")
             assert step.name == "tool"

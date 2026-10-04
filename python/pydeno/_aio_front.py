@@ -18,11 +18,11 @@ import asyncio
 import contextvars
 import functools
 import inspect
+import itertools
 from collections.abc import Callable
 from typing import Any, Literal
 
-from . import _aio
-from ._agent import _MISSING, Done, Failed, ToolCall
+from ._agent import _MISSING, _TOOL_OF, Done, Failed, ToolCall, _ToolThread
 from ._aio import AsyncIsolatedRuntime
 from ._aio_agent import AsyncAgentSandbox, apreinstall
 from ._front import (
@@ -59,6 +59,8 @@ from ._isolated import WorkerCrashed
 from ._sandbox_pool import AsyncSandboxPool
 
 __all__ = ["AsyncPydeno", "AsyncPydenoSession", "AsyncPydenoSnapshot"]
+
+_FRONT_SESSIONS = itertools.count(1)
 
 
 class _Pool(AsyncSandboxPool):
@@ -316,6 +318,8 @@ class AsyncPydenoSession:
         self._printer = _Printer()
         self._entered = False
         self._busy = False
+        self._sid = next(_FRONT_SESSIONS)
+        self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}")
 
     async def __aenter__(self) -> AsyncPydenoSession:
         if self._entered:
@@ -331,6 +335,11 @@ class AsyncPydenoSession:
 
     async def close(self) -> None:
         """Kill the session's worker (it is never reused). Idempotent."""
+        if _TOOL_OF.get() == self._sid:
+            raise RuntimeError(
+                "an external function cannot close the session that called it"
+            )
+        self._tools.close()
         agent, self._agent = self._agent, None
         if agent is not None:
             # SIGKILL at once: a worker that will never run again need not exit cleanly.
@@ -525,23 +534,24 @@ class AsyncPydenoSession:
                 return await agent.resume(step, error=exc)
         return await agent.resume(step, error=error)
 
-    @staticmethod
     async def _call_external(
-        fn: Any, name: str, args: tuple[Any, ...]
+        self, fn: Any, name: str, args: tuple[Any, ...]
     ) -> tuple[Any, BaseException | None]:
         if fn is None:
             return _MISSING, _not_available(name)
         try:
+            # Each call in a fresh copy of the caller's context, marked as this session's tool.
+            context = contextvars.copy_context()
+            context.run(_TOOL_OF.set, self._sid)
             if inspect.iscoroutinefunction(fn):
-                result = await fn(*args)
+                result = await context.run(
+                    asyncio.get_running_loop().create_task, fn(*args)
+                )
             else:
-                # A plain function may block: never on the loop (as AsyncAgentSandbox does).
-                context = contextvars.copy_context()
-                result = await asyncio.get_running_loop().run_in_executor(
-                    _aio._pool("handlers"),  # noqa: SLF001
-                    context.run,
-                    fn,
-                    *args,
+                # A plain function may block: never on the loop, and never on a thread another
+                # session uses (its thread-locals, or a wedged call, stay this session's).
+                result = await asyncio.wrap_future(
+                    self._tools.submit(context.run, fn, *args)
                 )
                 if inspect.isawaitable(result):
                     result = await result

@@ -61,7 +61,7 @@ from ._agent import (
     _error_class,
     _open_journal,
     _public,
-    _tool_loop,
+    _TOOL_OF,
     preinstall,
 )
 from ._isolated import IsolatedRuntime, WorkerCrashed
@@ -1282,7 +1282,12 @@ class PydenoSession:
 
     def close(self) -> None:
         """Kill the session's worker (it is never reused). Idempotent."""
-        agent, self._agent = self._agent, None
+        agent = self._agent
+        if agent is not None and _TOOL_OF.get() == agent._core.session_id:  # noqa: SLF001
+            raise RuntimeError(
+                "an external function cannot close the session that called it"
+            )
+        self._agent = None
         if agent is not None:
             # SIGKILL at once instead of asking a worker that will never run again to exit
             # cleanly (which costs its interpreter's teardown, waited for by the caller).
@@ -1518,11 +1523,12 @@ class PydenoSession:
         enforced while the external runs killed it): the caller is released at once; the
         external is left to finish on its thread and its answer is discarded."""
         agent = self._live()
-        _, executor = _tool_loop()
-        future = executor.submit(
-            contextvars.copy_context().run, self._call_external, fn, name, args
-        )
-        rt = agent._core.rt  # noqa: SLF001
+        core = agent._core  # noqa: SLF001
+        context = contextvars.copy_context()
+        context.run(_TOOL_OF.set, core.session_id)
+        # The session's own tool thread: never shared with another session.
+        future = core.tools.submit(context.run, self._call_external, fn, name, args)
+        rt = core.rt
         while True:
             try:
                 return future.result(_POLL)

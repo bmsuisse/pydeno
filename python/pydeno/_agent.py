@@ -30,6 +30,7 @@ import asyncio
 import base64
 import collections
 import collections.abc
+import concurrent.futures
 import contextvars
 import dataclasses
 import functools
@@ -40,6 +41,7 @@ import itertools
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import threading
@@ -47,7 +49,6 @@ import types
 import typing
 import weakref
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -818,6 +819,11 @@ class _Core:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.thread: threading.Thread | None = None
         self._loop_lock = threading.Lock()
+        # The session's own thread for plain tools in runs driven by `_drive` (started lazily).
+        self.tools = _ToolThread(f"pydeno-agent-tool-{session_id}")
+        # A tool of this session is running (on its loop or its tool thread): closing then must
+        # not wait for either, since the tool may never return.
+        self.tool_busy = False
 
     def ensure_loop(self) -> asyncio.AbstractEventLoop:
         with self._loop_lock:
@@ -1004,10 +1010,19 @@ class _Core:
             self.rt.close()
         except Exception:  # noqa: BLE001, S110 - closing must not fail half-way
             pass
+        self.tools.close()
         with self._loop_lock:
             pass  # a loop being started right now has finished starting
         on_loop_thread = threading.current_thread() is self.thread
         if self.loop is None or self.loop.is_closed():
+            return
+        if self.tool_busy:
+            # A tool (possibly wedged) holds the loop or the tool thread: stop the loop once it
+            # is free, and do not wait; both threads are daemons and belong to nobody else.
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except RuntimeError:
+                pass
             return
         if not on_loop_thread:
 
@@ -1571,13 +1586,12 @@ class _InlineRun:
     """One `AgentSandbox._drive`: its answering function, the caller's context, the order its
     tool calls are answered in, and whether it is still the run in progress."""
 
-    __slots__ = ("active", "answer", "context", "executor", "order", "state")
+    __slots__ = ("active", "answer", "context", "order", "state")
 
     def __init__(
-        self, answer: Callable[[ToolCall], Any] | None, executor: Any, session_id: int
+        self, answer: Callable[[ToolCall], Any] | None, session_id: int
     ) -> None:
         self.answer = answer
-        self.executor = executor
         self.context = contextvars.copy_context()
         # Tools see which session they are answering for, so they cannot drive or close it.
         self.context.run(_TOOL_OF.set, session_id)
@@ -1594,32 +1608,105 @@ class _InlineRun:
 _TOOL_OF: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "pydeno_agent_tool_of", default=None
 )
-_TOOL_LOOP_LOCK = threading.Lock()
-_TOOL_LOOP: tuple[int, asyncio.AbstractEventLoop, ThreadPoolExecutor] | None = None
-# Plain tools run here (an event loop must never block on one). A tool that never returns keeps
-# its thread; the limits still end its run and release the caller.
-_TOOL_THREADS = 64
 
 
-def _tool_loop() -> tuple[asyncio.AbstractEventLoop, ThreadPoolExecutor]:
-    """The process's one loop for answering tool calls of runs driven by `_drive` (started on
-    first use, and again in a fork()ed child), and the thread pool plain tools run on."""
-    global _TOOL_LOOP  # noqa: PLW0603
-    current = _TOOL_LOOP
-    if current is not None and current[0] == os.getpid():
-        return current[1], current[2]
-    with _TOOL_LOOP_LOCK:
-        current = _TOOL_LOOP
-        if current is None or current[0] != os.getpid():
-            loop = asyncio.new_event_loop()
-            threading.Thread(
-                target=loop.run_forever, name="pydeno-agent-tools", daemon=True
-            ).start()
-            executor = ThreadPoolExecutor(
-                max_workers=_TOOL_THREADS, thread_name_prefix="pydeno-agent-tool"
-            )
-            current = _TOOL_LOOP = (os.getpid(), loop, executor)
-        return current[1], current[2]
+class ToolThreadLimitError(ToolError):
+    """The process already runs `MAX_TOOL_THREADS` session tool threads (most of them, typically,
+    stuck in tools whose runs were killed): no new session tool thread is started until some
+    of them finish. Only the call that needed a new thread fails; running ones are unaffected."""
+
+
+#: Most session tool threads alive in the process at once. Each session gets at most one (plus
+#: its loop thread), so this bounds how many sessions with wedged tools a process tolerates.
+MAX_TOOL_THREADS = 512
+_TOOL_THREADS_LOCK = threading.Lock()
+_TOOL_THREADS_ALIVE = 0
+
+
+class _ToolThread:
+    """One session's own thread for its plain (synchronous) tools: started at the session's
+    first such call, never shared with another session and never reused by one, so a tool that
+    blocks forever, or that leaves thread-local state behind, affects only its own session.
+    One call at a time. `close()` lets it exit after the call in progress, without waiting."""
+
+    __slots__ = ("_lock", "_name", "_queue", "_started", "_closed")
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+
+    def submit(
+        self, fn: Callable[..., Any], *args: Any
+    ) -> concurrent.futures.Future[Any]:
+        global _TOOL_THREADS_ALIVE  # noqa: PLW0603
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the session is closed")
+            if not self._started:
+                with _TOOL_THREADS_LOCK:
+                    if _TOOL_THREADS_ALIVE >= MAX_TOOL_THREADS:
+                        raise _public(
+                            ToolThreadLimitError(
+                                f"this process already runs {MAX_TOOL_THREADS} session tool "
+                                "threads; no new one can start until some finish"
+                            )
+                        )
+                    _TOOL_THREADS_ALIVE += 1
+                try:
+                    threading.Thread(
+                        target=self._serve, name=self._name, daemon=True
+                    ).start()
+                except BaseException:
+                    with _TOOL_THREADS_LOCK:
+                        _TOOL_THREADS_ALIVE -= 1
+                    raise
+                self._started = True
+            self._queue.put((future, fn, args))
+        return future
+
+    def _serve(self) -> None:
+        global _TOOL_THREADS_ALIVE  # noqa: PLW0603
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                future, fn, args = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(fn(*args))
+                except BaseException as exc:  # noqa: BLE001 - delivered to whoever waits
+                    future.set_exception(exc)
+                del future, fn, args, item  # hold nothing of a finished call
+        finally:
+            with _TOOL_THREADS_LOCK:
+                _TOOL_THREADS_ALIVE -= 1
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._started:
+                self._queue.put(None)
+
+
+class _LazyLoop:
+    """The session's loop as the runtime's host-call loop, started only when the runtime first
+    schedules a call on it: a run that calls no tool starts no thread."""
+
+    __slots__ = ("_core",)
+
+    def __init__(self, core: _Core) -> None:
+        self._core = core
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._core.ensure_loop(), name)
 
 
 class _Slot:
@@ -1975,10 +2062,11 @@ class AgentSandbox(_SessionBase):
 
         The caller's thread runs the command's pump, which enforces the deadline, the CPU cap,
         `max_pause` and the memory ceiling the whole time, also while a tool runs: tool calls
-        are answered off this thread, on the shared tool loop (`_tool_loop`), one at a time in
-        the order the guest made them (by `answer(call)`, default the real tool, run in a copy
-        of the caller's context), and journaled exactly as `start`/`resume` journal them (an
-        observed `ToolCall`, then its answer). A tool that outlives a limit gets the worker
+        are answered off this thread, on the session's own loop (async tools) and the session's
+        own tool thread (plain ones), neither shared with any other session, one at a time in
+        the order the guest made them (by `answer(call)`, default the real tool, each call in a
+        fresh copy of the caller's context), and journaled exactly as `start`/`resume` journal
+        them (an observed `ToolCall`, then its answer). A tool that outlives a limit gets the worker
         killed and the caller released at once; its late answer is discarded. A run that calls
         no tool touches no other thread.
         """
@@ -1993,8 +2081,7 @@ class AgentSandbox(_SessionBase):
                 )
             core = self._core
             rt = core.rt
-            loop, executor = _tool_loop()
-            run = _InlineRun(answer, executor, core.session_id)
+            run = _InlineRun(answer, core.session_id)
             self._record(["run", code])
             capture = OutputCapture(self._max_output_bytes)
             core.console.capture = capture
@@ -2008,7 +2095,7 @@ class AgentSandbox(_SessionBase):
                         "timeout": rt._soft_timeout,  # noqa: SLF001
                     },
                     soft_timeout=rt._soft_timeout,  # noqa: SLF001
-                    loop=loop,
+                    loop=_LazyLoop(core),  # type: ignore[arg-type]
                 )
                 # Over the cap, the run fails but the session goes on.
                 bounded_result(value, self._max_result_bytes)
@@ -2070,18 +2157,28 @@ class AgentSandbox(_SessionBase):
         return sent_value
 
     async def _run_tool(self, run: _InlineRun, call: ToolCall) -> Any:
+        """On the session's loop. Each call gets a fresh copy of the caller's context, so what
+        one call sets is not seen by the next."""
         loop = asyncio.get_running_loop()
+        core = self._core
         if run.answer is not None:
             fn, args = run.answer, (call,)
         else:
             fn, args = self._check_call(call)
-        if inspect.iscoroutinefunction(fn):
-            # A task made inside the caller's context runs in (a copy of) it.
-            return await run.context.run(loop.create_task, fn(*args))
-        result = await loop.run_in_executor(run.executor, run.context.run, fn, *args)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
+        context = run.context.copy()
+        core.tool_busy = True
+        try:
+            if inspect.iscoroutinefunction(fn):
+                # A task made inside the context runs in (a copy of) it.
+                return await context.run(loop.create_task, fn(*args))
+            result = await asyncio.wrap_future(
+                core.tools.submit(context.run, fn, *args)
+            )
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            core.tool_busy = False
 
     def call(self, step: ToolCall) -> Any:
         """Run the real tool for a `ToolCall` (what `run` does for each one) and return its

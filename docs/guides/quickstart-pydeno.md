@@ -152,11 +152,19 @@ How `Pydeno` gets there:
   to the checkout's instant by a command of its own sent just before the first feed (one round
   trip, on the first feed only), so it holds even when that feed fails before any of it runs.
 - **Feeds are driven from your thread.** `feed_run` runs the worker's command loop on the calling
-  thread, which enforces every limit the whole time. External calls are answered on a shared tool
-  thread, in the order the guest made them, in a copy of your context. A feed that calls nothing
+  thread, which enforces every limit the whole time. External calls are answered on the
+  **session's own** threads, never shared with another session: plain functions on the session's
+  tool thread, coroutine functions on its event-loop thread (sync API), both started at the
+  session's first external call (about 0.2 ms, once) and never reused by another session. Calls
+  are answered one at a time, in the order the guest made them, each in a fresh copy of your
+  context (contextvars set by one call are not seen by the next). A feed that calls nothing
   touches no other thread. An external that outlives `max_host_wait_secs` (or a guest that burns
   the CPU cap meanwhile) gets the worker killed and your thread released within about 0.1 s; the
-  external is left to finish on its thread and its answer is discarded.
+  external is left to finish on its session's thread and its answer is discarded.
+- **Thread-locals:** an external runs on the session's thread, not on yours, so it does **not**
+  see your thread-local state (`threading.local()`), and nothing it leaves in thread-locals can
+  reach another session. Pass per-request state through contextvars (copied per call) or the
+  function's closure.
 - **The refill waits.** Replacing a checked-out worker starts 50 ms after the checkout (at once if
   the pool is empty), because starting a process stalls the parent for about a millisecond, which
   would otherwise land on the session's first feed. This is why a `Pydeno` checkout plus its first
@@ -170,7 +178,12 @@ What limits it:
   command (`asyncio.run` in `_worker.py`). A plain `eval` takes about 0.1 ms; the front door's own
   Python costs about 0.05 ms per feed. A persistent event loop in the worker would close most of
   that gap.
-- **An external function that never returns keeps its thread.** Its run is ended and your thread released, but plain externals share a pool of 64 tool threads, so many such hangs would starve later external calls. Give your externals their own timeouts.
+- **An external function that never returns keeps its session's thread.** Its run is ended,
+  your thread released and the session is over, so it cannot start another: one session leaves
+  at most its tool thread and its loop thread behind, and other sessions are unaffected. The
+  process caps live session tool threads at `pydeno._agent.MAX_TOOL_THREADS` (512); past it, an
+  external call that needs a new thread fails in the guest with `ToolThreadLimitError` (only that
+  call; running sessions keep theirs). Give your externals their own timeouts.
 - **The first command after a worker has sat idle is slower** (0.3 to 1 ms on macOS) whatever
   sends it.
 - Monty is faster again: its workers are reused between sessions (pydeno's are single-use, by
