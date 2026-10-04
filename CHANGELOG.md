@@ -50,8 +50,10 @@
   instead of the promised catchable `RangeError`. The bridge now charges their committed bytes to the same
   budget at construction, `resize`/`grow` and `transfer*`, through one op that keys each buffer by a private
   symbol and holds it weakly; when a charge would exceed the cap the op forces a GC, gives collected buffers'
-  bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget.
-  `instanceof`, subclassing, `Symbol.species` and the prototype objects are unchanged. `WebAssembly.Memory`
+  bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget; the
+  allocator does the same cheap sweep before refusing a fixed-length buffer, and the bookkeeping is bounded
+  (it is swept as it doubles and capped). `instanceof`, subclassing, `Symbol.species` and the prototype
+  objects are unchanged. `WebAssembly.Memory`
   remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
 - **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
   `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's
@@ -60,7 +62,8 @@
   `on_console` and `capture_console` are unaffected.
 - **Captured console output carries no control or escape characters.** `execute()` (and the agent layer's
   `ExecutionResult`) cleaned error text but returned `stdout`/`stderr` with raw ANSI/C1 sequences; they now
-  follow the same rule (newlines and tabs stay).
+  follow the same rule (newlines and tabs stay), and both also drop the Unicode bidirectional controls that
+  reorder a line. An `on_console` callback still receives the guest's text raw; sanitise it before printing.
 
 ### Fixed
 
