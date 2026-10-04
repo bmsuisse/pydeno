@@ -568,6 +568,39 @@ def front_syntax_check_is_steered_by_the_guest() -> bool:
     return False
 
 
+@_c_probe
+def front_snapshot_for_an_undeclared_function() -> bool:
+    """`feed_start` handed the host a snapshot for any name the guest passed to the hidden
+    dispatcher (or a stub left from an earlier feed), not only for this feed's `external_lookup`: an
+    approver dispatching on `function_name` could be asked to run a function the feed never had."""
+    from pydeno import AsyncPydeno, Pydeno, PydenoSnapshot
+
+    code = (
+        "for (const f of [() => leftover(), () => __pydeno_external('drop_db', 1), () => read(1)])"
+        " { try { await f() } catch (e) {} } 1"
+    )
+    with Pydeno(min_processes=1) as pool, pool.checkout() as s:
+        s.feed_run("1", external_lookup={"leftover": lambda: 1})
+        snap = s.feed_start(code, external_lookup={"read": lambda x: x})
+        while isinstance(snap, PydenoSnapshot):
+            if snap.function_name != "read":
+                return True
+            snap = snap.resume(value=None)
+
+    async def go() -> bool:
+        async with AsyncPydeno(min_processes=1) as pool:
+            async with pool.checkout() as s:
+                await s.feed_run("1", external_lookup={"leftover": lambda: 1})
+                snap = await s.feed_start(code, external_lookup={"read": lambda x: x})
+                while not hasattr(snap, "output"):
+                    if snap.function_name != "read":
+                        return True
+                    snap = await snap.resume(value=None)
+        return False
+
+    return _c_asyncio.run(go())
+
+
 # 2. journals and state ----------------------------------------------------------------------------------------
 @_c_probe
 def tampered_truncated_or_spliced_journal_loads() -> bool:
