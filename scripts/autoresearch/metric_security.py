@@ -811,13 +811,13 @@ with Runtime(RuntimeConfig(**config)) as rt:
     rt.bind_function("f", lambda *a: 1)
     try:
         if mode == "eval":
-            rt.eval(expr)
+            out = rt.eval(expr)
         elif mode == "async":
 
             async def run():
                 return await rt.eval_async(expr, timeout=%r)
 
-            asyncio.run(run())
+            out = asyncio.run(run())
         else:
 
             async def read():
@@ -826,8 +826,8 @@ with Runtime(RuntimeConfig(**config)) as rt:
                 )
                 return [chunk async for chunk in stream]
 
-            asyncio.run(read())
-        print("ACCEPTED")
+            out = asyncio.run(read())
+        print("ACCEPTED", len(repr(out)))
     except Exception:
         print("REFUSED")
 """ % (TIMEOUT, TIMEOUT)
@@ -850,6 +850,30 @@ def _slice_a_child_fails_open(mode: str, expr: str, budget: int = 0) -> bool:
         return True
     took = time.monotonic() - started
     return proc.returncode != 0 or "REFUSED" not in proc.stdout or took > TIMEOUT * 3
+
+
+def _slice_a_child_slow_or_huge(mode: str, expr: str) -> bool:
+    """True if the in-process conversion died, hung, ran past the deadline, or accepted a huge result
+    (refusing, or returning something small such as a Proxy's empty target, both hold)."""
+    import subprocess
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _SLICE_A_CHILD, mode, expr, "0"],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT * 10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    if proc.returncode != 0 or time.monotonic() - started > TIMEOUT * 3:
+        return True
+    words = proc.stdout.split()
+    if "REFUSED" in words:
+        return False
+    return "ACCEPTED" not in words or int(words[words.index("ACCEPTED") + 1]) > 10_000
 
 
 @probe
@@ -885,12 +909,11 @@ def slice_a_raised_budget_brings_back_the_unbounded_listing() -> bool:
     # The element cap must hold whatever `max_serialization_bytes` is.
     return _slice_a_child_fails_open(
         "eval", "new Float64Array(2 ** 24)", budget=2**31
-    ) or _slice_a_child_fails_open("eval", f"f({_SLICE_A_PROXIED[0]})", budget=2**31)
+    ) or _slice_a_child_fails_open("eval", f"f({_SLICE_A_PROXIED[1]})", budget=2**31)
 
 
 _SLICE_A_UNCONVERTIBLE = (
     "({get x() { throw new Error('getter') }})",
-    "new Proxy({}, {ownKeys() { throw new Error('trap') }})",
     "(() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy })()",
     "(() => { const a = {}; a.self = a; return a })()",
     "(() => { let o = 1; for (let i = 0; i < 100000; i++) o = [o]; return o })()",
@@ -925,14 +948,71 @@ def slice_a_unconvertible_result_crosses_silently() -> bool:
 
 @probe
 def slice_a_looping_getter_or_trap_in_a_result_outlives_the_deadline() -> bool:
+    # A getter runs and must end at the deadline. A Proxy is converted as its target and its traps
+    # never run (see slice_a_conversion_runs_a_proxy_trap), so for those the result must come back
+    # well inside the deadline, as the target.
+    with iso() as rt:
+        took, exc = _elapsed(lambda: rt.eval("({get x() { for (;;) {} }})"))
+        if exc is None or took > TIMEOUT * 2:
+            return True
     for expr in (
-        "({get x() { for (;;) {} }})",
         "new Proxy({a: 1}, {get() { for (;;) {} }})",
         "new Proxy({}, {ownKeys() { for (;;) {} }})",
     ):
         with iso() as rt:
-            took, exc = _elapsed(lambda e=expr: rt.eval(e))
-            if exc is None or took > TIMEOUT * 2:
+            started = time.monotonic()
+            try:
+                out = rt.eval(expr)
+            except Exception:  # noqa: BLE001
+                return True
+            if time.monotonic() - started > TIMEOUT or out not in ({"a": 1}, {}):
+                return True
+    return False
+
+
+@probe
+def slice_a_conversion_runs_a_proxy_trap() -> bool:
+    # Review of #80, round 2: a trap that runs during conversion can grow a resizable buffer after its
+    # size was checked, hide an Array from the metered array branch, or answer `ownKeys` with `[]`
+    # while V8 lists the whole target to check the invariants. None may run, in results or arguments.
+    handler = (
+        "{get(t, k) { hits++; return Reflect.get(t, k) },"
+        " ownKeys(t) { hits++; return Reflect.ownKeys(t) },"
+        " getOwnPropertyDescriptor(t, k) { hits++; return Reflect.getOwnPropertyDescriptor(t, k) },"
+        " getPrototypeOf(t) { hits++; return Reflect.getPrototypeOf(t) }}"
+    )
+    for factory in (iso, Runtime):
+        with factory() as rt:
+            rt.bind_function("f", lambda *a: 1)
+            rt.eval("globalThis.hits = 0; 0")
+            for target in ("{a: 1}", "[1, 2]", "new Int8Array(4)", "new String('ab')"):
+                rt.eval(f"new Proxy({target}, {handler})")
+                rt.eval(f"f(new Proxy({target}, {handler}))")
+            if rt.eval("hits") != 0:
+                return True
+    return False
+
+
+@probe
+def slice_a_proxy_trap_slips_work_past_the_budget() -> bool:
+    # Review of #80, round 2, end to end in a child process with a hard timeout.
+    growing = (
+        "(() => { const b = new ArrayBuffer(0, {maxByteLength: 2 ** 24}); const ta = new Int8Array(b);"
+        " return new Proxy(ta, {ownKeys(t) { b.resize(2 ** 24); return [] }}) })()"
+    )
+    for expr in (
+        growing,
+        "new Proxy(new Array(2 ** 22).fill(0), {})",
+        "(() => { const p = new Proxy(new Int8Array(2 ** 20 - 1), {ownKeys() { return [] }});"
+        " return Array(200).fill(p) })()",
+    ):
+        for mode, source in (
+            ("eval", expr),
+            ("eval", f"f({expr})"),
+            ("async", f"Promise.resolve({expr})"),
+            ("stream", expr),
+        ):
+            if _slice_a_child_slow_or_huge(mode, source):
                 return True
     return False
 
