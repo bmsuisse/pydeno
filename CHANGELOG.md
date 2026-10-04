@@ -217,6 +217,20 @@ and the red-team restrictions under Security; see
   line and paragraph separators, variation selectors, TAG characters) that carry text a reader never sees
   but a model does. Emoji sequences lose their joiners and skin-tone modifiers and render as their parts.
   An `on_console` callback still receives the guest's text raw; sanitise it before printing.
+- **`http_fetch` caps host name lookups in flight per process** (`DNS_MAX_PENDING`, 64 by default,
+  running or waiting for one of the `DNS_THREADS`; both read when the first lookup creates the
+  pool). A running lookup cannot be stopped, so each call that timed out used to leave its lookup
+  queued behind stalled ones, and later calls from any session in the process waited behind all of
+  them. A lookup still waiting for a thread is now cancelled when its caller gives up, a running one
+  counts until it finishes, and past the cap a call fails at once with `HttpFetchFailed` ("too many
+  host name lookups are in progress"). A forked child starts with a fresh pool.
+- **A result its caller never receives no longer leaves function or stream handles behind.**
+  Converting a value registers each function and `ReadableStream` in it. When the caller got an
+  error instead (a later part failed to convert, on the runtime thread or in Python, e.g. a `Map`,
+  a throwing getter, a cycle, the size limit, a date past year 9999; or the deadline passed while
+  the value was converted) or had stopped waiting (a cancelled `eval_async`), those registrations
+  stayed for the life of the runtime, so repeating the call grew memory without bound. They are now
+  released.
 
 ### Fixed
 

@@ -472,6 +472,40 @@ impl RuntimeHandle {
         .await
     }
 
+    /// Release the function and stream handles in `value` that no Python wrapper owns, without
+    /// waiting for the runtime thread: `value` reached this side but will never reach its caller
+    /// (its conversion failed, or the caller stopped waiting). A wrapper releases its own handle
+    /// when it is collected, so wrapped ids are left to it.
+    pub fn release_unowned_handles(&self, value: &JSValue) {
+        let mut stack = vec![value];
+        while let Some(value) = stack.pop() {
+            match value {
+                JSValue::Function { id } if !self.is_function_tracked(*id) => {
+                    let (responder, _) = oneshot::channel();
+                    let fn_id = *id;
+                    let _ = self.send(
+                        RuntimeCommand::ReleaseFunction { fn_id, responder },
+                        "release_function",
+                    );
+                }
+                JSValue::JsStream { id } if !self.is_js_stream_tracked(*id) => {
+                    let (responder, _) = mpsc::channel();
+                    let stream_id = *id;
+                    let _ = self.send(
+                        RuntimeCommand::StreamRelease {
+                            stream_id,
+                            responder,
+                        },
+                        "stream_release",
+                    );
+                }
+                JSValue::Array(items) | JSValue::Set(items) => stack.extend(items),
+                JSValue::Object(map) => stack.extend(map.values()),
+                _ => {}
+            }
+        }
+    }
+
     /// Read the next chunk from a JavaScript ReadableStream (`done=true` at the end).
     ///
     /// # Errors
@@ -683,6 +717,10 @@ impl RuntimeHandle {
 
     pub fn track_js_stream_id(&self, stream_id: u32) {
         self.tracked_js_streams.lock().unwrap().insert(stream_id);
+    }
+
+    pub fn is_js_stream_tracked(&self, stream_id: u32) -> bool {
+        self.tracked_js_streams.lock().unwrap().contains(&stream_id)
     }
 
     pub fn untrack_js_stream_id(&self, stream_id: u32) {

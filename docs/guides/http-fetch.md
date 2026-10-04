@@ -171,9 +171,13 @@ What every request, and every redirect hop, goes through:
   caller, but keeps its thread until the OS resolver gives up, often 10 to 30 seconds. So an
   allow-listed name whose DNS is broken or hangs can occupy the pool and delay every `HttpFetch`
   in the process by up to the resolver timeout; each caller still gets `HttpFetchTimeout` at its
-  own deadline, never a hang. Only allow-listed host names are ever resolved (the allow-list check
-  comes first), so the guest cannot pick arbitrary names to stall the pool with. Pass
-  `resolver=` if you need a resolver with its own timeout.
+  own deadline, never a hang. Lookups in flight (running or waiting for a thread) are capped per
+  process (`pydeno.tools.http_fetch.DNS_MAX_PENDING`, 64 by default, read with `DNS_THREADS` when
+  the first lookup starts). A lookup still waiting for a thread is cancelled when its caller times
+  out; a running one counts until it finishes. Past the cap a call fails at once with
+  `HttpFetchFailed` instead of queueing, so stalled lookups cannot pile up. Only allow-listed host
+  names are ever resolved (the allow-list check comes first), so the guest cannot pick arbitrary
+  names to stall the pool with. Pass `resolver=` if you need a resolver with its own timeout.
 - **TLS policy** is Python's default context (system trust store, certificate and host name
   verification, TLS 1.2 minimum). Pass `ssl_context=` to change it. The DNS-rebinding defence has
   two halves: the socket goes to the vetted IP, and the certificate proves that the server there

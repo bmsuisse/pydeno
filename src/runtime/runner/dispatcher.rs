@@ -305,7 +305,7 @@ impl RuntimeDispatcher {
                     self.core
                         .run_timed(wd, "Sync evaluation", |core| core.eval_sync(&code))
                 });
-                let _ = responder.send(result);
+                self.core.send_sync_result(responder, result);
             }
             RuntimeCommand::EvalModule {
                 specifier,
@@ -319,7 +319,7 @@ impl RuntimeDispatcher {
                         core.eval_module_sync(&specifier)
                     })
                 });
-                let _ = responder.send(result);
+                self.core.send_sync_result(responder, result);
             }
             RuntimeCommand::CallFunctionSync {
                 fn_id,
@@ -338,7 +338,7 @@ impl RuntimeDispatcher {
                         core.call_function_sync(fn_id, args, timeout_ms)
                     })
                 });
-                let _ = responder.send(result);
+                self.core.send_sync_result(responder, result);
             }
             RuntimeCommand::EvalAsync {
                 code,

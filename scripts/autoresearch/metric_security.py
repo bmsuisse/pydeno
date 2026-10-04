@@ -2091,6 +2091,69 @@ def default_printer_volume_is_capped_per_feed() -> bool:
     return len(out) > 2 * 1024 * 1024
 
 
+@probe
+def a_failed_result_conversion_leaves_no_handles() -> bool:
+    # Converting a result registers its functions and streams; a later unconvertible part used to
+    # leave them registered for the runtime's life, so repeating the call grew memory without bound.
+    with Runtime() as rt:
+        for code in (
+            "({f: () => 1, m: new Map()})",
+            "[new ReadableStream(), () => 1, Symbol('x')]",
+        ):
+            for _ in range(200):
+                try:
+                    rt.eval(code)
+                except RuntimeError:
+                    pass
+        return (
+            rt._debug_function_handle_count() != 0
+            or rt.get_stats().active_js_streams != 0
+        )
+
+
+@probe
+def stalled_dns_lookups_cannot_pile_up() -> bool:
+    # A lookup cannot be cancelled: callers that time out used to leave their lookups queued without
+    # bound behind stalled ones, delaying every later http_fetch in the process.
+    import importlib
+    import threading
+
+    hf = importlib.import_module("pydeno.tools.http_fetch")
+    saved = (hf.DNS_THREADS, getattr(hf, "DNS_MAX_PENDING", None), hf._dns_pool)
+    hf.DNS_THREADS, hf.DNS_MAX_PENDING, hf._dns_pool = 2, 4, None
+    release = threading.Event()
+    ran = []
+
+    def stalled(host: str, port: int) -> list[str]:
+        release.wait(10)
+        ran.append(host)
+        return ["93.184.216.34"]
+
+    fetch = hf.http_fetch(
+        ["fetch.test"], schemes=["http"], timeout=0.3, resolver=stalled
+    )
+
+    def call() -> None:
+        try:
+            fetch("http://fetch.test/")
+        except hf.HttpFetchError:
+            pass
+
+    try:
+        callers = [threading.Thread(target=call) for _ in range(40)]
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(5)
+    finally:
+        release.set()
+        pool = hf._dns_pool
+        if pool is not None:
+            getattr(pool, "executor", pool).shutdown(wait=True)
+        hf.DNS_THREADS, hf.DNS_MAX_PENDING, hf._dns_pool = saved
+    return len(ran) > 4
+
+
 def main() -> None:
     violations = []
     for name, fn in PROBES.items():
