@@ -496,4 +496,15 @@ uses one of those features fails. `--no-harmony-shipping` has the same effect.
 The flags for the individual features (`--no-harmony-temporal`, `--no-js-float16array`,
 `--no-js-explicit-resource-management`, ...) do not work: the engine's own start-up switches those
 features back on after `v8_flags` are applied, so `IsolatedRuntime` refuses them with a `ValueError`
-instead of reporting a restriction that never applied.
+instead of reporting a restriction that never applied. A flag V8 does not recognise at all (a typo,
+`--flag=false` on a boolean flag, upper case, a stray space) stops the worker from starting: that
+surfaces as `WorkerCrashed` naming the flag.
+
+## Proxies crossing the boundary
+
+A Proxy in a result, a stream chunk or a host-function argument crosses as its innermost target,
+found natively, and **none of its traps runs**. Running them would let guest code act in the middle
+of a conversion (grow a buffer after its size was checked, or answer `ownKeys` with `[]` while the
+engine walks the whole target). So `new Proxy({a: 1}, {get: () => 'x'})` arrives as `{"a": 1}`, a
+Proxy around an Array arrives as a list, and a revoked Proxy or one behind more than 64 others is
+refused.

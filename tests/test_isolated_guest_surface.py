@@ -64,3 +64,44 @@ def test_a_restriction_v8_honours_still_applies() -> None:
         assert "--no-js-regexp-modifiers" in runtime.v8_flags
         with pytest.raises(Exception, match="SyntaxError"):
             runtime.eval("new RegExp('(?i:a)')")
+
+
+# Everything the isolation guide says `--no-js-shipping` removes, and what it says stays.
+_NO_SHIPPING_GONE = {
+    "Temporal": "typeof Temporal",
+    "Float16Array": "typeof Float16Array",
+    "DisposableStack": "typeof DisposableStack",
+    "AsyncDisposableStack": "typeof AsyncDisposableStack",
+    "SuppressedError": "typeof SuppressedError",
+    "Promise.try": "typeof Promise.try",
+    "RegExp.escape": "typeof RegExp.escape",
+    "Math.sumPrecise": "typeof Math.sumPrecise",
+    "Error.isError": "typeof Error.isError",
+    "Uint8Array.fromBase64": "typeof Uint8Array.fromBase64",
+    "Uint8Array.prototype.toBase64": "typeof Uint8Array.prototype.toBase64",
+}
+_NO_SHIPPING_SYNTAX_GONE = ["{ using x = null; }", "new RegExp('(?i:a)')"]
+_NO_SHIPPING_KEPT = {
+    "iterator helpers": "typeof Iterator.prototype.map",
+    "Set methods": "typeof Set.prototype.union",
+    "Object.groupBy": "typeof Object.groupBy",
+    "findLast": "typeof [].findLast",
+}
+
+
+def test_no_js_shipping_removes_exactly_what_the_guide_says() -> None:
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=5), v8_flags=["--no-js-shipping"]
+    ) as runtime:
+        for name, expr in _NO_SHIPPING_GONE.items():
+            assert runtime.eval(expr) == "undefined", name
+        for source in _NO_SHIPPING_SYNTAX_GONE:
+            with pytest.raises(Exception, match="SyntaxError"):
+                runtime.eval(source)
+        for name, expr in _NO_SHIPPING_KEPT.items():
+            assert runtime.eval(expr) == "function", name
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=5)
+    ) as runtime:  # and all present by default
+        for name, expr in _NO_SHIPPING_GONE.items():
+            assert runtime.eval(expr) != "undefined", name

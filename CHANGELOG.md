@@ -73,6 +73,14 @@ Security; see
   plain `Runtime`, could run V8 out of memory. Such values are now refused at once; small ones convert
   as before. Upgrade note: whatever `max_serialization_bytes` is, a typed array or `String` object of
   more than 1,048,576 elements is refused as a result (return a `Uint8Array` over its buffer instead).
+- **A Proxy crosses the boundary as its target, and no trap runs.** In a result, stream chunk or
+  host-function argument, a Proxy's traps ran during conversion, so guest code could act mid-conversion:
+  an `ownKeys` trap could grow a resizable buffer after its size was checked (16 million keys listed
+  past the budget), a Proxy hid an Array from the metered array path, and `ownKeys() { return [] }`
+  made the engine walk the whole target for free at every reference. A Proxy is now unwrapped natively
+  to its innermost target, which is converted instead; a revoked Proxy or a chain of more than 64 is
+  refused. Upgrade note: a Proxy whose traps synthesise values now arrives as its target's data, and a
+  Proxy around an Array arrives as a list (it used to be a dict of indices).
 - **`v8_flags` that cannot take effect are refused.** deno_core's start-up switches on `Temporal`,
   `Float16Array`, explicit resource management, source-phase and deferred imports and the native
   `queueMicrotask` after the worker's flags, so a flag such as `--no-harmony-temporal` was undone
