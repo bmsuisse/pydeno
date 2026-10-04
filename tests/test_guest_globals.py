@@ -108,6 +108,7 @@ _PYDENO_BRIDGE_GLOBALS = {
     "__host_op_sync__",
     "__host_op_async__",
     "__pydeno_bind_object",
+    "__pydeno_bind_function",
     "__pydeno_from_py_stream",
     "ReadableStream",
 }

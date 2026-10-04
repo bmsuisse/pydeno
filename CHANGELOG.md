@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
+  installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
+  `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
+  Proxy namespace that swallowed `defineProperty`, an accessor returning a throwaway object, a read-only or
+  setter global, or a replaced `Array.prototype[Symbol.iterator]`, and the bind then installed nothing while
+  the host still received and exposed the op tokens. The bind now defines own data properties only, runs no
+  guest-replaceable built-in, and raises `Cannot bind '<name>': ...` (exposing no token) when the existing
+  global is an accessor, read-only, a Proxy, a function, a class instance, or frozen. An existing plain
+  object is still extended, a writable global (including a `var`) is still replaced, and an inherited
+  property is shadowed rather than written through.
+- The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
+  `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`, and host arrays are created
+  without `Array.prototype` index setters, so a guest that replaced them only affects its own code.
+
+### Changed
+
+- `bind_function(name, ...)` now defines exactly the global property `name`. A dotted name such as `"a.b"`
+  used to be spliced into a script and assign `globalThis.a.b`; it now defines a property literally named
+  `"a.b"`. Use `bind_object` for a namespace.
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change

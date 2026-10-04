@@ -235,12 +235,17 @@ impl Runtime {
         let op_id = py
             .detach(|| handle.register_op(name.clone(), mode, handler))
             .map_err(context("Op registration failed"))?;
-        let bridge = match mode {
-            PythonOpMode::Sync => "__host_op_sync__",
-            PythonOpMode::Async => "__host_op_async__",
+        let mode = match mode {
+            PythonOpMode::Sync => "sync",
+            PythonOpMode::Async => "async",
         };
+        // The helper defines an own property and throws on a global it cannot
+        // replace (an accessor, a read-only value), instead of the sloppy-mode
+        // assignment that a guest-planted setter or read-only global swallowed.
+        let name_literal = serde_json::to_string(&name)
+            .map_err(|err| PyRuntimeError::new_err(format!("Invalid binding name: {err}")))?;
         let script =
-            format!("globalThis.{name} = (...args) => {bridge}({op_id}, ...args); void 0;");
+            format!("__pydeno_bind_function({name_literal}, {op_id}, \"{mode}\"); void 0;");
 
         // Expose only after the binding script succeeded, so a failed binding
         // leaves the handler registered but not dispatchable.

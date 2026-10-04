@@ -155,6 +155,7 @@ def test_a_sparse_array_is_refused_before_it_is_iterated() -> None:
         "__host_op_sync__",
         "__host_op_async__",
         "__pydeno_bind_object",
+        "__pydeno_bind_function",
     ],
 )
 def test_the_bridge_globals_cannot_be_replaced_or_deleted(name: str) -> None:
@@ -168,3 +169,233 @@ def test_the_bridge_globals_cannot_be_replaced_or_deleted(name: str) -> None:
         assert rt.eval(f"typeof {name}") == "function"
         assert rt.eval("echo(5)") == 5  # and the bound host function still works
         assert rt.eval(f"Object.keys(globalThis).includes('{name}')") is False
+
+
+# ---------------------------------------------------------------------------------------------
+# A guest that prepares the ground *before* a later host bind.
+#
+# A long-lived runtime runs guest code, and the host binds more tools afterwards (a second
+# `ToolBridge.attach`, a late `bind_function`). The bind step used to install onto whatever
+# `globalThis[name]` already was, by plain assignment and `for...of`, so a guest could plant a
+# Proxy, an accessor or a replaced `Array.prototype[Symbol.iterator]` and make that bind silently
+# inert -- while the host still got (and exposed) a token for a binding that was never installed.
+# The bind now refuses a namespace or global it cannot install onto, and runs no guest code.
+# ---------------------------------------------------------------------------------------------
+
+_BIND_REFUSED = r"Cannot bind '(tools|lookup)'"
+
+
+@pytest.fixture(params=["runtime", "isolated"])
+def make_rt(request: pytest.FixtureRequest):
+    from pydeno import Runtime
+
+    opened: list = []
+
+    def factory():
+        cls = Runtime if request.param == "runtime" else IsolatedRuntime
+        rt = cls(RuntimeConfig(timeout=20.0))
+        opened.append(rt)
+        return rt
+
+    yield factory
+    for rt in opened:
+        rt.close()
+
+
+# Each of these used to leave `tools` without the host's members while `bind_object` returned
+# the tokens (the frozen object already failed loudly; it is pinned so it stays that way). A
+# namespace the bridge cannot verify as a plain, extensible object is now refused.
+REFUSED_NAMESPACES = {
+    "proxy-swallows-define": "globalThis.tools = new Proxy({}, {defineProperty: () => true})",
+    "accessor-returns-fresh-object": (
+        "Object.defineProperty(globalThis, 'tools', {get() { return {} }, configurable: true})"
+    ),
+    "frozen-object": "globalThis.tools = Object.freeze({})",
+    "class-instance": "globalThis.tools = new (class Tools {})()",
+    "function": "globalThis.tools = function () {}",
+}
+
+
+@pytest.mark.parametrize("name", list(REFUSED_NAMESPACES))
+def test_bind_object_refuses_a_namespace_it_cannot_install_onto(
+    make_rt, name: str
+) -> None:
+    rt = make_rt()
+    rt.eval(REFUSED_NAMESPACES[name] + "; 0")
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"f": lambda: 1})
+    assert rt.eval("1 + 1") == 2
+
+
+@pytest.mark.parametrize("name", list(REFUSED_NAMESPACES))
+def test_tool_bridge_attach_fails_closed_and_keeps_no_token(make_rt, name: str) -> None:
+    from pydeno import ToolBridge
+
+    rt = make_rt()
+    rt.eval(REFUSED_NAMESPACES[name] + "; 0")
+    bridge = ToolBridge({"f": lambda: 1})
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        bridge.attach(rt)
+    assert bridge.detach(rt) == 0  # nothing was recorded, so nothing to revoke
+
+
+def test_an_inherited_namespace_is_shadowed_not_installed_onto(make_rt) -> None:
+    rt = make_rt()
+    rt.eval("Object.prototype.tools = new Proxy({}, {defineProperty: () => true}); 0")
+    rt.bind_object("tools", {"f": lambda: 1})
+    assert rt.eval("tools.f()") == 1
+    assert rt.eval("Object.hasOwn(globalThis, 'tools')") is True
+
+
+def test_a_replaced_array_iterator_does_not_run_during_bind(make_rt) -> None:
+    rt = make_rt()
+    # The hook would see `this`, the host's assignment list (tokens included), and by yielding
+    # nothing it left the namespace empty.
+    rt.eval(
+        "globalThis.hits = 0; globalThis.seen = null;"
+        "Array.prototype[Symbol.iterator] = function* () { hits++; seen = this; }; 0"
+    )
+    rt.bind_object("tools", {"f": lambda: 1, "g": lambda x: x})
+    assert rt.eval("tools.f()") == 1
+    assert rt.eval("hits") == 0
+    assert rt.eval("seen") is None
+    # Calling a bound function does not spread its arguments through the guest's iterator.
+    assert rt.eval("tools.g(5)") == 5
+
+
+def test_an_array_index_setter_does_not_intercept_bind(make_rt) -> None:
+    rt = make_rt()
+    rt.eval(
+        "for (const i of ['0', '1']) Object.defineProperty(Array.prototype, i, "
+        "{get() { return 'guest' }, set(v) {}, configurable: true}); 0"
+    )
+    rt.bind_object("tools", {"f": lambda: 1, "g": lambda: 2})
+    assert rt.eval("[tools.f(), tools.g()]") == [1, 2]
+
+
+def test_a_plain_namespace_is_still_extended_and_rebinding_still_works(make_rt) -> None:
+    rt = make_rt()
+    rt.eval("globalThis.tools = {own: 1}; 0")
+    rt.bind_object("tools", {"f": lambda: 1})
+    rt.bind_object("tools", {"g": lambda: 2})
+    assert rt.eval("[tools.own, tools.f(), tools.g()]") == [1, 1, 2]
+    rt.eval("globalThis.bare = Object.create(null); 0")
+    rt.bind_object("bare", {"h": lambda: 3})
+    assert rt.eval("bare.h()") == 3
+
+
+# The single-function path assigned `globalThis.name = ...` in sloppy mode: a read-only global
+# swallowed the assignment and an accessor (own or inherited) intercepted it.
+REFUSED_GLOBALS = {
+    "read-only": (
+        "Object.defineProperty(globalThis, 'lookup', "
+        "{value: () => 'guest', writable: false, configurable: false})"
+    ),
+    "accessor": (
+        "Object.defineProperty(globalThis, 'lookup', "
+        "{get() { return () => 'guest' }, set(v) {}, configurable: true})"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(REFUSED_GLOBALS))
+def test_bind_function_refuses_a_global_it_cannot_install(make_rt, name: str) -> None:
+    rt = make_rt()
+    rt.eval(REFUSED_GLOBALS[name] + "; 0")
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_function("lookup", lambda: "host")
+
+
+@pytest.mark.parametrize("name", list(REFUSED_GLOBALS))
+def test_tool_bridge_without_namespace_fails_closed(make_rt, name: str) -> None:
+    from pydeno import ToolBridge
+
+    rt = make_rt()
+    rt.eval(REFUSED_GLOBALS[name] + "; 0")
+    bridge = ToolBridge({"lookup": lambda: "host"}, namespace=None)
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        bridge.attach(rt)
+    assert bridge.detach(rt) == 0
+
+
+def test_an_inherited_setter_cannot_intercept_bind_function(make_rt) -> None:
+    rt = make_rt()
+    rt.eval(
+        "Object.defineProperty(Object.prototype, 'lookup', "
+        "{get() { return () => 'guest' }, set(v) {}, configurable: true}); 0"
+    )
+    rt.bind_function("lookup", lambda: "host")
+    assert rt.eval("lookup()") == "host"
+
+
+def test_bind_function_still_replaces_a_writable_global(make_rt) -> None:
+    rt = make_rt()
+    rt.eval(
+        "var lookup = () => 'guest'; globalThis.other = 1; 0"
+    )  # `var`: non-configurable
+    rt.bind_function("lookup", lambda: "host")
+    rt.bind_function("other", lambda: "other")
+    rt.bind_function("lookup", lambda: "again")  # rebinding the same name
+    assert rt.eval("[lookup(), other()]") == ["again", "other"]
+    rt.eval("Array.prototype[Symbol.iterator] = function* () {}; 0")
+    rt.bind_function("echo", lambda v: v)
+    assert rt.eval("echo(5)") == 5  # arguments do not go through the guest's iterator
+
+
+# A host function's result is rebuilt into JavaScript values by the bridge. It used to do that
+# with `Array.prototype.map`, `Object.entries`, `for...of` and the global `Array`/`Date`/`Set`/
+# `BigInt`, all of which the guest can replace. That only ever let a guest corrupt its own view of
+# a result, but the bridge should not run guest code while it does its job.
+REVIVE_POISON = {
+    "array-map": "Array.prototype.map = () => 'poisoned'",
+    "object-entries": "Object.entries = () => [['poisoned', 1]]",
+    "array-iterator": "Array.prototype[Symbol.iterator] = function* () { yield 'poisoned' }",
+    "array-isarray": "Array.isArray = () => false",
+    "global-date": "globalThis.Date = function () { return 'poisoned' }",
+    "global-set": "globalThis.Set = function () { return 'poisoned' }",
+    "global-bigint": "globalThis.BigInt = () => 'poisoned'",
+}
+
+
+@pytest.mark.parametrize("name", list(REVIVE_POISON))
+def test_a_host_result_is_revived_without_guest_code(make_rt, name: str) -> None:
+    import datetime
+
+    rt = make_rt()
+    rt.bind_function(
+        "lookup",
+        lambda: {
+            "list": [1, 2, {"a": 1}],
+            "when": datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc),
+            "set": {1, 2},
+            "big": 2**70,
+        },
+    )
+    # Uses only references captured before the poison, and no array iteration.
+    rt.eval(
+        "globalThis.probe = ((RealDate, RealSet, size, stringify) => () => {"
+        " const r = lookup();"
+        " return stringify([r.list, r.when instanceof RealDate && r.when.getTime(),"
+        " r.set instanceof RealSet && size.call(r.set), typeof r.big]) })"
+        "(Date, Set, Object.getOwnPropertyDescriptor(Set.prototype, 'size').get, JSON.stringify);"
+        " 0"
+    )
+    expected = '[[1,2,{"a":1}],1577836800000,2,"bigint"]'
+    assert rt.eval("probe()") == expected
+    rt.eval(REVIVE_POISON[name] + "; 0")
+    assert rt.eval("probe()") == expected
+
+
+async def test_an_async_host_result_does_not_go_through_a_replaced_promise_then(
+    make_rt,
+) -> None:
+    rt = make_rt()
+
+    async def lookup():
+        return [1, 2]
+
+    rt.bind_function("lookup", lookup)
+    rt.eval("Promise.prototype.then = function () { return 'poisoned' }; 0")
+    assert (
+        await rt.eval_async("(async () => JSON.stringify(await lookup()))()") == "[1,2]"
+    )

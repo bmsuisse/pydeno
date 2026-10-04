@@ -409,14 +409,14 @@ impl Converter {
                     .into()
             }
             JSValue::Array(items) => {
-                let array = v8::Array::new(scope, items.len() as i32);
-                for (index, item) in items.iter().enumerate() {
-                    let v8_value = self.to_v8(scope, item)?;
-                    array
-                        .set_index(scope, index as u32, v8_value)
-                        .ok_or_else(|| RuntimeError::internal("Failed to set array element"))?;
-                }
-                array.into()
+                // Built from its elements in one go, not `set_index` on a holey
+                // array: that assignment would run an index setter the guest
+                // planted on `Array.prototype` instead of storing the element.
+                let elements = items
+                    .iter()
+                    .map(|item| self.to_v8(scope, item))
+                    .collect::<RuntimeResult<Vec<_>>>()?;
+                v8::Array::new_with_elements(scope, &elements).into()
             }
             JSValue::Set(values) => {
                 let set = v8::Set::new(scope);
