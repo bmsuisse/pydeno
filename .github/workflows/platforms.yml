@@ -74,25 +74,6 @@ jobs:
           uv pip install --python .venv maturin "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
           uv run --no-sync --python .venv maturin develop --uv --release
 
-      - name: Bisect Seatbelt rules (macOS)
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        shell: bash
-        run: .venv/bin/python scripts/seatbelt_bisect.py 2>&1 | tail -20
-
-      - name: Diagnose worker start (macOS)
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        shell: bash
-        run: |
-          sw_vers; sysctl hw.pagesize hw.memsize
-          for mode in off auto require; do
-            .venv/bin/python -c "
-          from pydeno import IsolatedRuntime
-          with IsolatedRuntime(sandbox='$mode') as rt: print('$mode ok', rt.sandbox, rt.eval('1+1'))
-          " 2>&1 | tail -2
-          done
-
       - name: Run the suite
         shell: bash
         run: |
@@ -108,4 +89,4 @@ jobs:
           PY=.venv/bin/python
           [ -x "$PY" ] || PY=.venv/Scripts/python.exe
           "$PY" scripts/check_test_report.py --label "${{ matrix.os }} py${{ matrix.python }}" \
-            --junit junit.xml --min-tests 1 --max-skipped 0 --max-xfailed 10 || true
+            --junit junit.xml --min-tests 500 --max-skipped 0 --max-xfailed 10
