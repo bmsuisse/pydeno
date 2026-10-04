@@ -568,6 +568,245 @@ class TestSessionPoolConsistency:
                 await pool.get("o", bad)
 
 
+class _CtlStore(InMemoryJournalStore):
+    """Gates (stall until set) and one-shot failures per (op, key suffix)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gates: dict[tuple[str, str], asyncio.Event] = {}
+        self.reached: set[tuple[str, str]] = set()
+        self.fail: dict[tuple[str, str], int] = {}
+
+    async def _hook(self, op: str, key: str) -> None:
+        k = (op, key.rsplit(":", 1)[-1])
+        gate = self.gates.pop(k, None)
+        if gate is not None:
+            self.reached.add(k)
+            await gate.wait()
+        if self.fail.get(k):
+            self.fail[k] -= 1
+            raise ConnectionError(f"store {k} failed")
+
+    async def get(self, key: str) -> bytes | None:
+        await self._hook("get", key)
+        return await super().get(key)
+
+    async def set(self, key: str, value: bytes, *, ttl: float | None) -> None:
+        await self._hook("set", key)
+        await super().set(key, value, ttl=ttl)
+
+    async def delete(self, key: str) -> None:
+        await self._hook("delete", key)
+        await super().delete(key)
+
+    def gate(self, op: str, suffix: str) -> asyncio.Event:
+        event = self.gates[(op, suffix)] = asyncio.Event()
+        return event
+
+    async def until_reached(self, op: str, suffix: str) -> None:
+        for _ in range(1000):
+            if (op, suffix) in self.reached:
+                return
+            await asyncio.sleep(0.005)
+        raise TimeoutError((op, suffix))
+
+
+async def _remaining(
+    store: InMemoryJournalStore, tools: dict, **kw: object
+) -> int | None:
+    async with SessionPool(store, KEY, tools, sandbox=MODE, **kw) as pool:
+        async with pool.session("o", "s") as sb:
+            return sb.calls_remaining
+
+
+class TestSessionPoolLifecycle:
+    """Closing the pool, failing or cancelled store writes and waiters on dropped sessions keep
+    one session with one budget, and no lease or waiter is left behind."""
+
+    def _counting(self) -> tuple[list[int], dict]:
+        ran: list[int] = []
+        return ran, {"t": lambda i: ran.append(i) or i}
+
+    async def test_close_during_a_release_keeps_what_the_release_wrote(self) -> None:
+        for op in (("set", "journal"), ("set", "counter")):
+            ran, tools = self._counting()
+            store = _CtlStore()
+            pool = SessionPool(store, KEY, tools, max_tool_calls=4, sandbox=MODE)
+            sb = await pool.get("o", "s")
+            await sb.execute("await t(0); await t(1); await t(2)")
+            gate = store.gate(*op)
+            releasing = asyncio.ensure_future(pool.release("o", "s"))
+            await store.until_reached(*op)
+            closing = asyncio.ensure_future(pool.close())
+            await asyncio.sleep(0.05)
+            gate.set()
+            await asyncio.gather(releasing, closing)
+            assert await _remaining(store, tools, max_tool_calls=4) == 1, op
+
+    async def test_a_failed_budget_only_write_is_retried(self) -> None:
+        ran: list[int] = []
+        tools = {"big": lambda i: ran.append(i) or "x" * 5000}
+        kw = dict(max_tool_calls=6, max_journal_bytes=8000)
+        store = _CtlStore()
+        async with SessionPool(store, KEY, tools, sandbox=MODE, **kw) as pool:
+            async with pool.session("o", "s") as sb:
+                await sb.execute("await big(0)")
+            sb = await pool.get("o", "s")
+            await sb.execute(_LOOP % (9, "big"))
+            store.fail[("set", "journal")] = 1
+            with pytest.raises(ConnectionError):
+                await pool.release("o", "s")
+            with pytest.raises(JournalTooLarge):
+                await pool.get("o", "s")  # the retry stores the budget-only journal
+            async with pool.session("o", "s") as again:
+                assert again.calls_remaining == 0
+        assert len(ran) == 6
+
+    async def test_a_cancelled_budget_only_write_is_retried(self) -> None:
+        for op in (("set", "journal"), ("set", "counter")):
+            ran: list[int] = []
+            tools = {"big": lambda i: ran.append(i) or "x" * 5000}
+            kw = dict(max_tool_calls=6, max_journal_bytes=8000)
+            store = _CtlStore()
+            async with SessionPool(store, KEY, tools, sandbox=MODE, **kw) as pool:
+                async with pool.session("o", "s") as sb:
+                    await sb.execute("await big(0)")
+                sb = await pool.get("o", "s")
+                await sb.execute(_LOOP % (9, "big"))
+                gate = store.gate(*op)
+                task = asyncio.ensure_future(pool.release("o", "s"))
+                await store.until_reached(*op)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                gate.set()
+            assert await _remaining(store, tools, **kw) == 0, op
+
+    async def test_close_with_a_leased_session_keeps_its_spending(self) -> None:
+        ran, tools = self._counting()
+        store = InMemoryJournalStore()
+        pool = SessionPool(store, KEY, tools, max_tool_calls=4, sandbox=MODE)
+        async with pool.session("o", "s") as sb:
+            await sb.execute("await t(0)")
+        sb = await pool.get("o", "s")
+        await sb.execute("await t(1); await t(2)")
+        await pool.close()
+        assert await _remaining(store, tools, max_tool_calls=4) == 1
+
+    async def test_close_during_a_run_keeps_its_spending(self) -> None:
+        ran: list[int] = []
+
+        async def slow(i: int) -> int:
+            ran.append(i)
+            await asyncio.sleep(0.05)
+            return i
+
+        store = InMemoryJournalStore()
+        pool = SessionPool(store, KEY, {"t": slow}, max_tool_calls=4, sandbox=MODE)
+        sb = await pool.get("o", "s")
+        task = asyncio.ensure_future(sb.execute("for (let i=0;i<3;i++) await t(i)"))
+        await asyncio.sleep(0.12)
+        await pool.close()
+        await asyncio.gather(task, return_exceptions=True)
+        assert await _remaining(store, {"t": slow}, max_tool_calls=4) == 4 - len(ran)
+
+    async def test_close_warns_when_a_session_cannot_be_stored(self) -> None:
+        ran, tools = self._counting()
+        store = _CtlStore()
+        pool = SessionPool(store, KEY, tools, max_tool_calls=4, sandbox=MODE)
+        sb = await pool.get("o", "s")
+        await sb.execute("await t(0)")
+        store.fail[("set", "journal")] = 2
+        with pytest.raises(ConnectionError):
+            await pool.release("o", "s")
+        with pytest.warns(RuntimeWarning, match="could not be stored"):
+            await pool.close()
+
+    async def test_get_racing_close_hands_out_nothing(self) -> None:
+        store = _CtlStore()
+        pool = SessionPool(store, KEY, {}, sandbox=MODE)
+        async with pool.session("o", "s"):
+            pass
+        for entry in list(pool._entries.values()):  # noqa: SLF001
+            pool._evict(entry)  # noqa: SLF001
+        gate = store.gate("get", "journal")
+        getting = asyncio.ensure_future(pool.get("o", "s"))
+        await store.until_reached("get", "journal")
+        closing = asyncio.ensure_future(pool.close())
+        await asyncio.sleep(0.05)
+        gate.set()
+        await closing
+        with pytest.raises(RuntimeError, match="closed"):
+            await getting
+
+    async def test_a_waiter_wakes_when_a_leased_session_is_dropped(self) -> None:
+        for how in ("release", "session"):
+            async with SessionPool(
+                InMemoryJournalStore(), KEY, {}, acquire_timeout=None, sandbox=MODE
+            ) as pool:
+                if how == "release":
+                    await pool.get("o", "s")
+                else:
+                    cm = pool.session("o", "s")
+                    await cm.__aenter__()
+                waiter = asyncio.ensure_future(pool.get("o", "s"))
+                await asyncio.sleep(0.1)
+                await pool.drop("o", "s")
+                if how == "release":
+                    await pool.release("o", "s")
+                else:
+                    await cm.__aexit__(None, None, None)
+                fresh = await asyncio.wait_for(waiter, 5)
+                assert await fresh.run("return 1") == 1
+                await pool.release("o", "s")
+
+    async def test_a_waiter_wakes_when_the_pool_closes(self) -> None:
+        pool = SessionPool(
+            InMemoryJournalStore(), KEY, {}, acquire_timeout=None, sandbox=MODE
+        )
+        await pool.get("o", "s")
+        waiter = asyncio.ensure_future(pool.get("o", "s"))
+        await asyncio.sleep(0.1)
+        await asyncio.wait_for(pool.close(), 10)
+        with pytest.raises(RuntimeError, match="closed"):
+            await asyncio.wait_for(waiter, 5)
+
+    async def test_runs_after_release_are_not_forgotten_by_eviction(self) -> None:
+        ran, tools = self._counting()
+        async with SessionPool(
+            InMemoryJournalStore(),
+            KEY,
+            tools,
+            max_tool_calls=4,
+            idle_timeout=0.05,
+            eviction_interval=1000,
+            sandbox=MODE,
+        ) as pool:
+            async with pool.session("o", "s") as sb:
+                await sb.execute("await t(0)")
+            await sb.execute(_LOOP % (9, "t"))  # used after its release
+            await asyncio.sleep(0.1)
+            await pool.evict_idle()
+            async with pool.session("o", "s") as again:
+                await again.execute(_LOOP % (9, "t"))
+        assert len(ran) == 4
+
+
+def test_the_text_filter_covers_the_cli_filter() -> None:
+    import unicodedata
+
+    from pydeno._cli import _unsafe
+    from pydeno._result import UNSAFE_TEXT
+
+    missing = [
+        hex(cp)
+        for cp in range(0x110000)
+        if chr(cp) not in "\t\n"
+        and _unsafe(chr(cp))
+        and not UNSAFE_TEXT.fullmatch(chr(cp))
+    ]
+    assert not missing, (unicodedata.unidata_version, missing[:20])
+
+
 # ---------------------------------------------------------------------------
 # text pydeno writes for the host
 # ---------------------------------------------------------------------------
