@@ -63,6 +63,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         sign_snapshot,
         verify_snapshot,
     )
+    from ._sandbox_pool import AsyncSandboxPool, SandboxPool
     from ._status import Layer, SandboxStatus, sandbox_status
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
 
@@ -93,6 +94,8 @@ _LAZY = {
     "JournalTooLarge": "_pool",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
+    "SandboxPool": "_sandbox_pool",
+    "AsyncSandboxPool": "_sandbox_pool",
     "WEB_POLYFILLS": "_polyfills",
     "SnapshotAuthenticationError": "_snapshot_auth",
     "sign_snapshot": "_snapshot_auth",
@@ -414,6 +417,8 @@ __all__ = [
     "bind_object",
     "Runtime",
     "IsolatedRuntime",
+    "SandboxPool",
+    "AsyncSandboxPool",
     "AgentSandbox",
     "ToolCall",
     "Done",

@@ -47,11 +47,8 @@ from typing import Any
 
 from . import _isolated, _sandbox, _wire
 from ._isolated import (
-    DEFAULT_MAX_HOST_WAIT,
-    DEFAULT_MAX_INFLIGHT_HOST_CALLS,
     DEFAULT_MAX_MEMORY,
     DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_WRITE_STALL_TIMEOUT,
     IsolatedRuntime,
     WorkerCrashed,
     _CONFIG_KEYS,
@@ -76,6 +73,7 @@ from ._isolated import (
     _is_token,
     _revoked_handler,
     _seconds,
+    _session_options,
     _start_worker,
     _terminate_process,
 )
@@ -694,30 +692,18 @@ class AsyncIsolatedRuntime:
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
         self._soft_timeout = _seconds(config.timeout)
         self._max_memory = max_memory
-        self._request_timeout: float | None | Any = (
-            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
-        )
-        self._max_host_calls = max_host_calls
         self._host_calls = 0
-        self._max_host_wait = (
-            DEFAULT_MAX_HOST_WAIT
-            if max_host_wait is _DEFAULT
-            else _seconds(max_host_wait)
-        )
-        self._max_inflight = (
-            DEFAULT_MAX_INFLIGHT_HOST_CALLS
-            if max_inflight_host_calls is _DEFAULT
-            else max_inflight_host_calls
-        )
-        if self._max_inflight is not None and self._max_inflight < 1:
-            raise ValueError("max_inflight_host_calls must be at least 1")
-        self._stall = (
-            DEFAULT_WRITE_STALL_TIMEOUT
-            if write_stall_timeout is _DEFAULT
-            else _seconds(write_stall_timeout)
-        )
-        self._redact = bool(redact_host_errors)
-        self._grace = float(timeout_grace)
+        self._request_timeout: float | None | Any
+        for attr, value in _session_options(
+            request_timeout=request_timeout,
+            timeout_grace=timeout_grace,
+            max_host_calls=max_host_calls,
+            max_host_wait=max_host_wait,
+            max_inflight_host_calls=max_inflight_host_calls,
+            write_stall_timeout=write_stall_timeout,
+            redact_host_errors=redact_host_errors,
+        ).items():
+            setattr(self, attr, value)
         self._python = python
         self._prewarm = bool(prewarm)
         self._handler_executor = handler_executor
@@ -945,6 +931,11 @@ class AsyncIsolatedRuntime:
             RuntimeWarning,
             stacklevel=4,
         )
+
+    def _apply_session(self, options: dict[str, Any]) -> None:
+        """Install `_session_options(...)` on a runtime nobody has used yet (a pool checkout)."""
+        for attr, value in options.items():
+            setattr(self, attr, value)
 
     def is_closed(self) -> bool:
         return self._closed

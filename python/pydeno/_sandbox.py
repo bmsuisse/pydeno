@@ -24,9 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import ctypes.util
 import os
-import platform
 import resource
 import socket
 import struct
@@ -82,10 +80,12 @@ _SEATBELT_PROFILE = """
 
 
 def _apply_seatbelt() -> bool:
-    name = ctypes.util.find_library("sandbox")
-    if not name:
+    # `sandbox_init` lives in libsystem_sandbox, which libSystem re-exports, so it is already
+    # loaded in every process. Looking it up there saves `ctypes.util` (and `shutil`, which it
+    # imports): about 4 ms of worker start-up, for a library search that always found the same one.
+    lib = ctypes.CDLL(None)
+    if not hasattr(lib, "sandbox_init"):
         return False
-    lib = ctypes.CDLL(name)
     lib.sandbox_init.argtypes = [
         ctypes.c_char_p,
         ctypes.c_uint64,
@@ -568,7 +568,7 @@ def _libc() -> ctypes.CDLL:
 
 
 def _apply_seccomp(*, allow_exec: bool = True) -> bool:
-    arch = platform.machine()
+    arch = _machine()
     if arch == "arm64":
         arch = "aarch64"
     if arch not in _AUDIT_ARCH:
@@ -685,8 +685,13 @@ class _CapData(ctypes.Structure):
     ]
 
 
+def _machine() -> str:
+    # What `platform.machine()` returns on POSIX, without importing `platform` into the worker.
+    return os.uname().machine
+
+
 def _arch_index() -> int | None:
-    machine = platform.machine()
+    machine = _machine()
     return {"x86_64": 0, "aarch64": 1, "arm64": 1}.get(machine)
 
 
@@ -1187,7 +1192,7 @@ def cpu_seconds(pid: int) -> float | None:
         if sys.platform == "darwin":
             global _libproc  # noqa: PLW0603
             if _libproc is None:
-                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+                _libproc = ctypes.CDLL(None)  # libproc is part of libSystem
             info = _TaskInfo()
             n = _libproc.proc_pidinfo(
                 pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
@@ -1220,7 +1225,7 @@ def thread_count(pid: int) -> int | None:
         if sys.platform == "darwin":
             global _libproc  # noqa: PLW0603
             if _libproc is None:
-                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+                _libproc = ctypes.CDLL(None)  # libproc is part of libSystem
             info = _TaskInfo()
             n = _libproc.proc_pidinfo(
                 pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
@@ -1240,7 +1245,7 @@ def rss_bytes(pid: int) -> int | None:
                 return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
         if sys.platform == "darwin":
             if _libproc is None:
-                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+                _libproc = ctypes.CDLL(None)  # libproc is part of libSystem
             info = _TaskInfo()
             # PROC_PIDTASKINFO = 4
             n = _libproc.proc_pidinfo(
