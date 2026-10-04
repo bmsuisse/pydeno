@@ -525,7 +525,9 @@ class IsolatedRuntime:
         jitless: Run V8 in the worker with `--jitless`: no JIT compiler and no
             WebAssembly, which removes the largest class of V8 exploits at a modest
             speed cost. Pass `False` to allow WebAssembly and JIT speed.
-        v8_flags: Extra V8 flags for the worker, applied before the isolate exists.
+        v8_flags: Extra V8 flags for the worker, applied before the isolate exists. A flag the
+            engine's own start-up would override (for example `--no-harmony-temporal`) is
+            refused rather than silently undone.
         strict_eval: Forbid code generation from strings in the guest: ``eval(...)``,
             ``new Function(...)`` and the async, generator and async-generator function
             constructors throw ``EvalError``, however the guest reaches them. The host's own
