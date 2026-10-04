@@ -170,6 +170,7 @@ What limits it:
   command (`asyncio.run` in `_worker.py`). A plain `eval` takes about 0.1 ms; the front door's own
   Python costs about 0.05 ms per feed. A persistent event loop in the worker would close most of
   that gap.
+- **An external function that never returns keeps its thread.** Its run is ended and your thread released, but plain externals share a pool of 64 tool threads, so many such hangs would starve later external calls. Give your externals their own timeouts.
 - **The first command after a worker has sat idle is slower** (0.3 to 1 ms on macOS) whatever
   sends it.
 - Monty is faster again: its workers are reused between sessions (pydeno's are single-use, by
