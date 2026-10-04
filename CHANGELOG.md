@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-10-04
+
+Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change
+behaviour you have today, and [`docs/roadmap.md`](docs/roadmap.md) for where this is going.
 
 ### Added
 
@@ -10,22 +13,6 @@
   replacements start in the background; an empty pool falls back to a cold start, never an error. Options the
   worker receives at start-up are fixed per pool; parent-side ones (`SandboxPool.SESSION_OPTIONS`) can be set
   per checkout. `benches_py/alternatives_bench.py pydeno-pool` measures it.
-
-### Changed
-
-- Faster cold start of the isolation worker (about 59 to 55 ms on macOS arm64): the worker runs with `-S`
-  (no `site`, so no `.pth` file runs in it) and imports `pydeno` from the parent's own package directory, so
-  parent and worker always run the same code; the sandbox module no longer imports `ctypes.util` and
-  `platform` (`sandbox_init` and `proc_pidinfo` are looked up in the already loaded libSystem,
-  `os.uname()` replaces `platform.machine()`). A worker for a custom `python=` is started as before.
-
-## 0.7.0 — 2026-10-04
-
-Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change
-behaviour you have today, and [`docs/roadmap.md`](docs/roadmap.md) for where this is going.
-
-### Added
-
 - **`AsyncIsolatedRuntime`**: an asyncio-native isolated runtime. Pipes on the event loop, one shared
   supervisor task per loop, no thread per runtime; cancelling a call kills the worker. On macOS (1 to 64
   runtimes) it was 1.4 to 2 times faster and the worst event-loop stall fell from 116 to 335 ms to 1 to 12 ms.
@@ -47,6 +34,11 @@ behaviour you have today, and [`docs/roadmap.md`](docs/roadmap.md) for where thi
 
 ### Changed
 
+- Faster cold start of the isolation worker (about 59 to 55 ms on macOS arm64): the worker runs with `-S`
+  (no `site`, so no `.pth` file runs in it) and imports `pydeno` from the parent's own package directory, so
+  parent and worker always run the same code; the sandbox module no longer imports `ctypes.util` and
+  `platform` (`sandbox_init` and `proc_pidinfo` are looked up in the already loaded libSystem,
+  `os.uname()` replaces `platform.machine()`). A worker for a custom `python=` is started as before.
 - A JS `Map`, `WeakMap`, `WeakSet` or `Error` result now raises instead of becoming an empty dict.
 - `dump()` after a crash returns the last good journal instead of raising.
 - The worker's seccomp filter denies `memfd_create` (memory the RSS poll could not see).
