@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
+  installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
+  `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
+  Proxy namespace that swallowed `defineProperty`, an accessor returning a throwaway object, a read-only or
+  setter global, or a replaced `Array.prototype[Symbol.iterator]`, and the bind then installed nothing while
+  the host still received and exposed the op tokens. The bind now defines own data properties only, runs no
+  guest-replaceable built-in, and raises `Cannot bind '<name>': ...` (exposing no token) when the existing
+  global is an accessor, read-only, a Proxy, a function, a class instance, or frozen. An existing plain
+  object is still extended, a writable global (including a `var`) is still replaced, and an inherited
+  property is shadowed rather than written through. A built-in object (`Object.prototype`, `Math`,
+  `Array.prototype`, `%IteratorPrototype%`...) is refused as a namespace too, and the refusal's error carries a
+  pre-rendered stack so a guest `Error.prepareStackTrace` does not run inside the host's bind.
+- `ToolBridge.attach(..., namespace=None)` is all-or-nothing: when a later tool is refused, the tools this
+  call already bound are revoked before the error propagates.
+- The Python-stream helper `__pydeno_from_py_stream` is fixed in place like the other bridge globals (it was
+  defined after them and stayed writable), and the bridge builds streams with a captured `ReadableStream` and
+  a prototype-less source. A guest could otherwise run code inside a host `bind_object` (or any hand-over of a
+  Python stream), see every stream id and substitute its own value.
+- The `ReadableStream` polyfill keeps its state in a private WeakMap, so setters a guest plants on
+  `ReadableStream.prototype` no longer run (and receive the stream's source) when the bridge creates a stream.
+  Recognising a guest's `ReadableStream` result no longer uses `instanceof globalThis.ReadableStream` (a guest
+  `Symbol.hasInstance` or a replaced global could turn every object result into a stream); it checks the
+  prototype chain against the prototype captured at startup.
+- A refused bind's error has own `name`, `message`, `constructor` (`null`), `cause`, `stack` and
+  `Symbol.for("errorAdditionalPropertyKeys")` (everything deno_core reads when it converts the error, including
+  the `constructor` walk of its AggregateError check), so reading it runs no getter from a prototype or
+  constructor.
+  No deadline covers a bind, so a looping getter there used to block `bind_object` indefinitely (and an
+  `IsolatedRuntime` bind until the worker's hard deadline killed it). A non-extensible global object is
+  refused with the same clear error, and the handlers a refused bind registered are dropped instead of kept for
+  the runtime's lifetime.
+- The built-in set behind the namespace check is collected from the standard global names only, so objects a
+  host snapshot puts on the global object are bindable again (this was a regression in the previous change),
+  and now also covers `CallSite.prototype`, `%SegmentsPrototype%`, the iterator-helper prototypes and the
+  `ReadableStream` polyfill.
+- The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
+  `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
+  (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
+  properties, so an index setter on `Array.prototype` neither sees nor replaces them.
+
+### Fixed
+
+- Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
+  the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
+  even when the guest's error was still being read at that point.
+
+### Changed
+
+- `bind_function(name, ...)` now defines exactly the global property `name`. A dotted name such as `"a.b"`
+  used to be spliced into a script and assign `globalThis.a.b`; it now defines a property literally named
+  `"a.b"`. Use `bind_object` for a namespace.
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change

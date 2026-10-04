@@ -11,6 +11,15 @@ const TERMINATION_STATUS_RUNNING: u8 = 0;
 const TERMINATION_STATUS_REQUESTED: u8 = 1;
 const TERMINATION_STATUS_TERMINATED: u8 = 2;
 
+/// While a fired deadline is still armed, the watchdog re-issues `terminate_execution` this often.
+///
+/// One termination is not enough: when it stops a script, deno_core converts the resulting
+/// "execution terminated" error after *cancelling* the termination, and that conversion reads
+/// properties of the error (`constructor`, `name`, `cause`, `stack`...) whose prototype is the
+/// guest's `Error.prototype`. A getter there would otherwise run with no deadline left. Re-issuing
+/// cuts each such read short; the caller's `disarm` (and its cancel) ends the repeats.
+const REISSUE_INTERVAL: Duration = Duration::from_millis(20);
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -167,57 +176,70 @@ impl Watchdog {
 
         let handle = thread::Builder::new()
             .name("pydeno-watchdog".to_string())
-            .spawn(move || loop {
-                let mut armed = lock(&thread_state.armed);
-                if *lock(&thread_state.shutdown) {
-                    return;
-                }
+            .spawn(move || {
+                let mut last_terminate: Option<Instant> = None;
+                loop {
+                    let mut armed = lock(&thread_state.armed);
+                    if *lock(&thread_state.shutdown) {
+                        return;
+                    }
 
-                let now = Instant::now();
-                let mut any_fired = false;
-                for entry in armed.iter_mut().filter(|e| !e.fired && e.deadline <= now) {
-                    entry.fired = true;
-                    any_fired = true;
-                }
+                    let now = Instant::now();
+                    let mut any_fired = false;
+                    for entry in armed.iter_mut().filter(|e| !e.fired && e.deadline <= now) {
+                        entry.fired = true;
+                        any_fired = true;
+                    }
+                    let outstanding = armed.iter().any(|entry| entry.fired);
+                    let reissue_due = outstanding
+                        && last_terminate
+                            .is_none_or(|at| now.saturating_duration_since(at) >= REISSUE_INTERVAL);
 
-                // One termination covers every deadline that just expired;
-                // report the one that expired first.
-                if any_fired {
-                    let reason = armed
+                    // One termination covers every deadline that just expired;
+                    // report the one that expired first.
+                    if any_fired || reissue_due {
+                        if any_fired {
+                            let reason = armed
+                                .iter()
+                                .filter(|entry| entry.fired)
+                                .min_by_key(|entry| entry.deadline)
+                                .map(|entry| entry.reason.clone());
+                            if let Some(reason) = reason {
+                                termination.ensure_reason(reason);
+                            }
+                        }
+                        // Hold `armed` until `terminate_execution` is issued:
+                        // `disarm` reads `fired` under this lock and its caller
+                        // cancels the termination, so releasing earlier lets a late
+                        // terminate latch the isolate for the next, unrelated call.
+                        termination.terminate_execution();
+                        last_terminate = Some(now);
+                    }
+
+                    let mut next_deadline = armed
                         .iter()
-                        .filter(|entry| entry.fired)
-                        .min_by_key(|entry| entry.deadline)
-                        .map(|entry| entry.reason.clone());
-                    // Hold `armed` until `terminate_execution` is issued:
-                    // `disarm` reads `fired` under this lock and its caller
-                    // cancels the termination, so releasing earlier lets a late
-                    // terminate latch the isolate for the next, unrelated call.
-                    if let Some(reason) = reason {
-                        termination.ensure_reason(reason);
+                        .filter(|entry| !entry.fired)
+                        .map(|entry| entry.deadline)
+                        .min();
+                    if outstanding {
+                        let reissue_at = now + REISSUE_INTERVAL;
+                        next_deadline =
+                            Some(next_deadline.map_or(reissue_at, |d| d.min(reissue_at)));
                     }
-                    termination.terminate_execution();
-                    drop(armed);
-                    continue;
-                }
-
-                let next_deadline = armed
-                    .iter()
-                    .filter(|entry| !entry.fired)
-                    .map(|entry| entry.deadline)
-                    .min();
-                let _guard = match next_deadline {
-                    None => thread_state
-                        .wake
-                        .wait(armed)
-                        .unwrap_or_else(PoisonError::into_inner),
-                    Some(deadline) => {
-                        thread_state
+                    let _guard = match next_deadline {
+                        None => thread_state
                             .wake
-                            .wait_timeout(armed, deadline.saturating_duration_since(now))
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .0
-                    }
-                };
+                            .wait(armed)
+                            .unwrap_or_else(PoisonError::into_inner),
+                        Some(deadline) => {
+                            thread_state
+                                .wake
+                                .wait_timeout(armed, deadline.saturating_duration_since(now))
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .0
+                        }
+                    };
+                }
             })
             .map_err(|e| {
                 RuntimeError::internal(format!("Failed to spawn watchdog thread: {}", e))

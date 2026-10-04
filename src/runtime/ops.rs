@@ -358,10 +358,26 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const IsView = ArrayBuffer.isView;
   const ObjectEntries = Object.entries;
   const DefineProperty = Object.defineProperty;
+  const GetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+  const GetPrototypeOf = Object.getPrototypeOf;
+  const IsExtensible = Object.isExtensible;
+  const HasOwn = Object.hasOwn;
+  const ObjectPrototype = Object.prototype;
+  const IsProxy = Deno.core.isProxy;
+  const OwnKeys = Reflect.ownKeys;
+  const WeakSetAdd = uncurry(WeakSet.prototype.add);
+  const WeakSetHas = uncurry(WeakSet.prototype.has);
   const DateValueOf = uncurry(Date.prototype.valueOf);
   const BigIntToString = uncurry(BigInt.prototype.toString);
   const SetForEach = uncurry(Set.prototype.forEach);
+  const SetAdd = uncurry(Set.prototype.add);
+  const PromiseThen = uncurry(Promise.prototype.then);
+  const DateCtor = Date;
+  const SetCtor = Set;
+  const BigIntCtor = BigInt;
   const TypeErrorCtor = TypeError;
+  // deno_core reads this registered symbol from every thrown error (`errorAdditionalPropertyKeys`).
+  const ErrorAdditionalPropertyKeys = Symbol.for("errorAdditionalPropertyKeys");
   const RangeErrorCtor = RangeError;
   // A host-bound function's arguments are copied before they cross: cap the work and the depth
   // up front, so one call cannot make the copy itself the denial of service.
@@ -377,8 +393,11 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
 
   // Install `key` as own data: plain assignment of "__proto__" would invoke
   // the setter and swap the prototype (tests/test_fuzz_eval_boundary.py).
+  // The descriptor has no prototype, so `Object.prototype.get` (or `.set`, `.writable`...) planted
+  // by the guest cannot turn it into something else.
   function setOwn(target, key, value) {
     DefineProperty(target, key, {
+      __proto__: null,
       value,
       writable: true,
       enumerable: true,
@@ -433,7 +452,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       }
       const out = [];
       for (let index = 0; index < length; index++) {
-        out[index] = prepare(value[index], at + "[" + index + "]", level + 1);
+        setOwn(out, index, prepare(value[index], at + "[" + index + "]", level + 1));
       }
       return out;
     }
@@ -443,7 +462,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     if (value instanceof Set) {
       const values = [];
       SetForEach(value, (entry) => {
-        values[values.length] = prepare(entry, at + ".<set item " + values.length + ">", level + 1);
+        const at2 = at + ".<set item " + values.length + ">";
+        setOwn(values, values.length, prepare(entry, at2, level + 1));
       });
       return { __pydeno_type: "Set", values };
     }
@@ -469,7 +489,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     argNodes = 0;
     const out = [];
     for (let index = 0; index < args.length; index++) {
-      out[index] = prepare(args[index], "args[" + index + "]", 0);
+      setOwn(out, index, prepare(args[index], "args[" + index + "]", 0));
     }
     return out;
   }
@@ -484,40 +504,53 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     };
   }
 
+  // Read an own property only: a key the host value lacks must not fall through to a getter the
+  // guest planted on `Object.prototype`.
+  function own(value, key) {
+    return HasOwn(value, key) ? value[key] : undefined;
+  }
+
+  // Rebuild a host result as guest values. Same rule as `prepare`: captured intrinsics and indexed
+  // loops only, so a guest that replaced `Array.prototype.map`, `Object.entries`, the array
+  // iterator or the global `Date`/`Set`/`BigInt` does not get to run during the rebuild.
   function revive(value) {
     if (value && typeof value === "object") {
-      if (ArrayBuffer.isView(value)) {
+      if (IsView(value)) {
         return value;
       }
-      if (Array.isArray(value)) {
-        return value.map(revive);
+      if (ArrayIsArray(value)) {
+        const length = value.length;
+        const out = [];
+        for (let index = 0; index < length; index++) {
+          setOwn(out, index, revive(value[index]));
+        }
+        return out;
       }
-      const tag = value.__pydeno_type;
-      switch (tag) {
+      switch (own(value, "__pydeno_type")) {
         case "Undefined":
           return undefined;
         case "Date":
-          return new Date(value.epoch_ms);
+          return new DateCtor(own(value, "epoch_ms"));
         case "Set": {
-          const set = new Set();
-          if (Array.isArray(value.values)) {
-            for (const entry of value.values) {
-              set.add(revive(entry));
+          const set = new SetCtor();
+          const values = own(value, "values");
+          if (ArrayIsArray(values)) {
+            for (let index = 0; index < values.length; index++) {
+              SetAdd(set, revive(values[index]));
             }
           }
           return set;
         }
         case "BigInt":
-          return BigInt(value.value);
+          return BigIntCtor(own(value, "value"));
         case "PyStream":
-          if (typeof globalThis.__pydeno_from_py_stream === "function") {
-            return globalThis.__pydeno_from_py_stream(value.id);
-          }
-          return value;
+          return fromPyStream(own(value, "id"));
         default: {
           const result = {};
-          for (const [key, val] of Object.entries(value)) {
-            setOwn(result, key, revive(val));
+          const entries = ObjectEntries(value);
+          for (let index = 0; index < entries.length; index++) {
+            const entry = entries[index];
+            setOwn(result, entry[0], revive(entry[1]));
           }
           return result;
         }
@@ -582,129 +615,364 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     return err;
   }
 
-  globalThis.__pydenoCallSync = function (opId, ...args) {
+  // `args` is always an array built by a rest parameter, never spread: spreading goes through
+  // `Array.prototype[Symbol.iterator]`, which the guest can replace.
+  function callSync(opId, args) {
     const prepared = prepareArgs(args);
     try {
       return revive(ops.op_pydeno_call_python_sync(opId, prepared));
     } catch (err) {
       throw sanitizeHostError(restoreHostError(err));
     }
-  };
-  globalThis.__pydenoCallAsync = function (opId, ...args) {
+  }
+  function callAsync(opId, args) {
     const prepared = prepareArgs(args);
-    return ops.op_pydeno_call_python_async(opId, prepared).then(revive, (err) => {
+    return PromiseThen(ops.op_pydeno_call_python_async(opId, prepared), revive, (err) => {
       throw sanitizeHostError(restoreHostError(err));
     });
+  }
+  function hostFunction(opId, mode) {
+    return mode === "async"
+      ? (...args) => callAsync(opId, args)
+      : (...args) => callSync(opId, args);
+  }
+
+  globalThis.__pydenoCallSync = function (opId, ...args) {
+    return callSync(opId, args);
+  };
+  globalThis.__pydenoCallAsync = function (opId, ...args) {
+    return callAsync(opId, args);
   };
   globalThis.__host_op_sync__ = globalThis.__pydenoCallSync;
-  globalThis.__host_op_async__ = function (opId, ...args) {
-    return globalThis.__pydenoCallAsync(opId, ...args);
-  };
-  globalThis.__pydeno_bind_object = function (globalName, assignments) {
-    if (typeof globalName !== "string" || !Array.isArray(assignments)) {
+  globalThis.__host_op_async__ = globalThis.__pydenoCallAsync;
+
+  // The bind helpers below run on behalf of the host, often long after guest code has had the
+  // run of the global object. The host exposes the op tokens only if a helper returns normally,
+  // so each helper must either install every binding where the guest will look for it, or throw:
+  // never return having installed nothing (a Proxy namespace that swallows `defineProperty`, an
+  // accessor that hands back a throwaway object, a read-only global that ignores the assignment).
+  // And they run no guest code: no `for...of`, no plain assignment that could hit a setter, no
+  // lookups on a namespace that could be a Proxy.
+  // The host converts the error it gets back with deno_core's `JsError::from_v8_exception`. Its
+  // ordinary [[Get]]s on the error are: `name` and `message` (serde), `cause`, `stack`,
+  // `Symbol.for("errorAdditionalPropertyKeys")` (then each key it lists, and that value's
+  // `toString()`), and, in the AggregateError check, `constructor` and that constructor's `name`,
+  // repeated up the prototype chain (and `errors` when the name says AggregateError). Every one of
+  // those is an own data property here, so no read reaches a getter the guest planted on a
+  // prototype or constructor -- no deadline covers a bind, so a looping getter would block the
+  // host. `constructor` is `null`: deno_core stops the AggregateError walk as soon as it is not an
+  // object, before it looks at any prototype. `stack` is plain text, so it is never formatted (no
+  // guest `Error.prepareStackTrace`, no CallSite frames to read). The remaining steps
+  // (`is_instance_of_error`, the V8 message) walk prototypes natively without calling JavaScript.
+  function refuseBind(name, why) {
+    const message = "Cannot bind '" + name + "': " + why;
+    const error = new TypeErrorCtor(message);
+    const fields = [
+      "name", "TypeError",
+      "message", message,
+      "constructor", null,
+      "cause", undefined,
+      "stack", "TypeError: " + message,
+      ErrorAdditionalPropertyKeys, undefined,
+    ];
+    for (let index = 0; index < fields.length; index += 2) {
+      DefineProperty(error, fields[index], {
+        __proto__: null,
+        value: fields[index + 1],
+        writable: true,
+        configurable: true,
+      });
+    }
+    throw error;
+  }
+
+  // Define `globalThis[name] = value` as an own data property, never through a setter.
+  function installGlobal(name, value) {
+    const desc = GetOwnPropertyDescriptor(globalThis, name);
+    if (desc === undefined) {
+      if (!IsExtensible(globalThis)) {
+        refuseBind(name, "the global object is not extensible");
+      }
+      DefineProperty(globalThis, name, {
+        __proto__: null,
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
       return;
     }
-    const target = globalThis[globalName] ?? (globalThis[globalName] = {});
-    for (const entry of assignments) {
+    if (!HasOwn(desc, "value")) {
+      refuseBind(name, "globalThis." + name + " is already a getter/setter property");
+    }
+    if (!desc.writable) {
+      refuseBind(name, "globalThis." + name + " is already a read-only property");
+    }
+    // Writable (a `var`, say, which is also non-configurable): replace the value only.
+    DefineProperty(globalThis, name, { __proto__: null, value });
+  }
+
+  // The object a namespace binding goes on: a fresh one, or an existing *plain* object -- not a
+  // Proxy, not an accessor, not a function or class instance, not frozen. Anything else could
+  // run guest code during the install or discard it, so it is refused rather than guessed at.
+  // Every built-in object a guest could point a namespace at (`Object.prototype`, `Math`,
+  // `Array.prototype`, `%IteratorPrototype%`...): installing host tools on one of those would put
+  // them on every object, or on a shared built-in. Collected once, before any guest code, from the
+  // *standard* global names only: this script also runs after a host snapshot is restored, and
+  // the objects that snapshot's bootstrap put on the global object are the host's own namespaces,
+  // not built-ins. From each standard global: the value, its own object-valued properties (a
+  // constructor's `prototype`, `Intl.Collator`...) and theirs (`Intl.Collator.prototype`,
+  // `Array.prototype[Symbol.unscopables]`), plus the prototypes reachable only through instances.
+  const STANDARD_GLOBALS = [
+    "AggregateError", "Array", "ArrayBuffer", "AsyncDisposableStack", "Atomics", "BigInt",
+    "BigInt64Array", "BigUint64Array", "Boolean", "DataView", "Date", "DisposableStack", "Error",
+    "EvalError", "FinalizationRegistry", "Float16Array", "Float32Array", "Float64Array",
+    "Function", "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map",
+    "Math", "Number", "Object", "Promise", "Proxy", "RangeError", "ReferenceError", "Reflect",
+    "RegExp", "Set", "SharedArrayBuffer", "String", "SuppressedError", "Symbol", "SyntaxError",
+    "Temporal", "TypeError", "URIError", "Uint16Array", "Uint32Array", "Uint8Array",
+    "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "console",
+  ];
+  const INTRINSICS = new WeakSet();
+  function markIntrinsic(value, depth) {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+      return;
+    }
+    if (WeakSetHas(INTRINSICS, value)) {
+      return;
+    }
+    WeakSetAdd(INTRINSICS, value);
+    if (depth === 0) {
+      return;
+    }
+    const keys = OwnKeys(value);
+    for (let index = 0; index < keys.length; index++) {
+      const desc = GetOwnPropertyDescriptor(value, keys[index]);
+      if (desc !== undefined && HasOwn(desc, "value")) {
+        markIntrinsic(desc.value, depth - 1);
+      }
+    }
+  }
+  markIntrinsic(globalThis, 0);
+  for (let index = 0; index < STANDARD_GLOBALS.length; index++) {
+    const desc = GetOwnPropertyDescriptor(globalThis, STANDARD_GLOBALS[index]);
+    if (desc !== undefined && HasOwn(desc, "value")) {
+      markIntrinsic(desc.value, 2);
+    }
+  }
+  // `CallSite.prototype`, only handed out to `Error.prepareStackTrace`.
+  function callSitePrototype() {
+    const saved = GetOwnPropertyDescriptor(Error, "prepareStackTrace");
+    let frames;
+    try {
+      DefineProperty(Error, "prepareStackTrace", {
+        __proto__: null,
+        value: (error, callSites) => callSites,
+        writable: true,
+        configurable: true,
+      });
+      frames = new Error().stack;
+    } finally {
+      if (saved === undefined) {
+        delete Error.prepareStackTrace;
+      } else {
+        DefineProperty(Error, "prepareStackTrace", saved);
+      }
+    }
+    return ArrayIsArray(frames) && frames.length > 0 ? GetPrototypeOf(frames[0]) : null;
+  }
+  const iteratorHelper = [][Symbol.iterator]();
+  for (const hidden of [
+    callSitePrototype(),
+    typeof Intl === "object" && typeof Intl.Segmenter === "function"
+      ? GetPrototypeOf(new Intl.Segmenter().segment("a"))
+      : null,
+    typeof Intl === "object" && typeof Intl.Segmenter === "function"
+      ? GetPrototypeOf(new Intl.Segmenter().segment("a")[Symbol.iterator]())
+      : null,
+    typeof iteratorHelper.map === "function" ? GetPrototypeOf(iteratorHelper.map((x) => x)) : null,
+    typeof WebAssembly === "object" && typeof WebAssembly.Module === "function"
+      ? GetPrototypeOf(WebAssembly.Module.prototype)
+      : null,
+    typeof Iterator === "function" && typeof Iterator.from === "function"
+      ? GetPrototypeOf(Iterator.from({ next() { return { done: true }; } }))
+      : null,
+    GetPrototypeOf([][Symbol.iterator]()),
+    GetPrototypeOf(GetPrototypeOf([][Symbol.iterator]())),
+    GetPrototypeOf(new Map()[Symbol.iterator]()),
+    GetPrototypeOf(new Set()[Symbol.iterator]()),
+    GetPrototypeOf(""[Symbol.iterator]()),
+    GetPrototypeOf(/x/[Symbol.matchAll]("")),
+    GetPrototypeOf(Uint8Array),
+    GetPrototypeOf(Uint8Array.prototype),
+    GetPrototypeOf(function* () {}),
+    GetPrototypeOf(function* () {}).prototype,
+    GetPrototypeOf(async function () {}),
+    GetPrototypeOf(async function* () {}),
+    GetPrototypeOf(async function* () {}).prototype,
+    GetPrototypeOf(GetPrototypeOf(async function* () {}).prototype),
+  ]) {
+    markIntrinsic(hidden, 1);
+  }
+
+  function namespaceFor(name, keys) {
+    const desc = GetOwnPropertyDescriptor(globalThis, name);
+    if (desc === undefined) {
+      return undefined;
+    }
+    const where = "globalThis." + name;
+    if (!HasOwn(desc, "value")) {
+      refuseBind(name, where + " is already a getter/setter property, not a plain object");
+    }
+    const target = desc.value;
+    if (target === null || typeof target !== "object" || IsProxy(target)) {
+      refuseBind(name, where + " already exists and is not a plain object");
+    }
+    if (WeakSetHas(INTRINSICS, target)) {
+      refuseBind(name, where + " is a built-in object, not a namespace of its own");
+    }
+    const proto = GetPrototypeOf(target);
+    if (proto !== ObjectPrototype && proto !== null) {
+      refuseBind(name, where + " already exists and is not a plain object (it has a prototype)");
+    }
+    if (!IsExtensible(target)) {
+      refuseBind(name, where + " is frozen, sealed or otherwise not extensible");
+    }
+    for (let index = 0; index < keys.length; index++) {
+      const existing = GetOwnPropertyDescriptor(target, keys[index]);
+      if (existing !== undefined && !existing.configurable) {
+        refuseBind(name, where + "." + keys[index] + " already exists and is non-configurable");
+      }
+    }
+    return target;
+  }
+
+  globalThis.__pydeno_bind_object = function (globalName, assignments) {
+    if (typeof globalName !== "string" || !ArrayIsArray(assignments)) {
+      throw new TypeErrorCtor("__pydeno_bind_object: invalid arguments");
+    }
+    // Validate and build everything first, so a refusal installs nothing. `setOwn`, not
+    // `keys[index] = ...`: an index setter on `Array.prototype` would intercept the assignment.
+    const keys = [];
+    const values = [];
+    for (let index = 0; index < assignments.length; index++) {
+      const entry = assignments[index];
       if (!entry || typeof entry !== "object" || typeof entry.key !== "string") {
-        continue;
+        throw new TypeErrorCtor("__pydeno_bind_object: invalid assignment");
       }
-      if (entry.kind === "op") {
-        const bridge =
-          entry.mode === "async"
-            ? globalThis.__host_op_async__
-            : globalThis.__host_op_sync__;
-        if (typeof bridge !== "function" || typeof entry.op_id !== "number") {
-          continue;
-        }
-        setOwn(target, entry.key, (...args) => bridge(entry.op_id, ...args));
+      if (entry.kind === "op" && typeof entry.op_id === "number") {
+        setOwn(values, index, hostFunction(entry.op_id, entry.mode));
       } else if (entry.kind === "value") {
-        setOwn(target, entry.key, entry.value);
+        setOwn(values, index, entry.value);
+      } else {
+        throw new TypeErrorCtor("__pydeno_bind_object: invalid assignment");
       }
+      setOwn(keys, index, entry.key);
+    }
+    let target = namespaceFor(globalName, keys);
+    if (target === undefined) {
+      target = {};
+      installGlobal(globalName, target);
+    }
+    for (let index = 0; index < keys.length; index++) {
+      setOwn(target, keys[index], values[index]);
     }
   };
 
-  // Library code (or a guest) that assigns to one of these would silently reroute every bound
-  // host function, since they look the bridge up by name at call time. Fixed in place, and hidden
-  // from enumeration.
-  for (const name of [
-    "__pydenoCallSync",
-    "__pydenoCallAsync",
-    "__host_op_sync__",
-    "__host_op_async__",
-    "__pydeno_bind_object",
-  ]) {
-    DefineProperty(globalThis, name, { writable: false, configurable: false, enumerable: false });
-  }
+  globalThis.__pydeno_bind_function = function (name, opId, mode) {
+    if (typeof name !== "string" || typeof opId !== "number") {
+      throw new TypeErrorCtor("__pydeno_bind_function: invalid arguments");
+    }
+    installGlobal(name, hostFunction(opId, mode));
+  };
 
   if (typeof globalThis.ReadableStream !== "function") {
     // Note: This minimal polyfill does not implement backpressure or BYOB readers.
+    //
+    // Its state lives in a WeakMap, not in `this._queue = ...` properties: an assignment to the
+    // instance would run a setter the guest planted on `ReadableStream.prototype`, and the bridge
+    // constructs these streams inside a host bind. The state holders have no prototype for the
+    // same reason.
+    const streamState = new WeakMap();
+    const StateGet = uncurry(WeakMap.prototype.get);
+    const StateSet = uncurry(WeakMap.prototype.set);
+    const stateOf = (stream) => {
+      const state = StateGet(streamState, stream);
+      if (state === undefined) {
+        throw new TypeErrorCtor("not a ReadableStream");
+      }
+      return state;
+    };
+    const maybePull = async (state) => {
+      if (state.closed || state.pulling) {
+        return;
+      }
+      if (typeof state.underlying.pull === "function") {
+        state.pulling = true;
+        try {
+          await state.underlying.pull(state.controller);
+        } finally {
+          state.pulling = false;
+        }
+      }
+    };
     class PydenoReadableStream {
       constructor(underlying = {}) {
-        this._queue = [];
-        this._closed = false;
-        this._errored = false;
-        this._error = undefined;
-        this._pulling = false;
-        this._underlying = underlying;
-        this._controller = {
+        const state = {
+          __proto__: null,
+          queue: [],
+          closed: false,
+          errored: false,
+          error: undefined,
+          pulling: false,
+          underlying,
+          controller: undefined,
+        };
+        state.controller = {
           enqueue: (value) => {
-            if (this._closed) {
+            if (state.closed) {
               return;
             }
-            this._queue.push(value);
+            state.queue.push(value);
           },
           close: () => {
-            this._closed = true;
+            state.closed = true;
           },
           error: (reason) => {
-            this._errored = true;
-            this._error =
+            state.errored = true;
+            state.error =
               reason instanceof Error
                 ? reason
                 : new Error(String(reason ?? "ReadableStream error"));
-            this._closed = true;
+            state.closed = true;
           },
         };
+        StateSet(streamState, this, state);
         if (typeof underlying.start === "function") {
-          underlying.start(this._controller);
-        }
-      }
-
-      async _maybePull() {
-        if (this._closed || this._pulling) {
-          return;
-        }
-        if (typeof this._underlying.pull === "function") {
-          this._pulling = true;
-          try {
-            await this._underlying.pull(this._controller);
-          } finally {
-            this._pulling = false;
-          }
+          underlying.start(state.controller);
         }
       }
 
       getReader() {
-        const stream = this;
+        const state = stateOf(this);
         return {
           async read() {
-            if (stream._queue.length === 0 && !stream._closed) {
-              await stream._maybePull();
+            if (state.queue.length === 0 && !state.closed) {
+              await maybePull(state);
             }
-            if (stream._queue.length > 0) {
-              const value = stream._queue.shift();
+            if (state.queue.length > 0) {
+              const value = state.queue.shift();
               return { done: false, value };
             }
-            if (stream._errored) {
-              throw stream._error || new Error("ReadableStream error");
+            if (state.errored) {
+              throw state.error || new Error("ReadableStream error");
             }
             return { done: true, value: undefined };
           },
           async cancel(reason) {
-            stream._closed = true;
-            if (typeof stream._underlying.cancel === "function") {
-              await stream._underlying.cancel(reason);
+            state.closed = true;
+            if (typeof state.underlying.cancel === "function") {
+              await state.underlying.cancel(reason);
             }
           },
         };
@@ -713,8 +981,19 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     globalThis.ReadableStream = PydenoReadableStream;
   }
 
-  globalThis.__pydeno_from_py_stream = function (id) {
-    return new ReadableStream({
+  // Captured after the polyfill: a guest that later replaces `globalThis.ReadableStream` must not
+  // get its constructor called (with the stream id and the pull closure) when the host hands a
+  // Python stream to JavaScript, which can happen inside a bind.
+  const ReadableStreamCtor = globalThis.ReadableStream;
+  // Defined after the built-in scan above, and just as much a built-in for the namespace check.
+  markIntrinsic(ReadableStreamCtor, 1);
+
+  // Called by `revive` directly and by the Rust converter through the fixed global below. The
+  // underlying source has no prototype, so the constructor's reads of `start`, `type` or
+  // `autoAllocateChunkSize` cannot reach a getter the guest planted on `Object.prototype`.
+  function fromPyStream(id) {
+    return new ReadableStreamCtor({
+      __proto__: null,
       async pull(controller) {
         let raw;
         try {
@@ -733,7 +1012,29 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         return ops.op_pydeno_stream_cancel_py(id);
       },
     });
-  };
+  }
+  globalThis.__pydeno_from_py_stream = fromPyStream;
+
+  // Library code (or a guest) that assigns to one of these would silently reroute every bound
+  // host function, since they look the bridge up by name at call time, and the Rust side looks up
+  // `__pydeno_bind_object` and `__pydeno_from_py_stream` on the live global. Fixed in place and
+  // hidden from enumeration; last, so that every helper above already exists.
+  const FIXED_GLOBALS = [
+    "__pydenoCallSync",
+    "__pydenoCallAsync",
+    "__host_op_sync__",
+    "__host_op_async__",
+    "__pydeno_bind_object",
+    "__pydeno_bind_function",
+    "__pydeno_from_py_stream",
+  ];
+  for (let index = 0; index < FIXED_GLOBALS.length; index++) {
+    DefineProperty(globalThis, FIXED_GLOBALS[index], {
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  }
 })(globalThis);"#
     );
 

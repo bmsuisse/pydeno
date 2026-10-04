@@ -56,14 +56,22 @@ def test_timeout_rejects_unrepresentable_deadline(value):
 
 
 def test_bind_object_setter_can_call_python_without_deadlock():
+    # The setter used to run (and call back into Python) during the bind, which is what once
+    # deadlocked. The bind now refuses an accessor global without running it
+    # (tests/test_bridge_poisoning.py); this still pins that the attempt neither hangs nor calls it.
     code = textwrap.dedent("""
         from pydeno import Runtime
         with Runtime() as rt:
             seen = []
             rt.bind_function("record", lambda: seen.append("called"))
             rt.eval('Object.defineProperty(globalThis, "target", {set(v) {record();}})')
-            rt.bind_object("target", {"value": 42})
-            assert seen == ["called"]
+            try:
+                rt.bind_object("target", {"value": 42})
+            except Exception as exc:
+                assert "Cannot bind 'target'" in str(exc), exc
+            else:
+                raise AssertionError("bind over an accessor was not refused")
+            assert seen == []
     """)
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=5

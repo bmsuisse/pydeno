@@ -1,7 +1,9 @@
 //! [`RuntimeCoreState`]: the V8 isolate and everything that lives beside it on
 //! the runtime thread.
 
-use super::convert::{caught_call_error, global_helper, CallError, Converter};
+use super::convert::{
+    capture_stream_prototype, caught_call_error, global_helper, CallError, Converter,
+};
 use super::termination::{TerminationController, Watchdog, WatchdogToken};
 use super::FunctionCallResult;
 use crate::runtime::config::RuntimeConfig;
@@ -365,6 +367,11 @@ impl RuntimeCoreState {
             None => None,
         };
 
+        let stream_prototype = {
+            deno_core::scope!(scope, js_runtime);
+            capture_stream_prototype(scope).map(Rc::new)
+        };
+
         Ok(Self {
             js_runtime,
             registry,
@@ -376,6 +383,7 @@ impl RuntimeCoreState {
                 next_fn_id: Default::default(),
                 limits: serialization_limits,
                 streams: Rc::new(JsStreamRegistry::new()),
+                stream_prototype,
             },
             pending_calls: Default::default(),
             next_pending_call_id: Default::default(),
@@ -521,11 +529,11 @@ impl RuntimeCoreState {
         if let Some(watchdog) = watchdog {
             let (fired, duration) = self.resolve_watchdog(watchdog);
             if fired {
+                // The deadline passed, whatever the call produced meanwhile: a guest error whose
+                // conversion ran into the deadline (a looping `cause` getter, say) is reported as
+                // the timeout it is, not as the guest's error.
                 let message = format!("{context} timed out after {}ms", duration.as_millis());
-                return match result {
-                    Err(err) if !runtime_error_indicates_termination(&err) => Err(err),
-                    _ => Err(RuntimeError::timeout(message)),
-                };
+                return Err(RuntimeError::timeout(message));
             }
         }
         result
@@ -669,6 +677,11 @@ impl RuntimeCoreState {
                 registry.expose(token);
             }
             return Ok(());
+        }
+        // Refused: the handlers were never reachable; drop them rather than keep them for the
+        // runtime's lifetime.
+        for token in op_tokens {
+            registry.revoke(token);
         }
         match try_catch.exception() {
             Some(exception) => Err(js_error(JsError::from_v8_exception(try_catch, exception))),
