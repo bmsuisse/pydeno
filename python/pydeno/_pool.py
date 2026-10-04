@@ -136,6 +136,7 @@ class _Entry:
     __slots__ = (
         "barrier",
         "counter",
+        "dirty",
         "gone",
         "last_used",
         "lock",
@@ -157,9 +158,15 @@ class _Entry:
         # Held by `drop` while it works: a `get` waits on it instead of restoring (from a store
         # `drop` is busy emptying) a session that is being dropped.
         self.barrier = False
+        # Leased since its journal was last stored: eviction keeps it (closing it would forget
+        # what it ran and spent since) until a `release` stores it.
+        self.dirty = False
 
     def idle(self) -> bool:
         return not self.lock.locked() and self.waiters == 0
+
+    def evictable(self) -> bool:
+        return self.idle() and not self.dirty
 
 
 class _Default:
@@ -314,24 +321,52 @@ class SessionPool:
             if entry.gone:
                 entry.lock.release()
                 continue
+            try:
+                ready = await self._prepare(entry)
+            except BaseException:
+                if entry.sandbox is None:
+                    self._forget(entry)
+                entry.lock.release()
+                raise
+            if not ready:  # dropped while it was being prepared: start over
+                entry.lock.release()
+                continue
             break
-        try:
-            sandbox = entry.sandbox
-            if sandbox is not None and sandbox.is_closed():
+        entry.dirty = True
+        entry.last_used = time.monotonic()
+        assert entry.sandbox is not None
+        return entry.sandbox
+
+    async def _prepare(self, entry: _Entry) -> bool:
+        """With the lease held: make `entry.sandbox` the session's current state. False if the
+        session was dropped meanwhile (whatever was restored is closed)."""
+        owner, session_id = entry.owner, entry.session_id
+        sandbox = entry.sandbox
+        if sandbox is not None:
+            stored = await self._stored_counter(owner, session_id)
+            if entry.gone:
+                return False
+            if stored > entry.counter:
+                # Another pool (or process) stored a newer journal of this session since this
+                # live copy was last stored: the copy is out of date. Use the stored one.
+                entry.sandbox = None
+                entry.dirty = False
+                self._close_later(sandbox)
+            elif sandbox.is_closed():
                 # Crashed, killed or timed out since its last lease. Store what it still holds
                 # (its last good state, and what a lost run spent), then restore from that.
                 entry.sandbox = None
                 self._close_later(sandbox)
                 await self._persist(entry, sandbox)
-            if entry.sandbox is None:
-                entry.sandbox = await self._restore(entry)
-        except BaseException:
-            if entry.sandbox is None:
-                self._forget(entry)
-            entry.lock.release()
-            raise
-        entry.last_used = time.monotonic()
-        return entry.sandbox
+                if entry.gone:
+                    return False
+        if entry.sandbox is None:
+            restored = await self._restore(entry)
+            if entry.gone:
+                await _quiet_close(restored)
+                return False
+            entry.sandbox = restored
+        return True
 
     async def release(self, owner: str, session_id: str) -> None:
         """Persist the leased session's journal and end the lease.
@@ -369,7 +404,7 @@ class SessionPool:
             if sandbox is None:
                 return
             await self._persist(entry, sandbox)
-            if sandbox.is_closed():
+            if entry.sandbox is sandbox and sandbox.is_closed():
                 entry.sandbox = None
                 self._close_later(sandbox)
             entry.last_used = time.monotonic()
@@ -377,9 +412,26 @@ class SessionPool:
             entry.lock.release()
 
     async def _persist(self, entry: _Entry, sandbox: AsyncAgentSandbox) -> None:
-        """Dump `sandbox` under the next counter and store it (the lease is held)."""
+        """Dump `sandbox` under the next counter and store it (the lease is held).
+
+        Nothing is written for a session dropped meanwhile, nor over a newer journal another
+        pool stored (`StaleJournal`; the live copy is closed and the next `get` restores the
+        stored one). A dump that fails because the journal is over its cap stores a journal
+        without state that keeps the spent budget (`JournalTooLarge`). Any other failure leaves
+        the session live and unevictable until a later `release` stores it."""
         owner, session_id = entry.owner, entry.session_id
         counter = entry.counter + 1
+        stored = await self._stored_counter(owner, session_id)
+        if entry.gone:
+            return
+        if stored > entry.counter:
+            entry.sandbox = None
+            entry.dirty = False
+            self._close_later(sandbox)
+            raise StaleJournal(
+                f"session {owner}:{session_id} was stored by another pool or process since this "
+                "pool loaded it; this copy was not stored (route each session to one pool)"
+            )
         try:
             blob = await sandbox.dump(
                 self._key, associated_data=_bound(owner, session_id, counter)
@@ -391,17 +443,32 @@ class SessionPool:
                 f"{self._max_journal_bytes}; its state was dropped, its spent tool budget "
                 f"kept ({exc})"
             ) from None
+        if await self._write(entry, counter, blob):
+            entry.dirty = False
+
+    async def _write(self, entry: _Entry, counter: int, blob: bytes) -> bool:
+        """Store a signed journal under `counter` and record the counter, unless the session is
+        dropped meanwhile (a journal that lands after the drop is deleted again)."""
+        owner, session_id = entry.owner, entry.session_id
+        if entry.gone:
+            return False
+        journal_key = self._journal_key(owner, session_id)
         await self._store.set(
-            self._journal_key(owner, session_id),
-            _ENVELOPE + _COUNTER.pack(counter) + blob,
-            ttl=self._ttl,
+            journal_key, _ENVELOPE + _COUNTER.pack(counter) + blob, ttl=self._ttl
         )
+        if entry.gone:
+            await self._store.delete(journal_key)
+            return False
         await self._store.set(
             self._counter_key(owner, session_id),
             str(counter).encode(),
             ttl=self._counter_ttl,
         )
         entry.counter = counter
+        if entry.gone:
+            await self._store.delete(journal_key)
+            return False
+        return True
 
     async def drop(self, owner: str, session_id: str) -> None:
         """Forget the session: close its worker (even if leased: a run in progress is killed),
@@ -461,7 +528,7 @@ class SessionPool:
         victims = [
             e
             for e in self._entries.values()
-            if e.idle()
+            if e.evictable()
             and (
                 (e.sandbox is not None and e.sandbox.is_closed())
                 or (
@@ -472,7 +539,9 @@ class SessionPool:
         ]
         excess = len(self._entries) - len(victims) - self._max_sessions
         if excess > 0:
-            spare = [e for e in self._entries.values() if e.idle() and e not in victims]
+            spare = [
+                e for e in self._entries.values() if e.evictable() and e not in victims
+            ]
             victims.extend(spare[:excess])  # oldest first: the dict is in LRU order
         for entry in victims:
             self._evict(entry)
@@ -501,6 +570,13 @@ class SessionPool:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._sweeper
             self._sweeper = None
+        # A session whose last release failed (so it is still unstored) gets one more try, so
+        # closing the pool does not forget what it ran and spent since its last stored journal.
+        for entry in list(self._entries.values()):
+            if entry.dirty and entry.idle() and entry.sandbox is not None:
+                async with entry.lock:
+                    with contextlib.suppress(Exception):
+                        await self._persist(entry, entry.sandbox)
         entries = list(self._entries.values())
         self._entries.clear()
         sandboxes = []
@@ -613,31 +689,26 @@ class SessionPool:
     async def _drop_state(
         self, entry: _Entry, sandbox: AsyncAgentSandbox, counter: int
     ) -> None:
-        """The journal is over its cap: close the session and store, under the next counter (so
-        no earlier journal loads again), a journal with no state that charges every tool call
-        the session made. The next `get` restores a fresh session with that budget spent: a
-        guest that grows its own journal (every tool answer is in it) cannot win back its
-        budget that way."""
-        entry.sandbox = None
+        """The journal is over its cap: store, under the next counter (so no earlier journal
+        loads again), a journal with no state that charges every tool call the session made,
+        then close the session. The next `get` restores a fresh session with that budget spent.
+        Everything is written while the lease is held and the session is still in the map, so a
+        `get` waiting for it sees the new journal, never the previous one."""
         owner, session_id = entry.owner, entry.session_id
-        self._forget(entry)
+        with contextlib.suppress(Exception):
+            await (
+                sandbox.close()
+            )  # first: the spending is final once the worker is gone
         config, records = sandbox._spent_journal("JournalTooLarge")  # noqa: SLF001
         blob = _seal_journal(
             config, records, self._key, _bound(owner, session_id, counter)
         )
-        with contextlib.suppress(Exception):
-            await sandbox.close()
-        await self._store.set(
-            self._journal_key(owner, session_id),
-            _ENVELOPE + _COUNTER.pack(counter) + blob,
-            ttl=self._ttl,
-        )
-        await self._store.set(
-            self._counter_key(owner, session_id),
-            str(counter).encode(),
-            ttl=self._counter_ttl,
-        )
-        entry.counter = counter
+        try:
+            await self._write(entry, counter, blob)
+        finally:
+            entry.sandbox = None
+            entry.dirty = False
+            self._forget(entry)
 
     def _forget(self, entry: _Entry) -> None:
         entry.gone = True
@@ -665,7 +736,7 @@ class SessionPool:
         if self._max_per_owner is not None:
             mine = [e for e in self._entries.values() if e.owner == owner]
             if len(mine) >= self._max_per_owner:
-                victim = next((e for e in mine if e.idle()), None)
+                victim = next((e for e in mine if e.evictable()), None)
                 if victim is None:
                     raise PoolFull(
                         f"owner {owner!r} has {len(mine)} sessions (max_per_owner="
@@ -674,7 +745,7 @@ class SessionPool:
                 self._evict(victim)
                 evicted = True
         if len(self._entries) >= self._max_sessions:
-            victim = next((e for e in self._entries.values() if e.idle()), None)
+            victim = next((e for e in self._entries.values() if e.evictable()), None)
             if victim is None:
                 raise PoolFull(
                     f"{len(self._entries)} sessions (max_sessions={self._max_sessions}), "
@@ -695,10 +766,19 @@ def _static_tools(tools: Any) -> bool:
 
 
 def _check_id(value: Any, what: str) -> None:
-    if not isinstance(value, str) or not _ID.fullmatch(value):
+    if not isinstance(value, str) or not _ID.fullmatch(value) or not _utf8(value):
         raise ValueError(
-            f"{what} must be a string of 1-256 characters without ':' or control characters"
+            f"{what} must be a string of 1-256 characters without ':' or control characters "
+            "(and valid UTF-8: no lone surrogates)"
         )
+
+
+def _utf8(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _bound(owner: str, session_id: str, counter: int) -> bytes:
