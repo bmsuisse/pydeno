@@ -50,16 +50,11 @@ jobs:
         # Pull requests and pushes test the oldest, a middle and the newest CPython (the macOS runners queue
         # slowest); a manual run (`gh workflow run platforms.yml --ref <branch>`) tests all five.
         python: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["3.10","3.11","3.12","3.13","3.14"]' || '["3.10","3.12","3.14"]') }}
-        include:
-          # Windows has no IsolatedRuntime (POSIX-only: Seatbelt / Landlock+seccomp); the
-          # in-process Runtime is what is checked there.
-          - { os: windows-2022, python: "3.12", experimental: true }
-          - { os: windows-2025, python: "3.12", experimental: true }
-          - { os: windows-2025, python: "3.14", experimental: true }
-          - { os: windows-11-arm, python: "3.13", experimental: true }
-          # Free-threaded CPython.
-          - { os: ubuntu-24.04, python: "3.14t", experimental: true }
-          - { os: macos-15, python: "3.14t", experimental: true }
+        # Windows has no IsolatedRuntime (POSIX-only: Seatbelt / Landlock+seccomp); the in-process
+        # Runtime is what is checked there. Free-threaded CPython (3.14t) is not supported yet (the
+        # extension does not declare it can run without the GIL), so those two cells run only on a
+        # manual run, for information.
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"os":"windows-2022","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.14","experimental":true},{"os":"windows-11-arm","python":"3.13","experimental":true},{"os":"ubuntu-24.04","python":"3.14t","experimental":true},{"os":"macos-15","python":"3.14t","experimental":true}]' || '[{"os":"windows-2022","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.14","experimental":true},{"os":"windows-11-arm","python":"3.13","experimental":true}]') }}
     steps:
       - uses: actions/checkout@v5
 

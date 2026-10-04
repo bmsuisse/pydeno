@@ -85,10 +85,21 @@ def test_python_side_failure_releases_unwrapped_handles() -> None:
 async def test_deadline_during_a_successful_conversion_releases_handles() -> None:
     with Runtime() as rt:
         rt.eval("globalThis.big = Array.from({length: 300000}, (_, i) => () => i); 0")
-        for _ in range(3):
-            with pytest.raises(Exception, match="timed out"):  # noqa: PT011
-                await rt.eval_async("Promise.resolve(big)", timeout=0.001)
+        timed_out = 0
+        # A fast machine can convert the result inside a millisecond, so tighten the deadline until it
+        # fires; a result that does arrive is dropped and must release its handles too.
+        for timeout in (1e-3, 5e-4, 2e-4, 1e-4, 5e-5, 2e-5, 1e-5, 1e-6) * 3:
+            try:
+                result = await rt.eval_async("Promise.resolve(big)", timeout=timeout)
+            except Exception as exc:  # noqa: BLE001
+                assert "timed out" in str(exc)  # noqa: PT017
+                timed_out += 1
+            else:
+                del result
+            gc.collect()
+            rt.eval("0")
             assert handles(rt) == (0, 0)
+        assert timed_out, "the deadline never fired during the conversion"
 
 
 @pytest.mark.asyncio
