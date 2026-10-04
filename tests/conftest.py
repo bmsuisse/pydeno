@@ -59,6 +59,7 @@ collect_ignore = (
         "test_sandbox_attest_edges.py",
         "test_review_regressions.py",
         "test_aio_isolated_runtime.py",
+        "test_async_reply_backpressure.py",
         "test_aio_agent.py",
         "test_session_pool.py",
         "test_strict_eval.py",
