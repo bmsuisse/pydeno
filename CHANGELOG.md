@@ -27,6 +27,17 @@
   tool call, fails generically for the guest, is logged once per session for the host, and raises
   `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
   gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
+- **`strict_eval=True`: no code generation from strings in the guest** (#42). On `IsolatedRuntime`,
+  `AsyncIsolatedRuntime`, `SandboxPool` / `AsyncSandboxPool` (a spawn option: fixed per pool, refused
+  per checkout), `AgentSandbox` / `AsyncAgentSandbox` and `Pydeno` / `AsyncPydeno`. `eval`, `new
+  Function` and the async/generator function constructors throw `EvalError` however the guest reaches
+  them; the host's own scripts still run. It appends V8's `--disallow-code-generation-from-strings`
+  after the hardening flags, frozen with them. Sessions record it in their journal (only when on, so
+  default journals are unchanged) and refuse to load a journal under the other setting. It does not
+  cover WebAssembly with `jitless=False`; see the isolation guide. Off by default.
+- `vendor/libs/vega-interpreter-2.3.2.bundle.js` (BSD-3-Clause, 5 KB): Vega's CSP-safe expression
+  interpreter, so Vega and Vega-Lite render under `strict_eval=True`. The library tests now also run
+  d3, turf and ECharts SSR, and every library under strict eval.
 
 Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
