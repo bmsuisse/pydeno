@@ -1175,6 +1175,76 @@ class _TimebaseInfo(ctypes.Structure):
     _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
 
+# Resolved once, on first use: looking a symbol up through a fresh `ctypes.CDLL(None)` costs tens
+# of microseconds, and the parent reads these on every command it supervises.
+_proc_pidinfo: Callable[..., int] | None = None
+# Mach absolute-time units (darwin) or clock ticks (Linux) per second.
+_TICKS_PER_SECOND = 0.0
+_TASK_INFO_SIZE = ctypes.sizeof(_TaskInfo)
+
+
+def _darwin_task_info(pid: int) -> _TaskInfo | None:
+    """One `proc_pidinfo(PROC_PIDTASKINFO)` call: memory, CPU times and thread count together."""
+    global _proc_pidinfo, _TICKS_PER_SECOND  # noqa: PLW0603
+    fn = _proc_pidinfo
+    if fn is None:
+        libc = ctypes.CDLL(None)  # libproc is part of libSystem
+        base = _TimebaseInfo()
+        libc.mach_timebase_info(ctypes.byref(base))
+        # task times are in Mach absolute-time units, not nanoseconds
+        _TICKS_PER_SECOND = 1e9 * base.denom / base.numer
+        fn = libc.proc_pidinfo
+        fn.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        fn.restype = ctypes.c_int
+        _proc_pidinfo = fn
+    # A fresh structure per call: the parent samples from more than one thread.
+    info = _TaskInfo()
+    if fn(pid, 4, 0, ctypes.addressof(info), _TASK_INFO_SIZE) != _TASK_INFO_SIZE:
+        return None
+    return info
+
+
+def _linux_stat(pid: int) -> list[bytes]:
+    with open(f"/proc/{pid}/stat", "rb") as fh:
+        # the command name (field 2) may contain spaces and parentheses: split after it
+        return fh.read().rsplit(b")", 1)[1].split()
+
+
+def usage(pid: int) -> tuple[int | None, float | None, int | None]:
+    """`(rss_bytes, cpu_seconds, thread_count)` of `pid` from ONE kernel read, each None if it
+    cannot be read. What the parent samples as each command finishes."""
+    global _TICKS_PER_SECOND  # noqa: PLW0603
+    try:
+        if sys.platform.startswith("linux"):
+            fields = _linux_stat(pid)
+            if not _TICKS_PER_SECOND:
+                _TICKS_PER_SECOND = float(os.sysconf("SC_CLK_TCK"))
+            # The list starts at field 3: utime 14, stime 15, num_threads 20, rss 24 (pages).
+            return (
+                int(fields[21]) * os.sysconf("SC_PAGE_SIZE"),
+                (int(fields[11]) + int(fields[12])) / _TICKS_PER_SECOND,
+                int(fields[17]),
+            )
+        if sys.platform == "darwin":
+            info = _darwin_task_info(pid)
+            if info is None:
+                return (None, None, None)
+            return (
+                int(info.resident_size),
+                (info.total_user + info.total_system) / _TICKS_PER_SECOND,
+                int(info.threadnum),
+            )
+    except (OSError, ValueError, IndexError, TypeError, AttributeError):
+        pass
+    return (None, None, None)
+
+
 def cpu_seconds(pid: int) -> float | None:
     """CPU time (user + system, all threads) the process `pid` has consumed so far, or None.
 
@@ -1182,76 +1252,25 @@ def cpu_seconds(pid: int) -> float | None:
     runs a callback, and a guest can arrange for a callback to always be outstanding; CPU time
     only goes up when something is actually computing.
     """
-    try:
-        if sys.platform.startswith("linux"):
-            with open(f"/proc/{pid}/stat", "rb") as fh:
-                # the command name (field 2) may contain spaces and parentheses: split after it
-                fields = fh.read().rsplit(b")", 1)[1].split()
-            ticks = int(fields[11]) + int(fields[12])  # utime, stime (fields 14 and 15)
-            return ticks / os.sysconf("SC_CLK_TCK")
-        if sys.platform == "darwin":
-            global _libproc  # noqa: PLW0603
-            if _libproc is None:
-                _libproc = ctypes.CDLL(None)  # libproc is part of libSystem
-            info = _TaskInfo()
-            n = _libproc.proc_pidinfo(
-                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            if n != ctypes.sizeof(info):
-                return None
-            base = _TimebaseInfo()
-            ctypes.CDLL(None).mach_timebase_info(ctypes.byref(base))
-            # task times are in Mach absolute-time units, not nanoseconds
-            return (info.total_user + info.total_system) * base.numer / base.denom / 1e9
-    except (OSError, ValueError, IndexError, TypeError, AttributeError):
-        return None
-    return None
-
-
-_libproc: ctypes.CDLL | None = None
+    return usage(pid)[1]
 
 
 def thread_count(pid: int) -> int | None:
     """How many threads the process `pid` has, or None. A worker has about 13 on Linux and 17 on
     macOS; a guest that gets native code can start thousands within a second, well under a
     memory ceiling, and a handful of such workers exhausts the host's thread table."""
-    try:
-        if sys.platform.startswith("linux"):
-            with open(f"/proc/{pid}/stat", "rb") as fh:
-                fields = fh.read().rsplit(b")", 1)[1].split()
-            return int(
-                fields[17]
-            )  # num_threads is field 20; the list starts at field 3
-        if sys.platform == "darwin":
-            global _libproc  # noqa: PLW0603
-            if _libproc is None:
-                _libproc = ctypes.CDLL(None)  # libproc is part of libSystem
-            info = _TaskInfo()
-            n = _libproc.proc_pidinfo(
-                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            return int(info.threadnum) if n == ctypes.sizeof(info) else None
-    except (OSError, ValueError, IndexError, TypeError, AttributeError):
-        return None
-    return None
+    return usage(pid)[2]
 
 
 def rss_bytes(pid: int) -> int | None:
     """Resident memory of `pid` without spawning anything, or None if unreadable."""
-    global _libproc  # noqa: PLW0603
     try:
         if sys.platform.startswith("linux"):
             with open(f"/proc/{pid}/statm", "rb") as fh:
                 return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
         if sys.platform == "darwin":
-            if _libproc is None:
-                _libproc = ctypes.CDLL(None)  # libproc is part of libSystem
-            info = _TaskInfo()
-            # PROC_PIDTASKINFO = 4
-            n = _libproc.proc_pidinfo(
-                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            return int(info.resident_size) if n == ctypes.sizeof(info) else None
+            info = _darwin_task_info(pid)
+            return None if info is None else int(info.resident_size)
     except (OSError, ValueError, TypeError, AttributeError):
         return None
     return None
