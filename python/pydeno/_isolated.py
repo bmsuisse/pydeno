@@ -57,6 +57,7 @@ from ._pydeno import (
     RuntimeForceKilled,
     RuntimeTerminated,
     RuntimeTimeout,
+    _v8_flags_undone_by_engine,
 )
 
 __all__ = ["IsolatedRuntime", "WorkerCrashed"]
@@ -201,6 +202,14 @@ def _worker_v8_flags(
     if not isinstance(strict_eval, bool):
         raise TypeError("strict_eval must be a bool")
     v8_flags = list(v8_flags)
+    undone = _v8_flags_undone_by_engine([f for f in v8_flags if isinstance(f, str)])
+    if undone:
+        # deno_core's start-up sets these after the worker's flags and V8 keeps its value: refuse
+        # here, before a worker exists, rather than report a restriction that never applied.
+        raise ValueError(
+            f"these V8 flags cannot take effect: the engine's own start-up sets {undone} "
+            "afterwards and V8 keeps that value"
+        )
     if strict_eval:
         for flag in (_STRICT_EVAL_NAME, "freeze-flags-after-init"):
             if _bool_flag_setting(v8_flags, flag) is False:
@@ -578,7 +587,9 @@ class IsolatedRuntime:
         jitless: Run V8 in the worker with `--jitless`: no JIT compiler and no
             WebAssembly, which removes the largest class of V8 exploits at a modest
             speed cost. Pass `False` to allow WebAssembly and JIT speed.
-        v8_flags: Extra V8 flags for the worker, applied before the isolate exists.
+        v8_flags: Extra V8 flags for the worker, applied before the isolate exists. A flag the
+            engine's own start-up would override (for example `--no-harmony-temporal`) is
+            refused rather than silently undone.
         strict_eval: Forbid code generation from strings in the guest: ``eval(...)``,
             ``new Function(...)`` and the async, generator and async-generator function
             constructors throw ``EvalError``, however the guest reaches them. The host's own
