@@ -375,12 +375,15 @@ class TestContainment:
             # The two sinks `max_buffer_bytes` cannot see: V8 reserves these pages
             # through its own page allocator. Touched pages show up in RSS.
             (
-                "new Uint8Array(new WebAssembly.Memory({initial: 8192}).buffer).fill(1).length",
+                # The buffer is kept reachable: once the expression ends, V8 may free it
+                # before the end-of-command memory check, and the test would race the GC.
+                "globalThis.keep = new WebAssembly.Memory({initial: 8192});"
+                " new Uint8Array(keep.buffer).fill(1).length",
                 False,  # WebAssembly does not exist under --jitless
             ),
             (
-                "const b = new ArrayBuffer(8, {maxByteLength: 2 ** 31}); b.resize(2 ** 29);"
-                " new Uint8Array(b).fill(1).length",
+                "globalThis.keep = new ArrayBuffer(8, {maxByteLength: 2 ** 31});"
+                " keep.resize(2 ** 29); new Uint8Array(keep).fill(1).length",
                 True,
             ),
         ],
