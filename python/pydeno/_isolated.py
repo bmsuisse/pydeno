@@ -43,6 +43,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import _sandbox, _wire
+from ._result import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_RESULT_BYTES,
+    ExecutionResult,
+    OutputCapture,
+    capture_result,
+    check_limit,
+)
 from ._pydeno import (
     JavaScriptError,
     RuntimeConfig,
@@ -169,6 +177,23 @@ def _checked_specifiers(fn: Callable[..., Any], arity: int) -> Callable[..., Any
         return fn(*args)
 
     return call
+
+
+def _console_router(
+    ref: weakref.ref[IsolatedRuntime], user: Callable[..., Any] | None
+) -> Callable[..., Any]:
+    """The parent's console handler: the capture of the command in flight (`execute`), then the
+    caller's `on_console`. Holds the runtime weakly, so it does not keep it alive."""
+
+    def route(level: str, args: list[Any]) -> None:
+        rt = ref()
+        capture = rt._capture if rt is not None else None  # noqa: SLF001
+        if capture is not None:
+            capture(level, args)
+        if user is not None:
+            user(level, args)
+
+    return route
 
 
 def _checked_console(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -305,8 +330,9 @@ class IsolatedRuntime:
     """A `Runtime` whose V8 isolate lives in a supervised worker process.
 
     Args:
-        config: Limits and bootstrap for the guest. `inspector` and `on_console`
-            are not supported across the boundary yet.
+        config: Limits and bootstrap for the guest. `inspector` and `snapshot` are not
+            supported across the boundary yet. `on_console` is: each `console.*` call is a
+            (synchronous) host call, counted by `max_host_calls`.
         max_memory: Kill the worker if its resident memory exceeds this many bytes
             (default 1 GiB; `None` removes the limit). Enforced twice: by the worker itself every ~20ms (it exits with a dedicated
             code) and by the parent every ~50ms (Linux and macOS).
@@ -350,6 +376,10 @@ class IsolatedRuntime:
             then never advance, which removes the wall clock as a timing source (a busy loop
             can still count) and makes runs reproducible. `None`: the real clock.
         random_seed: Seed `Math.random` (V8's `--random-seed`) for reproducible runs.
+        capture_console: Route the guest's `console.*` to the parent even without an
+            `on_console`, so `execute()` can return it as `stdout`/`stderr`. Off by default:
+            every `console.*` call is then a host call (counted by `max_host_calls`). With an
+            `on_console`, console output is captured either way.
         python: Interpreter for the worker (default: this one).
 
     A worker crash, a hard timeout or a memory kill closes the runtime and raises
@@ -374,6 +404,7 @@ class IsolatedRuntime:
         v8_flags: Sequence[str] = (),
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
+        capture_console: bool = False,
         python: str | None = None,
         prewarm: bool = True,
     ) -> None:
@@ -469,10 +500,15 @@ class IsolatedRuntime:
         # Why the idle watchdog killed the worker, for the pump to report: the watchdog thread
         # cannot raise into the caller, so without this the caller sees only "killed by SIGKILL".
         self._kill_reason: str | None = None
-        if config.on_console is not None:
+        # Where `execute()` collects the console output of the command in flight.
+        self._capture: OutputCapture | None = None
+        if config.on_console is not None or capture_console:
             # `console.*` in the guest calls this in the parent, like any host function.
             console_hid = next(self._hids)
-            self._handlers[console_hid] = (_checked_console(config.on_console), False)
+            self._handlers[console_hid] = (
+                _checked_console(_console_router(weakref.ref(self), config.on_console)),
+                False,
+            )
             self._options["console_hid"] = console_hid
 
         self._idle_cpu_base: float | None = None
@@ -754,6 +790,7 @@ class IsolatedRuntime:
         *,
         soft_timeout: float | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
+        capture: OutputCapture | None = None,
     ) -> Any:
         self._refuse_reentry()
         if os.getpid() != self._owner_pid:
@@ -785,9 +822,11 @@ class IsolatedRuntime:
             except OSError:
                 self._kill()
                 raise WorkerCrashed(self._describe_death("worker is gone")) from None
+            self._capture = capture
             try:
                 return self._pump(cmd_id, pump)
             finally:
+                self._capture = None
                 # Where "idle" starts: what the worker burns from here on, with no command
                 # running, is the idle watchdog's business.
                 self._idle_since = time.monotonic()
@@ -1085,6 +1124,57 @@ class IsolatedRuntime:
             self._kill()
             raise
 
+    def execute(
+        self,
+        code: str,
+        *,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+    ) -> ExecutionResult:
+        """`eval` the code and return an `ExecutionResult` instead of raising.
+
+        `stdout`/`stderr` hold the command's console output when the runtime was created with
+        `capture_console=True` or an `on_console` (empty otherwise), each capped at
+        `max_output_bytes`; a result over `max_result_bytes` of JSON is a ``Failed`` result with
+        ``error_type="ResultTooLarge"``. Every failure of the run (a JavaScript error, a timeout,
+        a crashed worker) is reported in the result, not raised."""
+        capture = OutputCapture(max_output_bytes)
+        check_limit("max_result_bytes", max_result_bytes)
+        try:
+            value = self._request(
+                {"t": "eval", "code": code},
+                soft_timeout=self._soft_timeout,
+                capture=capture,
+            )
+        except Exception as exc:  # noqa: BLE001 - the run's failure is the result
+            return capture_result(capture, error=exc)
+        return capture_result(capture, value=value, max_result_bytes=max_result_bytes)
+
+    async def execute_async(
+        self,
+        code: str,
+        *,
+        timeout: float | int | timedelta | None = None,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+    ) -> ExecutionResult:
+        """`eval_async` (promises are awaited) returning an `ExecutionResult`; see `execute`."""
+        capture = OutputCapture(max_output_bytes)
+        check_limit("max_result_bytes", max_result_bytes)
+        soft = _seconds(timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        loop = asyncio.get_running_loop()
+        message = {"t": "eval_async", "code": code, "timeout": soft}
+        try:
+            value = await self._in_own_thread(message, soft, loop, capture)
+        except asyncio.CancelledError:
+            self._kill()
+            raise
+        except Exception as exc:  # noqa: BLE001 - the run's failure is the result
+            return capture_result(capture, error=exc)
+        return capture_result(capture, value=value, max_result_bytes=max_result_bytes)
+
     def _refuse_reentry(self) -> None:
         """A host function must not call back into the runtime that is waiting for it."""
         if getattr(self._guard, "in_host_call", False) or _IN_HOST_CALL.get():
@@ -1105,6 +1195,7 @@ class IsolatedRuntime:
         message: dict[str, Any],
         soft: float | None,
         loop: asyncio.AbstractEventLoop,
+        capture: OutputCapture | None = None,
     ) -> Any:
         """Run a command off the caller's event loop on a thread this runtime owns.
 
@@ -1119,7 +1210,12 @@ class IsolatedRuntime:
         # the caller's contextvars (tracing spans, request ids, ...).
         context = contextvars.copy_context()
         call = functools.partial(
-            context.run, self._request, message, soft_timeout=soft, loop=loop
+            context.run,
+            self._request,
+            message,
+            soft_timeout=soft,
+            loop=loop,
+            capture=capture,
         )
         return await loop.run_in_executor(self._own_executor(), call)
 
@@ -1271,7 +1367,10 @@ def _error_reply(
     `redact` keeps the class name (guests branch on it) but replaces the message, for hosts whose
     tools put paths, queries or secrets in their error text."""
     etype = "TypeError" if isinstance(exc, _wire.WireError) else type(exc).__name__
-    text = "host function failed" if redact else str(exc)
+    # pydeno's own guidance to the guest ("search for the tool first") is written by pydeno, not
+    # by the host's tools, so it holds nothing to redact and is the whole point of the error.
+    public = getattr(exc, "_pydeno_public", False) is True
+    text = "host function failed" if redact and not public else str(exc)
     return {"t": "reply", "cid": cid, "err": text, "etype": etype}
 
 
