@@ -399,3 +399,150 @@ async def test_an_async_host_result_does_not_go_through_a_replaced_promise_then(
     assert (
         await rt.eval_async("(async () => JSON.stringify(await lookup()))()") == "[1,2]"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Follow-up review of the bind hardening.
+# ---------------------------------------------------------------------------------------------
+
+# The Rust converter turns a Python stream into a JS `ReadableStream` through the global
+# `__pydeno_from_py_stream`, and `revive` did the same. It was defined after the bridge fixed its
+# globals in place, so a guest could replace it (or `ReadableStream`, or plant `Object.prototype`
+# getters the stream constructor reads) and run code inside a later host bind, see every stream
+# id, and have its own value installed. Streams exist only on the in-process `Runtime`
+# (`IsolatedRuntime` has no `stream_from_async_iterable`), so these run there only.
+STREAM_POISON = {
+    "replace-helper": (
+        "globalThis.__pydeno_from_py_stream = (id) => { hits++; return 'guest' }"
+    ),
+    "replace-readablestream": (
+        "globalThis.ReadableStream = function (src) { hits++; return 'guest' }"
+    ),
+    "object-prototype-getter": (
+        "Object.defineProperty(Object.prototype, 'start', "
+        "{get() { hits++; return undefined }, configurable: true})"
+    ),
+}
+
+
+async def _two_chunks():
+    yield "a"
+    yield "b"
+
+
+def _stream_runtime(poison: str):
+    from pydeno import Runtime
+
+    rt = Runtime(RuntimeConfig(timeout=20.0))
+    rt.eval("globalThis.hits = 0; " + poison + "; 0")
+    return rt
+
+
+@pytest.mark.parametrize("name", list(STREAM_POISON))
+async def test_binding_a_python_stream_runs_no_guest_code(name: str) -> None:
+    rt = _stream_runtime(STREAM_POISON[name])
+    try:
+        rt.bind_object("tools", {"s": rt.stream_from_async_iterable(_two_chunks())})
+        assert rt.eval("hits") == 0
+        assert (
+            rt.eval("typeof tools.s") == "object"
+        )  # a stream, not the guest's 'guest'
+    finally:
+        rt.close()
+
+
+@pytest.mark.parametrize("name", list(STREAM_POISON))
+async def test_passing_a_python_stream_to_js_runs_no_guest_code(name: str) -> None:
+    rt = _stream_runtime(STREAM_POISON[name])
+    try:
+        store = rt.eval("(s) => { globalThis.kept = s; }")
+        store(rt.stream_from_async_iterable(_two_chunks()))
+        assert rt.eval("hits") == 0
+        assert rt.eval("typeof kept") == "object"
+    finally:
+        rt.close()
+
+
+def test_the_stream_helper_is_fixed_in_place() -> None:
+    from pydeno import Runtime
+
+    with Runtime(RuntimeConfig(timeout=20.0)) as rt:
+        rt.eval("globalThis.__pydeno_from_py_stream = () => 'guest'; 0")
+        assert rt.eval("delete globalThis.__pydeno_from_py_stream") is False
+        assert (
+            rt.eval("Object.keys(globalThis).includes('__pydeno_from_py_stream')")
+            is False
+        )
+
+
+# `ToolBridge.attach(namespace=None)` binds one function at a time. When a later one was refused,
+# the earlier ones stayed installed and exposed although the caller got an exception.
+_BLOCK_B = (
+    "Object.defineProperty(globalThis, 'b', "
+    "{value: 1, writable: false, configurable: false}); 0"
+)
+
+
+def test_tool_bridge_without_namespace_is_all_or_nothing(make_rt) -> None:
+    from pydeno import ToolBridge
+
+    rt = make_rt()
+    rt.eval(_BLOCK_B)
+    bridge = ToolBridge({"a": lambda: "a", "b": lambda: "b"}, namespace=None)
+    with pytest.raises(Exception, match=r"Cannot bind 'b'"):
+        bridge.attach(rt)
+    assert bridge.detach(rt) == 0
+    # `a` may still name the closure, but its capability was revoked: nothing is callable.
+    assert rt.eval("try { a(); 'called' } catch (e) { 'refused' }") == "refused"
+
+
+def test_tool_bridge_with_namespace_is_all_or_nothing(make_rt) -> None:
+    from pydeno import ToolBridge
+
+    rt = make_rt()
+    rt.eval(
+        "globalThis.tools = {}; Object.defineProperty(tools, 'b', "
+        "{value: 1, writable: false, configurable: false}); 0"
+    )
+    bridge = ToolBridge({"a": lambda: "a", "b": lambda: "b"})
+    with pytest.raises(Exception, match=r"Cannot bind 'tools'"):
+        bridge.attach(rt)
+    assert bridge.detach(rt) == 0
+    assert rt.eval("typeof tools.a") == "undefined"
+
+
+# A refused bind's error is read (its `.stack`) by the host. A guest `Error.prepareStackTrace`
+# used to run then, inside the host's bind, and could read the message.
+def test_a_refused_bind_does_not_run_prepare_stack_trace(make_rt) -> None:
+    rt = make_rt()
+    rt.eval(
+        "globalThis.seen = null;"
+        "Error.prepareStackTrace = (e, frames) => { seen = String(e.message); return 'x' };"
+        "globalThis.tools = new Proxy({}, {}); 0"
+    )
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"f": lambda: 1})
+    assert rt.eval("seen") is None
+
+
+# The plain-object test looked at the prototype only, so a guest could point the namespace at an
+# intrinsic such as `Object.prototype` and have the host's tools installed on every object.
+INTRINSIC_NAMESPACES = {
+    "object-prototype": "Object.prototype",
+    "array-prototype": "Array.prototype",
+    "math": "Math",
+    "json": "JSON",
+    "reflect": "Reflect",
+    "iterator-prototype": "Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))",
+    "typedarray-prototype": "Object.getPrototypeOf(Uint8Array.prototype)",
+}
+
+
+@pytest.mark.parametrize("name", list(INTRINSIC_NAMESPACES))
+def test_bind_object_refuses_an_intrinsic_namespace(make_rt, name: str) -> None:
+    rt = make_rt()
+    rt.eval(f"globalThis.tools = {INTRINSIC_NAMESPACES[name]}; 0")
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"zz_host_tool": lambda: 1})
+    assert rt.eval("typeof ({}).zz_host_tool") == "undefined"
+    assert rt.eval("typeof tools.zz_host_tool") == "undefined"

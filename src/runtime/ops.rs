@@ -364,6 +364,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const HasOwn = Object.hasOwn;
   const ObjectPrototype = Object.prototype;
   const IsProxy = Deno.core.isProxy;
+  const OwnKeys = Reflect.ownKeys;
+  const WeakSetAdd = uncurry(WeakSet.prototype.add);
+  const WeakSetHas = uncurry(WeakSet.prototype.has);
   const DateValueOf = uncurry(Date.prototype.valueOf);
   const BigIntToString = uncurry(BigInt.prototype.toString);
   const SetForEach = uncurry(Set.prototype.forEach);
@@ -538,10 +541,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         case "BigInt":
           return BigIntCtor(own(value, "value"));
         case "PyStream":
-          if (typeof globalThis.__pydeno_from_py_stream === "function") {
-            return globalThis.__pydeno_from_py_stream(value.id);
-          }
-          return value;
+          return fromPyStream(own(value, "id"));
         default: {
           const result = {};
           const entries = ObjectEntries(value);
@@ -650,8 +650,18 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // accessor that hands back a throwaway object, a read-only global that ignores the assignment).
   // And they run no guest code: no `for...of`, no plain assignment that could hit a setter, no
   // lookups on a namespace that could be a Proxy.
+  // The error's `stack` is replaced with plain text before anyone reads it: formatting the real
+  // one would call a guest-installed `Error.prepareStackTrace` inside the host's bind.
   function refuseBind(name, why) {
-    throw new TypeErrorCtor("Cannot bind '" + name + "': " + why);
+    const message = "Cannot bind '" + name + "': " + why;
+    const error = new TypeErrorCtor(message);
+    DefineProperty(error, "stack", {
+      __proto__: null,
+      value: "TypeError: " + message,
+      writable: true,
+      configurable: true,
+    });
+    throw error;
   }
 
   // Define `globalThis[name] = value` as an own data property, never through a setter.
@@ -680,6 +690,51 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // The object a namespace binding goes on: a fresh one, or an existing *plain* object -- not a
   // Proxy, not an accessor, not a function or class instance, not frozen. Anything else could
   // run guest code during the install or discard it, so it is refused rather than guessed at.
+  // Every built-in object a guest could point a namespace at (`Object.prototype`, `Math`,
+  // `Array.prototype`, `%IteratorPrototype%`...): installing host tools on one of those would put
+  // them on every object, or on a shared built-in. Collected once, before any guest code: each
+  // global value, its own object-valued properties, and the `prototype` of every function among
+  // them, plus the prototypes only reachable through instances.
+  const INTRINSICS = new WeakSet();
+  function markIntrinsic(value, depth) {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) {
+      return;
+    }
+    if (WeakSetHas(INTRINSICS, value)) {
+      return;
+    }
+    WeakSetAdd(INTRINSICS, value);
+    if (depth === 0) {
+      return;
+    }
+    const keys = OwnKeys(value);
+    for (let index = 0; index < keys.length; index++) {
+      const desc = GetOwnPropertyDescriptor(value, keys[index]);
+      if (desc !== undefined && HasOwn(desc, "value")) {
+        markIntrinsic(desc.value, depth - 1);
+      }
+    }
+  }
+  markIntrinsic(globalThis, 3);
+  for (const hidden of [
+    GetPrototypeOf([][Symbol.iterator]()),
+    GetPrototypeOf(GetPrototypeOf([][Symbol.iterator]())),
+    GetPrototypeOf(new Map()[Symbol.iterator]()),
+    GetPrototypeOf(new Set()[Symbol.iterator]()),
+    GetPrototypeOf(""[Symbol.iterator]()),
+    GetPrototypeOf(/x/[Symbol.matchAll]("")),
+    GetPrototypeOf(Uint8Array),
+    GetPrototypeOf(Uint8Array.prototype),
+    GetPrototypeOf(function* () {}),
+    GetPrototypeOf(function* () {}).prototype,
+    GetPrototypeOf(async function () {}),
+    GetPrototypeOf(async function* () {}),
+    GetPrototypeOf(async function* () {}).prototype,
+    GetPrototypeOf(GetPrototypeOf(async function* () {}).prototype),
+  ]) {
+    markIntrinsic(hidden, 1);
+  }
+
   function namespaceFor(name, keys) {
     const desc = GetOwnPropertyDescriptor(globalThis, name);
     if (desc === undefined) {
@@ -692,6 +747,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     const target = desc.value;
     if (target === null || typeof target !== "object" || IsProxy(target)) {
       refuseBind(name, where + " already exists and is not a plain object");
+    }
+    if (WeakSetHas(INTRINSICS, target)) {
+      refuseBind(name, where + " is a built-in object, not a namespace of its own");
     }
     const proto = GetPrototypeOf(target);
     if (proto !== ObjectPrototype && proto !== null) {
@@ -747,25 +805,6 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     }
     installGlobal(name, hostFunction(opId, mode));
   };
-
-  // Library code (or a guest) that assigns to one of these would silently reroute every bound
-  // host function, since they look the bridge up by name at call time. Fixed in place, and hidden
-  // from enumeration.
-  const FIXED_GLOBALS = [
-    "__pydenoCallSync",
-    "__pydenoCallAsync",
-    "__host_op_sync__",
-    "__host_op_async__",
-    "__pydeno_bind_object",
-    "__pydeno_bind_function",
-  ];
-  for (let index = 0; index < FIXED_GLOBALS.length; index++) {
-    DefineProperty(globalThis, FIXED_GLOBALS[index], {
-      writable: false,
-      configurable: false,
-      enumerable: false,
-    });
-  }
 
   if (typeof globalThis.ReadableStream !== "function") {
     // Note: This minimal polyfill does not implement backpressure or BYOB readers.
@@ -843,8 +882,17 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     globalThis.ReadableStream = PydenoReadableStream;
   }
 
-  globalThis.__pydeno_from_py_stream = function (id) {
-    return new ReadableStream({
+  // Captured after the polyfill: a guest that later replaces `globalThis.ReadableStream` must not
+  // get its constructor called (with the stream id and the pull closure) when the host hands a
+  // Python stream to JavaScript, which can happen inside a bind.
+  const ReadableStreamCtor = globalThis.ReadableStream;
+
+  // Called by `revive` directly and by the Rust converter through the fixed global below. The
+  // underlying source has no prototype, so the constructor's reads of `start`, `type` or
+  // `autoAllocateChunkSize` cannot reach a getter the guest planted on `Object.prototype`.
+  function fromPyStream(id) {
+    return new ReadableStreamCtor({
+      __proto__: null,
       async pull(controller) {
         let raw;
         try {
@@ -863,7 +911,29 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         return ops.op_pydeno_stream_cancel_py(id);
       },
     });
-  };
+  }
+  globalThis.__pydeno_from_py_stream = fromPyStream;
+
+  // Library code (or a guest) that assigns to one of these would silently reroute every bound
+  // host function, since they look the bridge up by name at call time, and the Rust side looks up
+  // `__pydeno_bind_object` and `__pydeno_from_py_stream` on the live global. Fixed in place and
+  // hidden from enumeration; last, so that every helper above already exists.
+  const FIXED_GLOBALS = [
+    "__pydenoCallSync",
+    "__pydenoCallAsync",
+    "__host_op_sync__",
+    "__host_op_async__",
+    "__pydeno_bind_object",
+    "__pydeno_bind_function",
+    "__pydeno_from_py_stream",
+  ];
+  for (let index = 0; index < FIXED_GLOBALS.length; index++) {
+    DefineProperty(globalThis, FIXED_GLOBALS[index], {
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  }
 })(globalThis);"#
     );
 

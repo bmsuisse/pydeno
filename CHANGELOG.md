@@ -13,7 +13,15 @@
   guest-replaceable built-in, and raises `Cannot bind '<name>': ...` (exposing no token) when the existing
   global is an accessor, read-only, a Proxy, a function, a class instance, or frozen. An existing plain
   object is still extended, a writable global (including a `var`) is still replaced, and an inherited
-  property is shadowed rather than written through.
+  property is shadowed rather than written through. A built-in object (`Object.prototype`, `Math`,
+  `Array.prototype`, `%IteratorPrototype%`...) is refused as a namespace too, and the refusal's error carries a
+  pre-rendered stack so a guest `Error.prepareStackTrace` does not run inside the host's bind.
+- `ToolBridge.attach(..., namespace=None)` is all-or-nothing: when a later tool is refused, the tools this
+  call already bound are revoked before the error propagates.
+- The Python-stream helper `__pydeno_from_py_stream` is fixed in place like the other bridge globals (it was
+  defined after them and stayed writable), and the bridge builds streams with a captured `ReadableStream` and
+  a prototype-less source. A guest could otherwise run code inside a host `bind_object` (or any hand-over of a
+  Python stream), see every stream id and substitute its own value.
 - The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
   `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`, and host arrays are created
   without `Array.prototype` index setters, so a guest that replaced them only affects its own code.
