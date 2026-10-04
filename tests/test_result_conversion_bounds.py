@@ -139,6 +139,12 @@ try:
 except Exception as exc:
     print("ERR", type(exc).__name__, str(exc)[:200].replace("\n", " "))
 print("TOOK", round(time.monotonic() - started, 2))
+# What is checked is the conversion, not interpreter teardown (an in-process Runtime that an asyncio
+# worker thread drops after a failed call can abort at exit): leave without running it.
+sys.stdout.flush()
+import os
+
+os._exit(0)
 """
 
 

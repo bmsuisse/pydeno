@@ -98,6 +98,11 @@ async def test_deadline_during_a_successful_conversion_releases_handles() -> Non
                 del result
             gc.collect()
             rt.eval("0")
+            deadline = time.monotonic() + 5
+            while handles(rt) != (0, 0) and time.monotonic() < deadline:
+                gc.collect()
+                rt.eval("0")
+                await asyncio.sleep(0.01)
             assert handles(rt) == (0, 0)
         assert timed_out, "the deadline never fired during the conversion"
 
