@@ -371,6 +371,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const BigIntToString = uncurry(BigInt.prototype.toString);
   const SetForEach = uncurry(Set.prototype.forEach);
   const SetAdd = uncurry(Set.prototype.add);
+  const StringValueOf = uncurry(String.prototype.valueOf);
   const PromiseThen = uncurry(Promise.prototype.then);
   const DateCtor = Date;
   const SetCtor = Set;
@@ -471,6 +472,19 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       return { __pydeno_type: "BigInt", value: BigIntToString(value) };
     }
     if (typeof value === "object") {
+      // A boxed string lists one entry per character, all in one native `Object.entries` call
+      // that termination cannot interrupt: charge its length before that call, not after.
+      // `String.prototype.valueOf` is a brand check that runs no guest code (it throws for
+      // anything else, a Proxy included).
+      let boxedLength = 0;
+      try {
+        boxedLength = StringValueOf(value).length;
+      } catch (_) {
+        // not a String object
+      }
+      if (boxedLength > MAX_ARG_NODES - argNodes) {
+        throw new RangeErrorCtor("Host tool argument is too large (a String object of " + boxedLength + " characters)");
+      }
       const result = {};
       // Indexed loops, not `for...of` or destructuring: those go through
       // `Array.prototype[Symbol.iterator]`, which the guest can replace.

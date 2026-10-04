@@ -75,3 +75,24 @@ def test_int64_boundaries_still_come_back_as_ints() -> None:
         assert rt.eval("-(2 ** 63)") == -(2**63)
         assert rt.eval("2 ** 53") == 2**53
         assert isinstance(rt.eval("2 ** 62"), int)
+
+
+@pytest.mark.parametrize("factory", ["inprocess", "isolated"])
+def test_a_huge_boxed_string_argument_is_refused_before_it_is_listed(
+    factory: str,
+) -> None:
+    """The bridge copies a host-call argument with `Object.entries`, which lists a boxed string's
+    characters in one native call; the node cap was only checked per entry afterwards."""
+    if factory == "inprocess":
+        rt = Runtime(RuntimeConfig(timeout=TIMEOUT))
+    else:
+        rt = IsolatedRuntime(
+            RuntimeConfig(timeout=TIMEOUT), request_timeout=TIMEOUT * 2
+        )
+    with rt:
+        rt.bind_function("f", lambda *a: len(a))
+        started = time.monotonic()
+        with pytest.raises(Exception, match="too large"):
+            rt.eval("f(new String('x'.repeat(2 ** 24)))")
+        assert time.monotonic() - started < QUICK
+        assert rt.eval("f(new String('ab'))") == 1  # small ones still cross
