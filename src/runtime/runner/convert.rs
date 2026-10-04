@@ -63,6 +63,14 @@ pub(super) struct Converter {
     pub(super) stream_prototype: Option<Rc<v8::Global<v8::Object>>>,
 }
 
+/// Handles one top-level conversion registered, released again if that conversion fails (the
+/// caller never sees their ids, so nothing else would release them).
+#[derive(Default)]
+struct Registered {
+    functions: Vec<u32>,
+    streams: Vec<u32>,
+}
+
 fn circular_check<'s>(
     seen: &mut Vec<v8::Local<'s, v8::Object>>,
     obj: v8::Local<'s, v8::Object>,
@@ -179,7 +187,25 @@ impl Converter {
         value: v8::Local<'s, v8::Value>,
     ) -> RuntimeResult<JSValue> {
         let mut tracker = LimitTracker::new(self.limits.max_depth, self.limits.max_bytes);
-        self.to_js_value_inner(scope, value, &mut Vec::new(), &mut tracker, None)
+        let mut registered = Registered::default();
+        let result = self.to_js_value_inner(
+            scope,
+            value,
+            &mut Vec::new(),
+            &mut tracker,
+            &mut registered,
+            None,
+        );
+        if result.is_err() {
+            let mut functions = self.fn_registry.borrow_mut();
+            for fn_id in registered.functions {
+                functions.remove(&fn_id);
+            }
+            for stream_id in registered.streams {
+                self.streams.release(stream_id);
+            }
+        }
+        result
     }
 
     /// Recursive converter. `seen` is the current path of container objects,
@@ -191,6 +217,7 @@ impl Converter {
         value: v8::Local<'s, v8::Value>,
         seen: &mut Vec<v8::Local<'s, v8::Object>>,
         tracker: &mut LimitTracker,
+        registered: &mut Registered,
         receiver: Option<v8::Global<v8::Value>>,
     ) -> RuntimeResult<JSValue> {
         tracker.enter()?;
@@ -251,6 +278,7 @@ impl Converter {
             self.fn_registry
                 .borrow_mut()
                 .insert(fn_id, StoredFunction { function, receiver });
+            registered.functions.push(fn_id);
             tracker.add_bytes(8)?; // ID size
             Ok(JSValue::Function { id: fn_id })
         } else if value.is_symbol() {
@@ -315,7 +343,7 @@ impl Converter {
                 let item = array.get_index(scope, i as u32).ok_or_else(|| {
                     RuntimeError::internal(format!("Failed to get array index {}", i))
                 })?;
-                items.push(self.to_js_value_inner(scope, item, seen, tracker, None)?);
+                items.push(self.to_js_value_inner(scope, item, seen, tracker, registered, None)?);
             }
 
             seen.pop();
@@ -338,7 +366,8 @@ impl Converter {
                 let element = entries
                     .get_index(scope, index as u32)
                     .ok_or_else(|| RuntimeError::internal("Failed to get Set entry"))?;
-                values.push(self.to_js_value_inner(scope, element, seen, tracker, None)?);
+                values
+                    .push(self.to_js_value_inner(scope, element, seen, tracker, registered, None)?);
             }
 
             seen.pop();
@@ -356,6 +385,7 @@ impl Converter {
             && is_readable_stream(scope, value, self.stream_prototype.as_deref())
         {
             let stream_id = self.streams.register_stream(scope, value);
+            registered.streams.push(stream_id);
             tracker.add_bytes(size_of::<u32>())?;
             Ok(JSValue::JsStream { id: stream_id })
         } else if value.is_object() {
@@ -388,7 +418,8 @@ impl Converter {
                 });
 
                 tracker.add_bytes(key_str.len())?;
-                let converted = self.to_js_value_inner(scope, val, seen, tracker, receiver)?;
+                let converted =
+                    self.to_js_value_inner(scope, val, seen, tracker, registered, receiver)?;
                 map.insert(key_str, converted);
             }
 

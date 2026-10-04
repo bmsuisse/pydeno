@@ -77,6 +77,61 @@ mod tests {
         }
     }
 
+    /// (function handles, active JS streams) the runtime thread currently holds.
+    fn handle_counts(handle: &RuntimeHandle) -> (u64, u64) {
+        let stats = handle.get_stats().unwrap();
+        (stats.function_handles, stats.active_js_streams)
+    }
+
+    #[test]
+    fn failed_conversion_rolls_back_function_and_stream_handles() {
+        let handle = spawn(RuntimeConfig::default());
+        for code in [
+            // A function, then a value that cannot be converted.
+            "({f: () => 1, m: new Map()})",
+            "[() => 1, {g() {}}, Symbol('x')]",
+            "new Set([() => 1, new WeakMap()])",
+            // A stream, then a value that cannot be converted.
+            "({s: new ReadableStream(), e: new Error('x')})",
+            "[new ReadableStream(), () => 1, new ReadableStream(), new Map()]",
+            // A getter that throws after a function was registered.
+            "({f() {}, get boom() { throw new Error('getter'); }})",
+            // A cycle found after a function was registered.
+            "(() => { const o = {f() {}}; o.self = o; return o; })()",
+        ] {
+            for _ in 0..50 {
+                assert!(handle.eval_sync(code).is_err(), "{code} should fail");
+            }
+            assert_eq!(handle_counts(&handle), (0, 0), "{code} left handles behind");
+        }
+    }
+
+    #[test]
+    fn failed_conversion_over_byte_limit_rolls_back_handles() {
+        let handle = spawn(RuntimeConfig {
+            max_serialization_bytes: 1024,
+            ..RuntimeConfig::default()
+        });
+        for _ in 0..20 {
+            let err = handle
+                .eval_sync("[() => 1, new ReadableStream(), 'x'.repeat(4096)]")
+                .unwrap_err();
+            assert!(err.to_string().contains("size"), "{err}");
+        }
+        assert_eq!(handle_counts(&handle), (0, 0));
+    }
+
+    #[test]
+    fn successful_conversion_keeps_its_handles() {
+        let handle = spawn(RuntimeConfig::default());
+        assert!(handle.eval_sync("({m: new Map()})").is_err());
+        let value = handle
+            .eval_sync("({f: () => 1, s: new ReadableStream(), g: [() => 2]})")
+            .unwrap();
+        assert!(matches!(value, JSValue::Object(_)));
+        assert_eq!(handle_counts(&handle), (2, 1));
+    }
+
     #[test]
     fn test_runtime_with_heap_limits() {
         let handle = spawn(RuntimeConfig {

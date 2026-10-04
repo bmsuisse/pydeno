@@ -1014,12 +1014,10 @@ impl RuntimeCoreState {
         );
         let mut streams = self.conv.streams.stats_snapshot();
         streams.merge(&self.py_stream_registry.stats_snapshot());
-        Ok(RuntimeStatsSnapshot::new(
-            heap,
-            self.stats_state.snapshot(),
-            activity,
-            streams,
-        ))
+        let mut snapshot =
+            RuntimeStatsSnapshot::new(heap, self.stats_state.snapshot(), activity, streams);
+        snapshot.function_handles = self.conv.fn_registry.borrow().len() as u64;
+        Ok(snapshot)
     }
 }
 

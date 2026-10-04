@@ -160,6 +160,15 @@ Security; see
   line and paragraph separators, variation selectors, TAG characters) that carry text a reader never sees
   but a model does. Emoji sequences lose their joiners and skin-tone modifiers and render as their parts.
   An `on_console` callback still receives the guest's text raw; sanitise it before printing.
+- **`http_fetch` caps host name lookups in flight per process** (`DNS_MAX_PENDING`, 64 by default,
+  running or waiting for one of the `DNS_THREADS`). A lookup cannot be cancelled, so each call that
+  timed out used to leave its lookup queued behind stalled ones, and later calls from any session
+  in the process waited behind all of them. A lookup now counts until it finishes; past the cap a
+  call fails at once with `HttpFetchFailed` ("too many host name lookups are in progress").
+- **A result that fails to convert no longer leaves function or stream handles behind.** Converting
+  a value registers each function and `ReadableStream` in it; when a later part failed (a `Map`, a
+  throwing getter, a cycle, the size limit), those registrations stayed for the life of the
+  runtime, so repeating the call grew memory without bound. Conversion is now all or nothing.
 
 ### Fixed
 

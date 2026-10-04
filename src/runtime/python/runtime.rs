@@ -164,6 +164,15 @@ impl Runtime {
             .map_or(0, |handle| handle.tracked_function_count()))
     }
 
+    /// Test hook: JS functions the runtime thread holds for Python (its registry size).
+    fn _debug_function_handle_count(&self, py: Python<'_>) -> PyResult<u64> {
+        let handle = self.live_handle()?;
+        let stats = py
+            .detach(|| handle.get_stats())
+            .map_err(context("Failed to obtain runtime stats"))?;
+        Ok(stats.function_handles)
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         match self.handle.borrow_mut().take() {
             Some(runtime) => py.detach(move || Self::close_blocking(runtime)),

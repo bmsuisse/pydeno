@@ -475,21 +475,59 @@ _MAX_HEADER_VALUE = 1024
 
 # Threads for name resolution, shared by every `HttpFetch` in the process. The system resolver
 # cannot be cancelled: a lookup that outlives its caller's deadline keeps its thread until the OS
-# gives up (often 10-30 s), and while all of them are busy, new lookups queue behind them (each
+# gives up (often 10-30 s), and while all of them are busy, new lookups wait for a thread (each
 # caller still gets `HttpFetchTimeout` at its own deadline). Set before the first request.
 DNS_THREADS = 8
 
-_dns_pool: concurrent.futures.ThreadPoolExecutor | None = None
+# Most lookups in flight at once in the process, running or waiting for a thread (at least
+# DNS_THREADS). A lookup counts until it finishes, not until its caller gives up, so stalled
+# lookups cannot pile up without bound; past this a call fails at once with `HttpFetchFailed`.
+DNS_MAX_PENDING = 64
+
+
+class _DnsPool:
+    """The lookup threads plus a process-wide cap on lookups submitted and not yet finished."""
+
+    def __init__(self, threads: int, limit: int) -> None:
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=threads, thread_name_prefix="pydeno-http-fetch-dns"
+        )
+        self.limit = max(limit, threads)
+        self.pending = 0
+        self._lock = threading.Lock()
+
+    def submit(
+        self, resolver: Resolver, host: str, port: int
+    ) -> concurrent.futures.Future[list[object]]:
+        with self._lock:
+            if self.pending >= self.limit:
+                raise HttpFetchFailed(
+                    "too many host name lookups are in progress; try again later"
+                )
+            self.pending += 1
+        try:
+            future = self.executor.submit(_resolve, resolver, host, port)
+        except BaseException:
+            self._done()
+            raise
+        # Released when the lookup itself ends, which may be long after its caller timed out.
+        future.add_done_callback(self._done)
+        return future
+
+    def _done(self, _future: object = None) -> None:
+        with self._lock:
+            self.pending -= 1
+
+
+_dns_pool: _DnsPool | None = None
 _dns_pool_lock = threading.Lock()
 
 
-def _dns_executor() -> concurrent.futures.ThreadPoolExecutor:
+def _dns() -> _DnsPool:
     global _dns_pool  # noqa: PLW0603 - one lazily created pool for the process
     with _dns_pool_lock:
         if _dns_pool is None:
-            _dns_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=DNS_THREADS, thread_name_prefix="pydeno-http-fetch-dns"
-            )
+            _dns_pool = _DnsPool(DNS_THREADS, DNS_MAX_PENDING)
         return _dns_pool
 
 
@@ -671,7 +709,7 @@ class HttpFetch:
         if t.is_ip:
             answers: list[object] = [t.host]
         else:
-            future = _dns_executor().submit(_resolve, self._resolver, t.host, t.port)
+            future = _dns().submit(self._resolver, t.host, t.port)
             try:
                 answers = future.result(timeout=deadline.remaining())
             except concurrent.futures.TimeoutError:
