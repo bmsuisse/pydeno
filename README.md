@@ -79,6 +79,12 @@ Defaults: `sandbox="require"` (`pydeno.sandbox_status()` explains a refusal), ji
 30 s per feed, 512 MiB, 1000 external calls per session, and a worker never serves two sessions. The
 [front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit.
 
+From a shell, the same sandboxed worker ([command line guide][guide-cli]):
+
+```bash
+pydeno '[1, 2, 3].map(x => x * 2)'     # prints [2, 4, 6]; exit code 1 on a JavaScript error
+```
+
 ## Code mode for AI agents
 
 Code mode lets the model write one program that calls your tools, instead of one tool call per turn. pydeno
@@ -117,6 +123,7 @@ The threat model is in [`SECURITY.md`](SECURITY.md); the details are in [the iso
 | **OS sandbox, applied before the engine exists** | macOS: Seatbelt. Linux: Landlock, a private empty root (mount, network, IPC, UTS namespaces) and a seccomp-bpf filter. `sandbox="require"` refuses to start unless **every** layer applied; the worker proves its own confinement with a self-test first. |
 | **No privileges** | A worker started as root drops to `nobody` with an empty capability set; `no_new_privs` is set. |
 | **Smaller engine surface** | V8 runs `--jitless` by default. `SharedArrayBuffer`, `Atomics`, `WeakRef` and `FinalizationRegistry` are removed; there is no `Deno`, `process` or `require`. |
+| **No code from strings** (opt-in) | `strict_eval=True`: `eval` and `new Function` throw in the guest, so a string that reaches them is never compiled. A guard for trusted code against injection, not a boundary against hostile code (that is the process and OS sandbox); it removes no engine code and does not cover WebAssembly with `jitless=False`. |
 | **Limits enforced from outside** | Wall-clock deadline, CPU cap, memory ceiling, buffer cap, host-call budgets, message and console size. The parent kills a worker that breaks a limit. |
 | **The worker is untrusted input** | Every frame goes through a strict native decoder with size, depth and node budgets. A worker that sends nonsense is killed. |
 | **Capability tokens, fail-closed binds** | A bound function is reachable only through an unguessable token. A guest that tampers with the scope before a bind makes the bind **fail**, never silently do nothing. |
@@ -384,6 +391,7 @@ The sandbox is tested the way an attacker would try it: from inside, and against
 
 - [**FastMCP tool bridge**](examples/fastmcp_tool_bridge.py): expose FastMCP tools to sandboxed JS via `bind_function` and an in-process `fastmcp.Client`
 - [**pydantic-ai code mode (`JSCodeMode`)**](docs/guides/pydantic-ai.md): the JavaScript counterpart of pydantic-ai's Monty-based code mode. The agent gets one `run_javascript` tool; your other tools become typed `tools.*` functions the model's code calls with `await` and `Promise.all`, with retries, usage limits and approvals mapped onto pydantic-ai's own. Runs offline: [`examples/pydantic_ai_agent.py`](examples/pydantic_ai_agent.py). `pip install "pydeno[pydantic-ai]"`
+- [**`llm` plugin (`llm-pydeno`)**](integrations/llm-pydeno/README.md): a `PyDeno` toolbox for the [`llm`](https://llm.datasette.io/) CLI. One `run_javascript` tool runs the model's code in a sandboxed session that keeps state between calls and returns `stdout`, `stderr`, `result` and `error` with size caps. A separate package; `pydeno` does not depend on `llm`.
 - [**Agent sessions (`AgentSandbox`)**](docs/guides/agent-sessions.md): state across turns, pause and resume at every tool call (approval flows), a signed replay journal you can `dump()` and `load()`, and the tool descriptions and `.d.ts` for your prompt
 - [**ToolBridge**](examples/tool_bridge.py): several Python tools with a total call budget, typed errors the model's JS can branch on, and `console.log` routed back to Python
 - [**Monty + pydeno**](examples/monty_and_pydeno.py): the model's Python runs in [Monty][monty], its JavaScript in pydeno, both sandboxed, sharing one tool and one call budget; Python computes, a Vega-Lite chart is drawn in JS
@@ -426,3 +434,4 @@ this problem; the two sandboxes work well side by side.
 [pydeno-pypi]: https://pypi.org/project/pydeno/
 [pydeno-docs]: https://bmsuisse.github.io/pydeno/
 [workflows-tests]: https://github.com/bmsuisse/pydeno/actions/workflows/test.yml
+[guide-cli]: https://bmsuisse.github.io/pydeno/guides/cli/

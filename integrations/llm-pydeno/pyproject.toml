@@ -1,0 +1,40 @@
+[build-system]
+# 1.27 is the first hatchling to write PEP 639 metadata (License-Expression, License-File).
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-pydeno"
+version = "0.1.0"
+description = "llm plugin: a sandboxed JavaScript interpreter for models, backed by pydeno."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+maintainers = [{ name = "BMSuisse", email = "dominik.peter@bmsuisse.ch" }]
+keywords = ["llm", "llm-plugin", "javascript", "sandbox", "v8"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+]
+# AgentSandbox.execute and ExecutionResult are in pydeno 0.7.0; llm.Toolbox in llm 0.26.
+dependencies = ["pydeno>=0.7.0", "llm>=0.26"]
+
+[project.urls]
+Homepage = "https://github.com/bmsuisse/pydeno/tree/main/integrations/llm-pydeno"
+Repository = "https://github.com/bmsuisse/pydeno"
+
+[project.entry-points.llm]
+pydeno = "llm_pydeno.plugin"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["llm_pydeno"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The tests import the package from this directory when it is not installed.
+pythonpath = ["."]

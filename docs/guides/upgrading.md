@@ -64,8 +64,9 @@ you have today.
 
 ## 0.7.x to the next release: the `Pydeno` front door
 
-**Nothing breaks.** `Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits and errors are new
-names; every existing class keeps its behaviour, and the docs now lead with `Pydeno` and file the
+**One thing changes behaviour: `python -m pydeno`** (the CLI rows below). `Pydeno` / `AsyncPydeno`
+and their sessions, snapshots, limits and errors are new names; every existing class keeps its
+behaviour, and the docs now lead with `Pydeno` and file the
 building blocks under "Advanced".
 
 | Change | Affects | Who notices | What to change |
@@ -77,6 +78,11 @@ building blocks under "Advanced".
 | `AgentSandbox.run()` / `execute()` drive the worker from the calling thread, which keeps enforcing every limit; tool calls are answered on the session's own threads (a tool thread for plain functions, its loop thread for coroutine functions; started at its first tool call, never shared with another session), in the order the guest made them, as before, each call in a fresh copy of the caller's context, instead of on the calling thread | `AgentSandbox` | Tools that read the caller's **thread-local** state (`threading.local()`): they no longer see it. Tools see the caller's contextvars as before (a copy per call) | Keep per-call state in contextvars or closures, not thread-locals |
 | `AsyncAgentSandbox.run()` / `execute()` stop waiting for a tool once its run has ended (the supervisor killed the worker for `max_pause`, the CPU cap or memory): the call raises at once instead of when the tool returns; the tool is cancelled | `AsyncAgentSandbox` | Nobody, unless they waited for a slow tool to finish after its run was killed | Nothing |
 | `SandboxPool` builds its runtimes through an overridable core (`_core_type`, private) | internal | Nobody | Nothing |
+| `python -m pydeno` runs code in `IsolatedRuntime(sandbox="require")`; it used the in-process `Runtime` | the CLI | Scripts that ran `python -m pydeno` on a machine without the complete OS sandbox: they now exit with code 4 | Pass `--sandbox auto`, or `--no-sandbox` for code you trust; `pydeno.sandbox_status()` shows what is missing |
+| A positional argument is JavaScript to evaluate; it used to be a file name | the CLI | `python -m pydeno script.js` now evaluates the text `script.js` (a `ReferenceError`, exit code 1) | `python -m pydeno -f script.js` |
+| The result prints as JSON (`"text"` with quotes, `{"a": 1}`); it used to print Python's `str()` of it | the CLI | Scripts that parse the output | Parse it as JSON, or pass `--raw` for a plain string |
+| A JavaScript error exits with code 1 and `pydeno: js_error: ...` on stderr; a timeout exits 3, a missing sandbox 4, another failure 5, a result with no JSON form 6 (all used to exit 1) | the CLI | Scripts that match on the old `JavaScript Error:` text or treat every failure the same | See the exit codes in [Command line](cli.md) |
+| The code runs in a separate worker with `--jitless` V8 (no WebAssembly), a 30 s default deadline and a 1 GiB memory cap; the old CLI had no deadline | the CLI | Code that ran long, used a lot of memory or used WebAssembly from the CLI | `--timeout`, `--max-memory`; for WebAssembly use the API (`IsolatedRuntime(jitless=False)`) |
 
 ## Safe to bump?
 

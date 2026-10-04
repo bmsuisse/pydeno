@@ -127,6 +127,10 @@ Pydeno(jitless=False)                   # V8's JIT and WebAssembly: faster, a la
 Pydeno(limits={"max_memory": None})     # remove a limit
 ```
 
+And one that tightens them: `Pydeno(strict_eval=True)` makes `eval` and `new Function` throw in the
+guest (no code from strings at run time). Dumps record it and load only into a pool with the same
+setting. See [strict eval](advanced/isolation.md#strict-eval-no-code-from-strings).
+
 ## Performance
 
 `benches_py/alternatives_bench.py` on an Apple-silicon laptop (macOS, Python 3.14, medians with p95
