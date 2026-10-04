@@ -129,6 +129,26 @@ fn is_readable_stream(
     false
 }
 
+/// How many index properties `obj` lists without storing them: a typed array's element count, or
+/// a boxed string's length. Runs no guest code: a typed array's length is native, and a `String`
+/// object's `length` is its own non-configurable data property, which nothing can shadow.
+fn indexed_length(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    obj: v8::Local<'_, v8::Object>,
+) -> usize {
+    if let Ok(typed_array) = v8::Local::<v8::TypedArray>::try_from(value) {
+        return typed_array.length();
+    }
+    if value.is_string_object() {
+        let length = v8::String::new(scope, "length").and_then(|key| obj.get(scope, key.into()));
+        if let Some(length) = length.filter(|length| length.is_number()) {
+            return length.number_value(scope).unwrap_or(0.0).max(0.0) as usize;
+        }
+    }
+    0
+}
+
 /// Look up the global JS helper function `name` (installed by the ops bootstrap).
 pub(super) fn global_helper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -209,8 +229,12 @@ impl Converter {
                 .to_number(scope)
                 .ok_or_else(|| RuntimeError::internal("Failed to convert value to number"))?
                 .value();
-            // NaN/±Infinity and non-integral values stay floats.
-            if num_val.is_finite() && num_val.fract() == 0.0 && num_val as i64 as f64 == num_val {
+            // NaN/±Infinity, non-integral values and anything outside i64 stay floats. Not
+            // `num_val as i64 as f64 == num_val`: the cast saturates, and `i64::MAX as f64` rounds
+            // back up to 2**63, so 2**63 came back as 2**63 - 1.
+            const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+            if num_val.is_finite() && num_val.fract() == 0.0 && (-TWO_63..TWO_63).contains(&num_val)
+            {
                 tracker.add_bytes(20)?;
                 Ok(JSValue::Int(num_val as i64))
             } else {
@@ -362,6 +386,13 @@ impl Converter {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             circular_check(seen, obj)?;
+
+            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings have one
+            // virtual own property per element: listing them for a 16 MB `Int8Array` builds 16
+            // million index strings in one native call that termination cannot interrupt. Charge
+            // the element count first, as the array branch does, so that fails before the listing.
+            tracker
+                .add_bytes(indexed_length(scope, value, obj).saturating_mul(size_of::<usize>()))?;
 
             let prop_names = obj
                 .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
