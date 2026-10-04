@@ -121,14 +121,41 @@ pub struct BufferBudget(pub Option<Arc<crate::runtime::capped_allocator::Budget>
 /// collected at the next sweep and gives its bytes back; the sweep runs when a charge would
 /// exceed the cap, after a forced GC, so churn through short-lived resizable buffers does not
 /// exhaust the budget inside one synchronous run.
-#[derive(Default)]
 pub struct ResizableBuffers {
-    next_id: u32,
-    entries: HashMap<u32, (v8::Weak<v8::Object>, usize)>,
+    next_id: u64,
+    entries: HashMap<u64, (v8::Weak<v8::Object>, usize)>,
+    /// Table size at which the next cheap sweep (no GC: drop the entries whose handle V8 has
+    /// emptied) runs. Doubles with the live count, so the table never holds more than about
+    /// twice the live buffers, and tiny buffers that never touch the cap cannot grow it without
+    /// bound.
+    sweep_at: usize,
+}
+
+/// The table as OpState holds it: shared with the allocator's refusal path (see
+/// `capped_allocator::set_thread_sweeper`), which runs on the same isolate thread.
+pub type SharedBuffers = Rc<RefCell<ResizableBuffers>>;
+
+/// First cheap sweep after this many entries.
+const SWEEP_START: usize = 1024;
+/// Hard bound on tracked resizable buffers. A guest keeping this many alive (each one also a
+/// JS object on its heap) is refused the next, with the same RangeError as an exhausted cap.
+const MAX_TRACKED: usize = 1 << 22;
+
+impl Default for ResizableBuffers {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            entries: HashMap::new(),
+            sweep_at: SWEEP_START,
+        }
+    }
 }
 
 impl ResizableBuffers {
-    fn sweep(&mut self, budget: &crate::runtime::capped_allocator::Budget) {
+    /// Drop the entries whose buffer V8 has collected, giving their bytes back. No GC here:
+    /// callers that need one run it first. Cost is linear in the table, so it runs on a cap hit,
+    /// on a table that doubled, and when the allocator refuses a fixed-length buffer.
+    pub fn sweep(&mut self, budget: &crate::runtime::capped_allocator::Budget) {
         self.entries.retain(|_, (handle, bytes)| {
             if handle.is_empty() {
                 budget.release(*bytes);
@@ -137,6 +164,7 @@ impl ResizableBuffers {
                 true
             }
         });
+        self.sweep_at = (self.entries.len() * 2).max(SWEEP_START);
     }
 }
 
@@ -179,34 +207,57 @@ fn op_pydeno_buffer_charge<'s>(
     let known = buffer
         .get_private(scope, key)
         .filter(|value| value.is_number())
-        .and_then(|value| value.uint32_value(scope));
+        .and_then(|value| value.number_value(scope))
+        .filter(|id| *id >= 1.0 && id.fract() == 0.0)
+        .map(|id| id as u64);
 
-    let mut guard = state.borrow_mut();
-    let tracked = guard.borrow_mut::<ResizableBuffers>();
-    let id = match known.filter(|id| tracked.entries.contains_key(id)) {
+    // The table is borrowed in short scopes only: a GC (`low_memory_notification`) must never
+    // run while it is held, and the allocator's refusal path borrows it too.
+    let Some(table) = state.borrow().try_borrow::<SharedBuffers>().cloned() else {
+        return false;
+    };
+    let known = known.filter(|id| table.borrow().entries.contains_key(id));
+    let id = match known {
         Some(id) => id,
         None => {
-            tracked.next_id = tracked.next_id.wrapping_add(1).max(1);
-            let id = tracked.next_id;
-            let tag = v8::Number::new(scope, f64::from(id));
+            let mut full = {
+                let mut tracked = table.borrow_mut();
+                if tracked.entries.len() >= tracked.sweep_at {
+                    tracked.sweep(&budget);
+                }
+                tracked.entries.len() >= MAX_TRACKED
+            };
+            if full {
+                // Collect before refusing: the table may be full of buffers the guest dropped.
+                scope.low_memory_notification();
+                let mut tracked = table.borrow_mut();
+                tracked.sweep(&budget);
+                full = tracked.entries.len() >= MAX_TRACKED;
+            }
+            if full {
+                return false;
+            }
+            let id = {
+                let mut tracked = table.borrow_mut();
+                // Never reused: ids stay exact as doubles far past any count a runtime reaches.
+                tracked.next_id += 1;
+                tracked.next_id
+            };
+            let tag = v8::Number::new(scope, id as f64);
             buffer.set_private(scope, key, tag.into());
-            tracked
-                .entries
-                .insert(id, (v8::Weak::new(scope, buffer), 0));
+            let handle = v8::Weak::new(scope, buffer);
+            table.borrow_mut().entries.insert(id, (handle, 0));
             id
         }
     };
-    let current = tracked.entries.get(&id).map_or(0, |entry| entry.1);
+    let current = table.borrow().entries.get(&id).map_or(0, |entry| entry.1);
     if bytes > current {
         let growth = bytes - current;
         if !budget.reserve(growth) {
             // Over the cap: collect first. A resizable buffer the guest dropped still holds
             // its bytes here until its handle is seen emptied.
-            drop(guard);
             scope.low_memory_notification();
-            guard = state.borrow_mut();
-            let tracked = guard.borrow_mut::<ResizableBuffers>();
-            tracked.sweep(&budget);
+            table.borrow_mut().sweep(&budget);
             if !budget.reserve(growth) {
                 return false;
             }
@@ -214,7 +265,7 @@ fn op_pydeno_buffer_charge<'s>(
     } else {
         budget.release(current - bytes);
     }
-    let tracked = guard.borrow_mut::<ResizableBuffers>();
+    let mut tracked = table.borrow_mut();
     if bytes == 0 {
         tracked.entries.remove(&id);
     } else if let Some(entry) = tracked.entries.get_mut(&id) {

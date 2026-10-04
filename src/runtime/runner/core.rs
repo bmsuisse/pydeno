@@ -17,7 +17,7 @@ use crate::runtime::js_value::{JSValue, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{
     python_extension, BufferBudget, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
-    ResizableBuffers,
+    SharedBuffers,
 };
 use crate::runtime::stats::{
     ActivitySummary, HeapSnapshot, RuntimeCallKind, RuntimeStatsSnapshot, RuntimeStatsState,
@@ -281,7 +281,7 @@ impl RuntimeCoreState {
             // from OpState, and console capture / bootstrap logging call ops.
             op_state.put(serialization_limits);
             op_state.put(BufferBudget(buffer_budget));
-            op_state.put(ResizableBuffers::default());
+            op_state.put(SharedBuffers::default());
         }
 
         if inspector_enabled {
