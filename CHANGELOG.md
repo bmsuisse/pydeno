@@ -52,6 +52,11 @@
 
 ### Changed
 
+- Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
+  creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
+  and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s
+  ~8 ms; same profile, same self-test, falls back to `sandbox_init`); the worker never loads `ssl` (asyncio
+  imports it only optionally, and the worker has no network) and, on Python 3.14, never imports `typing`.
 - Lower warm-call overhead of `IsolatedRuntime` (#47): a warm `eval("1 + 1")` went from about 112 to 67 µs
   (interleaved A/B, 30 rounds, medians; debug build of the extension on a loaded macOS arm64 machine, so
   release numbers will differ). Where it came from:
