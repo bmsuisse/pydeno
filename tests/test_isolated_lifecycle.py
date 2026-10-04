@@ -11,6 +11,7 @@ import asyncio
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -562,3 +563,12 @@ class TestSizeLimitsAcrossTheBoundary:
         with _iso() as rt:
             for i in range(300):
                 assert rt.eval(f"{i} + 1") == i + 1
+
+
+def test_a_kill_by_the_idle_watchdog_keeps_its_reason() -> None:
+    # The watchdog thread cannot raise into the caller; the pump used to report a bare "SIGKILL".
+    rt = IsolatedRuntime(RuntimeConfig(), request_timeout=30)
+    rt._kill_reason = "worker used 1 bytes, over max_memory=0; killed"  # noqa: SLF001
+    os.kill(rt._proc.pid, signal.SIGKILL)  # noqa: SLF001
+    with pytest.raises(WorkerCrashed, match="over max_memory"):
+        rt.eval("1")
