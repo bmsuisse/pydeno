@@ -9,11 +9,21 @@ range, before any worker starts."""
 from __future__ import annotations
 
 import math
+import time
 from datetime import timedelta
 
 import pytest
 
-from pydeno import AgentSandbox, AsyncIsolatedRuntime, IsolatedRuntime, SandboxPool
+from pydeno import (
+    AgentSandbox,
+    AsyncIsolatedRuntime,
+    IsolatedRuntime,
+    Pydeno,
+    PydenoTimeoutError,
+    RuntimeConfig,
+    RuntimeTimeout,
+    SandboxPool,
+)
 from pydeno._isolated import _session_options
 
 NON_FINITE = [math.nan, math.inf, -math.inf]
@@ -97,3 +107,54 @@ def test_pool_checkout_refuses_a_nan_deadline() -> None:
             pool.checkout(request_timeout=math.nan)
         with pytest.raises(ValueError):
             pool.checkout(max_host_wait=math.inf)
+
+
+class TestConsoleCountsAgainstTheDeadline:
+    """Console output is the guest's own work, not a tool call: the time the host spends handling
+    it must not pause the hard deadline. Otherwise a guest that floods `console.*` stretches a
+    1.5 s deadline by however slow the host's console handling is, up to `max_host_wait`."""
+
+    HARD = 1.5
+    CEILING = 5.0  # the deadline, start-up and slack; a paused deadline measured ~4-6x the limit
+
+    @staticmethod
+    def slow_console(level: str, args: list[object]) -> None:
+        time.sleep(0.002)
+
+    def test_sync(self) -> None:
+        cfg = RuntimeConfig(on_console=self.slow_console)
+        with IsolatedRuntime(cfg, request_timeout=self.HARD, max_host_wait=60) as rt:
+            t = time.monotonic()
+            with pytest.raises(RuntimeTimeout):
+                rt.eval("for (;;) console.log('x')")
+            assert time.monotonic() - t < self.CEILING
+
+    async def test_async(self) -> None:
+        cfg = RuntimeConfig(on_console=self.slow_console)
+        async with AsyncIsolatedRuntime(
+            cfg, request_timeout=self.HARD, max_host_wait=60
+        ) as rt:
+            t = time.monotonic()
+            with pytest.raises(RuntimeTimeout):
+                await rt.eval("for (;;) console.log('x')")
+            assert time.monotonic() - t < self.CEILING
+
+    def test_front_door_feed(self) -> None:
+        limits = {"max_feed_duration_secs": self.HARD, "max_host_wait_secs": 60}
+        with Pydeno(min_processes=1, limits=limits) as pool, pool.checkout() as session:
+            t = time.monotonic()
+            with pytest.raises(PydenoTimeoutError):
+                session.feed_run(
+                    "for (;;) console.log('x')",
+                    print_callback=lambda stream, text: time.sleep(0.002),
+                )
+            assert time.monotonic() - t < self.CEILING
+
+    def test_a_slow_tool_still_pauses_the_deadline(self) -> None:
+        def slow() -> int:
+            time.sleep(self.HARD + 0.5)
+            return 1
+
+        with IsolatedRuntime(request_timeout=self.HARD) as rt:
+            rt.bind_function("slow", slow)
+            assert rt.eval("slow()") == 1
