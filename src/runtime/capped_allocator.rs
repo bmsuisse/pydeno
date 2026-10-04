@@ -67,17 +67,20 @@ fn layout(len: usize) -> Option<Layout> {
     Layout::from_size_align(len.max(1), ALIGN).ok()
 }
 
+/// The refusal-path hook: given the budget, release what collected resizable buffers held.
+pub type Sweeper = Box<dyn Fn(&Budget)>;
+
 thread_local! {
     /// What the runtime on this thread wants run before a reservation is refused: the bridge's
     /// sweep of resizable buffers V8 has collected, whose bytes the budget still holds. V8 calls
     /// the allocator on the isolate thread, and when it gets `null` back it collects garbage and
     /// asks again, so the handles of dropped resizable buffers are empty by the retry; without
     /// this hook a fixed-length allocation could fail on bytes nobody holds any more.
-    static SWEEPER: RefCell<Option<Box<dyn Fn(&Budget)>>> = const { RefCell::new(None) };
+    static SWEEPER: RefCell<Option<Sweeper>> = const { RefCell::new(None) };
 }
 
 /// Install the refusal-path sweeper for the runtime on this thread (one runtime per thread).
-pub fn set_thread_sweeper(sweeper: Box<dyn Fn(&Budget)>) {
+pub fn set_thread_sweeper(sweeper: Sweeper) {
     SWEEPER.with(|slot| *slot.borrow_mut() = Some(sweeper));
 }
 

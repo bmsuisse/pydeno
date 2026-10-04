@@ -249,9 +249,7 @@ impl RuntimeCoreState {
             create_params = Some(
                 create_params
                     .unwrap_or_default()
-                    .array_buffer_allocator(crate::runtime::capped_allocator::new(
-                        budget.clone(),
-                    )),
+                    .array_buffer_allocator(crate::runtime::capped_allocator::new(budget.clone())),
             );
         }
 

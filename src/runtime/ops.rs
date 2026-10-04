@@ -16,9 +16,9 @@ use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
 use crate::runtime::stream::PyStreamRegistry;
 use deno_core::ascii_str;
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::Extension;
 use deno_core::ExtensionFileSource;
-use deno_core::v8;
 use deno_core::OpState;
 use deno_error::JsErrorBox;
 use pyo3::prelude::*;
@@ -123,13 +123,16 @@ pub struct BufferBudget(pub Option<Arc<crate::runtime::capped_allocator::Budget>
 /// exhaust the budget inside one synchronous run.
 pub struct ResizableBuffers {
     next_id: u64,
-    entries: HashMap<u64, (v8::Weak<v8::Object>, usize)>,
+    entries: HashMap<u64, TrackedBuffer>,
     /// Table size at which the next cheap sweep (no GC: drop the entries whose handle V8 has
     /// emptied) runs. Doubles with the live count, so the table never holds more than about
     /// twice the live buffers, and tiny buffers that never touch the cap cannot grow it without
     /// bound.
     sweep_at: usize,
 }
+
+/// A charged buffer: V8's weak handle to it and the bytes it holds of the budget.
+type TrackedBuffer = (v8::Weak<v8::Object>, usize);
 
 /// The table as OpState holds it: shared with the allocator's refusal path (see
 /// `capped_allocator::set_thread_sweeper`), which runs on the same isolate thread.
@@ -175,7 +178,7 @@ const BUFFER_ID_KEY: &str = "pydeno.buffer#id";
 /// (`NaN`, a negative, a fraction) is refused rather than rounded.
 fn byte_count(raw: f64) -> Option<usize> {
     (raw.is_finite() && raw >= 0.0 && raw.fract() == 0.0 && raw <= usize::MAX as f64)
-        .then(|| raw as usize)
+        .then_some(raw as usize)
 }
 
 /// Set the bytes `buffer` (a resizable ArrayBuffer or growable SharedArrayBuffer) holds of the
