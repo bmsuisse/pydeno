@@ -1471,7 +1471,11 @@ class AsyncIsolatedRuntime:
                 None,
             )
             return
-        pump.begin_call()
+        # Console output is the guest's own work, not a tool call: its handling time is charged to
+        # the guest (see IsolatedRuntime._on_call), so the deadline is not paused for it.
+        console = hid == self._options.get("console_hid")
+        if not console:
+            pump.begin_call()
         loop = asyncio.get_running_loop()
         if is_async:
             self._async_inflight += 1
@@ -1495,7 +1499,7 @@ class AsyncIsolatedRuntime:
             self._serial,
         )
         frame = await self._await_or_death(fut)
-        await self._send_reply(frame, pump)
+        await self._send_reply(frame, None if console else pump)
 
     async def _async_call(
         self, handler: Callable[..., Any], args: list[Any], cid: int, pump: _Pump

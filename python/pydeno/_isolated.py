@@ -1164,6 +1164,12 @@ class IsolatedRuntime:
                 None,
             )
             return
+        if hid == self._options.get("console_hid"):
+            # Console output is the guest's own work, not a tool call: the time the host spends on
+            # it is charged to the guest. Pausing the deadline here would let a console flood
+            # stretch it by however slow the host's console handling is, up to `max_host_wait`.
+            self._run_sync_handler(handler, decoded, cid, None)
+            return
         pump.begin_call()
         if is_async and pump.loop is not None:
             coro = _call_guarded(handler, decoded)
@@ -1181,6 +1187,11 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
+        self._run_sync_handler(handler, decoded, cid, pump)
+
+    def _run_sync_handler(
+        self, handler: Callable[..., Any], decoded: list[Any], cid: int, pump: _Pump | None
+    ) -> None:
         try:
             self._guard.in_host_call = True
             try:
