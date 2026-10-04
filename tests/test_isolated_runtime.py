@@ -374,16 +374,17 @@ class TestContainment:
         [
             # The two sinks `max_buffer_bytes` cannot see: V8 reserves these pages
             # through its own page allocator. Touched pages show up in RSS.
+            # Each holds the memory and then keeps the guest busy, so it is the polling
+            # watchdog that has to catch it: a command that merely returns afterwards races
+            # the page being freed or compressed before the end-of-command check reads RSS.
             (
-                # The buffer is kept reachable: once the expression ends, V8 may free it
-                # before the end-of-command memory check, and the test would race the GC.
                 "globalThis.keep = new WebAssembly.Memory({initial: 8192});"
-                " new Uint8Array(keep.buffer).fill(1).length",
+                " new Uint8Array(keep.buffer).fill(1); for (;;) {}",
                 False,  # WebAssembly does not exist under --jitless
             ),
             (
                 "globalThis.keep = new ArrayBuffer(8, {maxByteLength: 2 ** 31});"
-                " keep.resize(2 ** 29); new Uint8Array(keep).fill(1).length",
+                " keep.resize(2 ** 29); new Uint8Array(keep).fill(1); for (;;) {}",
                 True,
             ),
         ],
