@@ -87,6 +87,14 @@ impl TerminationController {
         }
     }
 
+    /// Forget the reason of a termination that has been handled (cancelled), so a later,
+    /// unrelated termination does not report it. Kept while a termination is requested.
+    pub(super) fn clear_handled_reason(&self) {
+        if !self.is_requested() {
+            *self.inner.reason.lock().unwrap() = None;
+        }
+    }
+
     pub fn reason(&self) -> Option<String> {
         self.inner.reason.lock().unwrap().clone()
     }

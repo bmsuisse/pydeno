@@ -49,6 +49,13 @@
 - Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
   the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
   even when the guest's error was still being read at that point.
+- The runtime stays usable after a module evaluation times out (or waits on a top-level `await` that never
+  settles): later commands, timeouts and `TerminationHandle.terminate()` are served as usual, and the idle
+  runtime thread does not spin.
+- After a deadline has fired, a later `TerminationHandle.terminate()` reports its own reason instead of the
+  earlier timeout's.
+- Evaluating a module again after its first evaluation timed out or was terminated explains that, instead
+  of failing with `Uncaught null`.
 
 ### Changed
 

@@ -198,6 +198,11 @@ pub(super) struct RuntimeCoreState {
     #[allow(dead_code)]
     startup_snapshot: Option<OwnedSnapshot>,
     pub(super) py_stream_registry: PyStreamRegistry,
+    /// A module evaluation was abandoned (timed out, terminated, or stuck on a top-level `await`
+    /// that will never settle). deno_core keeps it pending for good and reports it as a stalled
+    /// top-level await on every later event-loop poll; once this is set, that report is about the
+    /// abandoned module, not about the work in hand.
+    pub(super) abandoned_module_evaluation: bool,
 }
 
 impl RuntimeCoreState {
@@ -394,6 +399,7 @@ impl RuntimeCoreState {
             inspector_state,
             startup_snapshot: snapshot_source,
             py_stream_registry,
+            abandoned_module_evaluation: false,
         })
     }
 
@@ -517,6 +523,7 @@ impl RuntimeCoreState {
     /// and kill the next, unrelated, call. A no-op when none is pending.
     pub(super) fn cancel_pending_termination(&mut self) {
         let _ = self.js_runtime.v8_isolate().cancel_terminate_execution();
+        self.termination.clear_handled_reason();
     }
 
     /// Resolve `watchdog` and, if it fired, turn the call's outcome into a timeout.
@@ -737,7 +744,22 @@ impl RuntimeCoreState {
     pub(super) fn load_module(&mut self, specifier: &str) -> RuntimeResult<ModuleId> {
         let module_specifier = module_specifier(specifier)?;
         futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier)).map_err(
-            |e| RuntimeError::internal(format!("Failed to load module '{}': {}", specifier, e)),
+            |e| {
+                let detail = e.to_string();
+                // deno_core's only words for a module whose earlier evaluation never finished.
+                if detail.contains("Uncaught null") {
+                    RuntimeError::internal(format!(
+                        "Failed to load module '{specifier}': its earlier evaluation did not \
+                         complete (it timed out or was terminated), so it cannot be evaluated \
+                         again in this runtime"
+                    ))
+                } else {
+                    RuntimeError::internal(format!(
+                        "Failed to load module '{}': {}",
+                        specifier, detail
+                    ))
+                }
+            },
         )
     }
 
@@ -755,12 +777,19 @@ impl RuntimeCoreState {
         self.with_timing(RuntimeCallKind::EvalModuleSync, |this| {
             let module_id = this.load_module(specifier)?;
             let receiver = this.js_runtime.mod_evaluate(module_id);
-            futures::executor::block_on(
+            let result = futures::executor::block_on(
                 this.js_runtime
                     .run_event_loop(PollEventLoopOptions::default()),
             )
-            .map_err(|err| this.translate_core_error(err))?;
-            futures::executor::block_on(receiver).map_err(|err| this.translate_core_error(err))?;
+            .map_err(|err| this.translate_core_error(err))
+            .and_then(|()| {
+                futures::executor::block_on(receiver).map_err(|err| this.translate_core_error(err))
+            });
+            if result.is_err() {
+                // Whatever stopped it, this evaluation may stay pending in deno_core for good.
+                this.abandoned_module_evaluation = true;
+            }
+            result?;
             // A bare top-level `queueMicrotask` is not on the path the event
             // loop waited for; drain it like `eval_sync` does.
             this.drain_microtasks();
@@ -901,6 +930,14 @@ impl RuntimeCoreState {
             streams,
         ))
     }
+}
+
+/// Whether `err` is deno_core's report that a module evaluation is stuck on a top-level `await`
+/// with nothing left that could settle it.
+pub(super) fn is_stalled_module_evaluation(err: &RuntimeError) -> bool {
+    let text = err.to_string();
+    text.contains("Top-level await promise never resolved")
+        || text.contains("Module evaluation is still pending after multiple event loop iterations")
 }
 
 pub(super) fn runtime_error_indicates_termination(err: &RuntimeError) -> bool {
