@@ -127,6 +127,13 @@ def test_worker_that_cannot_start_is_a_failed_result(monkeypatch) -> None:
         {"max_output_bytes": True},
         {"max_result_bytes": -1},
         {"sandbox": "off"},
+        {"timeout": float("inf")},
+        {"timeout": float("nan")},
+        {"timeout": 86401},
+        {"max_memory_mb": 2**40},
+        {"max_output_bytes": 2**53},
+        {"fresh_session_per_call": "false"},
+        {"fresh_session_per_call": 1},
     ],
     ids=str,
 )

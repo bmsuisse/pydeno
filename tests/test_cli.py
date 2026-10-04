@@ -121,6 +121,7 @@ def test_no_sandbox_warns_on_stderr() -> None:
 def test_usage_errors_exit_2(tmp_path) -> None:
     assert run().returncode == _cli.EXIT_USAGE  # nothing on stdin
     assert run("-c", "  ").returncode == _cli.EXIT_USAGE
+    assert "no code given" in run().stderr
     both = run("1", "-c", "2")
     assert both.returncode == _cli.EXIT_USAGE
     assert "give the code once" in both.stderr
@@ -289,21 +290,15 @@ def test_input_that_is_not_utf8_exits_2(tmp_path) -> None:
 
 # OSC 52 (clipboard write), CSI clear-screen, a C1 CSI, DEL, carriage return, bidi overrides,
 # zero-width and BOM characters, and a tag character.
-HOSTILE = "\x1b]52;c;ZXZpbA==\x07\x1b[2J\x9b31m\x7f\r\u202eevil\u202c\u200b\u2066\ufeff\U000e0041"
+HOSTILE = (
+    "\x1b]52;c;ZXZpbA==\x07\x1b[2J\x9b31m\x7f\r\u202eevil\u202c\u200b\u2066\ufeff\U000e0041"
+    # other format characters (Cf), line/paragraph separators, fillers, joiners, selectors
+    "\u00ad\u180e\u2028\u2029\u115f\u1160\u3164\uffa0\ufe0f\U000e0100\u034f"
+    "\u0600\u0605\u2061\u061c"
+)
 _JS_HOSTILE = json.dumps(HOSTILE)
-_FORBIDDEN = [
-    "\x1b",
-    "\x07",
-    "\x9b",
-    "\x7f",
-    "\r",
-    "\u202e",
-    "\u202c",
-    "\u200b",
-    "\u2066",
-    "\ufeff",
-    "\U000e0041",
-]
+# Every character of HOSTILE that is not printable ASCII must be gone from terminal output.
+_FORBIDDEN = sorted({ch for ch in HOSTILE if not (" " <= ch <= "~")})
 
 
 def _assert_inert(text: str) -> None:
@@ -446,3 +441,73 @@ def test_usage_errors_start_no_worker_machinery() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert out.stdout.strip() == "[]"
+
+
+# ---------------------------------------------------------------- re-review lows
+
+
+def test_frame_cap_after_escaping_exits_2(tmp_path) -> None:
+    """Under the 16 MiB read cap, but over the frame cap once JSON-escaped for the worker."""
+    newlines = run(stdin="1" + "\n" * (9 * 1024 * 1024))
+    assert newlines.returncode == _cli.EXIT_USAGE, newlines.stderr
+    assert "too large" in newlines.stderr
+    full = tmp_path / "full.js"
+    full.write_bytes(b"1" + b" " * (_cli.MAX_CODE_BYTES - 1))
+    proc = run("-f", str(full))
+    assert proc.returncode == _cli.EXIT_USAGE, proc.stderr
+    assert "too large" in proc.stderr
+
+
+def test_no_arguments_on_a_terminal_says_why(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    with pytest.raises(SystemExit) as exited:
+        _cli.main([])
+    assert exited.value.code == _cli.EXIT_USAGE
+    assert "no code given" in capsys.readouterr().err
+
+
+def test_argv_that_is_not_utf8_exits_2() -> None:
+    code = b"'\xff'".decode("utf-8", "surrogateescape")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pydeno", code],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert proc.returncode == _cli.EXIT_USAGE, proc.stderr
+    assert "UTF-8" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "ch",
+    [
+        "\u00ad",
+        "\u180e",
+        "\u2028",
+        "\u2029",
+        "\u3164",
+        "\ufe0f",
+        "\U000e0100",
+        "\u034f",
+        "\u0600",
+        "\ud800",
+    ],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+def test_every_invisible_class_is_handled(ch: str) -> None:
+    assert _cli.inert_text(f"a{ch}b") == "a?b"
+    encoded = _cli.to_json(f"a{ch}b")
+    assert ch not in encoded
+    assert json.loads(encoded) == f"a{ch}b"
+
+
+def test_frame_cap_refusal_from_the_encoder_is_also_exit_2(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """If the size estimate is ever short, the encoder's own refusal still maps to a usage error."""
+    monkeypatch.setattr(_cli, "_encoded_size", lambda code: 0)
+    newlines = tmp_path / "newlines.js"
+    newlines.write_bytes(b"1" + b"\n" * (9 * 1024 * 1024))
+    assert _cli.main(["--no-sandbox", "-f", str(newlines)]) == _cli.EXIT_USAGE
+    assert "too large" in capsys.readouterr().err

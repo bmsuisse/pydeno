@@ -40,7 +40,7 @@ llm -T 'PyDeno({"timeout": 5, "max_memory_mb": 128})' '...'
 
 | Option | Default | Meaning |
 |---|---|---|
-| `timeout` | 10 | Seconds of JavaScript running time per call. Exceeding it stops the worker |
+| `timeout` | 10 | Seconds of JavaScript running time per call (above 0, at most 86400). Exceeding it stops the worker |
 | `max_memory_mb` | 256 | Resident memory cap of the worker, in MiB |
 | `max_output_bytes` | 16384 | Cap on each of `stdout` and `stderr` per call; past it the stream ends with `[truncated]` |
 | `max_result_bytes` | 65536 | Cap on the returned value as JSON; a larger one is a failed call (the session goes on) |

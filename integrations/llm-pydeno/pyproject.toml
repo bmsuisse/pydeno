@@ -1,5 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.24"]
+# 1.27 is the first hatchling to write PEP 639 metadata (License-Expression, License-File).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]

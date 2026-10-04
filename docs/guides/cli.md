@@ -31,9 +31,11 @@ The code is evaluated as a script: the value of its last expression is the resul
 awaited. `console.log`, `info` and `debug` print to stdout, `console.warn`, `error` and `trace` to
 stderr, as they happen; the result is printed last. A result of `undefined` prints nothing.
 
-Input is read up to 16 MiB, the most the worker accepts in one message; larger input, or input that
-is not UTF-8, is a usage error (exit code 2). The read is bounded, so `pydeno -f /dev/zero` or an
-endless pipe stops at the cap instead of filling memory.
+Input is read up to 16 MiB, the most the worker accepts in one message. The limit applies to the
+code as it is sent, encoded as a JSON string, where a newline or a control character takes 2 to 6
+bytes: 9 MiB of newlines is over it. Input over the limit, or not valid UTF-8 (in a file, on stdin or
+on the command line), is a usage error (exit code 2). The read is bounded, so `pydeno -f /dev/zero`
+or an endless pipe stops at the cap instead of filling memory.
 
 ## Options
 
@@ -59,10 +61,13 @@ invalid `Date`) is exit code 6; the code itself ran. Convert it in the code firs
 ### Terminal safety
 
 Output is guest-controlled, so nothing the guest writes reaches the terminal as a control sequence.
-In console output, a `--raw` string and error messages, control characters (except tab and
-newline), escape sequences, C1 controls and invisible or bidirectional formatting characters
-(zero-width characters, direction overrides and isolates, the BOM, tag characters) are replaced with
-`?`. JSON output escapes the same characters as `\uXXXX`, so it stays lossless: parsing it gives the
+In console output, a `--raw` string and error messages, these are replaced with `?`: control
+characters except tab and newline (Unicode category Cc, which covers escape sequences and C1
+controls), format characters (Cf: soft hyphen, zero-width and direction marks, bidi overrides and
+isolates, the BOM, tag characters and the like), lone surrogates (Cs), the line and paragraph
+separators (Zl, Zp), and the invisible characters in other categories (the combining grapheme
+joiner, Hangul fillers, variation selectors). The categories come from the running Python's Unicode
+database. JSON output escapes the same characters as `\uXXXX`, so it stays lossless: parsing it gives the
 original string.
 
 ## Exit codes

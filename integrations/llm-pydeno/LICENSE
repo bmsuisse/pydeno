@@ -1,13 +1,6 @@
 MIT License
 
-Copyright (c) 2025 Xin Fu
 Copyright (c) 2026 Building Material Suisse
-
-This software ("pydeno") is derived from imfing/jsrun
-(https://github.com/imfing/jsrun), which is distributed under the MIT License.
-The original copyright notice above is retained as required by that license.
-See docs/contributing/upstream-divergence.md for the upstream base commit and
-the substantive changes made on top of it.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -16,6 +16,7 @@ earlier state is gone.
 
 from __future__ import annotations
 
+import math
 import threading
 from typing import Any
 
@@ -31,6 +32,9 @@ DEFAULT_TIMEOUT = 10.0
 DEFAULT_MAX_MEMORY_MB = 256
 DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024
 DEFAULT_MAX_RESULT_BYTES = 64 * 1024
+
+MAX_TIMEOUT = 24 * 3600.0
+_MAX_LIMIT = 2**53 - 1
 
 RESET_NOTE = " (the JavaScript session was restarted; state from earlier calls is gone)"
 
@@ -65,8 +69,15 @@ class JavaScriptSession:
         sandbox: str = "require",
         fresh_session_per_call: bool = False,
     ) -> None:
-        if not (isinstance(timeout, (int, float)) and timeout > 0):
-            raise ValueError("timeout must be a positive number of seconds")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or not 0 < timeout <= MAX_TIMEOUT
+        ):
+            raise ValueError(
+                f"timeout must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}"
+            )
         for name, value in (
             ("max_memory_mb", max_memory_mb),
             ("max_output_bytes", max_output_bytes),
@@ -74,14 +85,28 @@ class JavaScriptSession:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        # pydeno refuses limits it cannot send to the worker (above 2**53 - 1), at the first call;
+        # refuse them here, where the mistake is made.
+        if max_memory_mb * 1024 * 1024 > _MAX_LIMIT:
+            raise ValueError(
+                f"max_memory_mb must be at most {_MAX_LIMIT // (1024 * 1024)}"
+            )
+        for name, value in (
+            ("max_output_bytes", max_output_bytes),
+            ("max_result_bytes", max_result_bytes),
+        ):
+            if value > _MAX_LIMIT:
+                raise ValueError(f"{name} must be at most {_MAX_LIMIT}")
         if sandbox not in ("require", "auto"):
             raise ValueError("sandbox must be 'require' or 'auto'")
+        if not isinstance(fresh_session_per_call, bool):
+            raise ValueError("fresh_session_per_call must be true or false")
         self.timeout = float(timeout)
         self.max_memory = max_memory_mb * 1024 * 1024
         self.max_output_bytes = max_output_bytes
         self.max_result_bytes = max_result_bytes
         self.sandbox = sandbox
-        self.fresh_session_per_call = bool(fresh_session_per_call)
+        self.fresh_session_per_call = fresh_session_per_call
         self._sandbox: Any = None
         self._lock = threading.Lock()
 

@@ -10,9 +10,8 @@
   `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
   unavailable, 5 other runtime failure, 6 result has no JSON form; the error and its `classify_error`
   kind go to stderr. Input is read up to 16 MiB (bounded, so `-f /dev/zero` cannot fill memory),
-  guest output is stripped of terminal control and bidi characters, and integers past 2^53 - 1
-  print as JSON strings. See
-  [`docs/guides/cli.md`](docs/guides/cli.md).
+  guest output is stripped of control, format and other invisible characters, and integers past
+  2^53 - 1 print as JSON strings. See [`docs/guides/cli.md`](docs/guides/cli.md).
 - **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
   (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
   code in an `AgentSandbox` session that keeps its state between calls and returns the
