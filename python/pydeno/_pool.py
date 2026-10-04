@@ -146,6 +146,7 @@ class _Entry:
         "lock",
         "owner",
         "persisting",
+        "quiet",
         "sandbox",
         "saved_size",
         "session_id",
@@ -175,6 +176,8 @@ class _Entry:
         self.dirty = False
         self.saved_size = -1
         self.persisting = False  # a `_persist` is in progress
+        self.quiet = asyncio.Event()  # set while no `_persist` is in progress
+        self.quiet.set()
 
     def mark_gone(self) -> None:
         self.gone = True
@@ -457,10 +460,12 @@ class SessionPool:
         without state that keeps the spent budget (`JournalTooLarge`). Any other failure leaves
         the session live and unevictable until a later `release` stores it."""
         entry.persisting = True
+        entry.quiet.clear()
         try:
             await self._persist_held(entry, sandbox)
         finally:
             entry.persisting = False
+            entry.quiet.set()
 
     async def _persist_held(self, entry: _Entry, sandbox: AsyncAgentSandbox) -> None:
         owner, session_id = entry.owner, entry.session_id
@@ -541,6 +546,11 @@ class SessionPool:
                 sandbox is not None
             ):  # first: it is out of the map, nothing else will close it
                 await sandbox.close()
+            if entry is not None:
+                # A release (or get) of the old entry may be writing right now: let it finish (it
+                # sees `dropped` after each write and stops) before emptying the store, so a write
+                # landing late cannot bring the dropped state back.
+                await entry.quiet.wait()
             counter = await self._stored_counter(owner, session_id)
             if entry is not None:
                 counter = max(counter, entry.counter)
@@ -634,10 +644,9 @@ class SessionPool:
         failures: list[str] = []
         for entry in entries:
             if entry.persisting:
-                # A release is storing it right now: let it finish.
-                await entry.lock.acquire()
-                entry.lock.release()
-                continue
+                # A release is storing it right now: let it finish, then store it here if
+                # that failed.
+                await entry.quiet.wait()
             sandbox = entry.sandbox
             if sandbox is None or entry.dropped or not entry.unsaved():
                 continue
@@ -870,7 +879,9 @@ async def _acquire(
     """Take the entry's lease. False (lease not taken) if the entry is dropped, evicted or the
     pool closed while waiting: the holder of a replaced entry may never release it."""
     lock = entry.lock
-    if not lock.locked():
+    if not lock.locked() and entry.waiters <= 1:
+        # Uncontended (never suspends). With others queued, the lease is being handed to one of
+        # them: queue behind them below, with the timeout and the wake-up on drop/close.
         await lock.acquire()
         return True
     if entry.gone:

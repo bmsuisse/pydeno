@@ -1488,6 +1488,38 @@ def pool_failed_release_budget_mismatch() -> bool:
     return _c_asyncio.run(go())
 
 
+@_c_probe
+def pool_queued_get_ignores_its_timeout() -> bool:
+    """A get that queues in the instant a lease is handed to an earlier waiter must still time
+    out (`acquire_timeout`) instead of waiting forever."""
+    from pydeno import InMemoryJournalStore, SessionPool
+
+    async def go() -> bool:
+        pool = SessionPool(
+            InMemoryJournalStore(), _C_KEY, {}, acquire_timeout=0.5, sandbox="require"
+        )
+        try:
+            await pool.get("o", "s")
+            b = _c_asyncio.ensure_future(pool.get("o", "s"))
+            await _c_asyncio.sleep(0.1)
+
+            async def again() -> object:
+                await pool.release("o", "s")
+                return await pool.get("o", "s")
+
+            a = _c_asyncio.ensure_future(again())
+            await _c_asyncio.wait_for(b, 5)
+            done, _ = await _c_asyncio.wait({a}, timeout=4)
+            if not done:
+                a.cancel()
+                return True
+            return False
+        finally:
+            await pool.close()
+
+    return _c_asyncio.run(go())
+
+
 # 4. text pydeno writes for the host ---------------------------------------------------------------------------
 @_c_probe
 def cli_prints_guest_terminal_escapes() -> bool:

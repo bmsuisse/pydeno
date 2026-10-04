@@ -133,7 +133,10 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
 - **`await pool.drop(owner, session_id)`** closes the session (killing a run in progress, even
   under someone else's lease), deletes its journal and advances its counter. A `get` of the session
   made while `drop` is at work waits for it and then starts a fresh session. The fresh session has
-  a fresh tool budget: `drop` is your decision to start over.
+  a fresh tool budget: `drop` is your decision to start over. `drop` closes the worker first, then
+  waits for a write of the session still in flight (a release storing it) before emptying the
+  store, so that write cannot bring the dropped state back; a networked store that applies a write
+  after the client gave up on it (a cancelled or timed-out request) can still slip one through.
 - **`pool.session(owner, session_id)`** is `get` + `release` as an `async with` block. The release
   also happens when the block raises: a JavaScript error leaves the session valid, and for a
   session whose worker died it stores the last good journal plus a `lost` record charging what the
@@ -157,6 +160,10 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
   with a fresh tool budget. Keep `ttl` at least as long as budgets must hold.
 
 ### Concurrency: serialised, or rejected with `SessionBusy`
+
+The pool sets no timeout on store calls: a store that never answers holds up the `get`, `release`,
+`drop` or `close()` waiting for it (and `get`s queued behind that lease, up to their own
+`acquire_timeout`). Give your store client its own timeouts.
 
 A session has at most one lease. A second `get` of a leased session **waits** for the release, up
 to `acquire_timeout` (default 30 s, per call `get(..., timeout=)`), then raises `SessionBusy`.
