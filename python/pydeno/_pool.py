@@ -24,6 +24,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import collections
+import collections.abc
 import contextlib
 import re
 import struct
@@ -163,7 +164,10 @@ class _Default:
 
 _DEFAULT: Any = _Default()
 
-ToolsFactory = Callable[[str, str], Mapping[str, Callable[..., Any]]]
+Tools = Mapping[str, Any] | collections.abc.Sequence[Any]
+ToolsFactory = Callable[[str, str], Tools]
+# Taken from the journal when a session is restored, so only given to new sessions.
+_NEW_ONLY = frozenset({"max_result_bytes"})
 
 
 class SessionPool:
@@ -173,9 +177,11 @@ class SessionPool:
         store: A `JournalStore` (`InMemoryJournalStore`, or your Redis/Valkey adapter).
         key: HMAC key for the journals (at least 16 bytes). Every process sharing the store needs
             the same key.
-        tools: ``name -> callable`` for every session, or ``(owner, session_id) -> mapping`` to give
-            each owner its own tools (closures over the owner's credentials, say). The names must
-            not change for a session's life: a stored journal only loads with the same names.
+        tools: The tools of every session, as `AgentSandbox` takes them (``name -> callable``,
+            ``name -> SchemaTool``, or a list of schema tools), or ``(owner, session_id) -> tools``
+            to give each owner its own (closures over the owner's credentials, say). The names
+            must not change for a session's life: a stored journal only loads with the same names.
+        tools_catalog: A lazy catalog of `SchemaTool`s for every session (see `AgentSandbox`).
         ttl: Seconds a stored journal lives after its last write, and (unless ``idle_timeout`` says
             otherwise) how long an unleased live session is kept.
         max_sessions: Live sessions in this process, at most. A new one evicts the least recently
@@ -203,8 +209,9 @@ class SessionPool:
         self,
         store: JournalStore,
         key: bytes,
-        tools: Mapping[str, Callable[..., Any]] | ToolsFactory,
+        tools: Tools | ToolsFactory,
         *,
+        tools_catalog: Tools | None = None,
         ttl: float | None = DEFAULT_TTL,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         max_per_owner: int | None = None,
@@ -222,9 +229,10 @@ class SessionPool:
             raise TypeError("store must be a JournalStore")
         if not isinstance(key, (bytes, bytearray)) or len(key) < 16:
             raise ValueError("key must be at least 16 bytes")
-        if not (callable(tools) or isinstance(tools, Mapping)):
+        if not (callable(tools) or _static_tools(tools)):
             raise TypeError(
-                "tools must be a mapping or a (owner, session_id) -> mapping"
+                "tools must be a mapping, a list of schema tools, or a "
+                "(owner, session_id) -> tools function"
             )
         if not isinstance(max_sessions, int) or max_sessions < 1:
             raise ValueError("max_sessions must be a positive int")
@@ -245,6 +253,7 @@ class SessionPool:
         self._store = store
         self._key = bytes(key)
         self._tools = tools
+        self._catalog = tools_catalog
         self._ttl = ttl
         self._idle_timeout = ttl if idle_timeout is _DEFAULT else idle_timeout
         self._max_sessions = max_sessions
@@ -258,7 +267,7 @@ class SessionPool:
         self._prefix = key_prefix
         self._options = sandbox_options
         # Validate the sandbox options now, not at the first `get` (constructing starts nothing).
-        if isinstance(tools, Mapping):
+        if _static_tools(tools):
             AsyncAgentSandbox(tools, **self._new_options())
         self._entries: collections.OrderedDict[tuple[str, str], _Entry] = (
             collections.OrderedDict()
@@ -305,9 +314,11 @@ class SessionPool:
         try:
             sandbox = entry.sandbox
             if sandbox is not None and sandbox.is_closed():
-                # Crashed, killed or timed out since its last lease: start again from the store.
+                # Crashed, killed or timed out since its last lease. Store what it still holds
+                # (its last good state, and what a lost run spent), then restore from that.
                 entry.sandbox = None
                 self._close_later(sandbox)
+                await self._persist(entry, sandbox)
             if entry.sandbox is None:
                 entry.sandbox = await self._restore(entry)
         except BaseException:
@@ -322,8 +333,10 @@ class SessionPool:
         """Persist the leased session's journal and end the lease.
 
         The journal is signed with ``associated_data=f"{owner}:{session_id}:{counter}"`` under
-        the next counter and written with the TTL. If the worker is gone, nothing is written and
-        the next `get` restores the last stored journal. If the journal outgrew
+        the next counter and written with the TTL. If the worker is gone (a crash, a timeout, a
+        cancelled run), the journal written is the one as of the last good run plus a ``lost``
+        record charging the tool calls the lost run made, and the next `get` restores that state
+        on a fresh worker. If the journal outgrew
         ``max_journal_bytes``, the session's live and stored state is dropped and
         `JournalTooLarge` is raised. The lease ends either way. A session that was dropped while
         leased is released without effect."""
@@ -338,40 +351,41 @@ class SessionPool:
             if entry.gone:
                 return
             sandbox = entry.sandbox
-            if sandbox is None or sandbox.is_closed():
-                entry.sandbox = None
-                if sandbox is not None:
-                    self._close_later(sandbox)
+            if sandbox is None:
                 return
-            counter = entry.counter + 1
-            try:
-                blob = await sandbox.dump(
-                    self._key, associated_data=_bound(owner, session_id, counter)
-                )
-            except JournalError as exc:
-                if sandbox.is_closed():  # died during the dump
-                    entry.sandbox = None
-                    self._close_later(sandbox)
-                    return
-                await self._drop_state(entry)
-                raise JournalTooLarge(
-                    f"session {owner}:{session_id} outgrew max_journal_bytes="
-                    f"{self._max_journal_bytes}; its state was dropped ({exc})"
-                ) from None
-            await self._store.set(
-                self._journal_key(owner, session_id),
-                _ENVELOPE + _COUNTER.pack(counter) + blob,
-                ttl=self._ttl,
-            )
-            await self._store.set(
-                self._counter_key(owner, session_id),
-                str(counter).encode(),
-                ttl=self._counter_ttl,
-            )
-            entry.counter = counter
+            await self._persist(entry, sandbox)
+            if sandbox.is_closed():
+                entry.sandbox = None
+                self._close_later(sandbox)
             entry.last_used = time.monotonic()
         finally:
             entry.lock.release()
+
+    async def _persist(self, entry: _Entry, sandbox: AsyncAgentSandbox) -> None:
+        """Dump `sandbox` under the next counter and store it (the lease is held)."""
+        owner, session_id = entry.owner, entry.session_id
+        counter = entry.counter + 1
+        try:
+            blob = await sandbox.dump(
+                self._key, associated_data=_bound(owner, session_id, counter)
+            )
+        except JournalError as exc:
+            await self._drop_state(entry, sandbox)
+            raise JournalTooLarge(
+                f"session {owner}:{session_id} outgrew max_journal_bytes="
+                f"{self._max_journal_bytes}; its state was dropped ({exc})"
+            ) from None
+        await self._store.set(
+            self._journal_key(owner, session_id),
+            _ENVELOPE + _COUNTER.pack(counter) + blob,
+            ttl=self._ttl,
+        )
+        await self._store.set(
+            self._counter_key(owner, session_id),
+            str(counter).encode(),
+            ttl=self._counter_ttl,
+        )
+        entry.counter = counter
 
     async def drop(self, owner: str, session_id: str) -> None:
         """Forget the session: close its worker (even if leased: a run in progress is killed),
@@ -509,18 +523,17 @@ class SessionPool:
     def _counter_key(self, owner: str, session_id: str) -> str:
         return f"{self._prefix}{owner}:{session_id}:counter"
 
-    def _tools_for(
-        self, owner: str, session_id: str
-    ) -> Mapping[str, Callable[..., Any]]:
-        if isinstance(self._tools, Mapping):
-            return self._tools
-        return self._tools(owner, session_id)
+    def _tools_for(self, owner: str, session_id: str) -> Tools:
+        if _static_tools(self._tools):
+            return self._tools  # type: ignore[return-value]
+        return self._tools(owner, session_id)  # type: ignore[operator]
 
     def _new_options(self) -> dict[str, Any]:
         return {
             **self._options,
             "max_tool_calls": self._max_tool_calls,
             "namespace": self._namespace,
+            "tools_catalog": self._catalog,
             "max_journal_bytes": self._max_journal_bytes,
         }
 
@@ -553,11 +566,12 @@ class SessionPool:
         # The counter in the envelope is only a claim; the signature binds the real one. (It may
         # be above the recorded counter if a writer died between writing the journal and the
         # counter: that journal is genuine and newer, so it is accepted.)
-        options = dict(self._options)
+        options = {k: v for k, v in self._options.items() if k not in _NEW_ONLY}
         sandbox = await AsyncAgentSandbox.load(
             raw[head:],
             self._key,
             tools,
+            tools_catalog=self._catalog,
             max_journal_bytes=self._max_journal_bytes,
             associated_data=_bound(owner, session_id, counter),
             **options,
@@ -565,10 +579,10 @@ class SessionPool:
         entry.counter = counter
         return sandbox
 
-    async def _drop_state(self, entry: _Entry) -> None:
+    async def _drop_state(self, entry: _Entry, sandbox: AsyncAgentSandbox) -> None:
         """The journal is over its cap: close the session, delete the stored journal and advance
         the counter (so the last stored, smaller journal cannot be loaded either)."""
-        sandbox, entry.sandbox = entry.sandbox, None
+        entry.sandbox = None
         owner, session_id = entry.owner, entry.session_id
         self._forget(entry)
         if sandbox is not None:
@@ -626,6 +640,13 @@ class SessionPool:
         if evicted:
             await asyncio.sleep(0)
         return evicted
+
+
+def _static_tools(tools: Any) -> bool:
+    return isinstance(tools, Mapping) or (
+        isinstance(tools, collections.abc.Sequence)
+        and not isinstance(tools, (str, bytes))
+    )
 
 
 def _check_id(value: Any, what: str) -> None:

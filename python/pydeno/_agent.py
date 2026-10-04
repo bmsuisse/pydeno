@@ -957,65 +957,35 @@ class _Core:
             self.thread.join(20)
 
 
-class AgentSandbox:
-    """A stateful, pausable JavaScript session for an AI agent, in an `IsolatedRuntime`.
+class _SessionBase:
+    """What `AgentSandbox` and `AsyncAgentSandbox` share: configuration, the journal (with its
+    checkpoint and ``lost`` records), answer checking, outcome bookkeeping, the prompt helpers and
+    the load checks. No I/O happens here; a subclass drives its worker (a loop thread, or the
+    caller's event loop) and provides `_core` with ``calls_made``, ``discovered``, ``closed``,
+    ``rt.is_closed()`` and ``shutdown()``."""
 
-    Args:
-        tools: ``name -> callable`` (sync or async), called with the guest's positional
-            arguments; or ``name -> SchemaTool`` (or a mapping with its keys, or a list of
-            them), a tool described by JSON Schema that takes ONE object argument and whose
-            callable gets it as a ``dict``. Names follow `ToolBridge`'s rules. Every call
-            returns a Promise in the guest.
-        max_tool_calls: Total tool calls the guest may make over the session's life (across
-            every `start`, `resume` and `run`); further calls throw a ``ToolBudgetError`` in the
-            guest. ``None``: unlimited. For a budget per tool, count inside the tool (see
-            ``docs/guides/agent-sessions.md``).
-        namespace: Install the tools on this global object (``tools.search(...)``) instead of
-            as bare globals.
-        tools_catalog: Many more `SchemaTool`s, declared lazily: only ``search_tools(query,
-            limit?)`` and ``describe_tool(name)`` are added to the declared tools, whatever the
-            catalog's size, and a catalog tool is called as ``<namespace or "tools">.<name>(args)``
-            once one of those two has returned it to the guest. Calling one before throws a
-            `ToolNotDiscoveredError` telling the guest to search first. Catalog calls are tool
-            calls like any other (`ToolCall` steps, the same budget).
-        clock: The guest's frozen clock (a `datetime`, naive meaning UTC, or epoch seconds).
-            Default: the moment the session is created. It never advances, and a loaded session
-            gets the recorded one, which is what makes replay deterministic.
-        random_seed: Seed for `Math.random` (default: a random one, recorded in the journal).
-        timeout: Hard limit, in seconds, on the guest's own running time per run. Time paused at
-            a tool call does not count. Exceeding it kills the worker and closes the session.
-        max_pause: Most time (seconds) one run may spend waiting on tool answers in total, so a
-            session nobody resumes does not hold a worker forever. Exceeding it closes the session.
-        max_journal_bytes: Cap on the recorded journal. Past it the session keeps working, but
-            `dump()` raises `JournalError`.
-        max_output_bytes: Cap on each of a run's `stdout` and `stderr` (console output, carried
-            by `Done`/`Failed` and `execute()`), in UTF-8 bytes; past it the stream ends with a
-            ``[truncated]`` line. Default 64 KiB.
-        max_result_bytes: Cap on a run's result as compact JSON. A larger result makes the run
-            `Failed` with ``error_type == "ResultTooLarge"``; the session stays usable. Default
-            1 MiB. Recorded in the journal (it decides outcomes, so replay needs the same one).
-        **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
-            ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
-            count the time paused at a tool call. ``config.on_console`` still gets every console
-            call (each one is a host call, counted by ``max_host_calls``).
-    """
+    _core: Any
+    _tools: dict[str, Any]
+    _catalog: dict[str, SchemaTool]
 
-    def __init__(
+    def _configure(
         self,
         tools: Mapping[str, Any] | collections.abc.Sequence[Any],
         *,
-        max_tool_calls: int | None = None,
-        namespace: str | None = None,
-        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
-        clock: datetime | float | int | None = None,
-        random_seed: int | None = None,
-        timeout: float | None = DEFAULT_TIMEOUT,
-        max_pause: float | None = DEFAULT_MAX_PAUSE,
-        max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
-        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
-        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
-        **runtime_options: Any,
-    ) -> None:
+        max_tool_calls: int | None,
+        namespace: str | None,
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None,
+        clock: datetime | float | int | None,
+        random_seed: int | None,
+        max_journal_bytes: int,
+        max_output_bytes: int,
+        max_result_bytes: int,
+        runtime_options: dict[str, Any],
+    ) -> tuple[RuntimeConfig, _ConsoleSink]:
+        """Validate the arguments and set up the session's state. Pops ``config`` from
+        `runtime_options`; returns the runtime config to start the worker with (its console goes
+        to the returned sink) ."""
+        who = type(self).__name__
         entries = _normalize_tools(tools)
         catalog = _normalize_catalog(tools_catalog)
         if max_tool_calls is not None and (
@@ -1051,7 +1021,7 @@ class AgentSandbox:
         owned = _OWNED_OPTIONS & runtime_options.keys()
         if owned:
             raise TypeError(
-                f"AgentSandbox sets {sorted(owned)} itself (use clock=, random_seed=, "
+                f"{who} sets {sorted(owned)} itself (use clock=, random_seed=, "
                 "timeout=, max_pause=)"
             )
         config = runtime_options.pop("config", None)
@@ -1061,8 +1031,8 @@ class AgentSandbox:
             raise TypeError("config must be a pydeno.RuntimeConfig")
         if config.timeout is not None:
             raise ValueError(
-                "RuntimeConfig.timeout is not supported by AgentSandbox: it would count the time "
-                "a run is paused at a tool call. Use AgentSandbox(timeout=...)."
+                f"RuntimeConfig.timeout is not supported by {who}: it would count the time "
+                f"a run is paused at a tool call. Use {who}(timeout=...)."
             )
         if clock is None:
             clock = datetime.now(timezone.utc)
@@ -1090,7 +1060,6 @@ class AgentSandbox:
         self._max_journal_bytes = max_journal_bytes
         self._max_output_bytes = max_output_bytes
         self._max_result_bytes = max_result_bytes
-        self._lock = threading.Lock()
         self._records: list[list[Any]] | None = []
         self._journal_size = 0
         # The journal as of the last run that ended with the worker alive: its length, and the
@@ -1111,63 +1080,7 @@ class AgentSandbox:
             inspector=config.inspector,
             snapshot=config.snapshot,
         )
-        rt = IsolatedRuntime(
-            rt_config,
-            clock=clock_ms / 1000,
-            random_seed=random_seed,
-            request_timeout=timeout,
-            max_host_wait=max_pause,
-            **runtime_options,
-        )
-        try:
-            self._core = _Core(
-                rt,
-                next(_SESSION_IDS),
-                max_tool_calls,
-                console=sink,
-                max_output_bytes=max_output_bytes,
-                max_result_bytes=max_result_bytes,
-                catalog=frozenset(catalog),
-            )
-        except BaseException:
-            rt.close()
-            raise
-        self._finalizer = weakref.finalize(self, self._core.shutdown)
-        try:
-            self._bind()
-        except BaseException:
-            self.close()
-            raise
-
-    def _bind(self) -> None:
-        core = self._core
-
-        def shim_for(name: str) -> Callable[..., Any]:
-            async def shim(*args: Any) -> Any:
-                return await core.on_tool_call(name, list(args))
-
-            shim.__name__ = name
-            return shim
-
-        shims = {name: shim_for(name) for name in self._tools}
-        if self._namespace is None:
-            for name, shim in shims.items():
-                core.rt.bind_function(name, shim)
-        elif shims:
-            core.rt.bind_object(self._namespace, shims)
-        if self._catalog:
-
-            async def catalog_call(name: Any = None, *args: Any) -> Any:
-                return await core.on_catalog_call(name, list(args))
-
-            core.rt.bind_function(_CATALOG_CALL, catalog_call)
-        core.rt.eval(
-            _prelude(
-                list(self._tools),
-                self._namespace,
-                self._catalog_ns if self._catalog else None,
-            )
-        )
+        return rt_config, sink
 
     # -- introspection -------------------------------------------------------
 
@@ -1241,6 +1154,348 @@ class AgentSandbox:
                 + "\n"
             )
         return text
+
+    # -- shared steps --------------------------------------------------------
+
+    def _check_usable(self) -> None:
+        if self._dead:
+            raise RuntimeError(
+                "the session's worker is gone (crashed, killed or timed out)"
+            )
+        if self._core.closed:
+            raise RuntimeError("the session is closed")
+
+    def _check_call(self, step: Any) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        """The callable and arguments the real tool for `step` is called with (`call`)."""
+        if not isinstance(step, ToolCall) or step.name not in self._tools.keys() | set(
+            self._catalog
+        ):
+            raise TypeError("call() takes a ToolCall from this session")
+        tool = self._tools.get(step.name) or self._catalog[step.name]
+        if isinstance(tool, SchemaTool):
+            return tool.callable, (_schema_argument(step),)
+        return tool, step.args
+
+    @staticmethod
+    def _check_result(call: ToolCall, result: Any) -> Any:
+        try:
+            _encode(result)
+        except TypeError as exc:
+            raise TypeError(
+                f"tool {call.name!r} returned a value the sandbox cannot hold"
+            ) from exc
+        return result
+
+    def _answer(
+        self, step: ToolCall, value: Any, error: BaseException | None
+    ) -> tuple[Any, BaseException | None]:
+        """Check an answer to the paused call and record it; returns what to send (a value, or
+        an error), exactly what a replay of the record will send."""
+        if not isinstance(step, ToolCall):
+            raise TypeError("resume() takes the ToolCall the session is paused at")
+        self._check_usable()
+        if (
+            self._paused is None
+            or step._session != self._core.session_id  # noqa: SLF001
+            or step.call_id != self._paused.call_id
+        ):
+            raise RuntimeError(
+                "that tool call is not the one this session is paused at"
+            )
+        if (value is _MISSING) == (error is None):
+            raise TypeError("resume() takes exactly one of value= or error=")
+        sent_value: Any = None
+        sent: BaseException | None = None
+        if error is not None:
+            if not isinstance(error, Exception):
+                raise TypeError("error must be an Exception instance")
+            name = type(error).__name__
+            public = getattr(error, "_pydeno_public", False) is True
+            message = (
+                "host function failed" if self._redact and not public else str(error)
+            )
+            record = ["ans", "e", name, message]
+            sent = _error_class(name)(message)
+            # Redaction was decided just above (and recorded); the runtime must not redo it.
+            sent._pydeno_public = True  # type: ignore[attr-defined]
+        else:
+            # A TypeError here is the caller's to fix; nothing has been answered yet.
+            encoded = _encode(value)
+            record = ["ans", "v", encoded]
+            sent_value = _decode(encoded)  # exactly what a replay will send
+            if self._catalog and step.name in (_SEARCH, _DESCRIBE):
+                # Before the answer is delivered, so the guest can call what it just found. From
+                # the answer itself (live and on replay alike), not from who produced it.
+                self._core.discovered.update(_found(sent_value, self._catalog))
+        self._record(record)
+        self._paused = None
+        return sent_value, sent
+
+    def _observe(self, step: Step) -> Step:
+        kind, digest = _outcome(step)
+        self._record(["obs", kind, digest])
+        if isinstance(step, ToolCall):
+            self._paused = step
+        else:
+            self._paused = None
+            if self._core.rt.is_closed():
+                # The worker is gone (crash, hard timeout, memory kill, `max_pause`): nothing
+                # more can run, so give its resources back now rather than at `close()`.
+                # `dump()` cuts this run off at the last checkpoint, keeping what it spent.
+                self._mark_dead(_lost_reason(step))
+                self._core.shutdown()
+            elif self._records is not None:
+                self._checkpoint = len(self._records)
+                self._checkpoint_calls = self._core.calls_made
+        return step
+
+    def _mark_dead(self, reason: str | None) -> None:
+        """The worker is gone. With a `reason`, a run was in progress: `dump()` replaces it with a
+        ``lost`` record carrying the tool calls it made (dying refunds nothing)."""
+        if self._dead:
+            return
+        self._dead = True
+        self._paused = None
+        if reason is not None:
+            self._lost = [
+                "lost",
+                min(self._core.calls_made - self._checkpoint_calls, _MAX_LOST_CALLS),
+                reason if _SAFE_ERROR_NAME.fullmatch(reason) else "Error",
+            ]
+
+    def _record(self, record: list[Any]) -> None:
+        if self._records is None:
+            return
+        self._journal_size += len(json.dumps(record, separators=(",", ":")))
+        if self._journal_size > self._max_journal_bytes:
+            self._records = None  # free it; `dump` explains
+            return
+        self._records.append(record)
+
+    def _replay_lost(self, record: list[Any]) -> None:
+        """A run the worker died in, left out of the journal: only what it spent of the tool
+        budget is carried over."""
+        self._core.calls_made += record[1]
+        self._lost_runs += 1
+        self._record(record)
+        if self._records is not None:
+            self._checkpoint = len(self._records)
+            self._checkpoint_calls = self._core.calls_made
+
+    # -- durability ----------------------------------------------------------
+
+    def _journal(self) -> tuple[dict[str, Any], list[list[Any]]]:
+        """The config and records `dump()` signs (see `AgentSandbox.dump`)."""
+        if self._records is None:
+            raise JournalError(
+                f"the journal grew past max_journal_bytes={self._max_journal_bytes}"
+            )
+        records = self._records
+        if self._dead:
+            records = records[: self._checkpoint] + (
+                [self._lost] if self._lost is not None else []
+            )
+        config: dict[str, Any] = {
+            "clock_ms": self._clock_ms,
+            "random_seed": self._random_seed,
+            "max_tool_calls": self._max_tool_calls,
+            "namespace": self._namespace,
+            "tools": list(self._tools),
+            "release": _engine_version().decode(errors="replace"),
+            "redact": self._redact,
+        }
+        # Only when they differ from what a journal without them means, so a session that
+        # uses neither writes exactly the journal it always did.
+        if self._max_result_bytes != DEFAULT_MAX_RESULT_BYTES:
+            config["max_result_bytes"] = self._max_result_bytes
+        if self._catalog:
+            config["catalog"] = list(self._catalog)
+        return config, list(records)
+
+    @staticmethod
+    def _load_arguments(
+        journal: dict[str, Any],
+        tools: Mapping[str, Any] | collections.abc.Sequence[Any],
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None,
+        max_journal_bytes: int,
+        options: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """`load`'s checks, before any worker starts: (tools, constructor keyword arguments)."""
+        config = journal["config"]
+        made_by = _engine_version().decode(errors="replace")
+        if config["release"] != made_by:
+            # Before any worker starts: replaying under another engine would only fail later, as
+            # a divergence, after running the guest's code.
+            raise JournalError(
+                f"the journal was recorded by pydeno {config['release']!r}, this is {made_by!r}"
+            )
+        if bool(options.get("redact_host_errors", True)) != config["redact"]:
+            raise JournalError(
+                "the journal was recorded with a different redact_host_errors setting"
+            )
+        entries = _normalize_tools(tools)
+        catalog = _normalize_catalog(tools_catalog)
+        names = list(entries) + ([_SEARCH, _DESCRIBE] if catalog else [])
+        if names != config["tools"]:
+            raise JournalError(
+                f"the journal was recorded with tools {config['tools']}, not {names}"
+            )
+        if list(catalog) != config.get("catalog", []):
+            raise JournalError(
+                "the journal was recorded with a different tools_catalog "
+                f"({len(config.get('catalog', []))} tools, not {len(catalog)})"
+            )
+        for owned in (
+            "clock",
+            "random_seed",
+            "max_tool_calls",
+            "namespace",
+            "max_result_bytes",
+        ):
+            if owned in options:
+                raise TypeError(f"{owned} comes from the journal")
+        return entries, {
+            "max_tool_calls": config["max_tool_calls"],
+            "namespace": config["namespace"],
+            "tools_catalog": catalog or None,
+            "clock": config["clock_ms"] / 1000,
+            "random_seed": config["random_seed"],
+            "max_journal_bytes": max_journal_bytes,
+            "max_result_bytes": config.get(
+                "max_result_bytes", DEFAULT_MAX_RESULT_BYTES
+            ),
+        }
+
+
+class AgentSandbox(_SessionBase):
+    """A stateful, pausable JavaScript session for an AI agent, in an `IsolatedRuntime`.
+
+    Args:
+        tools: ``name -> callable`` (sync or async), called with the guest's positional
+            arguments; or ``name -> SchemaTool`` (or a mapping with its keys, or a list of
+            them), a tool described by JSON Schema that takes ONE object argument and whose
+            callable gets it as a ``dict``. Names follow `ToolBridge`'s rules. Every call
+            returns a Promise in the guest.
+        max_tool_calls: Total tool calls the guest may make over the session's life (across
+            every `start`, `resume` and `run`); further calls throw a ``ToolBudgetError`` in the
+            guest. ``None``: unlimited. For a budget per tool, count inside the tool (see
+            ``docs/guides/agent-sessions.md``).
+        namespace: Install the tools on this global object (``tools.search(...)``) instead of
+            as bare globals.
+        tools_catalog: Many more `SchemaTool`s, declared lazily: only ``search_tools(query,
+            limit?)`` and ``describe_tool(name)`` are added to the declared tools, whatever the
+            catalog's size, and a catalog tool is called as ``<namespace or "tools">.<name>(args)``
+            once one of those two has returned it to the guest. Calling one before throws a
+            `ToolNotDiscoveredError` telling the guest to search first. Catalog calls are tool
+            calls like any other (`ToolCall` steps, the same budget).
+        clock: The guest's frozen clock (a `datetime`, naive meaning UTC, or epoch seconds).
+            Default: the moment the session is created. It never advances, and a loaded session
+            gets the recorded one, which is what makes replay deterministic.
+        random_seed: Seed for `Math.random` (default: a random one, recorded in the journal).
+        timeout: Hard limit, in seconds, on the guest's own running time per run. Time paused at
+            a tool call does not count. Exceeding it kills the worker and closes the session.
+        max_pause: Most time (seconds) one run may spend waiting on tool answers in total, so a
+            session nobody resumes does not hold a worker forever. Exceeding it closes the session.
+        max_journal_bytes: Cap on the recorded journal. Past it the session keeps working, but
+            `dump()` raises `JournalError`.
+        max_output_bytes: Cap on each of a run's `stdout` and `stderr` (console output, carried
+            by `Done`/`Failed` and `execute()`), in UTF-8 bytes; past it the stream ends with a
+            ``[truncated]`` line. Default 64 KiB.
+        max_result_bytes: Cap on a run's result as compact JSON. A larger result makes the run
+            `Failed` with ``error_type == "ResultTooLarge"``; the session stays usable. Default
+            1 MiB. Recorded in the journal (it decides outcomes, so replay needs the same one).
+        **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
+            ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
+            count the time paused at a tool call. ``config.on_console`` still gets every console
+            call (each one is a host call, counted by ``max_host_calls``).
+    """
+
+    def __init__(
+        self,
+        tools: Mapping[str, Any] | collections.abc.Sequence[Any],
+        *,
+        max_tool_calls: int | None = None,
+        namespace: str | None = None,
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
+        clock: datetime | float | int | None = None,
+        random_seed: int | None = None,
+        timeout: float | None = DEFAULT_TIMEOUT,
+        max_pause: float | None = DEFAULT_MAX_PAUSE,
+        max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+        **runtime_options: Any,
+    ) -> None:
+        rt_config, sink = self._configure(
+            tools,
+            max_tool_calls=max_tool_calls,
+            namespace=namespace,
+            tools_catalog=tools_catalog,
+            clock=clock,
+            random_seed=random_seed,
+            max_journal_bytes=max_journal_bytes,
+            max_output_bytes=max_output_bytes,
+            max_result_bytes=max_result_bytes,
+            runtime_options=runtime_options,
+        )
+        self._lock = threading.Lock()
+        rt = IsolatedRuntime(
+            rt_config,
+            clock=self._clock_ms / 1000,
+            random_seed=self._random_seed,
+            request_timeout=timeout,
+            max_host_wait=max_pause,
+            **runtime_options,
+        )
+        try:
+            self._core = _Core(
+                rt,
+                next(_SESSION_IDS),
+                max_tool_calls,
+                console=sink,
+                max_output_bytes=max_output_bytes,
+                max_result_bytes=max_result_bytes,
+                catalog=frozenset(self._catalog),
+            )
+        except BaseException:
+            rt.close()
+            raise
+        self._finalizer = weakref.finalize(self, self._core.shutdown)
+        try:
+            self._bind()
+        except BaseException:
+            self.close()
+            raise
+
+    def _bind(self) -> None:
+        core = self._core
+
+        def shim_for(name: str) -> Callable[..., Any]:
+            async def shim(*args: Any) -> Any:
+                return await core.on_tool_call(name, list(args))
+
+            shim.__name__ = name
+            return shim
+
+        shims = {name: shim_for(name) for name in self._tools}
+        if self._namespace is None:
+            for name, shim in shims.items():
+                core.rt.bind_function(name, shim)
+        elif shims:
+            core.rt.bind_object(self._namespace, shims)
+        if self._catalog:
+
+            async def catalog_call(name: Any = None, *args: Any) -> Any:
+                return await core.on_catalog_call(name, list(args))
+
+            core.rt.bind_function(_CATALOG_CALL, catalog_call)
+        core.rt.eval(
+            _prelude(
+                list(self._tools),
+                self._namespace,
+                self._catalog_ns if self._catalog else None,
+            )
+        )
 
     # -- running -------------------------------------------------------------
 
@@ -1325,10 +1580,7 @@ class AgentSandbox:
         """Run the real tool for a `ToolCall` (what `run` does for each one) and return its
         result, or raise what it raised; answer the guest with `resume`. For a driver of
         `start`/`resume` that wants some calls (``search_tools``, say) handled as usual."""
-        if not isinstance(step, ToolCall) or step.name not in self._tools.keys() | set(
-            self._catalog
-        ):
-            raise TypeError("call() takes a ToolCall from this session")
+        self._check_call(step)
         if threading.current_thread() is self._core.thread:
             raise RuntimeError(
                 "an AgentSandbox cannot be driven from one of its own tools"
@@ -1336,32 +1588,15 @@ class AgentSandbox:
         return self._call_tool(step)
 
     def _call_tool(self, call: ToolCall) -> Any:
-        tool = self._tools.get(call.name) or self._catalog[call.name]
-        if isinstance(tool, SchemaTool):
-            result = tool.callable(_schema_argument(call))
-        else:
-            result = tool(*call.args)
+        fn, args = self._check_call(call)
+        result = fn(*args)
         if inspect.isawaitable(result):
 
             async def wait() -> Any:
                 return await result
 
             result = self._core.on_loop(wait())
-        try:
-            _encode(result)
-        except TypeError as exc:
-            raise TypeError(
-                f"tool {call.name!r} returned a value the sandbox cannot hold"
-            ) from exc
-        return result
-
-    def _check_usable(self) -> None:
-        if self._dead:
-            raise RuntimeError(
-                "the session's worker is gone (crashed, killed or timed out)"
-            )
-        if self._core.closed:
-            raise RuntimeError("the session is closed")
+        return self._check_result(call, result)
 
     def _start(self, code: str) -> Step:
         if not isinstance(code, str):
@@ -1382,86 +1617,11 @@ class AgentSandbox:
         return self._observe(core.next_step(run))
 
     def _resume(self, step: ToolCall, value: Any, error: BaseException | None) -> Step:
-        if not isinstance(step, ToolCall):
-            raise TypeError("resume() takes the ToolCall the session is paused at")
-        self._check_usable()
-        if (
-            self._paused is None
-            or step._session != self._core.session_id  # noqa: SLF001
-            or step.call_id != self._paused.call_id
-        ):
-            raise RuntimeError(
-                "that tool call is not the one this session is paused at"
-            )
-        if (value is _MISSING) == (error is None):
-            raise TypeError("resume() takes exactly one of value= or error=")
-        if error is not None:
-            if not isinstance(error, Exception):
-                raise TypeError("error must be an Exception instance")
-            name = type(error).__name__
-            public = getattr(error, "_pydeno_public", False) is True
-            message = (
-                "host function failed" if self._redact and not public else str(error)
-            )
-            record = ["ans", "e", name, message]
-            sent: BaseException = _error_class(name)(message)
-            # Redaction was decided just above (and recorded); the runtime must not redo it.
-            sent._pydeno_public = True  # type: ignore[attr-defined]
-        else:
-            # A TypeError here is the caller's to fix; nothing has been answered yet.
-            encoded = _encode(value)
-            record = ["ans", "v", encoded]
-            sent_value = _decode(encoded)  # exactly what a replay will send
-            if self._catalog and step.name in (_SEARCH, _DESCRIBE):
-                # Before the answer is delivered, so the guest can call what it just found. From
-                # the answer itself (live and on replay alike), not from who produced it.
-                self._core.discovered.update(_found(sent_value, self._catalog))
-        self._record(record)
+        sent_value, sent = self._answer(step, value, error)
         run = self._run
         assert run is not None
-        self._paused = None
-        self._core.call_on_loop(
-            self._core.answer,
-            run,
-            step.call_id,
-            None if error is not None else sent_value,
-            sent if error is not None else None,
-        )
+        self._core.call_on_loop(self._core.answer, run, step.call_id, sent_value, sent)
         return self._observe(self._core.next_step(run))
-
-    def _observe(self, step: Step) -> Step:
-        kind, digest = _outcome(step)
-        self._record(["obs", kind, digest])
-        if isinstance(step, ToolCall):
-            self._paused = step
-        else:
-            self._paused = None
-            if self._core.rt.is_closed():
-                # The worker is gone (crash, hard timeout, memory kill, `max_pause`): nothing
-                # more can run, so give back the thread now rather than at `close()`. `dump()`
-                # cuts this run off at the last checkpoint, keeping what it spent of the budget.
-                self._dead = True
-                self._lost = [
-                    "lost",
-                    min(
-                        self._core.calls_made - self._checkpoint_calls, _MAX_LOST_CALLS
-                    ),
-                    _lost_reason(step),
-                ]
-                self._core.shutdown()
-            elif self._records is not None:
-                self._checkpoint = len(self._records)
-                self._checkpoint_calls = self._core.calls_made
-        return step
-
-    def _record(self, record: list[Any]) -> None:
-        if self._records is None:
-            return
-        self._journal_size += len(json.dumps(record, separators=(",", ":")))
-        if self._journal_size > self._max_journal_bytes:
-            self._records = None  # free it; `dump` explains
-            return
-        self._records.append(record)
 
     # -- durability ----------------------------------------------------------
 
@@ -1485,35 +1645,8 @@ class AgentSandbox:
         did run, with their side effects; a loaded session does not know about them."""
         self._enter()
         try:
-            if self._records is None:
-                raise JournalError(
-                    f"the journal grew past max_journal_bytes={self._max_journal_bytes}"
-                )
-            records = self._records
-            if self._dead:
-                assert self._lost is not None
-                records = records[: self._checkpoint] + [self._lost]
-            config: dict[str, Any] = {
-                "clock_ms": self._clock_ms,
-                "random_seed": self._random_seed,
-                "max_tool_calls": self._max_tool_calls,
-                "namespace": self._namespace,
-                "tools": list(self._tools),
-                "release": _engine_version().decode(errors="replace"),
-                "redact": self._redact,
-            }
-            # Only when they differ from what a journal without them means, so a session that
-            # uses neither writes exactly the journal it always did.
-            if self._max_result_bytes != DEFAULT_MAX_RESULT_BYTES:
-                config["max_result_bytes"] = self._max_result_bytes
-            if self._catalog:
-                config["catalog"] = list(self._catalog)
-            payload = json.dumps(
-                {"format": _JOURNAL_FORMAT, "config": config, "records": records},
-                separators=(",", ":"),
-                ensure_ascii=True,
-            ).encode()
-            return _seal(payload, key, associated_data)
+            config, records = self._journal()
+            return _seal_journal(config, records, key, associated_data)
         finally:
             self._lock.release()
 
@@ -1537,55 +1670,11 @@ class AgentSandbox:
         ``tools_catalog`` (by name) and the same runtime options as the original. Raises `JournalError` for a blob that is
         not authentic or not well-formed, and `ReplayDivergence` (closing the new session) if
         the guest does not behave exactly as recorded."""
-        if not isinstance(blob, (bytes, bytearray)):
-            raise TypeError("blob must be bytes")
-        if len(blob) > max_journal_bytes * 2 + len(_MAGIC) + _MAC_LEN + 4096:
-            raise JournalError("journal is larger than max_journal_bytes allows")
-        journal = _parse(_open(bytes(blob), key, associated_data))
-        config = journal["config"]
-        made_by = _engine_version().decode(errors="replace")
-        if config["release"] != made_by:
-            # Before any worker starts: replaying under another engine would only fail later, as
-            # a divergence, after running the guest's code.
-            raise JournalError(
-                f"the journal was recorded by pydeno {config['release']!r}, this is {made_by!r}"
-            )
-        if bool(options.get("redact_host_errors", True)) != config["redact"]:
-            raise JournalError(
-                "the journal was recorded with a different redact_host_errors setting"
-            )
-        entries = _normalize_tools(tools)
-        catalog = _normalize_catalog(tools_catalog)
-        names = list(entries) + ([_SEARCH, _DESCRIBE] if catalog else [])
-        if names != config["tools"]:
-            raise JournalError(
-                f"the journal was recorded with tools {config['tools']}, not {names}"
-            )
-        if list(catalog) != config.get("catalog", []):
-            raise JournalError(
-                "the journal was recorded with a different tools_catalog "
-                f"({len(config.get('catalog', []))} tools, not {len(catalog)})"
-            )
-        for owned in (
-            "clock",
-            "random_seed",
-            "max_tool_calls",
-            "namespace",
-            "max_result_bytes",
-        ):
-            if owned in options:
-                raise TypeError(f"{owned} comes from the journal")
-        session = cls(
-            entries,
-            max_tool_calls=config["max_tool_calls"],
-            namespace=config["namespace"],
-            tools_catalog=catalog or None,
-            clock=config["clock_ms"] / 1000,
-            random_seed=config["random_seed"],
-            max_journal_bytes=max_journal_bytes,
-            max_result_bytes=config.get("max_result_bytes", DEFAULT_MAX_RESULT_BYTES),
-            **options,
+        journal = _open_journal(blob, key, associated_data, max_journal_bytes)
+        entries, arguments = cls._load_arguments(
+            journal, tools, tools_catalog, max_journal_bytes, options
         )
+        session = cls(entries, **arguments, **options)
         try:
             session._replay(journal["records"])
         except (ValueError, TypeError, OverflowError) as exc:
@@ -1597,68 +1686,21 @@ class AgentSandbox:
         return session
 
     def _replay(self, records: list[list[Any]]) -> None:
+        plan = _replay_plan(records)
         step: Step | None = None
-        # The input (a run's code, or a tool answer) that produces the next recorded outcome.
-        pending: tuple[str, Any] | None = None
-        for index, record in enumerate(records):
-            op = record[0]
-            if op == "lost":
-                # A run the worker died in, left out of the journal: only what it spent of the
-                # tool budget is carried over.
-                if pending is not None or isinstance(step, ToolCall):
-                    raise JournalError(
-                        f"record {index}: a lost run in the middle of another one"
-                    )
-                self._core.calls_made += record[1]
-                self._lost_runs += 1
-                self._record(record)
-                if self._records is not None:
-                    self._checkpoint = len(self._records)
-                    self._checkpoint_calls = self._core.calls_made
-                continue
-            if op == "run":
-                if pending is not None or isinstance(step, ToolCall):
-                    raise JournalError(
-                        f"record {index}: a run starts before the last one ended"
-                    )
-                pending = ("run", record[1])
-            elif op == "ans":
-                if pending is not None or not isinstance(step, ToolCall):
-                    raise JournalError(
-                        f"record {index}: an answer with no tool call to answer"
-                    )
-                pending = ("ans", record)
-            else:  # "obs"
-                if pending is None:
-                    raise JournalError(
-                        f"record {index}: an outcome with no input before it"
-                    )
-                kind, input_ = pending
-                pending = None
-                if kind == "run":
-                    step = self._start(input_)
+        try:
+            request = next(plan)
+            while True:
+                if request[0] == "lost":
+                    self._replay_lost(request[1])
+                    step = None
+                elif request[0] == "run":
+                    step = self._start(request[1])
                 else:
-                    assert isinstance(step, ToolCall)
-                    if input_[1] == "v":
-                        step = self._resume(step, _decode(input_[2]), None)
-                    else:
-                        step = self._resume(
-                            step, _MISSING, _error_class(input_[2])(input_[3])
-                        )
-                got_kind, got_digest = _outcome(step)
-                if (got_kind, got_digest) != (record[1], record[2]):
-                    detail = (
-                        f"{got_kind} {step.name!r}"
-                        if isinstance(step, ToolCall)
-                        else got_kind
-                    )
-                    raise ReplayDivergence(
-                        f"replay diverged at journal record {index}: recorded a {record[1]}, "
-                        f"got a different {detail} (the guest read something nondeterministic, "
-                        "or the journal does not belong to this code and these tools)"
-                    )
-        if pending is not None:
-            raise JournalError("the journal ends with an input that has no outcome")
+                    step = self._resume(request[1], request[2], request[3])
+                request = plan.send(step)  # type: ignore[arg-type]
+        except StopIteration:
+            return
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1678,6 +1720,101 @@ class AgentSandbox:
     def __repr__(self) -> str:
         state = "closed" if self.is_closed() else "paused" if self._paused else "idle"
         return f"AgentSandbox(tools={list(self._tools)!r}, {state}, calls={self.calls_made})"
+
+
+def _replay_plan(
+    records: list[list[Any]],
+) -> collections.abc.Generator[tuple[Any, ...], Step | None, None]:
+    """A journal's records as the inputs to replay, for any driver (a thread, an event loop).
+
+    Yields ``("lost", record)`` (charge the lost run's tool calls; send None back),
+    ``("run", code)`` or ``("ans", tool_call, value, error)`` (apply it; send back the step it
+    produced). Checks the records' order and raises `ReplayDivergence` at the first outcome that
+    differs from the recorded one."""
+    step: Step | None = None
+    # The input (a run's code, or a tool answer) that produces the next recorded outcome.
+    pending: tuple[str, Any] | None = None
+    for index, record in enumerate(records):
+        op = record[0]
+        if op == "lost":
+            if pending is not None or isinstance(step, ToolCall):
+                raise JournalError(
+                    f"record {index}: a lost run in the middle of another one"
+                )
+            yield ("lost", record)
+            step = None
+            continue
+        if op == "run":
+            if pending is not None or isinstance(step, ToolCall):
+                raise JournalError(
+                    f"record {index}: a run starts before the last one ended"
+                )
+            pending = ("run", record[1])
+        elif op == "ans":
+            if pending is not None or not isinstance(step, ToolCall):
+                raise JournalError(
+                    f"record {index}: an answer with no tool call to answer"
+                )
+            pending = ("ans", record)
+        else:  # "obs"
+            if pending is None:
+                raise JournalError(
+                    f"record {index}: an outcome with no input before it"
+                )
+            kind, input_ = pending
+            pending = None
+            if kind == "run":
+                step = yield ("run", input_)
+            else:
+                assert isinstance(step, ToolCall)
+                if input_[1] == "v":
+                    step = yield ("ans", step, _decode(input_[2]), None)
+                else:
+                    # The recorded message is already the redacted one (or a public one): the
+                    # replay must not redact it a second time, or it diverges from the live run.
+                    recorded = _error_class(input_[2])(input_[3])
+                    recorded._pydeno_public = True  # type: ignore[attr-defined]
+                    step = yield ("ans", step, _MISSING, recorded)
+            assert step is not None
+            got_kind, got_digest = _outcome(step)
+            if (got_kind, got_digest) != (record[1], record[2]):
+                detail = (
+                    f"{got_kind} {step.name!r}"
+                    if isinstance(step, ToolCall)
+                    else got_kind
+                )
+                raise ReplayDivergence(
+                    f"replay diverged at journal record {index}: recorded a {record[1]}, "
+                    f"got a different {detail} (the guest read something nondeterministic, "
+                    "or the journal does not belong to this code and these tools)"
+                )
+    if pending is not None:
+        raise JournalError("the journal ends with an input that has no outcome")
+
+
+def _seal_journal(
+    config: dict[str, Any],
+    records: list[list[Any]],
+    key: bytes,
+    associated_data: bytes,
+) -> bytes:
+    payload = json.dumps(
+        {"format": _JOURNAL_FORMAT, "config": config, "records": records},
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode()
+    return _seal(payload, key, associated_data)
+
+
+def _open_journal(
+    blob: bytes, key: bytes, associated_data: bytes, max_journal_bytes: int
+) -> dict[str, Any]:
+    """Size-check, authenticate and parse a journal (before any worker starts)."""
+    if not isinstance(blob, (bytes, bytearray)):
+        raise TypeError("blob must be bytes")
+    if len(blob) > max_journal_bytes * 2 + len(_MAGIC) + _MAC_LEN + 4096:
+        raise JournalError("journal is larger than max_journal_bytes allows")
+    return _parse(_open(bytes(blob), key, associated_data))
 
 
 def _prelude(
