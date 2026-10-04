@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.1 — 2026-10-04
+
+Hotfix.
+
+### Fixed
+
+- **macOS: the sandboxed worker aborted at start on Python 3.10, 3.11 and 3.12** (`LowLevelAlloc
+  arithmetic overflow`, SIGABRT). V8's allocator reads the page size through a sysctl, which the
+  Seatbelt profile denied; Python 3.13+ happens to have read it already. The profile now allows exactly one
+  read-only name, `hw.pagesize_compat`. Nothing else about the sandbox changes.
+- When the idle watchdog killed a worker for exceeding `max_memory` or the thread cap, the caller
+  could see a bare `killed by SIGKILL` instead of the reason. The reason is now kept.
+
 ## 0.6.0 — 2026-10-03
 
 Sandbox hardening round 2 (independent review by three models and Copilot, plus prior-art research),
