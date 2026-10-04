@@ -83,6 +83,7 @@ collect_ignore = (
         "test_front_door_isolation.py",
         "test_front_door_budgets.py",
         "test_front_door_refusals.py",
+        "test_redteam_boundary.py",
     ]
     if sys.platform == "win32"
     else []
