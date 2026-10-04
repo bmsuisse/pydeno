@@ -708,3 +708,122 @@ def test_a_refused_bind_does_not_keep_its_handler(make_rt, path: str) -> None:
     del handler
     gc.collect()
     assert ref() is None
+
+
+# ---------------------------------------------------------------------------------------------
+# Third follow-up review.
+# ---------------------------------------------------------------------------------------------
+
+# deno_core also reads `Symbol.for('errorAdditionalPropertyKeys')` from a thrown error, through the
+# prototype chain, then each listed key and its `toString()`. On the refusal error that ran guest
+# code inside the host's bind; a looping getter blocked `bind_object` for good, since no deadline
+# covers a bind.
+_EXTRA_KEYS_POISON = (
+    "globalThis.hits = [];"
+    "Object.defineProperty(Error.prototype, Symbol.for('errorAdditionalPropertyKeys'), "
+    "{get() { hits.push('keys'); return ['zzz'] }, configurable: true});"
+    "Object.defineProperty(Error.prototype, 'zzz', "
+    "{get() { hits.push('get'); return {toString() { hits.push('toString'); return 'x' }} },"
+    " configurable: true});"
+    "globalThis.tools = new Proxy({}, {});"
+    "Object.defineProperty(globalThis, 'lookup', {get() {}, configurable: true}); 0"
+)
+
+
+@pytest.mark.parametrize("path", ["bind_object", "bind_function"])
+def test_a_refused_bind_does_not_read_additional_error_keys(make_rt, path: str) -> None:
+    rt = make_rt()
+    rt.eval(_EXTRA_KEYS_POISON)
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        if path == "bind_object":
+            rt.bind_object("tools", {"f": lambda: 1})
+        else:
+            rt.bind_function("lookup", lambda: 1)
+    assert rt.eval("hits") == []
+
+
+_LOOPING_KEYS = (
+    "Object.defineProperty(Error.prototype, Symbol.for('errorAdditionalPropertyKeys'), "
+    "{get() { for (;;) {} }, configurable: true});"
+    "globalThis.tools = new Proxy({}, {}); 0"
+)
+
+_HANG_SCRIPT = textwrap.dedent(
+    """
+    from pydeno import Runtime, RuntimeConfig
+    rt = Runtime(RuntimeConfig(timeout=2.0))
+    rt.eval({setup!r})
+    try:
+        rt.bind_object("tools", {{"f": lambda: 1}})
+    except Exception as exc:
+        print("refused" if "Cannot bind 'tools'" in str(exc) else "other: " + str(exc))
+    else:
+        print("not refused")
+    """
+)
+
+
+def test_a_looping_getter_cannot_stall_a_bind_on_runtime() -> None:
+    import time
+
+    start = time.monotonic()
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", _HANG_SCRIPT.format(setup=_LOOPING_KEYS)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError("bind_object was still blocked after 30 s") from None
+    assert done.stdout.strip() == "refused", (done.stdout, done.stderr[-400:])
+    assert time.monotonic() - start < 20
+
+
+def test_a_looping_getter_cannot_stall_a_bind_on_the_isolated_worker() -> None:
+    import time
+
+    with IsolatedRuntime(RuntimeConfig(timeout=3.0)) as rt:
+        rt.eval(_LOOPING_KEYS)
+        start = time.monotonic()
+        with pytest.raises(Exception, match=_BIND_REFUSED):
+            rt.bind_object("tools", {"f": lambda: 1})
+        assert (
+            time.monotonic() - start < 2.5
+        )  # promptly, not by running into the deadline
+        assert rt.eval("1 + 1") == 2
+
+
+# `prepare` and `revive` filled fresh arrays with `out[index] = ...`, which runs an index setter
+# a guest planted on `Array.prototype` instead of storing the element.
+_INDEX_POISON = (
+    "Object.defineProperty(Array.prototype, '0', "
+    "{set(v) { hits++ }, get() { return 'poisoned' }, configurable: true}); 0"
+)
+
+
+def test_a_host_result_array_ignores_an_index_setter(make_rt) -> None:
+    rt = make_rt()
+    rt.bind_function("lookup", lambda: [7, {"a": 8}])
+    rt.eval("globalThis.hits = 0; " + _INDEX_POISON)
+    assert rt.eval("JSON.stringify(lookup())") == '[7,{"a":8}]'
+    assert rt.eval("hits") == 0
+
+
+def test_an_argument_array_ignores_an_index_setter(make_rt) -> None:
+    rt = make_rt()
+    seen: list = []
+    rt.bind_function("sink", lambda v: seen.append(v) or 1)
+    rt.eval("globalThis.hits = 0; " + _INDEX_POISON)
+    rt.eval("sink([1, 2]); 0")
+    assert seen == [[1, 2]]
+    assert rt.eval("hits") == 0
+
+
+def test_bind_object_refuses_the_webassembly_intermediate_prototype(make_rt) -> None:
+    rt = make_rt()
+    if rt.eval("typeof WebAssembly") != "object":
+        return  # nothing to refuse on a build without WebAssembly
+    rt.eval("globalThis.tools = Object.getPrototypeOf(WebAssembly.Module.prototype); 0")
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"zz_host_tool": lambda: 1})

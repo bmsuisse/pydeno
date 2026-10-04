@@ -27,16 +27,20 @@
   Recognising a guest's `ReadableStream` result no longer uses `instanceof globalThis.ReadableStream` (a guest
   `Symbol.hasInstance` or a replaced global could turn every object result into a stream); it checks the
   prototype chain against the prototype captured at startup.
-- A refused bind's error has own `name`, `cause` and `stack`, so reading it runs no getter from
-  `Error.prototype`; a non-extensible global object is refused with the same clear error; and the handlers a
-  refused bind registered are dropped instead of kept for the runtime's lifetime.
+- A refused bind's error has own `name`, `message`, `cause`, `stack` and `Symbol.for("errorAdditionalPropertyKeys")`
+  (all of which deno_core reads when it converts the error), so reading it runs no getter from `Error.prototype`.
+  No deadline covers a bind, so a looping getter there used to block `bind_object` indefinitely (and an
+  `IsolatedRuntime` bind until the worker's hard deadline killed it). A non-extensible global object is
+  refused with the same clear error, and the handlers a refused bind registered are dropped instead of kept for
+  the runtime's lifetime.
 - The built-in set behind the namespace check is collected from the standard global names only, so objects a
   host snapshot puts on the global object are bindable again (this was a regression in the previous change),
   and now also covers `CallSite.prototype`, `%SegmentsPrototype%`, the iterator-helper prototypes and the
   `ReadableStream` polyfill.
 - The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
-  `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`, and host arrays are created
-  without `Array.prototype` index setters, so a guest that replaced them only affects its own code.
+  `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
+  (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
+  properties, so an index setter on `Array.prototype` neither sees nor replaces them.
 
 ### Changed
 
