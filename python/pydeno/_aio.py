@@ -53,6 +53,7 @@ from ._isolated import (
     WorkerCrashed,
     _CONFIG_KEYS,
     _CPU_CAP_FACTOR,
+    _check_wire_limits,
     _DEFAULT,
     _HARDENING_V8_FLAGS,
     _HostCallBudgetExceeded,
@@ -682,6 +683,7 @@ class AsyncIsolatedRuntime:
                     f"RuntimeConfig.{attr} is not supported by AsyncIsolatedRuntime yet"
                 )
 
+        _check_wire_limits(config, max_memory)
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # See IsolatedRuntime: a catchable RangeError instead of an RSS kill.

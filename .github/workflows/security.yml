@@ -28,15 +28,21 @@ permissions:
 
 jobs:
   cargo-deny:
-    name: cargo-deny (advisories, licences, bans, sources)
+    name: cargo-deny (advisories, licences, bans, sources; ${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimal build (no `inspector` feature, so no hyper/fastwebsockets) is checked on its
+        # own too, so it cannot pick up a crate the full graph happens to hide.
+        features: ["--all-features", "--no-default-features"]
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
           # Duplicate versions only warn (deny.toml); everything else fails the job.
-          arguments: --all-features
+          arguments: ${{ matrix.features }}
 
   cargo-audit:
     name: cargo-audit (RustSec)

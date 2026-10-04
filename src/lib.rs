@@ -42,6 +42,8 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "SUGGESTED_FORCE_KILL_GRACE",
         runtime::config::SUGGESTED_FORCE_KILL_GRACE.as_secs_f64(),
     )?;
+    // Whether this build includes the DevTools inspector server (cargo feature `inspector`).
+    m.add("_INSPECTOR_AVAILABLE", cfg!(feature = "inspector"))?;
     let undefined: Py<PyAny> = runtime::python::get_js_undefined(m.py())?.into();
     m.add("undefined", undefined)?;
     m.add_function(pyo3::wrap_pyfunction!(
