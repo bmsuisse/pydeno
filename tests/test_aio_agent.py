@@ -244,7 +244,11 @@ class TestCancellation:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert sb.is_closed() and await _gone(sb, 2.0)
-        assert not sb._core.rt._tasks  # noqa: SLF001 - no shim task left waiting
+        # No shim task left waiting. They finish on a later loop turn than the cancel, so wait.
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while sb._core.rt._tasks and asyncio.get_running_loop().time() < deadline:  # noqa: SLF001
+            await asyncio.sleep(0.01)
+        assert not sb._core.rt._tasks  # noqa: SLF001
 
     async def test_cancel_the_task_holding_a_paused_session(self) -> None:
         holder: list[AsyncAgentSandbox] = []
