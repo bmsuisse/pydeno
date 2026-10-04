@@ -124,7 +124,6 @@ def test_worker_that_cannot_start_is_a_failed_result(monkeypatch) -> None:
     [
         {"timeout": 0},
         {"max_memory_mb": 0},
-        {"max_output_bytes": True},
         {"max_result_bytes": -1},
         {"sandbox": "off"},
         {"timeout": float("inf")},
@@ -238,3 +237,24 @@ def test_the_package_ships_its_license() -> None:
     assert 'license = "MIT"' in pyproject
     assert 'license-files = ["LICENSE"]' in pyproject
     assert "MIT License" in (root / "LICENSE").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"timeout": True}, {"max_output_bytes": True}, {"max_result_bytes": 1.5}]
+)
+def test_wrong_limit_type_is_type_error(kwargs):
+    with pytest.raises(TypeError):
+        JavaScriptSession(**kwargs)
+
+
+def test_numeric_limits_accept_real_seconds_and_integer_like_counts():
+    from decimal import Decimal
+
+    class Count:
+        def __index__(self):
+            return 256
+
+    session = JavaScriptSession(timeout=Decimal("1.5"), max_memory_mb=Count())
+    assert session.timeout == 1.5
+    assert session.max_memory == 256 * 1024 * 1024
+    session.close()
