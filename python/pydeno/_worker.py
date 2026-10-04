@@ -1,4 +1,4 @@
-"""Worker process for `IsolatedRuntime`: `python -I -m pydeno._worker`.
+"""Worker process for `IsolatedRuntime` (started by `_isolated._start_worker`).
 
 Hosts one ordinary `Runtime` and drives it from commands on stdin. Host
 functions bound by the parent become stubs here that send a `call` frame and
