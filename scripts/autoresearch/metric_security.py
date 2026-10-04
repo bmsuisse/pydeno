@@ -157,6 +157,30 @@ def resizable_array_buffers_respect_max_buffer_bytes() -> bool:
 
 
 @probe
+def growable_shared_array_buffers_respect_max_buffer_bytes() -> bool:
+    """The same hole for `SharedArrayBuffer(n, {maxByteLength}).grow()`. In-process only: the
+    worker strips `SharedArrayBuffer`."""
+    cap = 64 * 2**20
+    with Runtime(RuntimeConfig(max_buffer_bytes=cap)) as rt:
+        out = rt.eval(
+            """
+            (() => {
+              const out = [];
+              for (const make of [
+                () => new SharedArrayBuffer(%(big)d, {maxByteLength: %(big)d}),
+                () => { const b = new SharedArrayBuffer(8, {maxByteLength: %(big)d}); b.grow(%(big)d); return b; },
+              ]) {
+                try { out.push(make().byteLength); } catch (e) { out.push(e.name); }
+              }
+              return out;
+            })()
+            """
+            % {"big": 4 * cap}
+        )
+        return out != ["RangeError"] * 2
+
+
+@probe
 def huge_result_is_refused_without_killing_the_parent() -> bool:
     with iso() as rt:
         try:
