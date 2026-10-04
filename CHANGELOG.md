@@ -43,6 +43,24 @@
   `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
   (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
   properties, so an index setter on `Array.prototype` neither sees nor replaces them.
+- **`max_buffer_bytes` now covers resizable buffers.** V8 allocates a resizable `ArrayBuffer`
+  (`new ArrayBuffer(n, {maxByteLength})`), a growable `SharedArrayBuffer`, and the copy `transfer()` makes of
+  a resizable buffer from its own page allocator, not the embedder's, so the cap never saw them: a guest could
+  commit gigabytes under a cap of a few hundred megabytes, and filling the buffer was a `max_memory` kill
+  instead of the promised catchable `RangeError`. The bridge now charges their committed bytes to the same
+  budget at construction, `resize`/`grow` and `transfer*`, through one op that keys each buffer by a private
+  symbol and holds it weakly; when a charge would exceed the cap the op forces a GC, gives collected buffers'
+  bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget.
+  `instanceof`, subclassing, `Symbol.species` and the prototype objects are unchanged. `WebAssembly.Memory`
+  remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
+- **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
+  `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's
+  stderr capture file under `RLIMIT_FSIZE` (1 MiB), and deno_core's `op_print` unwraps the flush of the
+  failed write, so the worker aborted (SIGABRT). The worker no longer lets the engine echo console output;
+  `on_console` and `capture_console` are unaffected.
+- **Captured console output carries no control or escape characters.** `execute()` (and the agent layer's
+  `ExecutionResult`) cleaned error text but returned `stdout`/`stderr` with raw ANSI/C1 sequences; they now
+  follow the same rule (newlines and tabs stay).
 
 ### Fixed
 

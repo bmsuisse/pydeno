@@ -139,6 +139,10 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Bridge frames and `ext:` paths visible in stack traces | **Partly fixed** (strict mode); path filtering open. |
 | A huge source ignores `timeout=` while V8 parses it (plain `Runtime`; bounded by the frame cap in `IsolatedRuntime`) | **Open.** |
 | Prototype pollution persists across evals in one runtime | **By design.** One runtime per trust unit. |
+| A resizable `ArrayBuffer` (or growable `SharedArrayBuffer`, or the copy `transfer()` makes of one) was not counted by `max_buffer_bytes`: V8 takes those backing stores from its page allocator, not the embedder's, so 2 GiB could be committed under a 255 MiB cap and filling it was a `max_memory` kill instead of the promised `RangeError` | **Fixed.** The bridge charges their committed bytes to the same budget (constructor, `resize`/`grow`, `transfer*`), with weak handles and a GC-and-sweep when the cap is hit. `WebAssembly.Memory.grow` remains a sink the cap cannot see (not present under `--jitless`). |
+| `enable_console=True`: one `console.log` of a megabyte killed the worker (SIGABRT). Its stdout was the stderr capture file under `RLIMIT_FSIZE`, and deno_core's `op_print` unwraps the flush of the failed write | **Fixed.** The worker never lets the engine echo console output; `on_console` is unaffected. |
+| `execute()` returned console output with raw terminal escape sequences, while error text was already cleaned | **Fixed.** Same rule for both. |
+| Found by the autoresearch red team (`scripts/autoresearch/metric_security.py`, 28 probes, all passing): the probe battery pins each of the above and the deadline-bypass and refused-bind classes from the fourth review round | **Pinned.** |
 
 ### Round 3: review of the new code
 

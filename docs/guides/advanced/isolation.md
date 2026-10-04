@@ -171,7 +171,7 @@ trusted. Ordinary JavaScript errors and soft timeouts leave it usable.
 | Limit | Bounds | Effect |
 |---|---|---|
 | `max_heap_size` | the JS heap | the runtime is terminated |
-| `max_buffer_bytes` | live `ArrayBuffer` / `SharedArrayBuffer` bytes | a catchable `RangeError` |
+| `max_buffer_bytes` | live `ArrayBuffer` / `SharedArrayBuffer` bytes, resizable ones included (their committed size) | a catchable `RangeError` |
 | `max_memory` | worker RSS | the worker is killed |
 
 ## What works across the boundary
