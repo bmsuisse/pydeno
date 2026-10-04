@@ -41,3 +41,18 @@ Libraries that were also checked by hand under the sandbox (not vendored, too la
 date-fns, markdown-it, highlight.js, xlsx, d3, echarts (SSR to SVG), mathjs, katex, handlebars,
 zod, ajv, yaml, fuse.js, qrcode-generator, jsPDF, Tailwind CSS v4 (`compile`), immer.
 mermaid and Chart.js load but need a DOM or canvas, which a sandbox does not provide.
+
+## Pinned sizes and SHA-256
+
+Hosts can pin these bytes without rebuilding. The bundles stay byte-identical within a minor
+release (a change is a changelog entry), and the tests pin the same hashes.
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `d3-force-3.0.0-delaunay-6.0.4.bundle.js` | 175512 | `67e190242161066fea190c201ea2f97ea4d3d97fb1ba9f2f577f33d5dc5b97f7` |
+| `dagre.bundle.js` | 48411 | `ca109f634a32870d6865e6cb01702a3c8cca68eeb3dccde871aa031ef4b2dbd0` |
+| `echarts-6.1.0.min.js` | 1121883 | `b66b25aeb4df84e33199dc21694014d336d222cbd9deb0e5a7c14bd6aa0d0fd0` |
+| `three-0.180.0-gltf.bundle.js` | 738530 | `b3faa3da4cf40d0fad9883002324ed35bfb0a57cbc4fdb1584f1df8065ba061a` |
+| `turf-7.4.0.bundle.js` | 539760 | `ab93309f52566b6cd998200485d4825be1c434c5c8f81a3e18dde0a92dd63940` |
+| `vega-6.4.0.min.js` | 521123 | `8f6a3587cf8d4f42c7e08120e3eb05d067e746d554e39d2dcf52acc0bd5ba28f` |
+| `vega-lite-6.4.3.min.js` | 250845 | `35a9821df838825b05a6a73e9414b58747a1b18321583858ed903c66393a5c7e` |
