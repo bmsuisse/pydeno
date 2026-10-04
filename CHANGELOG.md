@@ -52,19 +52,29 @@ Security; see
 
 ### Security
 
-- **Limit values are validated.** `request_timeout`, `max_host_wait`, `write_stall_timeout` and per-call
-  `timeout=` must be `None` or a finite number of seconds above zero (or a `timedelta`); `timeout_grace`
-  a finite number `>= 0`; `max_memory` an `int >= 1`; `max_host_calls` an `int >= 0`;
-  `max_inflight_host_calls` an `int >= 1`. NaN or infinity was accepted before and turned the limit off
-  without saying so (every comparison with NaN is false); Python's `json` parses both, so they could come
-  from a config file. Applies to `IsolatedRuntime`, `AsyncIsolatedRuntime`, pool `checkout()`, and
-  `AgentSandbox`/`AsyncAgentSandbox` (including `runtime=`). *Upgrade note:* such values, and bools,
-  strings or floats for counts, now raise `ValueError`/`TypeError` at construction.
-- **Console output counts against the hard deadline.** The deadline pauses while the host runs a tool,
-  and console calls were treated the same way, so time spent handling a flood of `console.*` output
-  stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`. Console handling time is
-  now charged to the guest; tools still pause the deadline. *Upgrade note:* with a slow `on_console` /
-  `print_callback`, a chatty guest now times out at its deadline instead of running longer.
+- **Limit values are validated.** Durations (`request_timeout`, `max_host_wait`, `write_stall_timeout`,
+  `RuntimeConfig.timeout`, per-call `timeout=`, `AgentSandbox` `timeout`/`max_pause`, `SessionPool`
+  `ttl`/`counter_ttl`/`eviction_interval`/`idle_timeout`, `PydenoLimits` seconds) must be `None` or a
+  finite number of seconds above zero and at most about 70 years (`threading.TIMEOUT_MAX / 4`);
+  `timeout_grace`, `SessionPool(acquire_timeout=)` and `get(timeout=)` may be 0. Counts (`max_memory`,
+  `max_host_calls`, `max_inflight_host_calls`, `max_tool_calls`, `max_journal_bytes`, output caps, pool
+  sizes, `max_sessions`, `max_per_owner`, `max_suspensions`, `max_tool_threads`) must be an int between
+  their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
+  before and turned the limit off without saying so (every comparison with NaN is false); Python's
+  `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
+  wrong type raises `TypeError`, a bad value `ValueError`.
+- **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
+  host runs a tool, and console calls were treated the same way, so time spent handling a flood of
+  `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`
+  (600 s by default). Console time now pauses the deadline for at most one hard deadline in total per
+  command: one slow write does not end a run, and a flood can at most double it. Console time while a
+  tool call is in flight is covered by that call's pause. Console calls are no longer refused by
+  `max_inflight_host_calls` (they are synchronous, never in flight) and still count toward
+  `max_host_calls`.
+- **`Pydeno`'s default printer is capped.** Without a `print_callback`, a feed's console output goes to
+  the host's stdout/stderr; it now stops after 1 MiB per feed with one `[truncated]` line (it was
+  unbounded: about 150 MB in 2 s measured). An explicit `print_callback` gets everything.
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
   `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a

@@ -478,9 +478,14 @@ class IsolatedRuntime:
             callbacks in total. The hard deadline does not run while a callback does, which a
             guest could exploit by always keeping one asynchronous call in flight; this bounds it.
             The worker's CPU use is also capped at twice the hard deadline per command, which
-            callbacks cannot pause. `None` removes the wait cap.
+            callbacks cannot pause. `None` removes the wait cap. Console output is not a
+            callback in this sense: handling it pauses the hard deadline for at most one hard
+            deadline in total per command (a flood of slow console writes at most doubles a run),
+            and it does not count toward this wait cap. Console output while a tool call is in
+            flight is covered by that call's pause.
         max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);
-            further ones are answered with an error instead of being run.
+            further ones are answered with an error instead of being run. Console calls are
+            synchronous and never refused by it (they still count toward `max_host_calls`).
         write_stall_timeout: If the worker stops reading its input and the pipe stays full this
             long (seconds, default 10), the worker is killed rather than letting the host block
             forever. `None` waits indefinitely.

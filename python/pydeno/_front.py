@@ -1453,7 +1453,8 @@ class PydenoSession:
                 as an Error named after its class, its message redacted.
             print_callback: Gets the feed's console output as ``(stream, text)``, ``stream``
                 ``'stdout'`` (``log``/``info``/``debug``) or ``'stderr'``. Default: this
-                process's stdout/stderr, with control characters replaced.
+                process's stdout/stderr, with control characters replaced, at most 1 MiB per
+                feed (then one ``[truncated]`` line). A callback you pass is not capped.
 
         Raises:
             PydenoRuntimeError: the code threw (the session survives).
