@@ -327,6 +327,19 @@ class _Pump:
       computing costs CPU whether or not a callback is outstanding.
     """
 
+    __slots__ = (
+        "loop",
+        "hard",
+        "deadline",
+        "max_host_wait",
+        "cpu_cap",
+        "cpu_start",
+        "_outstanding",
+        "_paused_at",
+        "_paused_total",
+        "_lock",
+    )
+
     def __init__(
         self,
         hard_timeout: float | None,
@@ -854,7 +867,10 @@ class IsolatedRuntime:
                 "this IsolatedRuntime belongs to the process that created it, not to a fork() of it"
             )
         hard = self._hard_timeout(soft_timeout)
-        self._acquire_slot(hard)
+        if not self._lock.acquire(
+            False
+        ):  # the usual case is a free runtime: no timed wait
+            self._acquire_slot(hard)
         try:
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
@@ -904,21 +920,22 @@ class IsolatedRuntime:
             self._lock.release()
 
     def _pump(self, cmd_id: int, pump: _Pump) -> Any:
-        last_check = time.monotonic()
+        monotonic = time.monotonic
+        read = self._reader.read
+        last_check = monotonic()
         remote: Exception | None = None
         try:
             while True:
                 try:
-                    poll = time.monotonic() + _POLL_SECONDS
-                    payload = self._reader.read(poll)
+                    payload = read(monotonic() + _POLL_SECONDS)
                 except TimeoutError:
                     self._supervise(pump)
-                    last_check = time.monotonic()
+                    last_check = monotonic()
                     continue
                 # The limits are enforced on a clock, not on silence. If they ran only when
                 # the pipe went quiet, a guest that never lets it go quiet (a loop of cheap
                 # host calls) would switch the hard deadline and memory ceiling off.
-                now = time.monotonic()
+                now = monotonic()
                 if now - last_check >= _POLL_SECONDS:
                     self._supervise(pump)
                     last_check = now
