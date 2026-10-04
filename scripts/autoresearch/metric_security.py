@@ -13,6 +13,7 @@ The battery grows: when review or red-teaming finds a new class of attack, add a
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 import traceback
@@ -130,6 +131,38 @@ def huge_result_is_refused_without_killing_the_parent() -> bool:
             return len(out) > 2**27  # returned an absurd value instead of refusing
         except Exception:  # noqa: BLE001
             return rt.eval("1 + 1") != 2 if not rt.is_closed() else False
+
+
+# --- the console channel ---------------------------------------------------------------------------------------
+@probe
+def console_echo_of_a_large_line_does_not_kill_the_worker() -> bool:
+    """With `enable_console=True` the worker echoes console output to its own stdout/stderr, which
+    the parent captures in a size-limited file. One large line must not end the session."""
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=TIMEOUT, enable_console=True),
+        sandbox="require",
+        request_timeout=10,
+    ) as rt:
+        for level in ("log", "error"):
+            try:
+                rt.eval(f"console.{level}('x'.repeat(2 ** 20)); 0")
+            except Exception:  # noqa: BLE001
+                return True  # a console call must never fail the guest, let alone the worker
+            if rt.is_closed():
+                return True
+        return rt.eval("1 + 1") != 2
+
+
+@probe
+def captured_console_output_carries_no_terminal_escapes() -> bool:
+    """`execute()` returns console output as text a host will print or log. Like the error text
+    (`_clean`), it must not be able to carry escape or control sequences into that terminal."""
+    with iso(capture_console=True) as rt:
+        result = rt.execute(
+            "console.log('\\x1b[2J\\x1b]0;x\\x07', 'a\\rb', 'tab\\tok'); console.error('\\x9b1m'); 1"
+        )
+    text = result.stdout + result.stderr
+    return bool(re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", text)) or "tab\tok" not in text
 
 
 # --- the host bridge: a guest must not interfere with a later host bind ----------------------------------
