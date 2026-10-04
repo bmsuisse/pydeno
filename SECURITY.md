@@ -69,6 +69,22 @@ their limits are in `docs/guides/advanced/isolation.md`.
 
 ## Deploying it: the outer boundary
 
+### Linux resource visibility
+
+The supervisor must be able to read the worker's `/proc/<pid>/stat` and `statm` after the
+worker drops privileges. A `hidepid=2` procfs mount can hide a worker that changed from root
+to `nobody`; successfully reading an ordinary same-uid child does not prove these limits work.
+`sandbox_status()` therefore hardens its resource-probe child like a worker and waits for that
+step before measuring it. Missing memory, CPU or thread counters make `resource_probes.applied`
+and `complete` false. Both isolated runtimes refuse startup under `sandbox="require"`, and
+warn under `auto`, if an enabled counter is unreadable.
+
+For the supervisor's procfs mount, use `hidepid=0`, or deliberately configure procfs visibility
+for the service (for example an authorized `gid=` exemption). Verify the resulting deployment
+with `sandbox_status()` and `sandbox="require"`; do not assume root or a container label alone
+grants access. This is a startup check, not a promise that later procfs or credential changes
+are harmless.
+
 The in-process layers contain a V8 bug to the worker; they do not stop an attacker who chains it
 with a *kernel* bug. Container and microVM sandboxes exist for that gap, and they are a deployment
 choice, not a library feature, so build them around pydeno:
