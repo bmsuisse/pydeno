@@ -46,6 +46,7 @@ MEMORY_EXIT_CODE = 78
 _SEATBELT_PROFILE = """
 (version 1)
 (deny default)
+(allow sysctl-read (sysctl-name "hw.pagesize_compat"))
 (allow signal (target self))
 (deny process-info*)
 (allow process-info-pidinfo (target self))
@@ -63,8 +64,11 @@ _SEATBELT_PROFILE = """
 # `(deny default)` does NOT cover; each was found by asking from inside the sandbox, not assumed:
 #  * `process-info*`: KERN_PROCARGS2 on the parent returns its argv and *environment* (any
 #    same-user process's, in fact), which undoes `env={}`. `(deny default)` alone does not stop it,
-#    and neither does narrowing `sysctl-read`, so there is no `sysctl-read` allowance at all: the
-#    worker runs without one.
+#    and neither does narrowing `sysctl-read` to a prefix, so the only `sysctl-read` allowance is the
+#    one name below.
+#  * `sysctl-read hw.pagesize_compat` (the page size, nothing else): V8's allocator asks for it when
+#    the process has not already cached it. Python 3.13+ happens to, 3.10 to 3.12 do not, and
+#    without this name the worker aborts at start ("LowLevelAlloc arithmetic overflow") on those.
 #  * `iokit-get-properties`, `SYS_gethostuuid`: the machine's permanent hardware identifier.
 #  * `SYS_getpriority`/`getpgid`/`getsid`/`getfsstat`/`fstatfs`, `host_statistics*`: they list every
 #    host process, the mounted volumes and free disk space, and system-wide CPU and memory

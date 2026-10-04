@@ -223,6 +223,18 @@ impl Converter {
             Ok(JSValue::Function { id: fn_id })
         } else if value.is_symbol() {
             Err(RuntimeError::internal("Cannot serialize V8 symbol"))
+        } else if value.is_map() {
+            Err(RuntimeError::internal(
+                "Cannot serialize a JavaScript Map (convert it first, e.g. Object.fromEntries(map) or [...map])",
+            ))
+        } else if value.is_weak_map() || value.is_weak_set() {
+            Err(RuntimeError::internal(
+                "Cannot serialize a JavaScript WeakMap or WeakSet",
+            ))
+        } else if value.is_native_error() {
+            Err(RuntimeError::internal(
+                "Cannot serialize a JavaScript Error (return error.message or {name, message} instead)",
+            ))
         } else if value.is_uint8_array() {
             let typed_array = v8::Local::<v8::Uint8Array>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to Uint8Array"))?;

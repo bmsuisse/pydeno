@@ -69,13 +69,34 @@ globalThis.buildScene = () => {
   const pos = geo.attributes.position;
   const colors = new Float32Array(pos.count * 3);
   const color = new THREE.Color();
+  // Heights from escape time: the flat basin where points never escape, steep walls along the fractal's
+  // boundary. Neighbouring points near the boundary differ a lot, so smooth the *heights* (two passes of a
+  // 3x3 average); the colours and the counts themselves are left exactly as Monty computed them.
+  let heights = new Float32Array(n * n);
+  for (let k = 0; k < n * n; k++) {
+    heights[k] = counts[k] === max_iter ? 0 : scale * Math.sqrt(counts[k] / max_iter);
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    const next = new Float32Array(n * n);
+    for (let j = 0; j < n; j++) {
+      for (let i = 0; i < n; i++) {
+        let sum = 0, cnt = 0;
+        for (let dj = -1; dj <= 1; dj++) {
+          for (let di = -1; di <= 1; di++) {
+            const jj = j + dj, ii = i + di;
+            if (jj >= 0 && jj < n && ii >= 0 && ii < n) { sum += heights[jj * n + ii]; cnt++; }
+          }
+        }
+        next[j * n + i] = sum / cnt;
+      }
+    }
+    heights = next;
+  }
   let peak = 0;
   for (let k = 0; k < pos.count; k++) {
     const t = counts[k] / max_iter;               // 0 = escaped at once, 1 = never escapes
-    // Points that never escape form the flat basin; the steep walls follow the fractal boundary.
-    const h = counts[k] === max_iter ? 0 : scale * Math.sqrt(t);
-    pos.setY(k, h);
-    peak = Math.max(peak, h);
+    pos.setY(k, heights[k]);
+    peak = Math.max(peak, heights[k]);
     if (counts[k] === max_iter) color.setRGB(0.05, 0.05, 0.12);
     else color.setHSL(0.62 - 0.62 * Math.sqrt(t), 0.85, 0.35 + 0.35 * t);
     colors.set([color.r, color.g, color.b], k * 3);

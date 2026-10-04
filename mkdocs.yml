@@ -61,6 +61,7 @@ nav:
       - Serverless Runtime: use-cases/serverless-runtime.md
       - Workflow Orchestration: use-cases/workflow.md
   - Security report: security-report.md
+  - Roadmap to 1.0: roadmap.md
   - API Reference:
       - pydeno Module: api/pydeno.md
       - Runtime: api/runtime.md
