@@ -126,8 +126,9 @@ _IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 _NATIVE_FRAME = re.compile(r"0x[0-9a-fA-F]{4,}|\.(?:so|dylib)\b|\+\s*\d+\s*$")
-# Guest (or worker) text bound for an exception message, a log or a terminal: see `_result`.
-_CONTROL = UNSAFE_TEXT
+# Control and escape characters, the Unicode bidirectional controls that reorder a line, and the
+# invisible format characters (see `_result._CONTROL` for the list and the reasoning).
+_CONTROL = UNSAFE_TEXT  # one filter for console text and worker error text
 
 
 def _clean(text: str, limit: int = 500) -> str:
@@ -489,7 +490,10 @@ class IsolatedRuntime:
     Args:
         config: Limits and bootstrap for the guest. `inspector` and `snapshot` are not
             supported across the boundary yet. `on_console` is: each `console.*` call is a
-            (synchronous) host call, counted by `max_host_calls`.
+            (synchronous) host call, counted by `max_host_calls`. It receives the guest's
+            arguments as they are, text included: sanitise before printing or logging them
+            (`execute()`'s `stdout`/`stderr` are already stripped of control, escape and
+            bidirectional characters; a callback is not).
         max_memory: Kill the worker if its resident memory exceeds this many bytes
             (default 1 GiB; `None` removes the limit). Enforced twice: by the worker itself every ~20ms (it exits with a dedicated
             code) and by the parent every ~50ms (Linux and macOS).

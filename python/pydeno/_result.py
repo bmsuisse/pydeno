@@ -45,18 +45,23 @@ DEFAULT_MAX_RESULT_BYTES = 1024 * 1024
 TRUNCATED_MARKER = "[truncated]"
 
 _STDOUT_LEVELS = frozenset({"log", "info", "debug"})
-# What guest text must not carry into captured output, an exception message, a log or a terminal:
-# C0 and C1 controls except tab and newline (escape sequences, carriage returns), bidirectional
-# overrides, embeddings and isolates (text that displays in another order than it reads), the
-# line and paragraph separators, and invisible characters that hide text from a reader but not
-# from a program or a language model: zero-width space, word joiner, invisible operators, soft
-# hyphen, byte-order mark and the Unicode tag characters. Each is replaced by "?". ZWJ/ZWNJ and
-# variation selectors stay: scripts and emoji need them. (The CLI applies a broader filter of its
-# own to what it prints, `pydeno._cli.inert_text`.)
-UNSAFE_TEXT = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u061c\u180e\u200b\u200e\u200f"
-    "\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff\U000e0000-\U000e007f]"
+# Console text is the guest's to choose and a host prints, logs or hands to a model: no control or
+# escape characters (an ANSI sequence can clear a terminal, retitle it or hide a line; a carriage
+# return overwrites one), no Unicode bidirectional controls (they reorder what a terminal shows, so
+# a line reads as something it is not), and no invisible format characters (zero-width joiners and
+# spaces, the BOM, soft hyphen, line/paragraph separators, variation selectors, TAG characters:
+# text a reader never sees but a model does). Emoji sequences lose their joiners and skin tones
+# with this and render as their parts; a sandbox's log prefers that to an invisible payload.
+# Newlines and tabs stay, so multi-line output keeps its shape. The same rule the worker's error
+# text follows (`_isolated._CONTROL`).
+_CONTROL = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u034f\u0600-\u0605\u061c\u115f\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164"
+    r"\ud800-\udfff\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb"
+    r"\U00013430-\U0001343f\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
 )
+# Hangul fillers, Arabic number signs, Egyptian/shorthand/musical format controls and lone
+# surrogates are in the set too, as in the CLI's filter (`pydeno._cli.inert_text`).
+UNSAFE_TEXT = _CONTROL
 _MAX_DEPTH = 200
 _GUEST_ERROR = re.compile(r"^(?:Uncaught )?([A-Za-z_$][A-Za-z0-9_$]{0,63})(?::|$)")
 _EVAL_PREFIX = "Evaluation failed: "
@@ -184,9 +189,7 @@ class OutputCapture:
             return  # full: do not even format it
         if not isinstance(args, (list, tuple)):
             args = [args]
-        line = (
-            UNSAFE_TEXT.sub("?", " ".join(format_console_arg(a) for a in args)) + "\n"
-        )
+        line = _CONTROL.sub("?", " ".join(format_console_arg(a) for a in args)) + "\n"
         with self._lock:
             if stream.cut:
                 return
