@@ -386,6 +386,21 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
   let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
   Read it in the **[security report](docs/security-report.md)**.
+- **An autonomous pentest agent, run against the source.** Before 0.8 we ran [Strix][strix] (an
+  open-source AI pentest agent) as a white-box review of a clean export of the code, in standard
+  mode, locally, with no outside host reachable and a hard budget cap. It reported four weaknesses (three
+  medium, one low) and **no host escape and no capability-token bypass** in the paths it reviewed.
+  Two matched findings our own reviewers had already made (terminal output, and a session budget
+  across two pools that share one store); the other two were new (an unbounded DNS queue in
+  `HttpFetch`, and a failed value conversion that kept registered handles). All four are fixed or
+  documented in 0.8, with a regression test for each. This is one more reviewer, not a proof: it
+  read the code and did not exercise the native layer, so the OS-level checks above still carry that
+  part. We plan to run it on a schedule and on changes to the sandbox code.
+- **A probe battery that must stay at zero.** `scripts/autoresearch/metric_security.py` runs hostile
+  guests and hostile callers (limits, tampered binds, forged journals, oversized values, terminal
+  escapes) and has to report zero violations before anything merges to the release branch.
+
+[strix]: https://github.com/usestrix/strix
 
 ## Integrations
 
