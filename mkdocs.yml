@@ -65,6 +65,7 @@ nav:
   - Reference:
       - Error kinds: reference/error-kinds.md
       - Pre-check and sandbox status: reference/preflight-and-status.md
+  - Alternatives: alternatives.md
   - Roadmap to 1.0: roadmap.md
   - API Reference:
       - pydeno Module: api/pydeno.md
