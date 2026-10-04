@@ -307,6 +307,7 @@ def slice_a_worker_global_surface_grew() -> bool:
 def slice_a_requested_engine_restriction_is_silently_undone() -> bool:
     # deno_core's start-up re-enables Temporal (and others) after the worker's flags; a caller asking
     # for it off must be told, not shown a flag list that claims it applied.
+    # Only the specific refusal counts as holding: any other failure has not shown it.
     try:
         with IsolatedRuntime(
             RuntimeConfig(timeout=TIMEOUT),
@@ -315,8 +316,8 @@ def slice_a_requested_engine_restriction_is_silently_undone() -> bool:
             v8_flags=["--no-harmony-temporal"],
         ) as rt:
             return rt.eval("typeof Temporal") != "undefined"
-    except Exception:  # noqa: BLE001
-        return False  # refused loudly
+    except ValueError as exc:
+        return "cannot take effect" not in str(exc)
 
 
 @probe
@@ -348,6 +349,104 @@ def slice_a_boxed_string_argument_outruns_the_deadline() -> bool:
 def slice_a_number_outside_int64_comes_back_wrong() -> bool:
     with iso() as rt:
         return rt.eval("[2 ** 63, -(2 ** 63), 2 ** 64]") != [2.0**63, -(2**63), 2.0**64]
+
+
+# A Proxy around the value used to skip the up-front charge on every path; as a host-call argument in
+# plain `Runtime` it ran V8 out of memory, which aborts the process. The in-process cases therefore run
+# in a child process with a hard timeout, so a regression shows up as a violation, not a dead battery.
+_SLICE_A_PROXIED = (
+    "new Proxy(new Int8Array(2 ** 24), {})",
+    "new Proxy(new String('x'.repeat(2 ** 24)), {})",
+    "new Proxy(new Proxy(new Float64Array(2 ** 24), {}), {})",
+)
+
+_SLICE_A_CHILD = r"""
+import asyncio, sys
+from pydeno import Runtime, RuntimeConfig
+
+mode, expr, budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
+config = {"timeout": %r}
+if budget:
+    config["max_serialization_bytes"] = budget
+with Runtime(RuntimeConfig(**config)) as rt:
+    rt.bind_function("f", lambda *a: 1)
+    try:
+        if mode == "eval":
+            rt.eval(expr)
+        elif mode == "async":
+
+            async def run():
+                return await rt.eval_async(expr, timeout=%r)
+
+            asyncio.run(run())
+        else:
+
+            async def read():
+                stream = await rt.eval_async(
+                    "(async () => new ReadableStream({start(c) { c.enqueue(" + expr + "); c.close() }}))()"
+                )
+                return [chunk async for chunk in stream]
+
+            asyncio.run(read())
+        print("ACCEPTED")
+    except Exception:
+        print("REFUSED")
+""" % (TIMEOUT, TIMEOUT)
+
+
+def _slice_a_child_fails_open(mode: str, expr: str, budget: int = 0) -> bool:
+    """True if the in-process conversion died, hung, ran past the deadline, or accepted the value."""
+    import subprocess
+
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _SLICE_A_CHILD, mode, expr, str(budget)],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT * 10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    took = time.monotonic() - started
+    return proc.returncode != 0 or "REFUSED" not in proc.stdout or took > TIMEOUT * 3
+
+
+@probe
+def slice_a_proxied_indexed_value_outruns_the_deadline_isolated() -> bool:
+    for expr in _SLICE_A_PROXIED:
+        for source in (expr, f"f({expr})"):
+            with iso() as rt:
+                rt.bind_function("f", lambda *a: 1)
+                took, exc = _elapsed(lambda s=source: rt.eval(s))
+                if exc is None or took > TIMEOUT:
+                    return True
+                if rt.is_closed() or rt.eval("1 + 1") != 2:
+                    return True
+    return False
+
+
+@probe
+def slice_a_proxied_indexed_value_fails_open_inprocess() -> bool:
+    for expr in _SLICE_A_PROXIED:
+        for mode, source in (
+            ("eval", expr),
+            ("eval", f"f({expr})"),
+            ("async", f"Promise.resolve({expr})"),
+            ("stream", expr),
+        ):
+            if _slice_a_child_fails_open(mode, source):
+                return True
+    return False
+
+
+@probe
+def slice_a_raised_budget_brings_back_the_unbounded_listing() -> bool:
+    # The element cap must hold whatever `max_serialization_bytes` is.
+    return _slice_a_child_fails_open(
+        "eval", "new Float64Array(2 ** 24)", budget=2**31
+    ) or _slice_a_child_fails_open("eval", f"f({_SLICE_A_PROXIED[0]})", budget=2**31)
 
 
 _SLICE_A_UNCONVERTIBLE = (
@@ -420,7 +519,7 @@ def slice_a_prototype_pollution_changes_what_the_host_receives() -> bool:
 @probe
 def slice_a_native_builtin_outlives_the_hard_deadline() -> bool:
     # Sparse-array natives ignore V8 termination (in-process they cannot be bounded at all, see the
-    # strict xfails in tests/test_monty_parity_security.py); the worker's hard kill must still end them.
+    # strict xfails in the parity security tests); the worker's hard kill must still end them.
     sparse = "const a = []; a.length = 2 ** 32 - 1; a[0] = 1; "
     for body in ("a.sort()", "a.join()", "a.lastIndexOf(2)"):
         with IsolatedRuntime(
