@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`pydeno` command** (`[project.scripts]`, same as `python -m pydeno`): evaluates JavaScript from an
+  argument, `-c`, `-f FILE` or stdin and prints the result as JSON (`--raw` for plain strings). Runs in
+  `IsolatedRuntime(sandbox="require")`; `--timeout` (default 30 s), `--max-memory`, `--sandbox auto`,
+  `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
+  unavailable, 5 other runtime failure; the error and its `classify_error` kind go to stderr. See
+  [`docs/guides/cli.md`](docs/guides/cli.md).
+- **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
+  (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
+  code in an `AgentSandbox` session that keeps its state between calls and returns the
+  `ExecutionResult` fields with output and result caps.
+
+### Changed
+
+- **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
+  positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
+  [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change

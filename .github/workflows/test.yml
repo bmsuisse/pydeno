@@ -110,6 +110,18 @@ jobs:
           echo "::error::pytest exited non-zero in the ${{ matrix.profile }} profile"
           exit 1
 
+      # The llm plugin is a separate package (`pydeno` does not depend on `llm`). Installed with
+      # --no-deps so it runs against the extension built above, not a pydeno from PyPI. `-rs` plus
+      # the import check: its llm test must run, not skip.
+      - name: llm plugin tests (integrations/llm-pydeno)
+        if: matrix.profile == 'debug'
+        working-directory: integrations/llm-pydeno
+        run: |
+          uv pip install --python ../../.venv "llm>=0.26"
+          uv pip install --python ../../.venv --no-deps -e .
+          ../../.venv/bin/python -c "import llm, llm_pydeno.plugin"
+          ../../.venv/bin/python -m pytest -v -rs -p no:randomly
+
   # Closes the gap the `pytest` job's comment above states plainly:
   # `workflow.yaml` publishes `manylinux_2_28` wheels that no CI job ever
   # imported, let alone tested. This job builds that exact wheel (same
