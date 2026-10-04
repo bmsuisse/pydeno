@@ -14,7 +14,7 @@ Needs Docker (or a compatible engine) and an LLM key. Findings stay on your mach
 mkdir /tmp/pydeno-export && git archive HEAD | tar -x -C /tmp/pydeno-export
 rm -rf /tmp/pydeno-export/vendor /tmp/pydeno-export/docs
 
-export STRIX_LLM="openrouter/<model>"      # or any provider Strix supports
+export STRIX_LLM="<provider/model>"       # any provider Strix supports; keep the choice internal
 export LLM_API_KEY="..."
 strix -n -m standard --max-budget 10 \
   --mount /tmp/pydeno-export \
