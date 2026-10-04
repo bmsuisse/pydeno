@@ -64,10 +64,11 @@ you have today.
 
 ## 0.7.x to the next release: the `Pydeno` front door
 
-**Two things change behaviour: `python -m pydeno`** (the CLI rows below) **and the limit fixes** (the
-last rows). `Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits and errors are new names;
-otherwise every existing class keeps its behaviour, and the docs now lead with `Pydeno` and file the
-building blocks under "Advanced".
+**Three things change behaviour: `python -m pydeno`** (the CLI rows below), **the limit fixes**
+(the last rows of the first table) **and the restrictions from the 0.8 red team** (the second table;
+three rows are marked **BREAKING**). `Pydeno` / `AsyncPydeno` and their sessions, snapshots, limits
+and errors are new names; otherwise every existing class keeps its behaviour, and the docs now lead
+with `Pydeno` and file the building blocks under "Advanced".
 
 | Change | Affects | Who notices | What to change |
 |---|---|---|---|
@@ -87,6 +88,24 @@ building blocks under "Advanced".
 | Console output pauses the hard deadline only within an allowance of one hard deadline per command (it used to pause it like a tool call, up to `max_host_wait`); console time during an in-flight tool call is covered by the tool's pause | runtimes with `on_console` / `capture_console`, agent sessions, `Pydeno` feeds | A host with a slow `on_console` or `print_callback` and a very chatty guest: the run now ends by about twice its deadline instead of running up to `max_host_wait` | Make the console handler fast (buffer it), or raise the deadline |
 | Console calls are no longer refused by `max_inflight_host_calls` (they still count toward `max_host_calls`) | runtimes with a small in-flight cap and console routing | Nobody, unless they relied on console output being dropped while tools were in flight | Nothing |
 | `Pydeno` / `AsyncPydeno` without a `print_callback` write at most 1 MiB of console output per feed to stdout/stderr, then one `[truncated]` line | the front door's default printer | Feeds that print more than 1 MiB and read it from the host's stdout | Pass a `print_callback` (it is not capped) |
+
+Restrictions and fixes from the 0.8 red team (host boundary and state). The first three can change
+behaviour you have today:
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| **BREAKING:** a tool named like a guest global (`JSON`, `Promise`, `console`, `globalThis`, `eval`, `Math`, ...) installed as a bare global, a namespace with such a name, or any tool name starting with `__pydeno` / `__host_op`, is refused with `ValueError` | `AgentSandbox`, `AsyncAgentSandbox`, `SessionPool` | Constructing the session raises (such a tool replaced the global and broke the session or was unreachable) | Rename the tool, or pass `namespace="tools"` (`tools.JSON(...)` is fine) |
+| **BREAKING:** `SessionPool` keeps a session's spent tool budget when its journal outgrows `max_journal_bytes`: the next `get` restores a stateless session with the budget spent (`lost_runs == 1`) instead of a fresh one | `SessionPool` | Code that relied on `JournalTooLarge` handing out a fresh budget | `drop()` the session if you want to start over with a fresh budget |
+| **BREAKING:** `ExecutionResult.stdout`/`stderr` (and `Done`/`Failed`'s), error messages and the front door's default printer replace C0/C1 controls (except tab and newline), bidirectional overrides and isolates, line and paragraph separators, zero-width space, word joiner, invisible operators, soft hyphen, BOM and Unicode tag characters with `?` (the CLI already does) | `IsolatedRuntime.execute`, agent sessions, `Pydeno` | Guests that print ANSI colours, explicit bidi controls or emoji sequences (joiners and variation selectors become `?`, as in the CLI); tests comparing such output | Nothing for ordinary text (letters of every script are kept). A `print_callback` of your own still gets the raw text |
+| A tool that raises a `BaseException` (`SystemExit`, `KeyboardInterrupt`, a cancellation) during `AgentSandbox.run()` / `execute()` / `feed_run` ends the run like a crash (`WorkerCrashed`, run recorded as lost); it used to reach the guest as an error that the journal did not record | `AgentSandbox`, `Pydeno` | Tools that raise `SystemExit` & co. on purpose | Raise an `Exception` subclass for answers the guest should see |
+| Concurrent tool calls past `max_inflight_host_calls - 1` wait their turn instead of failing with "more than 64 host calls in flight" | agent sessions, `Pydeno` | Guests that counted on those failures | Nothing |
+| `SessionPool.drop()` wins against an overlapping `get` or `release`; `pool.session()` releases only its own lease | `SessionPool` | Nobody (fixes) | Prefer `async with pool.session(...)` over bare `release` |
+| `SessionPool.get` of a live session reads the stored counter (one store read) and restores the stored journal if another pool stored a newer one; `release` raises `StaleJournal` instead of storing over a newer journal | `SessionPool` | Deployments where two pools serve one session (they now see each other's journals, or get `StaleJournal`) | Route each session to one pool |
+| A session whose `release` failed stays live (not evicted) until a release stores it; ids must be valid UTF-8 | `SessionPool` | Code that let a failed release be cleaned up by eviction; ids with lone surrogates (`ValueError`) | Release again after fixing the cause; pass valid strings |
+| `PydenoSession.dump` / `load_session` / `load_snapshot` (and the async ones, and `snapshot.dump`) take `associated_data=` | new, opt-in | Nobody unless passed | Bind dumps to a tenant and a counter you keep if they leave your control |
+| A front-door snapshot is no longer used up by an answer the session refuses (`resume(error="...")`) | `Pydeno` | Nobody (fix) | Nothing |
+| `feed_start` surfaces snapshots only for functions in that feed's `external_lookup`; a call to another name throws a `ReferenceError` in the guest | `Pydeno` | Drivers that expected snapshots for names they did not declare | Declare every function the feed may call |
+| Journal associated data may be up to 4096 bytes (was 1024) | agent sessions, `SessionPool` | Nobody (a relaxation: 256-character non-ASCII pool ids now persist) | Nothing |
 
 ## Safe to bump?
 

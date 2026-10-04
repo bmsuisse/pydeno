@@ -53,6 +53,7 @@ from typing import Any, Literal, TypedDict
 
 from . import _sandbox_pool
 from ._agent import (
+    _COMPILES,
     _MISSING,
     DEFAULT_MAX_JOURNAL_BYTES,
     AgentSandbox,
@@ -70,7 +71,7 @@ from ._agent import (
     _unavailable,
     preinstall,
 )
-from ._isolated import IsolatedRuntime, WorkerCrashed
+from ._isolated import _CONTROL, IsolatedRuntime, WorkerCrashed
 from ._limits import limit_int, limit_seconds
 from ._pydeno import JavaScriptError, JsUndefined, RuntimeConfig, RuntimeTimeout
 from ._result import _STDOUT_LEVELS, ResultTooLarge, format_console_arg
@@ -716,12 +717,14 @@ def _prepare(
 
 
 def _compile_check(source: str) -> str:
-    """JavaScript answering whether `source` compiles as a feed (true), or is a SyntaxError."""
-    return (
-        "(() => { try { new (Object.getPrototypeOf(async function () {}).constructor)("
-        + json.dumps(source)
-        + "); return true; } catch (e) { return !(e instanceof SyntaxError); } })()"
-    )
+    """JavaScript answering whether `source` compiles as a feed (true), or is a SyntaxError.
+
+    It calls the session prelude's checker, which uses only intrinsics captured before any guest
+    code ran (a bare identifier: the global is non-configurable, so nothing can shadow it). Built
+    from `Object.getPrototypeOf` and `instanceof` at call time, the check ran guest code: a guest
+    could make a feed that ran look like one that never parsed, or change its own state outside
+    the journal."""
+    return f"{_COMPILES}({json.dumps(source)})"
 
 
 def _unpack(step: ToolCall) -> tuple[str, tuple[Any, ...]] | None:
@@ -773,16 +776,26 @@ def _external_result(
     return value, error
 
 
+def _checked_answer(
+    result: Any, value: Any, error: BaseException | None
+) -> tuple[Any, BaseException | None]:
+    """`_external_result`, refusing an answer the session would refuse, before the snapshot is
+    used up by it (a refused answer must leave the snapshot resumable)."""
+    value, error = _external_result(result, value, error)
+    if error is not None and not isinstance(error, Exception):
+        raise TypeError("the error to resume with must be an Exception instance")
+    return value, error
+
+
 # ---------------------------------------------------------------------------
 # console
 # ---------------------------------------------------------------------------
 
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-
 
 def _default_print(stream: str, text: str) -> None:
-    """Monty's default (the host's stdout/stderr), minus control characters: guest text must not
-    drive the host's terminal."""
+    """Monty's default (the host's stdout/stderr), minus control characters, bidirectional
+    overrides and invisible characters: guest text must not drive (or disguise itself on) the
+    host's terminal."""
     target = sys.stdout if stream == "stdout" else sys.stderr
     target.write(_CONTROL.sub("?", text))
 
@@ -856,6 +869,10 @@ def _external_placeholder(name: str, *args: Any) -> Any:
     raise RuntimeError("external functions are answered by the Pydeno session")
 
 
+# The front door's dispatcher is the one tool allowed a reserved `__pydeno` name.
+_external_placeholder._pydeno_internal = True  # type: ignore[attr-defined]
+
+
 # The one runtime config every front-door worker is built with.
 _CONFIG = RuntimeConfig(on_console=_drop_console)
 
@@ -887,6 +904,7 @@ class PydenoSnapshot:
 
     __slots__ = (
         "_call",
+        "_declared",
         "_lookup",
         "_session",
         "_used",
@@ -902,10 +920,14 @@ class PydenoSnapshot:
         name: str,
         args: tuple[Any, ...],
         lookup: dict[str, Any],
+        declared: frozenset[str] | None = None,
     ) -> None:
         self._session = session
         self._call = call
         self._lookup = lookup
+        # The functions the feed declared (None: not known, after `load_snapshot` without
+        # `external_lookup`); calls to any other name are refused, never surfaced.
+        self._declared = declared
         self._used = False
         self.function_name = name
         self.args = args
@@ -932,7 +954,7 @@ class PydenoSnapshot:
         """Answer the call: ``resume(value=v)`` / ``resume(error=exc)``, or Monty's
         ``resume({'return_value': v})`` / ``resume({'exception': exc})``. An error reaches the
         guest as an Error named after its class, its message redacted."""
-        value, error = _external_result(result, value, error)
+        value, error = _checked_answer(result, value, error)
         self._take()
         return self._session._answer(self, value, error)  # noqa: SLF001
 
@@ -950,10 +972,10 @@ class PydenoSnapshot:
         value, error = session._bounded_external(fn, self.function_name, self.args)  # noqa: SLF001
         return session._answer(self, value, error)  # noqa: SLF001
 
-    def dump(self) -> bytes:
+    def dump(self, *, associated_data: bytes = b"") -> bytes:
         """The suspended session, signed (see `PydenoSession.dump`); restore it with
         `PydenoSession.load_snapshot`."""
-        return self._session.dump()
+        return self._session.dump(associated_data=associated_data)
 
     def __repr__(self) -> str:
         return (
@@ -1304,14 +1326,19 @@ class Pydeno:
         agent._core.tools.budget = self._budget  # noqa: SLF001
         return agent
 
-    def _load(self, state: bytes, limits: _Limits) -> AgentSandbox:
-        seed = _journal_seed(state, self._key, self._spawn["strict_eval"])
+    def _load(
+        self, state: bytes, limits: _Limits, associated_data: bytes = b""
+    ) -> AgentSandbox:
+        seed = _journal_seed(
+            state, self._key, self._spawn["strict_eval"], associated_data
+        )
         rt = self._runtime(limits, seed)
         try:
             agent = AgentSandbox.load(
                 state,
                 self._key,
                 {_EXTERNAL: _external_placeholder},
+                associated_data=associated_data,
                 runtime=rt,
                 timeout=limits.timeout,
                 max_pause=limits.max_pause,
@@ -1323,11 +1350,13 @@ class Pydeno:
         return agent
 
 
-def _journal_seed(state: bytes, key: bytes, strict_eval: bool) -> int:
+def _journal_seed(
+    state: bytes, key: bytes, strict_eval: bool, associated_data: bytes = b""
+) -> int:
     """The state's random seed, checked before a worker is started for it (also its
     ``strict_eval``, which `AgentSandbox.load` checks again on the worker it gets)."""
     try:
-        journal = _open_journal(state, key, b"", DEFAULT_MAX_JOURNAL_BYTES)
+        journal = _open_journal(state, key, associated_data, DEFAULT_MAX_JOURNAL_BYTES)
     except Exception as exc:  # noqa: BLE001
         raise _load_failure(exc) from exc
     recorded = journal["config"].get("strict_eval", False)
@@ -1531,7 +1560,7 @@ class PydenoSession:
         self._printer.callback = _printer_for(print_callback)
         agent._core.refused = None  # noqa: SLF001
         try:
-            return self._step(self._start(agent, prepared), calls)
+            return self._step(self._start(agent, prepared), calls, frozenset(calls))
         except BaseException:
             self._printer.callback = None
             raise
@@ -1539,27 +1568,38 @@ class PydenoSession:
     # -- durability ----------------------------------------------------------
 
     @_exclusive
-    def dump(self) -> bytes:
+    def dump(self, *, associated_data: bytes = b"") -> bytes:
         """The session's state, idle or suspended mid-feed, as signed bytes (the agent sandbox's
         journal: every feed's code and every external answer, HMAC-signed with the pool's
         ``dump_key``). The session stays usable. Restore with `load_session` (idle) or
         `load_snapshot` (suspended), on a fresh worker, by deterministic replay. After the worker
         died (a crash, a timeout, a memory kill, a cancellation) it still works: it returns the
-        state as of the last feed that ended with the worker alive."""
+        state as of the last feed that ended with the worker alive.
+
+        `associated_data` (a tenant or conversation id, plus a counter of your own if rollback
+        matters) is folded into the signature, not stored: the state then loads only when
+        `load_session` / `load_snapshot` are given the same bytes. Without it, any state this
+        pool dumped loads into any of its sessions, including an older dump of the same session
+        (which restores the external-call budget it had then)."""
+        if not isinstance(associated_data, (bytes, bytearray)):
+            raise TypeError("associated_data must be bytes")
         try:
-            return self._dumpable().dump(self._pool._key)  # noqa: SLF001
+            return self._dumpable().dump(
+                self._pool._key,  # noqa: SLF001
+                associated_data=associated_data,
+            )
         except PydenoError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise PydenoError(f"cannot dump this session: {exc}", exc) from exc
 
     @_exclusive
-    def load_session(self, state: bytes) -> None:
+    def load_session(self, state: bytes, *, associated_data: bytes = b"") -> None:
         """Replace this session's state with `state` (a `dump()` taken between feeds), replayed
         on a fresh worker; the current worker is killed. Only state signed with this pool's
-        ``dump_key`` loads. Raises `PydenoError` for state that is not authentic or that was
-        dumped mid-feed (use `load_snapshot`)."""
-        self._replace(state, suspended=False)
+        ``dump_key`` (and dumped with the same `associated_data`) loads. Raises `PydenoError` for
+        state that is not authentic or that was dumped mid-feed (use `load_snapshot`)."""
+        self._replace(state, suspended=False, associated_data=associated_data)
 
     @_exclusive
     def load_snapshot(
@@ -1568,26 +1608,35 @@ class PydenoSession:
         *,
         print_callback: Callable[[Literal["stdout", "stderr"], str], Any] | None = None,
         external_lookup: dict[str, Any] | None = None,
+        associated_data: bytes = b"",
     ) -> PydenoSnapshot:
         """Restore a `dump()` taken mid-feed and return the snapshot it was suspended at.
-        `external_lookup` is for `resume_auto`; ``print_callback`` for the rest of the feed."""
+        `external_lookup` is for `resume_auto`; ``print_callback`` for the rest of the feed;
+        `associated_data` must be what the state was dumped with."""
         calls, _ = _check_lookup(external_lookup, sync=False)
-        agent = self._replace(state, suspended=True)
+        agent = self._replace(state, suspended=True, associated_data=associated_data)
         self._printer.callback = _printer_for(print_callback)
         step = agent.pending
         assert step is not None
-        snapshot = self._step(step, calls)
+        snapshot = self._step(
+            step,
+            calls,
+            None if external_lookup is None else frozenset(calls),
+            pending=True,
+        )
         assert isinstance(snapshot, PydenoSnapshot)
         return snapshot
 
-    def _replace(self, state: bytes, *, suspended: bool) -> AgentSandbox:
+    def _replace(
+        self, state: bytes, *, suspended: bool, associated_data: bytes = b""
+    ) -> AgentSandbox:
         old = self._agent  # its worker may be gone: loading is how a session recovers
         if old is None:
             self._live()  # raises: not checked out, or closed
         self._printer.callback = (
             None  # the replay's console output was printed long ago
         )
-        new = self._pool._load(state, self._limits)  # noqa: SLF001
+        new = self._pool._load(state, self._limits, associated_data)  # noqa: SLF001
         if (new.pending is not None) != suspended:
             new.close()
             raise PydenoError(
@@ -1706,14 +1755,26 @@ class PydenoSession:
         raise error from None
 
     def _step(
-        self, step: Any, calls: dict[str, Any]
+        self,
+        step: Any,
+        calls: dict[str, Any],
+        declared: frozenset[str] | None,
+        *,
+        pending: bool = False,
     ) -> PydenoSnapshot | PydenoComplete:
         agent = self._agent
         assert agent is not None
         while isinstance(step, ToolCall):
             unpacked = _unpack(step)
             if unpacked is not None:
-                return PydenoSnapshot(self, step, unpacked[0], unpacked[1], calls)
+                if pending or declared is None or unpacked[0] in declared:
+                    return PydenoSnapshot(
+                        self, step, unpacked[0], unpacked[1], calls, declared
+                    )
+                # Not a function this feed declared (a stub left by an earlier feed, or a
+                # name passed straight to the dispatcher): refused, as `feed_run` does.
+                step = agent.resume(step, error=_not_available(unpacked[0]))
+                continue
             step = agent.resume(step, error=_not_available(None))
         self._printer.callback = None
         return PydenoComplete(self._finish(step))
@@ -1728,7 +1789,7 @@ class PydenoSession:
         except BaseException:
             self._printer.callback = None
             raise
-        return self._step(step, snapshot._lookup)  # noqa: SLF001
+        return self._step(step, snapshot._lookup, snapshot._declared)  # noqa: SLF001
 
     def __repr__(self) -> str:
         state = (
