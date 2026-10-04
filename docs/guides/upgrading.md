@@ -62,6 +62,12 @@ you have today.
 0.6.1 fixed a macOS-only bug: the sandboxed worker aborted at start on Python 3.10 to 3.12. If you are on
 0.6.0 there, upgrade.
 
+## 0.7.x to 0.8.0
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| Worker startup now checks the supervisor's signal permission after hardening and refuses in every sandbox mode when termination authority is absent | `IsolatedRuntime`, `AsyncIsolatedRuntime`, and pools built on them | Deployments whose parent cannot signal its hardened workers now receive non-retryable `sandbox_unavailable`; `sandbox_status().termination` reports the missing protection | Run the supervisor with permission to terminate its workers and verify `sandbox_status()` before accepting traffic. Changing to `auto` or `off` does not bypass this requirement |
+
 ## Safe to bump?
 
 **From 0.4.x to 0.5.0** (`Runtime` users: nothing to change)
