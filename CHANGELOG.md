@@ -34,7 +34,9 @@
   them; the host's own scripts still run. It appends V8's `--disallow-code-generation-from-strings`
   after the hardening flags, frozen with them. Sessions record it in their journal (only when on, so
   default journals are unchanged) and refuse to load a journal under the other setting. It does not
-  cover WebAssembly with `jitless=False`; see the isolation guide. Off by default.
+  cover WebAssembly with `jitless=False`, and it guards trusted code against injected strings rather
+  than containing hostile code (a guest can ship its own interpreter); see the isolation guide. Off
+  by default.
 - `vendor/libs/vega-interpreter-2.3.2.bundle.js` (BSD-3-Clause, 5 KB): Vega's CSP-safe expression
   interpreter, so Vega and Vega-Lite render under `strict_eval=True`. The library tests now also run
   d3, turf and ECharts SSR, and every library under strict eval.

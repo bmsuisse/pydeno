@@ -58,6 +58,7 @@ from ._agent import (
     AgentSandbox,
     Done,
     Failed,
+    JournalError,
     ToolCall,
     _error_class,
     _open_journal,
@@ -1288,7 +1289,7 @@ class Pydeno:
         return agent
 
     def _load(self, state: bytes, limits: _Limits) -> AgentSandbox:
-        seed = _journal_seed(state, self._key)
+        seed = _journal_seed(state, self._key, self._spawn["strict_eval"])
         rt = self._runtime(limits, seed)
         try:
             agent = AgentSandbox.load(
@@ -1306,11 +1307,21 @@ class Pydeno:
         return agent
 
 
-def _journal_seed(state: bytes, key: bytes) -> int:
+def _journal_seed(state: bytes, key: bytes, strict_eval: bool) -> int:
+    """The state's random seed, checked before a worker is started for it (also its
+    ``strict_eval``, which `AgentSandbox.load` checks again on the worker it gets)."""
     try:
         journal = _open_journal(state, key, b"", DEFAULT_MAX_JOURNAL_BYTES)
     except Exception as exc:  # noqa: BLE001
         raise _load_failure(exc) from exc
+    recorded = journal["config"].get("strict_eval", False)
+    if recorded != strict_eval:
+        raise _load_failure(
+            JournalError(
+                f"the journal was recorded with strict_eval={recorded}; load it into a "
+                f"session with strict_eval={recorded}, not {strict_eval}"
+            )
+        )
     seed = journal["config"].get("random_seed")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31:
         raise PydenoError("cannot load this state: it has no valid random seed")

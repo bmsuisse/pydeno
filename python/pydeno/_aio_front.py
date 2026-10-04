@@ -221,7 +221,7 @@ class AsyncPydeno:
         return agent
 
     async def _load(self, state: bytes, limits: _Limits) -> AsyncAgentSandbox:
-        seed = _journal_seed(state, self._key)
+        seed = _journal_seed(state, self._key, self._spawn["strict_eval"])
         rt = await self._runtime(limits, seed)
         try:
             return await AsyncAgentSandbox.load(

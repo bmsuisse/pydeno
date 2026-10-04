@@ -145,13 +145,17 @@ shadowing it. The host's own `eval` / `execute` of a script, the bootstrap, and 
 registers still run. It is off by default.
 
 It is V8's `--disallow-code-generation-from-strings`, appended after the hardening flags and frozen
-with them (`--freeze-flags-after-init`), so the guest cannot switch it back on. `v8_flags` that switch
-it off are refused when `strict_eval=True`; `rt.strict_eval` says whether it is in force.
+with them (`--freeze-flags-after-init`), so the guest cannot switch it back on. With
+`strict_eval=True`, `v8_flags` that switch either flag off (`--no-disallow-code-generation-from-strings`,
+`--no-freeze-flags-after-init`) are refused; `rt.strict_eval` says whether it is in force.
 
-**What it buys.** Guest code cannot turn data into new code at run time: code a model assembles from
-strings, or a payload smuggled in through a tool result, cannot be compiled and run as a function.
-It also closes the run-time code-creation route used by some engine exploit techniques (JIT
-spraying among them).
+**What it buys.** Code you trust cannot be made to turn data into code at run time: a string
+from a tool result, a user, or a model's output that reaches an `eval` or `new Function` in that
+code (yours, or a library's) throws instead of running. It is a guard for trusted code against
+injection, a hardening of the guest's behaviour, and **not a boundary against hostile guest code**:
+a guest that wants to run code it builds from data can ship its own interpreter written in
+JavaScript, which needs no `eval`. Against hostile code the boundary is the worker process and the
+OS sandbox, as everywhere else on this page.
 
 **What it does not buy.**
 
@@ -351,8 +355,7 @@ start (`require`).
 Security that breaks the code people run gets switched off, so the sandbox is tested against real
 libraries (`tests/test_isolated_libraries.py`, bytes pinned under `vendor/libs/`): pptxgenjs, three.js
 with `GLTFExporter`, Vega-Lite, dagre, d3, turf, ECharts (server-side SVG), with the same results as
-the plain `Runtime`, and again under `strict_eval=True` (Vega with its expression interpreter). A wider hand check (not vendored) also passed for lodash, date-fns, d3, ECharts (server-side
-SVG), mathjs, KaTeX, Handlebars, zod, Ajv, yaml, jsPDF, pdf-lib, docx, JSZip, fflate, crypto-js,
+the plain `Runtime`, and again under `strict_eval=True` (Vega with its expression interpreter). A wider hand check (not vendored) also passed for lodash, date-fns, mathjs, KaTeX, Handlebars, zod, Ajv, yaml, jsPDF, pdf-lib, docx, JSZip, fflate, crypto-js,
 decimal.js, luxon, Prettier, Terser, Cytoscape, Tailwind CSS v4's `compile`, and more. Libraries that
 need a real DOM or canvas (mermaid rendering, Chart.js drawing) load but cannot draw.
 

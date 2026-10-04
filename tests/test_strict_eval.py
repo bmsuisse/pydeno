@@ -31,9 +31,16 @@ from pydeno import (
     RuntimeConfig,
     SandboxPool,
 )
-from pydeno._agent import JournalError, _open, _seal_journal
+from pydeno._agent import (
+    DEFAULT_MAX_JOURNAL_BYTES,
+    JournalError,
+    _open,
+    _open_journal,
+    _seal_journal,
+)
 from pydeno._isolated import (
     _HARDENING_V8_FLAGS,
+    WorkerCrashed,
     _STRICT_EVAL_FLAG,
     _strict_eval_requested,
     _strict_eval_setting,
@@ -119,8 +126,10 @@ class TestFlags:
             ([], None),
             (["--disallow-code-generation-from-strings"], True),
             (["--disallow_code_generation_from_strings"], True),
-            (["--disallow-code-generation-from-strings=true"], True),
-            (["--disallow-code-generation-from-strings=false"], False),
+            # V8 refuses `=true` / `=false` for this flag (the worker does not start), so
+            # they are not a mention: never reported as strict, never as switched off.
+            (["--disallow-code-generation-from-strings=true"], None),
+            (["--disallow-code-generation-from-strings=false"], None),
             (["--no-disallow-code-generation-from-strings"], False),
             (["--nodisallow-code-generation-from-strings"], False),
             (["--no_disallow_code_generation_from_strings"], False),
@@ -144,7 +153,11 @@ class TestFlags:
         [
             "--no-disallow-code-generation-from-strings",
             "--nodisallow-code-generation-from-strings",
-            "--disallow-code-generation-from-strings=false",
+            "--no_disallow_code_generation_from_strings",
+            # without the freeze the setting is no longer fixed for the worker's life
+            "--no-freeze-flags-after-init",
+            "--nofreeze-flags-after-init",
+            "--no_freeze_flags_after_init",
         ],
     )
     def test_strict_eval_refuses_flags_that_switch_it_off(self, flag: str) -> None:
@@ -152,6 +165,14 @@ class TestFlags:
             IsolatedRuntime(strict_eval=True, v8_flags=[flag], prewarm=False)
         with pytest.raises(ValueError, match="contradicts"):
             AsyncIsolatedRuntime(strict_eval=True, v8_flags=[flag], prewarm=False)
+
+    def test_a_flag_v8_refuses_is_never_reported_as_strict(self) -> None:
+        """`--x=true` is not a V8 spelling for this flag: the worker refuses to start, and nothing
+        claims a strictness that is not there."""
+        bad = [f"{_STRICT_EVAL_FLAG}=true"]
+        assert not _strict_eval_requested({"v8_flags": bad})
+        with pytest.raises(WorkerCrashed, match="did not recognise"):
+            IsolatedRuntime(sandbox=MODE, v8_flags=bad)
 
     def test_strict_eval_must_be_a_bool(self) -> None:
         with pytest.raises(TypeError, match="strict_eval"):
@@ -302,11 +323,18 @@ class TestAsyncIsolatedRuntime:
 class TestPools:
     def test_every_checkout_of_a_strict_pool_is_strict(self) -> None:
         with SandboxPool(size=1, sandbox=MODE, strict_eval=True) as pool:
-            for _ in range(3):  # the pooled worker, then cold starts and refills
-                with pool.checkout() as rt:
+            pool.wait_ready(30)
+            # Two at once from a pool of one: the second is a cold start.
+            with pool.checkout() as pooled, pool.checkout() as cold:
+                assert pool.stats()["cold_starts"] >= 1
+                for rt in (pooled, cold):
                     assert rt.strict_eval is True
                     with pytest.raises(JavaScriptError, match="EvalError"):
                         rt.eval("new Function('return 1')()")
+            with pool.checkout() as refilled:
+                assert refilled.strict_eval is True
+                with pytest.raises(JavaScriptError, match="EvalError"):
+                    refilled.eval("eval('1')")
 
     def test_a_pool_never_hands_out_the_other_setting(self) -> None:
         with (
@@ -409,14 +437,18 @@ class TestAgentJournal:
             sb.run("1")
             assert _config_of(sb.dump(KEY))["strict_eval"] is True
 
-    @pytest.mark.parametrize("value", [False, 1, "true", None])
+    @pytest.mark.parametrize("value", [False, 1, "true", None, 0, [True]])
     def test_a_malformed_strict_eval_entry_is_refused(self, value: object) -> None:
+        """The parser's own check, before any setting is compared: only `true` is written."""
         with AgentSandbox({}, sandbox=MODE) as sb:
             sb.run("1")
             config = _config_of(sb.dump(KEY))
         forged = _seal_journal({**config, "strict_eval": value}, [], KEY, b"")
-        with pytest.raises(JournalError, match="strict_eval"):
-            AgentSandbox.load(forged, KEY, {}, sandbox=MODE)
+        with pytest.raises(JournalError, match="malformed journal: strict_eval"):
+            _open_journal(forged, KEY, b"", DEFAULT_MAX_JOURNAL_BYTES)
+        for strict in (False, True):
+            with pytest.raises(JournalError, match="malformed journal: strict_eval"):
+                AgentSandbox.load(forged, KEY, {}, sandbox=MODE, strict_eval=strict)
 
     async def test_async_session(self) -> None:
         async with AsyncAgentSandbox({}, sandbox=MODE, strict_eval=True) as sb:
@@ -470,6 +502,28 @@ class TestFrontDoor:
             with pool.checkout() as session:
                 with pytest.raises(PydenoError, match="strict_eval"):
                     session.load_session(lax_state)
+
+    def test_a_mismatched_dump_is_refused_before_a_worker_starts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pydeno import _front
+
+        with Pydeno(
+            sandbox=MODE, min_processes=1, strict_eval=True, dump_key=KEY
+        ) as pool:
+            with pool.checkout() as session:
+                session.feed_run("var v = 1")
+                state = session.dump()
+        with Pydeno(sandbox=MODE, min_processes=1, dump_key=KEY) as lax:
+            with lax.checkout() as session:
+
+                def no_worker(*args: object, **kwargs: object) -> None:
+                    raise AssertionError("a worker was started for a refused state")
+
+                monkeypatch.setattr(_front, "IsolatedRuntime", no_worker)
+                with pytest.raises(PydenoError, match="strict_eval=True"):
+                    session.load_session(state)
+                monkeypatch.undo()
 
     def test_a_session_with_its_own_memory_limit_is_strict_too(self) -> None:
         """`checkout(limits={"max_memory": ...})` starts a worker outside the pool; it gets the

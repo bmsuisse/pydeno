@@ -151,25 +151,26 @@ _STRICT_EVAL_FLAG = "--disallow-code-generation-from-strings"
 _STRICT_EVAL_NAME = _STRICT_EVAL_FLAG[2:]
 
 
-def _strict_eval_setting(flags: Sequence[str]) -> bool | None:
-    """What `flags` leave V8's code-generation flag at (the last mention wins, as in V8), or None
-    when they do not mention it. Accepts V8's spellings: `--x`, `--no-x`, `--nox`, `--x=false`,
-    with `_` or `-`."""
+def _bool_flag_setting(flags: Sequence[str], name: str) -> bool | None:
+    """What `flags` leave the boolean V8 flag `name` (without dashes) at, the last mention winning
+    as in V8, or None when they do not mention it. V8's spellings: `--x`, `--no-x`, `--nox`, with
+    `_` or `-`. V8 does not accept `--x=true` / `--x=false` for these flags (the worker refuses to
+    start), so that spelling is not a mention."""
     value: bool | None = None
     for flag in flags:
         if not isinstance(flag, str):
             continue  # refused by the worker's own check
-        name, sep, arg = flag.lstrip("-").replace("_", "-").partition("=")
-        negated = False
-        if name.startswith("no-"):
-            name, negated = name[3:], True
-        elif name.startswith("no") and name[2:] == _STRICT_EVAL_NAME:
-            name, negated = name[2:], True
-        if name != _STRICT_EVAL_NAME:
-            continue
-        on = arg.lower() not in ("false", "0") if sep else True
-        value = on != negated
+        bare = flag.lstrip("-").replace("_", "-")
+        if bare == name:
+            value = True
+        elif bare in (f"no-{name}", f"no{name}"):
+            value = False
     return value
+
+
+def _strict_eval_setting(flags: Sequence[str]) -> bool | None:
+    """`_bool_flag_setting` for V8's code-generation flag."""
+    return _bool_flag_setting(flags, _STRICT_EVAL_NAME)
 
 
 def _strict_eval_requested(options: Mapping[str, Any]) -> bool:
@@ -192,10 +193,13 @@ def _worker_v8_flags(
     if not isinstance(strict_eval, bool):
         raise TypeError("strict_eval must be a bool")
     v8_flags = list(v8_flags)
-    if strict_eval and _strict_eval_setting(v8_flags) is False:
-        raise ValueError(
-            f"strict_eval=True contradicts v8_flags, which switch {_STRICT_EVAL_FLAG} off"
-        )
+    if strict_eval:
+        for flag in (_STRICT_EVAL_NAME, "freeze-flags-after-init"):
+            if _bool_flag_setting(v8_flags, flag) is False:
+                # Without the freeze the setting is no longer fixed for the worker's life.
+                raise ValueError(
+                    f"strict_eval=True contradicts v8_flags, which switch --{flag} off"
+                )
     return (
         (["--jitless"] if jitless else [])
         + list(_HARDENING_V8_FLAGS)
@@ -512,7 +516,10 @@ class IsolatedRuntime:
             `eval` / `execute` of a script is unaffected. Set with V8's
             ``--disallow-code-generation-from-strings`` and frozen with the other flags, so the
             guest cannot switch it off. It removes no engine code and does not cover WebAssembly
-            (with ``jitless=False``); see the isolation guide. Read `.strict_eval`.
+            (with ``jitless=False``), and it guards trusted code against injected strings: it
+            is not a boundary against hostile guest code, which can ship its own interpreter (see
+            the isolation guide). Refuses ``v8_flags`` that switch it or
+            ``--freeze-flags-after-init`` off. Read `.strict_eval`.
         clock: Freeze the guest's clock at this instant (a `datetime`, naive meaning UTC, or
             epoch seconds). `Date.now()`, `new Date()` and `Intl.DateTimeFormat#format()`
             then never advance, which removes the wall clock as a timing source (a busy loop
