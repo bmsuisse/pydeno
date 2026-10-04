@@ -61,6 +61,7 @@ from ._isolated import (
     _clock_ms,
     _limit_int,
     _limit_seconds,
+    _strict_eval_requested,
 )
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
 from ._result import (
@@ -1182,6 +1183,7 @@ class _SessionBase:
         self._namespace = namespace
         self._max_tool_calls = max_tool_calls
         self._redact = bool(runtime_options.get("redact_host_errors", True))
+        self._strict_eval = _strict_eval_requested(runtime_options)
         self._clock_ms = clock_ms
         self._random_seed = random_seed
         self._max_journal_bytes = max_journal_bytes
@@ -1311,6 +1313,7 @@ class _SessionBase:
             }
         )
         self._redact = bool(runtime._redact)  # noqa: SLF001
+        self._strict_eval = bool(runtime.strict_eval)
         prepared = getattr(runtime, "_pydeno_prepared", None)
         if "clock_ms" not in runtime._options:  # noqa: SLF001
             from ._worker import _FROZEN_CLOCK_JS  # noqa: PLC0415 - only for adopted runtimes
@@ -1556,6 +1559,9 @@ class _SessionBase:
             config["max_result_bytes"] = self._max_result_bytes
         if self._catalog:
             config["catalog"] = list(self._catalog)
+        if self._strict_eval:
+            # The guest's `eval` / `new Function` throw under it, so replay needs the same.
+            config["strict_eval"] = True
         return config, list(records)
 
     @staticmethod
@@ -1584,6 +1590,18 @@ class _SessionBase:
         if bool(redact) != config["redact"]:
             raise JournalError(
                 "the journal was recorded with a different redact_host_errors setting"
+            )
+        strict = (
+            bool(runtime.strict_eval)
+            if runtime is not None and hasattr(runtime, "strict_eval")
+            else _strict_eval_requested(options)
+        )
+        recorded = config.get("strict_eval", False)
+        if strict != recorded:
+            # Before any worker runs guest code: the same code throws in one and not the other.
+            raise JournalError(
+                f"the journal was recorded with strict_eval={recorded}; load it into a "
+                f"session with strict_eval={recorded}, not {strict}"
             )
         entries = _normalize_tools(tools)
         catalog = _normalize_catalog(tools_catalog)
@@ -2903,6 +2921,9 @@ def _parse(payload: bytes) -> dict[str, Any]:
     catalog = config.get("catalog", [])
     if not isinstance(catalog, list) or not all(isinstance(n, str) for n in catalog):
         raise bad("catalog")
+    if "strict_eval" in config and config["strict_eval"] is not True:
+        # Written only when True, so a journal without it reads exactly as it always did.
+        raise bad("strict_eval")
     for record in records:
         ok = (
             isinstance(record, list)

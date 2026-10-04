@@ -55,7 +55,6 @@ from ._isolated import (
     _CPU_CAP_FACTOR,
     _check_wire_limits,
     _DEFAULT,
-    _HARDENING_V8_FLAGS,
     _HostCallBudgetExceeded,
     _IDLE_CHECK_SECONDS,
     _IDLE_CPU_LIMIT_SECONDS,
@@ -77,7 +76,9 @@ from ._isolated import (
     _revoked_handler,
     _session_options,
     _start_worker,
+    _strict_eval_setting,
     _terminate_process,
+    _worker_v8_flags,
 )
 from ._pydeno import RuntimeConfig, RuntimeTimeout
 
@@ -652,6 +653,7 @@ class AsyncIsolatedRuntime:
         empty_root: bool = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
+        strict_eval: bool = False,
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
         python: str | None = None,
@@ -666,6 +668,12 @@ class AsyncIsolatedRuntime:
             or not 0 <= random_seed < 2**31
         ):
             raise ValueError("random_seed must be an integer in [0, 2**31)")
+        worker_flags = _worker_v8_flags(
+            jitless=jitless,
+            random_seed=random_seed,
+            v8_flags=v8_flags,
+            strict_eval=strict_eval,
+        )
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
         max_memory = _limit_int("max_memory", max_memory, minimum=1)
@@ -704,14 +712,10 @@ class AsyncIsolatedRuntime:
         self._python = python
         self._prewarm = bool(prewarm)
         self._handler_executor = handler_executor
-        seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
         self._options: dict[str, Any] = {
             "sandbox": sandbox,
             "empty_root": empty_root,
-            "v8_flags": (["--jitless"] if jitless else [])
-            + list(_HARDENING_V8_FLAGS)
-            + seed_flags
-            + list(v8_flags),
+            "v8_flags": worker_flags,
             "max_memory": max_memory,
         }
         if clock_ms is not None:
@@ -759,6 +763,11 @@ class AsyncIsolatedRuntime:
         self._idle_cpu_base: float | None = None
         self._last_cpu: float | None = None
         self._last_idle_sample = 0.0
+
+    @property
+    def strict_eval(self) -> bool:
+        """As `IsolatedRuntime.strict_eval`."""
+        return bool(_strict_eval_setting(self._options["v8_flags"]))
 
     # -- lifecycle ---------------------------------------------------------
 

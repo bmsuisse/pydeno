@@ -146,6 +146,72 @@ _HARDENING_V8_FLAGS = (
     "--enable-experimental-regexp-engine-on-excessive-backtracks",
     "--freeze-flags-after-init",
 )
+# `strict_eval=True`: `eval`, `new Function` (and the async/generator function constructors) throw
+# an EvalError in the guest. V8 sets this once per context at start-up and the freeze above keeps
+# it set. It does not cover WebAssembly (`jitless=False` compiles Wasm bytes regardless), nor
+# `import()`, which the module loader decides.
+_STRICT_EVAL_FLAG = "--disallow-code-generation-from-strings"
+_STRICT_EVAL_NAME = _STRICT_EVAL_FLAG[2:]
+
+
+def _bool_flag_setting(flags: Sequence[str], name: str) -> bool | None:
+    """What `flags` leave the boolean V8 flag `name` (without dashes) at, the last mention winning
+    as in V8, or None when they do not mention it. V8's spellings: `--x`, `--no-x`, `--nox`, with
+    `_` or `-`. V8 does not accept `--x=true` / `--x=false` for these flags (the worker refuses to
+    start), so that spelling is not a mention."""
+    value: bool | None = None
+    for flag in flags:
+        if not isinstance(flag, str):
+            continue  # refused by the worker's own check
+        bare = flag.lstrip("-").replace("_", "-")
+        if bare == name:
+            value = True
+        elif bare in (f"no-{name}", f"no{name}"):
+            value = False
+    return value
+
+
+def _strict_eval_setting(flags: Sequence[str]) -> bool | None:
+    """`_bool_flag_setting` for V8's code-generation flag."""
+    return _bool_flag_setting(flags, _STRICT_EVAL_NAME)
+
+
+def _strict_eval_requested(options: Mapping[str, Any]) -> bool:
+    """Whether runtime keyword arguments (`strict_eval=`, `v8_flags=`) make a strict runtime:
+    `IsolatedRuntime(**options).strict_eval`, without starting one."""
+    if options.get("strict_eval", False) is True:
+        return True
+    return bool(_strict_eval_setting(list(options.get("v8_flags", ()))))
+
+
+def _worker_v8_flags(
+    *,
+    jitless: bool,
+    random_seed: int | None,
+    v8_flags: Sequence[str],
+    strict_eval: bool,
+) -> list[str]:
+    """The V8 flags a worker starts with: `--jitless`, the hardening flags, the seed, the
+    caller's own, and then the strict-eval flag (last, so nothing before it can undo it)."""
+    if not isinstance(strict_eval, bool):
+        raise TypeError("strict_eval must be a bool")
+    v8_flags = list(v8_flags)
+    if strict_eval:
+        for flag in (_STRICT_EVAL_NAME, "freeze-flags-after-init"):
+            if _bool_flag_setting(v8_flags, flag) is False:
+                # Without the freeze the setting is no longer fixed for the worker's life.
+                raise ValueError(
+                    f"strict_eval=True contradicts v8_flags, which switch --{flag} off"
+                )
+    return (
+        (["--jitless"] if jitless else [])
+        + list(_HARDENING_V8_FLAGS)
+        + ([] if random_seed is None else [f"--random-seed={random_seed}"])
+        + v8_flags
+        + ([_STRICT_EVAL_FLAG] if strict_eval else [])
+    )
+
+
 # A worker runs about 13 threads (17 on macOS); this is far past that and far below a thread bomb.
 _MAX_WORKER_THREADS = 64
 
@@ -505,6 +571,16 @@ class IsolatedRuntime:
             WebAssembly, which removes the largest class of V8 exploits at a modest
             speed cost. Pass `False` to allow WebAssembly and JIT speed.
         v8_flags: Extra V8 flags for the worker, applied before the isolate exists.
+        strict_eval: Forbid code generation from strings in the guest: ``eval(...)``,
+            ``new Function(...)`` and the async, generator and async-generator function
+            constructors throw ``EvalError``, however the guest reaches them. The host's own
+            `eval` / `execute` of a script is unaffected. Set with V8's
+            ``--disallow-code-generation-from-strings`` and frozen with the other flags, so the
+            guest cannot switch it off. It removes no engine code and does not cover WebAssembly
+            (with ``jitless=False``), and it guards trusted code against injected strings: it
+            is not a boundary against hostile guest code, which can ship its own interpreter (see
+            the isolation guide). Refuses ``v8_flags`` that switch it or
+            ``--freeze-flags-after-init`` off. Read `.strict_eval`.
         clock: Freeze the guest's clock at this instant (a `datetime`, naive meaning UTC, or
             epoch seconds). `Date.now()`, `new Date()` and `Intl.DateTimeFormat#format()`
             then never advance, which removes the wall clock as a timing source (a busy loop
@@ -536,6 +612,7 @@ class IsolatedRuntime:
         empty_root: bool = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
+        strict_eval: bool = False,
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
         capture_console: bool = False,
@@ -549,6 +626,12 @@ class IsolatedRuntime:
             or not 0 <= random_seed < 2**31
         ):
             raise ValueError("random_seed must be an integer in [0, 2**31)")
+        worker_flags = _worker_v8_flags(
+            jitless=jitless,
+            random_seed=random_seed,
+            v8_flags=v8_flags,
+            strict_eval=strict_eval,
+        )
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
         max_memory = _limit_int("max_memory", max_memory, minimum=1)
@@ -589,14 +672,10 @@ class IsolatedRuntime:
         ).items():
             setattr(self, attr, value)
         self._python = python or sys.executable
-        seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
         self._options: dict[str, Any] = {
             "sandbox": sandbox,
             "empty_root": empty_root,
-            "v8_flags": (["--jitless"] if jitless else [])
-            + list(_HARDENING_V8_FLAGS)
-            + seed_flags
-            + list(v8_flags),
+            "v8_flags": worker_flags,
             "max_memory": max_memory,
         }
         if clock_ms is not None:
@@ -681,6 +760,13 @@ class IsolatedRuntime:
             name="pydeno-idle-watch",
             daemon=True,
         ).start()
+
+    @property
+    def strict_eval(self) -> bool:
+        """Whether the guest is refused code generation from strings (`strict_eval=True`, or the
+        same V8 flag passed in `v8_flags`), read from the flags the worker is started with.
+        Sessions record it in their journal."""
+        return bool(_strict_eval_setting(self._options["v8_flags"]))
 
     # -- lifecycle ---------------------------------------------------------
 
