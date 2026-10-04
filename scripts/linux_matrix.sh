@@ -118,7 +118,10 @@ print('layers:', r.sandbox, '| extras:', r.sandbox_extras or 'none', '| uid:', _
 r.close()
 " || echo "layers: could not start a worker"
 
-mkdir -p /work && cp -r /src/tests /work/tests && cp -r /src/vendor /work/vendor && cp /src/pyproject.toml /work/ && cd /work
+mkdir -p /work
+cp -r /src/tests /src/vendor /src/examples /work/
+cp /src/pyproject.toml /src/CLAUDE.md /work/
+cd /work
 echo "== $(. /etc/os-release; echo "$PRETTY_NAME") | $(/tmp/v/bin/python -V) | glibc $(ldd --version 2>/dev/null | head -1 | grep -o '[0-9.]*$' || echo '?') | kernel $(uname -r) | $(uname -m)"
 # shellcheck disable=SC2086
 /tmp/v/bin/python /src/scripts/collect_guard.py 180 $PYTEST_TARGETS --co -q -p no:randomly --strict-markers --strict-config \
