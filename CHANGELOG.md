@@ -18,6 +18,21 @@
   parent and worker always run the same code; the sandbox module no longer imports `ctypes.util` and
   `platform` (`sandbox_init` and `proc_pidinfo` are looked up in the already loaded libSystem,
   `os.uname()` replaces `platform.machine()`). A worker for a custom `python=` is started as before.
+- Lower warm-call overhead of `IsolatedRuntime` (#47): a warm `eval("1 + 1")` went from about 112 to 67 µs
+  (interleaved A/B, 30 rounds, medians; debug build of the extension on a loaded macOS arm64 machine, so
+  release numbers will differ). Where it came from:
+  - Reading the worker's CPU time on macOS no longer opens libSystem through a fresh `ctypes.CDLL` per call
+    (about 30 µs, done twice per command); `proc_pidinfo` and the timebase are resolved once, and
+    `_sandbox.usage(pid)` returns memory, CPU time and thread count from one kernel read (about 2 µs).
+  - A command's CPU baseline is the latest cached reading (the previous command's final check, or the idle
+    watchdog's, re-read if older than 0.5 s) instead of a fresh one, as `AsyncIsolatedRuntime` already did.
+    CPU time only grows, so an older baseline can only charge a command more, never less. The end-of-command
+    check is one reading for the memory ceiling, the thread cap and the idle baseline.
+  - The worker reads the next command on its main thread instead of handing it over from a reader thread.
+    The helper thread reads only while a command waits on host calls; a parent killed while a command runs
+    without one is caught by the worker's watchdog thread (it now always runs, and exits the worker when its
+    parent pid changes).
+  No limit, wire check or sandbox requirement changed.
 
 ## 0.7.0 — 2026-10-04
 
