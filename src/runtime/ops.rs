@@ -491,6 +491,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const SetCtor = Set;
   const BigIntCtor = BigInt;
   const TypeErrorCtor = TypeError;
+  // deno_core reads this registered symbol from every thrown error (`errorAdditionalPropertyKeys`).
+  const ErrorAdditionalPropertyKeys = Symbol.for("errorAdditionalPropertyKeys");
   const RangeErrorCtor = RangeError;
   // A host-bound function's arguments are copied before they cross: cap the work and the depth
   // up front, so one call cannot make the copy itself the denial of service.
@@ -565,7 +567,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       }
       const out = [];
       for (let index = 0; index < length; index++) {
-        out[index] = prepare(value[index], at + "[" + index + "]", level + 1);
+        setOwn(out, index, prepare(value[index], at + "[" + index + "]", level + 1));
       }
       return out;
     }
@@ -575,7 +577,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     if (value instanceof Set) {
       const values = [];
       SetForEach(value, (entry) => {
-        values[values.length] = prepare(entry, at + ".<set item " + values.length + ">", level + 1);
+        const at2 = at + ".<set item " + values.length + ">";
+        setOwn(values, values.length, prepare(entry, at2, level + 1));
       });
       return { __pydeno_type: "Set", values };
     }
@@ -601,7 +604,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     argNodes = 0;
     const out = [];
     for (let index = 0; index < args.length; index++) {
-      out[index] = prepare(args[index], "args[" + index + "]", 0);
+      setOwn(out, index, prepare(args[index], "args[" + index + "]", 0));
     }
     return out;
   }
@@ -634,7 +637,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         const length = value.length;
         const out = [];
         for (let index = 0; index < length; index++) {
-          out[index] = revive(value[index]);
+          setOwn(out, index, revive(value[index]));
         }
         return out;
       }
@@ -765,14 +768,25 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // accessor that hands back a throwaway object, a read-only global that ignores the assignment).
   // And they run no guest code: no `for...of`, no plain assignment that could hit a setter, no
   // lookups on a namespace that could be a Proxy.
-  // The host reads `name`, `message`, `cause` and `stack` of the error it gets back (deno_core's
-  // `JsError::from_v8_exception`). Each is an own data property here, so none of those reads walks
-  // the prototype chain into a getter the guest planted on `Error.prototype`, and `stack` is plain
-  // text, so formatting it never calls a guest `Error.prepareStackTrace` inside the host's bind.
+  // The host converts the error it gets back with deno_core's `JsError::from_v8_exception`, which
+  // reads `name` and `message` (serde), `cause`, `stack`, and `Symbol.for(
+  // "errorAdditionalPropertyKeys")` (then each key it lists, and that value's `toString()`). Each
+  // is an own data property here, so none of those reads walks the prototype chain into a getter
+  // the guest planted on `Error.prototype` -- no deadline covers a bind, so a looping getter there
+  // would block the host. `stack` is plain text, so it is never formatted (no guest
+  // `Error.prepareStackTrace`, and no CallSite frames to read). The rest of the conversion
+  // (`is_instance_of_error`, the AggregateError check, the V8 message) walks prototypes natively
+  // without calling into JavaScript, and a TypeError has no `errors`.
   function refuseBind(name, why) {
     const message = "Cannot bind '" + name + "': " + why;
     const error = new TypeErrorCtor(message);
-    const fields = ["name", "TypeError", "cause", undefined, "stack", "TypeError: " + message];
+    const fields = [
+      "name", "TypeError",
+      "message", message,
+      "cause", undefined,
+      "stack", "TypeError: " + message,
+      ErrorAdditionalPropertyKeys, undefined,
+    ];
     for (let index = 0; index < fields.length; index += 2) {
       DefineProperty(error, fields[index], {
         __proto__: null,
@@ -889,6 +903,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       ? GetPrototypeOf(new Intl.Segmenter().segment("a")[Symbol.iterator]())
       : null,
     typeof iteratorHelper.map === "function" ? GetPrototypeOf(iteratorHelper.map((x) => x)) : null,
+    typeof WebAssembly === "object" && typeof WebAssembly.Module === "function"
+      ? GetPrototypeOf(WebAssembly.Module.prototype)
+      : null,
     typeof Iterator === "function" && typeof Iterator.from === "function"
       ? GetPrototypeOf(Iterator.from({ next() { return { done: true }; } }))
       : null,
