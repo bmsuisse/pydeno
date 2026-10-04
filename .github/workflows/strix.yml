@@ -1,0 +1,67 @@
+name: Strix
+
+# White-box AI pentest review of the source with Strix (https://github.com/usestrix/strix).
+# Advisory: it costs LLM money and can be noisy, so it runs weekly and on demand, never on every PR.
+# The repository is public, so the findings stay OFF the public logs: only severity counts are
+# printed, nothing is uploaded as an artifact, and the scan output is discarded. Read findings by
+# running the scan locally (docs/contributing/strix.md). Needs the repository secrets STRIX_LLM and
+# LLM_API_KEY; without them the job is skipped.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Scan mode"
+        type: choice
+        options: [quick, standard, deep]
+        default: standard
+      budget:
+        description: "Hard budget cap in USD"
+        default: "10"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strix
+  cancel-in-progress: false
+
+jobs:
+  strix:
+    if: github.repository == 'bmsuisse/pydeno'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      STRIX_VERSION: "1.6.2"
+      STRIX_LLM: ${{ secrets.STRIX_LLM }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+    steps:
+      - name: Skip when the secrets are not configured
+        id: gate
+        run: |
+          if [ -z "$STRIX_LLM" ] || [ -z "$LLM_API_KEY" ]; then
+            echo "STRIX_LLM / LLM_API_KEY are not set; skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+      - uses: astral-sh/setup-uv@v6
+        if: steps.gate.outputs.run == 'true'
+      - name: Install Strix (pinned)
+        if: steps.gate.outputs.run == 'true'
+        run: uv tool install "strix-agent==${STRIX_VERSION}"
+      - name: Scan (output discarded; findings stay private)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          strix -n -m "${MODE}" --max-budget "${BUDGET}" \
+            --target . \
+            --instruction-file .github/strix-instructions.md > /dev/null 2>&1 || true
+        env:
+          MODE: ${{ inputs.mode || 'standard' }}
+          BUDGET: ${{ inputs.budget || '10' }}
+      - name: Severity counts only
+        if: steps.gate.outputs.run == 'true'
+        run: python3 scripts/security/strix_summary.py

@@ -19,6 +19,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Debug info is never read in CI; leaving it out makes builds faster and the Rust cache smaller.
+  # Test workflows only: the release wheels (workflow.yaml) are built as before.
+  RUSTFLAGS: "-C debuginfo=0"
   # A `>=` floor on the collected test count, not an equality check: adding
   # tests never needs a bump here, only deleting them does. This is the
   # assertion that makes a mass-skip fail the job -- see

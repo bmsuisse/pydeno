@@ -79,6 +79,22 @@ Defaults: `sandbox="require"` (`pydeno.sandbox_status()` explains a refusal), ji
 30 s per feed, 512 MiB, 1000 external calls per session, and a worker never serves two sessions. The
 [front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit.
 
+**One door, the same names as Monty.** `Pydeno` and `AsyncPydeno` are the default path for everything; you
+should not need another class to run untrusted code.
+
+| You want | Call |
+|---|---|
+| A sandboxed session, warm and fast | `pool.checkout(limits=...)` |
+| Run a snippet, state persists | `session.feed_run(code, inputs=..., external_lookup=...)` |
+| Pause at every tool call (approvals) | `session.feed_start(...)`, then `snapshot.resume(value=...)` / `resume(error=...)` |
+| Save and continue elsewhere | `session.dump()`, then `session.load_session(state)` / `load_snapshot(state, ...)` (signed, replayed) |
+| Bound it | `limits={"max_feed_duration_secs": ..., "max_memory": ...}` (safe defaults already on) |
+| Sync or async | `Pydeno` or `AsyncPydeno`, same methods |
+
+The [front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit. The lower-level
+classes (`IsolatedRuntime`, `AgentSandbox`, `SandboxPool`) stay available under
+[Which runtime?](#which-runtime).
+
 From a shell, the same sandboxed worker ([command line guide][guide-cli]):
 
 ```bash
@@ -386,6 +402,20 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
   let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
   Read it in the **[security report](docs/security-report.md)**.
+- **An autonomous pentest agent, run against the source.** Before 0.8 we ran [Strix][strix] (an
+  open-source AI pentest agent) as a white-box review of a clean export of the code, in standard
+  mode, locally, with no outside host reachable and a hard budget cap. It found no host escape and
+  no capability-token bypass in the paths it reviewed. What it did report went through the same path
+  as every other review finding: a failing test first, the smallest fix, a review by a different
+  model. Its findings are not published; that is deliberate for a public repository. It is one more
+  reviewer, not a proof: it read the code and did not exercise the native layer, so the OS-level
+  checks above still carry that part. It is set up to run on a schedule
+  ([how](docs/contributing/strix.md)).
+- **A probe battery that must stay at zero.** `scripts/autoresearch/metric_security.py` runs hostile
+  guests and hostile callers (limits, tampered binds, forged journals, oversized values, terminal
+  escapes) and has to report zero violations before anything merges to the release branch.
+
+[strix]: https://github.com/usestrix/strix
 
 ## Integrations
 
