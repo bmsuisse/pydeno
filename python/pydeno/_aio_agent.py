@@ -49,11 +49,14 @@ from ._agent import (
     _ConsoleSink,
     _open_journal,
     _prelude,
+    _prepared_prelude,
     _public,
     _replay_plan,
     _Run,
     _seal_journal,
+    _Prepared,
     _SessionBase,
+    _Slot,
     _wrap,
 )
 from ._aio import AsyncIsolatedRuntime
@@ -112,6 +115,8 @@ class _Core:
         self.abandoned: list[asyncio.Future[Any]] = []
         self.closed = False
         self.task: asyncio.Task[None] | None = None
+        # JavaScript run before the next run's code (not journaled): see `_SessionBase._install`.
+        self.pending_js = ""
 
     async def on_tool_call(self, name: str, args: list[Any]) -> Any:
         """A bound tool, as the guest sees it (see `_agent._Core.on_tool_call`)."""
@@ -155,7 +160,7 @@ class _Core:
         self.console.capture = capture
         cancelled = False
         try:
-            value = await self.rt.eval(_wrap(code))
+            value = await self.rt.eval(self.pending_js + _wrap(code))
             # Over the cap, the run fails but the session goes on (the value is dropped here).
             bounded_result(value, self.max_result_bytes)
             final: Step = Done(value)
@@ -168,15 +173,17 @@ class _Core:
             # Console calls are synchronous host calls: every one was answered before the
             # command's result arrived.
             self.console.capture = None
-        self.finish(
-            run,
-            dataclasses.replace(
-                final,
-                stdout=capture.stdout,
-                stderr=capture.stderr,
-                truncated=capture.truncated,
-            ),
+        final = dataclasses.replace(
+            final,
+            stdout=capture.stdout,
+            stderr=capture.stderr,
+            truncated=capture.truncated,
         )
+        if self.pending_js and not (
+            isinstance(final, Failed) and "SyntaxError" in str(final.error)[:80]
+        ):
+            self.pending_js = ""  # it ran (it is guarded: sending it again is harmless)
+        self.finish(run, final)
         if cancelled:
             raise asyncio.CancelledError
 
@@ -305,6 +312,7 @@ class AsyncAgentSandbox(_SessionBase):
             max_output_bytes=max_output_bytes,
             max_result_bytes=max_result_bytes,
             runtime_options=runtime_options,
+            adopted=runtime is not None,
         )
         self._executor = runtime_options.get("handler_executor")
         self._busy = False
@@ -322,6 +330,7 @@ class AsyncAgentSandbox(_SessionBase):
             # No I/O here: a failure leaves the runtime with the caller, who still owns it.
             rt = runtime
             self._executor = runtime._handler_executor  # noqa: SLF001
+            self._check_prepared(rt)
             self._install(rt, sink, timeout, max_pause)
         self._core = _Core(
             rt,
@@ -332,6 +341,7 @@ class AsyncAgentSandbox(_SessionBase):
             max_result_bytes=max_result_bytes,
             catalog=frozenset(self._catalog),
         )
+        self._core.pending_js = self._clock_pending
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -359,6 +369,12 @@ class AsyncAgentSandbox(_SessionBase):
         core = self._core
         try:
             await core.rt.__aenter__()
+            prepared = getattr(core.rt, "_pydeno_prepared", None)
+            if prepared is not None:
+                # Installed when the worker was started (`apreinstall`): just become the
+                # session its shims call.
+                prepared.slot.core = core
+                return
 
             def shim_for(name: str) -> Callable[..., Any]:
                 async def shim(*args: Any) -> Any:
@@ -659,3 +675,30 @@ class AsyncAgentSandbox(_SessionBase):
             else "not started"
         )
         return f"AsyncAgentSandbox(tools={list(self._tools)!r}, {state}, calls={self.calls_made})"
+
+
+async def apreinstall(
+    rt: AsyncIsolatedRuntime, names: list[str], namespace: str | None = None
+) -> None:
+    """`_agent.preinstall` for an `AsyncIsolatedRuntime` (started): the shims and the prelude an
+    `AsyncAgentSandbox` with exactly these tool names would install, ahead of time."""
+    slot = _Slot()
+
+    def shim_for(name: str) -> Callable[..., Any]:
+        async def shim(*args: Any) -> Any:
+            core = slot.core
+            if core is None:
+                raise RuntimeError("no session has adopted this runtime yet")
+            return await core.on_tool_call(name, list(args))
+
+        shim.__name__ = name
+        return shim
+
+    shims = {name: shim_for(name) for name in names}
+    if namespace is None:
+        for name, shim in shims.items():
+            await rt.bind_function(name, shim)
+    elif shims:
+        await rt.bind_object(namespace, shims)
+    await rt.eval(_prepared_prelude(rt, names, namespace))
+    rt._pydeno_prepared = _Prepared(tuple(names), namespace, slot)  # type: ignore[attr-defined]  # noqa: SLF001

@@ -57,6 +57,7 @@ from ._agent import (
     _error_class,
     _open_journal,
     _public,
+    preinstall,
 )
 from ._isolated import IsolatedRuntime, WorkerCrashed
 from ._pydeno import JavaScriptError, JsUndefined, RuntimeConfig, RuntimeTimeout
@@ -915,20 +916,28 @@ class PydenoSnapshot:
 # ---------------------------------------------------------------------------
 
 
+# How long a filler waits before replacing a checked-out worker while another is still ready.
+_REFILL_DELAY = 0.05
+
+
 def _fresh_seed() -> int:
     return secrets.randbelow(2**31)
 
 
-# Run once on every new worker, off the checkout path: a worker's first command costs over a
-# millisecond more than the next one, and it leaves no state behind.
-_WARM_UP = "0"
-
-
 class _Core(_sandbox_pool._Core):  # noqa: SLF001
     """`SandboxPool`'s core, except that every worker gets its own random seed (a session adopts
-    it; `Math.random` must not repeat across sessions) and has run its first command."""
+    it; `Math.random` must not repeat across sessions) and arrives with the session's
+    dispatcher and prelude installed (`preinstall`), so a checkout does no round trip."""
 
     def new(self, session: dict[str, Any] | None = None) -> IsolatedRuntime:
+        if session is None and self.ready:
+            # A filler replacing a worker just checked out. Starting a process forks this one
+            # and holds the GIL for about a millisecond, right when the new session runs its
+            # first feed; a pool that still has a worker ready can wait a moment.
+            with self.cond:
+                self.cond.wait_for(lambda: self.closed, timeout=_REFILL_DELAY)
+            if self.closed:
+                raise RuntimeError("the pool is closed")
         rt = IsolatedRuntime(
             self.config,
             prewarm=False,
@@ -937,7 +946,9 @@ class _Core(_sandbox_pool._Core):  # noqa: SLF001
             **(self.session if session is None else session),
         )
         try:
-            rt.eval(_WARM_UP)
+            # Everything a session needs that does not depend on it: the dispatcher binding and
+            # the session prelude (also the worker's first command, which is the slow one).
+            preinstall(rt, [_EXTERNAL])
         except BaseException:
             rt.close()
             raise
@@ -993,6 +1004,10 @@ class _Reaper:
 def _check_pool_arguments(
     min_processes: int, sandbox: str, jitless: bool, dump_key: bytes | None
 ) -> bytes:
+    # A session freezes the guest's clock with the worker's own script (`_SessionBase._install`):
+    # import it now, not inside the first checkout.
+    from . import _worker  # noqa: F401, PLC0415
+
     if sandbox not in ("require", "auto", "off"):
         raise ValueError("sandbox must be 'require' (the default), 'auto' or 'off'")
     if not isinstance(jitless, bool):
@@ -1090,7 +1105,9 @@ class Pydeno:
             script_name: A name for the session's code (kept as `PydenoSession.script_name`).
             limits: `PydenoLimits` for this session, over the pool's.
         """
-        resolved = _resolve_limits(self._limits_in, limits)
+        resolved = (
+            self._limits if limits is None else _resolve_limits(self._limits_in, limits)
+        )
         return PydenoSession(self, script_name, resolved)
 
     def stats(self) -> dict[str, Any]:
@@ -1286,18 +1303,21 @@ class PydenoSession:
         calls, names = _check_lookup(external_lookup, sync=True)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
+
+        def answer(call: ToolCall) -> Any:
+            unpacked = _unpack(call)
+            if unpacked is None:
+                raise _not_available(None)
+            value, error = self._call_external(calls.get(unpacked[0]), *unpacked)
+            if error is not None:
+                raise error
+            return value
+
         try:
-            step = self._start(agent, prepared)
-            while isinstance(step, ToolCall):
-                unpacked = _unpack(step)
-                if unpacked is None:
-                    value, error = _MISSING, _not_available(None)
-                else:
-                    value, error = self._call_external(
-                        calls.get(unpacked[0]), *unpacked
-                    )
-                step = self._resume(agent, step, value, error)
-            return self._finish(step)
+            # Driven on this thread: each external call is answered as it arrives.
+            return self._finish(
+                self._start(agent, prepared, lambda src: agent._drive(src, answer))  # noqa: SLF001
+            )
         finally:
             self._printer.callback = None
 
@@ -1389,8 +1409,14 @@ class PydenoSession:
 
     # -- internals -----------------------------------------------------------
 
-    def _start(self, agent: AgentSandbox, prepared: _Prepared) -> Any:
-        step = agent.start(prepared.source)
+    def _start(
+        self,
+        agent: AgentSandbox,
+        prepared: _Prepared,
+        run: Callable[[str], Any] | None = None,
+    ) -> Any:
+        run = run or agent.start
+        step = run(prepared.source)
         if not (isinstance(step, Failed) and _is_js_syntax(step.error)):
             return step
         # Was it the code that does not parse (nothing ran), or a SyntaxError it threw?
@@ -1398,7 +1424,7 @@ class PydenoSession:
             return step
         if prepared.fallback is not None:
             # The rewrite of the last statement did not parse: run the feed as written.
-            step = agent.start(prepared.fallback)
+            step = run(prepared.fallback)
             if not (isinstance(step, Failed) and _is_js_syntax(step.error)):
                 return step
             if self._compiles(agent, prepared.fallback):

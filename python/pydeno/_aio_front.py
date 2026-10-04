@@ -23,11 +23,11 @@ from typing import Any, Literal
 from . import _aio
 from ._agent import _MISSING, Done, Failed, ToolCall
 from ._aio import AsyncIsolatedRuntime
-from ._aio_agent import AsyncAgentSandbox
+from ._aio_agent import AsyncAgentSandbox, apreinstall
 from ._front import (
     _CONFIG,
     _EXTERNAL,
-    _WARM_UP,
+    _REFILL_DELAY,
     PydenoComplete,
     PydenoCrashedError,
     PydenoError,
@@ -65,6 +65,8 @@ class _Pool(AsyncSandboxPool):
     first command (see `_front._Core`)."""
 
     async def _new(self, session: dict[str, Any] | None = None) -> AsyncIsolatedRuntime:
+        if session is None and self._ready:
+            await asyncio.sleep(_REFILL_DELAY)  # see `_front._Core.new`
         rt = await AsyncIsolatedRuntime.create(
             self._config,
             prewarm=False,
@@ -73,7 +75,7 @@ class _Pool(AsyncSandboxPool):
             **(self._session if session is None else session),
         )
         try:
-            await rt.eval(_WARM_UP)  # off the checkout path, as in `Pydeno`
+            await apreinstall(rt, [_EXTERNAL])  # off the checkout path, as in `Pydeno`
         except BaseException:
             await rt.close()
             raise
@@ -132,7 +134,11 @@ class AsyncPydeno:
         """A session on one dedicated worker, checked out by ``async with`` (see
         `Pydeno.checkout`)."""
         return AsyncPydenoSession(
-            self, script_name, _resolve_limits(self._limits_in, limits)
+            self,
+            script_name,
+            self._limits
+            if limits is None
+            else _resolve_limits(self._limits_in, limits),
         )
 
     def stats(self) -> dict[str, Any]:

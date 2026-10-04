@@ -9,6 +9,7 @@ required, never silently downgraded).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import stat
 import subprocess
@@ -36,6 +37,7 @@ from pydeno import (
     classify_error,
 )
 from pydeno import _front, _isolated
+from pydeno._agent import preinstall
 from pydeno._front import _completion
 
 # A container matrix profile that simulates a kernel without every layer cannot give "require";
@@ -817,6 +819,146 @@ class TestAgentSandboxRuntime:
                 AgentSandbox({}, runtime=used)
         finally:
             used.close()
+
+
+# ---------------------------------------------------------------------------
+# pre-installed workers and runs driven on the caller's thread
+# ---------------------------------------------------------------------------
+
+
+def _prepared(names: list[str]) -> IsolatedRuntime:
+    rt = _adoptable()
+    preinstall(rt, names)
+    return rt
+
+
+class TestPreinstalled:
+    def test_the_clock_is_frozen_at_checkout_not_when_the_worker_started(self) -> None:
+        with Pydeno(sandbox=MODE, min_processes=1) as p:
+            assert p._pool.wait_ready(30)  # noqa: SLF001
+            time.sleep(1.5)  # the worker waits in the pool
+            before = int(time.time() * 1000)
+            with p.checkout() as session:
+                now = session.feed_run("Date.now()")
+                assert before - 5 <= now <= int(time.time() * 1000) + 5
+                assert session.feed_run("Date.now()") == now  # frozen
+                assert session.feed_run("new Date().getTime()") == now
+                # The freezer is gone before the first feed's code ran, and stays gone.
+                assert session.feed_run("typeof __pydeno_agent_freeze") == "undefined"
+
+    def test_a_first_feed_that_does_not_compile_still_freezes_before_guest_code(
+        self, pool: Pydeno
+    ) -> None:
+        with pool.checkout() as session:
+            with pytest.raises(PydenoSyntaxError):
+                session.feed_run("x y")
+            first = session.feed_run("Date.now()")
+            assert session.feed_run("Date.now()") == first
+        with pool.checkout() as session:
+            # A SyntaxError the guest throws: the freeze ran; sending it again changes nothing.
+            with pytest.raises(PydenoRuntimeError):
+                session.feed_run("JSON.parse('{')")
+            first = session.feed_run("Date.now()")
+            assert session.feed_run("Date.now()") == first
+
+    def test_dump_after_a_preinstalled_checkout_replays_to_the_same_state(
+        self, pool: Pydeno
+    ) -> None:
+        with pool.checkout() as session:
+            assert session._agent._core.rt._pydeno_prepared is not None  # noqa: SLF001
+            session.feed_run(
+                "var t = Date.now(); var r = [Math.random(), Math.random()]"
+            )
+            session.feed_run(
+                "var got = await Promise.all([f(1), f(2), f(3)])",
+                external_lookup={"f": lambda n: n * 10},
+            )
+            state = session.dump()
+            expected = session.feed_run("[t, r, got, Date.now(), Math.random()]")
+        with pool.checkout() as other:
+            other.load_session(state)
+            assert other.feed_run("[t, r, got, Date.now(), Math.random()]") == expected
+        # The same journal through the plain agent sandbox (threaded replay, a fresh worker).
+        with AgentSandbox.load(
+            state,
+            pool._key,
+            {"__pydeno_external": print},
+            sandbox=MODE,  # noqa: SLF001
+        ) as plain:
+            assert (
+                plain.run("return [t, r, got, Date.now(), Math.random()]") == expected
+            )
+
+    def test_a_prepared_runtime_serves_exactly_one_matching_session(self) -> None:
+        rt = _prepared(["f"])
+        with pytest.raises(ValueError, match="prepared for other tools"):
+            AgentSandbox({"g": print}, runtime=rt)
+        assert not rt.is_closed()  # a refusal leaves it with the caller
+        sb = AgentSandbox({"f": lambda: 3}, runtime=rt)
+        try:
+            assert sb.run("return await f()") == 3
+            with pytest.raises(ValueError, match="used already"):
+                AgentSandbox({"f": print}, runtime=rt)
+            assert sb.run("return 4") == 4  # the refusal did not touch the session
+        finally:
+            sb.close()
+
+    def test_a_prepared_runtime_answers_no_call_before_it_is_adopted(self) -> None:
+        rt = _prepared(["f"])
+        try:
+            with pytest.raises(pydeno.JavaScriptError, match="RuntimeError"):
+                rt._request(  # noqa: SLF001
+                    {"t": "eval_async", "code": "f()", "timeout": None},
+                    soft_timeout=None,
+                )
+        finally:
+            rt.close()
+
+
+class TestRunsOnTheCallersThread:
+    def test_run_needs_no_loop_thread_and_answers_tools_here(self) -> None:
+        threads: list[int] = []
+
+        def tool(n: int) -> int:
+            threads.append(threading.get_ident())
+            return n + 1
+
+        with AgentSandbox({"tool": tool}, sandbox=MODE) as sb:
+            assert sb.run("return await tool(1) + await tool(2)") == 5
+            assert threads == [threading.get_ident()] * 2
+            assert sb._core.thread is None  # noqa: SLF001
+            # start/resume still work on the same session (the loop starts on demand)
+            step = sb.start("return await tool(5)")
+            assert step.name == "tool"
+            assert sb.resume(step, 9).value == 9
+            assert sb.run("return await tool(10)") == 11
+
+    def test_async_tools_and_re_entry(self) -> None:
+        async def slow(n: int) -> int:
+            await asyncio.sleep(0)
+            return n * 2
+
+        with AgentSandbox({"slow": slow}, sandbox=MODE) as sb:
+            assert sb.run("return await slow(21)") == 42
+
+        holder: list[AgentSandbox] = []
+
+        def reenter() -> int:
+            return holder[0].run("return 1")
+
+        with AgentSandbox({"reenter": reenter}, sandbox=MODE) as sb:
+            holder.append(sb)
+            out = sb.run("try { await reenter() } catch (e) { return e.name }")
+            assert out == "RuntimeError"
+            assert sb.run("return 2") == 2
+
+    def test_deadlines_still_kill_a_run_driven_here(self) -> None:
+        with AgentSandbox({}, sandbox=MODE, timeout=0.5) as sb:
+            start = time.monotonic()
+            with pytest.raises(pydeno.RuntimeTimeout):
+                sb.run("for (;;) {}")
+            assert time.monotonic() - start < 10
+            assert sb.is_closed()
 
 
 def test_import_pydeno_stays_light() -> None:

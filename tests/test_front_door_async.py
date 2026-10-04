@@ -248,3 +248,21 @@ async def test_async_agent_sandbox_adopts_a_runtime() -> None:
     assert rt.is_closed()
     with pytest.raises(TypeError, match="drop"):
         AsyncAgentSandbox({}, runtime=AsyncIsolatedRuntime(sandbox=MODE), max_memory=1)
+
+
+async def test_preinstalled_workers_freeze_the_clock_at_checkout_and_replay() -> None:
+    async with AsyncPydeno(sandbox=MODE, min_processes=1) as pool:
+        assert await pool._pool.wait_ready(30)  # noqa: SLF001
+        await asyncio.sleep(1.5)  # the worker waits in the pool
+        before = int(time.time() * 1000)
+        async with pool.checkout() as session:
+            assert session._agent._core.rt._pydeno_prepared is not None  # noqa: SLF001
+            now = await session.feed_run("Date.now()")
+            assert before - 5 <= now <= int(time.time() * 1000) + 5
+            assert await session.feed_run("typeof __pydeno_agent_freeze") == "undefined"
+            await session.feed_run("var r = Math.random()")
+            state = await session.dump()
+            expected = await session.feed_run("[Date.now(), r, Math.random()]")
+        async with pool.checkout() as other:
+            await other.load_session(state)
+            assert await other.feed_run("[Date.now(), r, Math.random()]") == expected
