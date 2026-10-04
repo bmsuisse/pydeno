@@ -30,6 +30,7 @@ import asyncio
 import base64
 import collections
 import collections.abc
+import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -46,6 +47,7 @@ import types
 import typing
 import weakref
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -119,7 +121,6 @@ _DECLARATION = re.compile(
     re.MULTILINE | re.ASCII,  # JavaScript identifiers are narrower than Unicode "\w"
 )
 _SETTLE = "__pydeno_agent_settle"
-_CLOCK_MARK = "__pydeno_agent_clock"
 # On a runtime prepared ahead of time: the worker's clock-freezing script as a function of the
 # instant, compiled before any session exists and called (then deleted) before the first run's
 # code. No guest code runs between the two.
@@ -854,14 +855,13 @@ class _Core:
             )
         return name
 
-    def settle_pending(self, final: Step) -> None:
-        """The pending prefix ran unless the run's script did not compile (a SyntaxError); it
-        is guarded, so sending it again after a SyntaxError the guest threw is harmless."""
-        if not self.pending_js:
-            return
-        if isinstance(final, Failed) and "SyntaxError" in str(final.error)[:80]:
-            return
-        self.pending_js = ""
+    def freeze_first(self) -> None:
+        """Freeze the guest's clock before the first run (a runtime prepared ahead of time):
+        a command of its own, so it has run, completely, before any of the run's code is even
+        parsed. Cleared only once it succeeded; if it fails the worker is gone."""
+        if self.pending_js:
+            self.rt._request({"t": "eval", "code": self.pending_js})  # noqa: SLF001
+            self.pending_js = ""
 
     def _serve(self) -> None:
         assert self.loop is not None
@@ -913,7 +913,10 @@ class _Core:
         capture = OutputCapture(self.max_output_bytes)
         self.console.capture = capture
         try:
-            value = await self.rt.eval_async(self.pending_js + _wrap(code))
+            if self.pending_js:
+                await self.rt.eval_async(self.pending_js)
+                self.pending_js = ""
+            value = await self.rt.eval_async(_wrap(code))
             # Over the cap, the run fails but the session goes on (the value is dropped here).
             bounded_result(value, self.max_result_bytes)
             final: Step = Done(value)
@@ -928,7 +931,6 @@ class _Core:
             stderr=capture.stderr,
             truncated=capture.truncated,
         )
-        self.settle_pending(final)
         with self.cond:
             run.final = final
             # Calls still unanswered now belong to nobody: drop them from what the caller will
@@ -1264,14 +1266,14 @@ class _SessionBase:
             if prepared is None:
                 self._clock_js = _FROZEN_CLOCK_JS % {"ms": self._clock_ms}
             else:
-                # Before the first run's code, in the same script: no guest code can run
-                # before it. The marker is set by it, non-configurable, and tested with `in`
-                # (which the guest cannot redefine), so it runs exactly once.
+                # Sent as a command of its own before the first run's (see `freeze_first`):
+                # the run's own script may fail before executing anything (a parse error, a
+                # frame over the cap), and the guest must still never see the real clock. It
+                # removes the freezer, leaving the global environment exactly as a session
+                # started any other way has it (replay depends on that).
                 self._clock_pending = (
-                    f'if (!("{_CLOCK_MARK}" in globalThis)) {{ '
-                    f'const f = globalThis["{_FREEZER}"]; delete globalThis["{_FREEZER}"]; '
-                    f"f({int(self._clock_ms)}); "
-                    f'Object.defineProperty(globalThis, "{_CLOCK_MARK}", {{ value: true }}); }}'
+                    f'{{ const f = globalThis["{_FREEZER}"]; delete globalThis["{_FREEZER}"]; '
+                    f"f({int(self._clock_ms)}); }} undefined;"
                 )
 
     # -- introspection -------------------------------------------------------
@@ -1565,6 +1567,61 @@ class _SessionBase:
         }
 
 
+class _InlineRun:
+    """One `AgentSandbox._drive`: its answering function, the caller's context, the order its
+    tool calls are answered in, and whether it is still the run in progress."""
+
+    __slots__ = ("active", "answer", "context", "executor", "order", "state")
+
+    def __init__(
+        self, answer: Callable[[ToolCall], Any] | None, executor: Any, session_id: int
+    ) -> None:
+        self.answer = answer
+        self.executor = executor
+        self.context = contextvars.copy_context()
+        # Tools see which session they are answering for, so they cannot drive or close it.
+        self.context.run(_TOOL_OF.set, session_id)
+        self.order = asyncio.Lock()
+        self.state = threading.Lock()
+        self.active = True
+
+    def end(self) -> None:
+        with self.state:
+            self.active = False
+
+
+# The session whose tool is running in this context (set only in a `_drive` run's tools).
+_TOOL_OF: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "pydeno_agent_tool_of", default=None
+)
+_TOOL_LOOP_LOCK = threading.Lock()
+_TOOL_LOOP: tuple[int, asyncio.AbstractEventLoop, ThreadPoolExecutor] | None = None
+# Plain tools run here (an event loop must never block on one). A tool that never returns keeps
+# its thread; the limits still end its run and release the caller.
+_TOOL_THREADS = 64
+
+
+def _tool_loop() -> tuple[asyncio.AbstractEventLoop, ThreadPoolExecutor]:
+    """The process's one loop for answering tool calls of runs driven by `_drive` (started on
+    first use, and again in a fork()ed child), and the thread pool plain tools run on."""
+    global _TOOL_LOOP  # noqa: PLW0603
+    current = _TOOL_LOOP
+    if current is not None and current[0] == os.getpid():
+        return current[1], current[2]
+    with _TOOL_LOOP_LOCK:
+        current = _TOOL_LOOP
+        if current is None or current[0] != os.getpid():
+            loop = asyncio.new_event_loop()
+            threading.Thread(
+                target=loop.run_forever, name="pydeno-agent-tools", daemon=True
+            ).start()
+            executor = ThreadPoolExecutor(
+                max_workers=_TOOL_THREADS, thread_name_prefix="pydeno-agent-tool"
+            )
+            current = _TOOL_LOOP = (os.getpid(), loop, executor)
+        return current[1], current[2]
+
+
 class _Slot:
     """Where a runtime's tool shims find the session they belong to. Set when the session is
     built, or, for a runtime prepared ahead of time (`preinstall`), when a session adopts it."""
@@ -1576,10 +1633,10 @@ class _Slot:
 
 
 class _Shim:
-    """A tool as a sync session's runtime calls it. It is registered as asynchronous (the guest
-    gets a promise, which the prelude's settle step needs), but it is a plain callable: during a
-    run driven on the caller's thread (`AgentSandbox._drive`) it answers at once, there, without
-    an event loop; otherwise it returns the coroutine the runtime awaits on the session's loop."""
+    """A tool as a sync session's runtime calls it (an asynchronous host function, so the guest
+    gets a promise, which the prelude's settle step needs). It returns the coroutine the runtime
+    runs on the loop the command was given: the tool loop during `AgentSandbox._drive` (which
+    answers it), the session's loop otherwise (which hands it to `start`/`resume`)."""
 
     __slots__ = ("catalog", "name", "slot")
 
@@ -1847,7 +1904,10 @@ class AgentSandbox(_SessionBase):
     # -- running -------------------------------------------------------------
 
     def _enter(self) -> None:
-        if threading.current_thread() is self._core.thread:
+        if (
+            threading.current_thread() is self._core.thread
+            or _TOOL_OF.get() == self._core.session_id
+        ):
             raise RuntimeError(
                 "an AgentSandbox cannot be driven from one of its own tools"
             )
@@ -1911,14 +1971,17 @@ class AgentSandbox(_SessionBase):
     def _drive(
         self, code: str, answer: Callable[[ToolCall], Any] | None = None
     ) -> Done | Failed:
-        """A run with every tool call answered, driven on the caller's thread: the command's
-        pump runs here, and each tool call is answered by the shim, here, as it arrives (by
-        `answer(call)`, default the real tool), and journaled exactly as `start`/`resume` would
-        journal it (an observed `ToolCall`, then its answer). No loop thread, no hand-offs.
+        """A run with every tool call answered, the command driven from the caller's thread.
 
-        The pump enforces the deadlines as for any command; while a tool runs it is that tool's
-        caller, so the CPU cap and `max_pause` are checked when the tool returns rather than
-        during it (the idle watchdog still checks memory meanwhile)."""
+        The caller's thread runs the command's pump, which enforces the deadline, the CPU cap,
+        `max_pause` and the memory ceiling the whole time, also while a tool runs: tool calls
+        are answered off this thread, on the shared tool loop (`_tool_loop`), one at a time in
+        the order the guest made them (by `answer(call)`, default the real tool, run in a copy
+        of the caller's context), and journaled exactly as `start`/`resume` journal them (an
+        observed `ToolCall`, then its answer). A tool that outlives a limit gets the worker
+        killed and the caller released at once; its late answer is discarded. A run that calls
+        no tool touches no other thread.
+        """
         self._enter()
         try:
             if not isinstance(code, str):
@@ -1930,18 +1993,22 @@ class AgentSandbox(_SessionBase):
                 )
             core = self._core
             rt = core.rt
+            loop, executor = _tool_loop()
+            run = _InlineRun(answer, executor, core.session_id)
             self._record(["run", code])
             capture = OutputCapture(self._max_output_bytes)
             core.console.capture = capture
-            core.inline = functools.partial(self._inline_answer, answer)
+            core.inline = functools.partial(self._inline_call, run)
             try:
-                value = rt._request(  # noqa: SLF001 - `eval_async` without a loop: the pump runs here
+                core.freeze_first()
+                value = rt._request(  # noqa: SLF001 - `eval_async`, pumped on this thread
                     {
                         "t": "eval_async",
-                        "code": core.pending_js + _wrap(code),
+                        "code": _wrap(code),
                         "timeout": rt._soft_timeout,  # noqa: SLF001
                     },
                     soft_timeout=rt._soft_timeout,  # noqa: SLF001
+                    loop=loop,
                 )
                 # Over the cap, the run fails but the session goes on.
                 bounded_result(value, self._max_result_bytes)
@@ -1951,6 +2018,7 @@ class AgentSandbox(_SessionBase):
             except BaseException:
                 # KeyboardInterrupt and the like, mid-command: the worker cannot be left
                 # half-way through it. The run is lost (with what it spent), as after a crash.
+                run.end()
                 rt._kill()  # noqa: SLF001
                 self._mark_dead("WorkerCrashed")
                 core.shutdown()
@@ -1958,41 +2026,62 @@ class AgentSandbox(_SessionBase):
             finally:
                 core.inline = None
                 core.console.capture = None
-            final = dataclasses.replace(
-                final,
-                stdout=capture.stdout,
-                stderr=capture.stderr,
-                truncated=capture.truncated,
-            )
-            core.settle_pending(final)
-            step = self._observe(final)
+            # From here on a tool still running (the worker was killed under it) changes nothing.
+            with run.state:
+                run.active = False
+                final = dataclasses.replace(
+                    final,
+                    stdout=capture.stdout,
+                    stderr=capture.stderr,
+                    truncated=capture.truncated,
+                )
+                step = self._observe(final)
             assert not isinstance(step, ToolCall)
             return step
         finally:
             self._lock.release()
 
-    def _inline_answer(
-        self, answer: Callable[[ToolCall], Any] | None, name: str, args: list[Any]
-    ) -> Any:
-        """A tool call during `_drive`, answered on the spot (on the caller's thread, inside
-        the runtime's host-call guard, so the tool cannot re-enter the session)."""
+    async def _inline_call(self, run: _InlineRun, name: str, args: list[Any]) -> Any:
+        """A tool call during `_drive`, on the tool loop. Charged and numbered as it arrives,
+        then answered strictly in arrival order (`run.lock` is first come, first served)."""
         core = self._core
-        core.charge(name)
-        call = ToolCall(name, tuple(args), next(core.ids), core.session_id)
-        self._observe(call)
-        error: BaseException | None = None
-        value: Any = _MISSING
-        try:
-            if answer is None:
-                value = self._call_tool(call)
-            else:
-                value = self._check_result(call, answer(call))
-        except Exception as exc:  # noqa: BLE001 - the guest sees the failure
-            value, error = _MISSING, exc
-        sent_value, sent = self._answer(call, value, error)
+        with run.state:
+            if not run.active:
+                raise RuntimeError("the run has ended")
+            core.charge(name)
+            call = ToolCall(name, tuple(args), next(core.ids), core.session_id)
+        async with run.order:
+            with run.state:
+                if not run.active:
+                    raise RuntimeError("the run has ended")
+                self._observe(call)
+            error: BaseException | None = None
+            value: Any = _MISSING
+            try:
+                value = self._check_result(call, await self._run_tool(run, call))
+            except Exception as exc:  # noqa: BLE001 - the guest sees the failure
+                value, error = _MISSING, exc
+            with run.state:
+                if not run.active:
+                    raise RuntimeError("the run has ended")
+                sent_value, sent = self._answer(call, value, error)
         if sent is not None:
             raise sent
         return sent_value
+
+    async def _run_tool(self, run: _InlineRun, call: ToolCall) -> Any:
+        loop = asyncio.get_running_loop()
+        if run.answer is not None:
+            fn, args = run.answer, (call,)
+        else:
+            fn, args = self._check_call(call)
+        if inspect.iscoroutinefunction(fn):
+            # A task made inside the caller's context runs in (a copy of) it.
+            return await run.context.run(loop.create_task, fn(*args))
+        result = await loop.run_in_executor(run.executor, run.context.run, fn, *args)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
 
     def call(self, step: ToolCall) -> Any:
         """Run the real tool for a `ToolCall` (what `run` does for each one) and return its
@@ -2124,7 +2213,10 @@ class AgentSandbox(_SessionBase):
 
     def close(self) -> None:
         """Stop the worker and the session's thread. Idempotent; safe while paused."""
-        if threading.current_thread() is self._core.thread:
+        if (
+            threading.current_thread() is self._core.thread
+            or _TOOL_OF.get() == self._core.session_id
+        ):
             raise RuntimeError("a tool cannot close the session that is running it")
         self._paused = None
         self._finalizer()

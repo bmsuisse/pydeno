@@ -77,6 +77,10 @@ __all__ = ["AsyncAgentSandbox"]
 _OFFLOAD_BYTES = 1024 * 1024
 
 
+class _RunEnded(RuntimeError):
+    """The run ended (its worker was killed) while one of its tools was still running."""
+
+
 class _AsyncRun(_Run):
     __slots__ = ("wake",)
 
@@ -160,7 +164,11 @@ class _Core:
         self.console.capture = capture
         cancelled = False
         try:
-            value = await self.rt.eval(self.pending_js + _wrap(code))
+            if self.pending_js:
+                # Before the first run, as a command of its own (see `_agent._Core.freeze_first`).
+                await self.rt.eval(self.pending_js)
+                self.pending_js = ""
+            value = await self.rt.eval(_wrap(code))
             # Over the cap, the run fails but the session goes on (the value is dropped here).
             bounded_result(value, self.max_result_bytes)
             final: Step = Done(value)
@@ -179,10 +187,6 @@ class _Core:
             stderr=capture.stderr,
             truncated=capture.truncated,
         )
-        if self.pending_js and not (
-            isinstance(final, Failed) and "SyntaxError" in str(final.error)[:80]
-        ):
-            self.pending_js = ""  # it ran (it is guarded: sending it again is harmless)
         self.finish(run, final)
         if cancelled:
             raise asyncio.CancelledError
@@ -517,7 +521,7 @@ class AsyncAgentSandbox(_SessionBase):
             step = await self._start(code)
             while isinstance(step, ToolCall):
                 try:
-                    result = await self._call_tool(step)
+                    result = await self._until_run_ends(self._call_tool(step))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - the guest sees the failure
@@ -530,6 +534,28 @@ class AsyncAgentSandbox(_SessionBase):
         finally:
             self._busy = False
         return step
+
+    async def _until_run_ends(self, awaitable: Any) -> Any:
+        """Await a tool's answer, unless the run ends first: the worker was killed under it (a
+        limit, such as ``max_pause``, enforced by the runtime's supervisor while the tool runs).
+        Then the tool is cancelled (a plain one, on a thread, is left to finish; its answer is
+        discarded) and `_RunEnded` is raised, which answers the call with an error: the session
+        then observes the run's real outcome at once instead of waiting for the tool."""
+        task = asyncio.ensure_future(awaitable)
+        run_task = self._core.task
+        if run_task is None or run_task.done():
+            return await task
+        try:
+            done, _ = await asyncio.wait(
+                {task, run_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            task.cancel()
+            raise
+        if task in done:
+            return task.result()
+        task.cancel()
+        raise _RunEnded("the run ended while the tool was running")
 
     async def call(self, step: ToolCall) -> Any:
         """Run the real tool for a `ToolCall` and return its result (see `AgentSandbox.call`)."""

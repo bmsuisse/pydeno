@@ -32,6 +32,9 @@ documented argument.
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextvars
+import functools
 import inspect
 import json
 import math
@@ -42,6 +45,7 @@ import secrets
 import signal
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
@@ -57,6 +61,7 @@ from ._agent import (
     _error_class,
     _open_journal,
     _public,
+    _tool_loop,
     preinstall,
 )
 from ._isolated import IsolatedRuntime, WorkerCrashed
@@ -138,7 +143,10 @@ class PydenoLimits(TypedDict, total=False):
 
     max_host_wait_secs: float | None
     """pydeno only: most time one feed may spend suspended, waiting on external calls in total
-    (default 600 s), so a session nobody resumes does not hold a worker forever."""
+    (default 600 s). Enforced while the external call runs: past it the worker is killed and the
+    feed raises `PydenoTimeoutError` within about 0.1 s, even if the external function never
+    returns (it is left running on its own thread; its answer is discarded). The same holds for
+    the CPU cap while the guest computes during an external call."""
 
 
 _LIMIT_KEYS = frozenset(PydenoLimits.__annotations__)
@@ -896,8 +904,9 @@ class PydenoSnapshot:
                 f"external function {self.function_name!r} is async; use AsyncPydeno"
             )
         self._take()
-        value, error = self._session._call_external(fn, self.function_name, self.args)  # noqa: SLF001
-        return self._session._answer(self, value, error)  # noqa: SLF001
+        session = self._session
+        value, error = session._bounded_external(fn, self.function_name, self.args)  # noqa: SLF001
+        return session._answer(self, value, error)  # noqa: SLF001
 
     def dump(self) -> bytes:
         """The suspended session, signed (see `PydenoSession.dump`); restore it with
@@ -916,6 +925,8 @@ class PydenoSnapshot:
 # ---------------------------------------------------------------------------
 
 
+# How often a caller waiting on an external checks that the worker is still alive.
+_POLL = 0.05
 # How long a filler waits before replacing a checked-out worker while another is still ready.
 _REFILL_DELAY = 0.05
 
@@ -965,15 +976,30 @@ class _Reaper:
     The worker is killed before the session's exit returns; only the bookkeeping waits."""
 
     def __init__(self) -> None:
-        self._queue: queue.SimpleQueue[IsolatedRuntime] = queue.SimpleQueue()
+        self._queue: queue.SimpleQueue[IsolatedRuntime | None] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._stopped = False
+
+    def stop(self) -> None:
+        """Let the thread finish what is queued and exit. Workers of sessions that end later
+        are killed and reaped on their own thread. Idempotent."""
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            if self._thread is not None and self._thread.is_alive():
+                self._queue.put(None)
 
     def kill(self, rt: IsolatedRuntime) -> None:
         if rt.is_closed():
             return
-        if os.getpid() != rt._owner_pid:  # noqa: SLF001 - a fork()ed child: not ours to kill
-            rt.close()
+        if os.getpid() != rt._owner_pid or self._stopped:  # noqa: SLF001
+            # A fork()ed child (not ours to signal), or a closed pool: no reaper thread.
+            if os.getpid() == rt._owner_pid:  # noqa: SLF001
+                rt._kill()  # noqa: SLF001
+            else:
+                rt.close()
             return
         proc = rt._proc  # noqa: SLF001
         try:
@@ -984,8 +1010,11 @@ class _Reaper:
             except OSError:
                 pass
         rt._closed = True  # noqa: SLF001 - nothing may be sent to it any more
-        self._queue.put(rt)
         with self._lock:
+            if self._stopped:  # closed meanwhile: reap here
+                rt._reap()  # noqa: SLF001
+                return
+            self._queue.put(rt)
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
                     target=self._run, name="pydeno-front-reaper", daemon=True
@@ -995,6 +1024,8 @@ class _Reaper:
     def _run(self) -> None:
         while True:
             rt = self._queue.get()
+            if rt is None:
+                return
             try:
                 rt._reap()  # noqa: SLF001
             except Exception:  # noqa: BLE001, S110 - a reaper must not die of one worker
@@ -1075,6 +1106,7 @@ class Pydeno:
         self._limits = _resolve_limits(limits)
         self._sandbox = sandbox
         self._reaper = _Reaper()
+        weakref.finalize(self, self._reaper.stop)  # a pool dropped without close()
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
@@ -1092,8 +1124,9 @@ class Pydeno:
         self.close()
 
     def close(self) -> None:
-        """Kill the workers still waiting in the pool. Idempotent."""
+        """Kill the workers still waiting in the pool, and stop its threads. Idempotent."""
         self._pool.close()
+        self._reaper.stop()
 
     def checkout(
         self, *, script_name: str = "main.js", limits: PydenoLimits | None = None
@@ -1197,6 +1230,24 @@ def _load_failure(exc: BaseException) -> BaseException:
 # ---------------------------------------------------------------------------
 
 
+def _exclusive(method: Callable[..., Any]) -> Callable[..., Any]:
+    """One feed (or dump, or load) at a time per session. A second caller gets a `PydenoError`
+    and touches nothing the first one is using (its printer, its run)."""
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self._busy.acquire(blocking=False):
+            raise PydenoError(
+                "the session is busy (another thread is feeding it); use one session per thread"
+            )
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._busy.release()
+
+    return wrapper
+
+
 class PydenoSession:
     """A REPL session on one dedicated, single-use worker (Monty's `MontySession`).
 
@@ -1215,6 +1266,7 @@ class PydenoSession:
         self._agent: AgentSandbox | None = None
         self._printer = _Printer()
         self._entered = False
+        self._busy = threading.Lock()
 
     def __enter__(self) -> PydenoSession:
         if self._entered:
@@ -1269,6 +1321,7 @@ class PydenoSession:
 
     # -- feeding -------------------------------------------------------------
 
+    @_exclusive
     def feed_run(
         self,
         code: str,
@@ -1321,6 +1374,7 @@ class PydenoSession:
         finally:
             self._printer.callback = None
 
+    @_exclusive
     def feed_start(
         self,
         code: str,
@@ -1347,6 +1401,7 @@ class PydenoSession:
 
     # -- durability ----------------------------------------------------------
 
+    @_exclusive
     def dump(self) -> bytes:
         """The session's state, idle or suspended mid-feed, as signed bytes (the agent sandbox's
         journal: every feed's code and every external answer, HMAC-signed with the pool's
@@ -1361,6 +1416,7 @@ class PydenoSession:
         except Exception as exc:  # noqa: BLE001
             raise PydenoError(f"cannot dump this session: {exc}", exc) from exc
 
+    @_exclusive
     def load_session(self, state: bytes) -> None:
         """Replace this session's state with `state` (a `dump()` taken between feeds), replayed
         on a fresh worker; the current worker is killed. Only state signed with this pool's
@@ -1368,6 +1424,7 @@ class PydenoSession:
         dumped mid-feed (use `load_snapshot`)."""
         self._replace(state, suspended=False)
 
+    @_exclusive
     def load_snapshot(
         self,
         state: bytes,
@@ -1454,6 +1511,27 @@ class PydenoSession:
                 return agent.resume(step, error=exc)
         return agent.resume(step, error=error)
 
+    def _bounded_external(
+        self, fn: Any, name: str, args: tuple[Any, ...]
+    ) -> tuple[Any, BaseException | None]:
+        """`_call_external` on a tool thread, given up on as soon as the worker is gone (a limit
+        enforced while the external runs killed it): the caller is released at once; the
+        external is left to finish on its thread and its answer is discarded."""
+        agent = self._live()
+        _, executor = _tool_loop()
+        future = executor.submit(
+            contextvars.copy_context().run, self._call_external, fn, name, args
+        )
+        rt = agent._core.rt  # noqa: SLF001
+        while True:
+            try:
+                return future.result(_POLL)
+            except concurrent.futures.TimeoutError:
+                if rt.is_closed():
+                    return _MISSING, RuntimeError(
+                        "the run ended while the external ran"
+                    )
+
     @staticmethod
     def _call_external(
         fn: Any, name: str, args: tuple[Any, ...]
@@ -1494,6 +1572,7 @@ class PydenoSession:
         self._printer.callback = None
         return PydenoComplete(self._finish(step))
 
+    @_exclusive
     def _answer(
         self, snapshot: PydenoSnapshot, value: Any, error: BaseException | None
     ) -> PydenoSnapshot | PydenoComplete:

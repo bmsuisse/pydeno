@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import functools
 import inspect
 from collections.abc import Callable
 from typing import Any, Literal
@@ -262,9 +263,15 @@ class AsyncPydenoSnapshot:
         running a plain one on the handler thread pool)."""
         self._take()
         session = self._session
-        value, error = await session._call_external(  # noqa: SLF001
-            self._lookup.get(self.function_name), self.function_name, self.args
-        )
+        agent = session._live()  # noqa: SLF001
+        try:
+            value, error = await agent._until_run_ends(  # noqa: SLF001
+                session._call_external(  # noqa: SLF001
+                    self._lookup.get(self.function_name), self.function_name, self.args
+                )
+            )
+        except RuntimeError as exc:
+            value, error = _MISSING, exc
         return await session._answer(self, value, error)  # noqa: SLF001
 
     async def dump(self) -> bytes:
@@ -276,6 +283,24 @@ class AsyncPydenoSnapshot:
             f"AsyncPydenoSnapshot(function_name={self.function_name!r}, args={self.args!r}, "
             f"call_id={self.call_id})"
         )
+
+
+def _exclusive_async(method: Callable[..., Any]) -> Callable[..., Any]:
+    """`_front._exclusive` for a coroutine method: one feed at a time per session."""
+
+    @functools.wraps(method)
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if self._busy:
+            raise PydenoError(
+                "the session is busy (another task is feeding it); use one session per task"
+            )
+        self._busy = True
+        try:
+            return await method(self, *args, **kwargs)
+        finally:
+            self._busy = False
+
+    return wrapper
 
 
 class AsyncPydenoSession:
@@ -290,6 +315,7 @@ class AsyncPydenoSession:
         self._agent: AsyncAgentSandbox | None = None
         self._printer = _Printer()
         self._entered = False
+        self._busy = False
 
     async def __aenter__(self) -> AsyncPydenoSession:
         if self._entered:
@@ -350,6 +376,7 @@ class AsyncPydenoSession:
 
     # -- feeding -------------------------------------------------------------
 
+    @_exclusive_async
     async def feed_run(
         self,
         code: str,
@@ -370,9 +397,14 @@ class AsyncPydenoSession:
                 if unpacked is None:
                     value, error = _MISSING, _not_available(None)
                 else:
-                    value, error = await self._call_external(
-                        calls.get(unpacked[0]), *unpacked
-                    )
+                    try:
+                        # Bounded by the run: a limit that kills the worker while the
+                        # external runs ends the feed now, not when the external returns.
+                        value, error = await agent._until_run_ends(  # noqa: SLF001
+                            self._call_external(calls.get(unpacked[0]), *unpacked)
+                        )
+                    except RuntimeError as exc:
+                        value, error = _MISSING, exc
                 step = await self._resume(agent, step, value, error)
             return self._finish(step)
         except asyncio.CancelledError:
@@ -382,6 +414,7 @@ class AsyncPydenoSession:
         finally:
             self._printer.callback = None
 
+    @_exclusive_async
     async def feed_start(
         self,
         code: str,
@@ -403,6 +436,7 @@ class AsyncPydenoSession:
 
     # -- durability ----------------------------------------------------------
 
+    @_exclusive_async
     async def dump(self) -> bytes:
         """See `PydenoSession.dump`."""
         try:
@@ -412,10 +446,12 @@ class AsyncPydenoSession:
         except Exception as exc:  # noqa: BLE001
             raise PydenoError(f"cannot dump this session: {exc}", exc) from exc
 
+    @_exclusive_async
     async def load_session(self, state: bytes) -> None:
         """See `PydenoSession.load_session`."""
         await self._replace(state, suspended=False)
 
+    @_exclusive_async
     async def load_snapshot(
         self,
         state: bytes,
@@ -534,6 +570,7 @@ class AsyncPydenoSession:
         self._printer.callback = None
         return PydenoComplete(self._finish(step))
 
+    @_exclusive_async
     async def _answer(
         self, snapshot: AsyncPydenoSnapshot, value: Any, error: BaseException | None
     ) -> AsyncPydenoSnapshot | PydenoComplete:

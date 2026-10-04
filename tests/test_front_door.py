@@ -10,6 +10,7 @@ required, never silently downgraded).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import stat
 import subprocess
@@ -916,16 +917,20 @@ class TestPreinstalled:
 
 
 class TestRunsOnTheCallersThread:
-    def test_run_needs_no_loop_thread_and_answers_tools_here(self) -> None:
-        threads: list[int] = []
+    def test_run_needs_no_loop_thread_and_answers_tools_in_the_callers_context(
+        self,
+    ) -> None:
+        seen: list[str] = []
+        var: contextvars.ContextVar[str] = contextvars.ContextVar("v", default="unset")
 
         def tool(n: int) -> int:
-            threads.append(threading.get_ident())
+            seen.append(var.get())
             return n + 1
 
+        var.set("caller")
         with AgentSandbox({"tool": tool}, sandbox=MODE) as sb:
             assert sb.run("return await tool(1) + await tool(2)") == 5
-            assert threads == [threading.get_ident()] * 2
+            assert seen == ["caller", "caller"]
             assert sb._core.thread is None  # noqa: SLF001
             # start/resume still work on the same session (the loop starts on demand)
             step = sb.start("return await tool(5)")
