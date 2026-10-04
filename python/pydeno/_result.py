@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 from typing import Any, Literal
 
+from ._limits import limit_int
 from ._pydeno import JavaScriptError, JsUndefined
 
 __all__ = [
@@ -115,9 +116,12 @@ class ExecutionResult:
 
 
 def check_limit(name: str, value: Any) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ValueError(f"{name} must be a positive int")
-    return value
+    """A positive byte count: `TypeError` for a non-integer (or a bool), `ValueError` below 1."""
+    if value is None:
+        raise TypeError(f"{name} must be a positive int")
+    result = limit_int(name, value, minimum=1)
+    assert result is not None
+    return result
 
 
 # ---------------------------------------------------------------------------

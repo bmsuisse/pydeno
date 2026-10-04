@@ -59,11 +59,35 @@
   reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
   size and dependency difference. See `docs/guides/advanced/inspector.md`.
 
-Nothing changes for existing code except `python -m pydeno` (see Changed); see
+Nothing changes for existing code except `python -m pydeno` (see Changed) and the limit fixes under
+Security; see
 [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
 
+- **Limit values are validated.** Durations (`request_timeout`, `max_host_wait`, `write_stall_timeout`,
+  `RuntimeConfig.timeout`, per-call `timeout=`, `AgentSandbox` `timeout`/`max_pause`, `SessionPool`
+  `ttl`/`counter_ttl`/`eviction_interval`/`idle_timeout`, `PydenoLimits` seconds) must be `None` or a
+  finite number of seconds above zero and at most about 70 years (`threading.TIMEOUT_MAX / 4`);
+  `timeout_grace`, `SessionPool(acquire_timeout=)` and `get(timeout=)` may be 0. Counts (`max_memory`,
+  `max_host_calls`, `max_inflight_host_calls`, `max_tool_calls`, `max_journal_bytes`, output caps, pool
+  sizes, `max_sessions`, `max_per_owner`, `max_suspensions`, `max_tool_threads`) must be an int between
+  their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
+  before and turned the limit off without saying so (every comparison with NaN is false); Python's
+  `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
+  wrong type raises `TypeError`, a bad value `ValueError`.
+- **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
+  host runs a tool, and console calls were treated the same way, so time spent handling a flood of
+  `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`
+  (600 s by default). Console time now pauses the deadline for at most one hard deadline in total per
+  command: one slow write does not end a run, and a flood can at most double it. Console time while a
+  tool call is in flight is covered by that call's pause. Console calls are no longer refused by
+  `max_inflight_host_calls` (they are synchronous, never in flight) and still count toward
+  `max_host_calls`.
+- **`Pydeno`'s default printer is capped.** Without a `print_callback`, a feed's console output goes to
+  the host's stdout/stderr; it now stops after 1 MiB per feed with one `[truncated]` line (it was
+  unbounded: about 150 MB in 2 s measured). An explicit `print_callback` gets everything.
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
   `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a

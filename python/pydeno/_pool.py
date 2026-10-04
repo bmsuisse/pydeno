@@ -34,6 +34,8 @@ from typing import Any
 
 from ._agent import DEFAULT_MAX_JOURNAL_BYTES, JournalError
 from ._aio_agent import AsyncAgentSandbox
+from ._limits import limit_int, limit_seconds
+from ._result import check_limit
 
 __all__ = [
     "InMemoryJournalStore",
@@ -234,19 +236,21 @@ class SessionPool:
                 "tools must be a mapping, a list of schema tools, or a "
                 "(owner, session_id) -> tools function"
             )
-        if not isinstance(max_sessions, int) or max_sessions < 1:
-            raise ValueError("max_sessions must be a positive int")
-        if max_per_owner is not None and (
-            not isinstance(max_per_owner, int) or max_per_owner < 1
-        ):
-            raise ValueError("max_per_owner must be a positive int or None")
-        if not isinstance(max_journal_bytes, int) or max_journal_bytes <= 0:
-            raise ValueError("max_journal_bytes must be a positive int")
-        for name, value in (("ttl", ttl), ("counter_ttl", counter_ttl)):
-            if value is not None and value <= 0:
-                raise ValueError(f"{name} must be positive or None")
-        if eviction_interval <= 0:
-            raise ValueError("eviction_interval must be positive")
+        # TypeError for a wrong type, ValueError for a bad value; NaN and infinity are refused (a NaN
+        # TTL or interval is a comparison that never fires, silently).
+        max_sessions = check_limit("max_sessions", max_sessions)
+        max_per_owner = limit_int("max_per_owner", max_per_owner, minimum=1)
+        max_journal_bytes = check_limit("max_journal_bytes", max_journal_bytes)
+        ttl = limit_seconds("ttl", ttl)
+        counter_ttl = limit_seconds("counter_ttl", counter_ttl)
+        if eviction_interval is None:
+            raise TypeError("eviction_interval must be a number of seconds")
+        eviction_interval = limit_seconds("eviction_interval", eviction_interval)
+        if idle_timeout is not _DEFAULT:
+            idle_timeout = limit_seconds("idle_timeout", idle_timeout)
+        acquire_timeout = limit_seconds(
+            "acquire_timeout", acquire_timeout, allow_zero=True
+        )
         owned = {"clock", "random_seed", "max_journal_bytes"} & sandbox_options.keys()
         if owned:
             raise TypeError(f"SessionPool sets {sorted(owned)} itself")
@@ -293,7 +297,11 @@ class SessionPool:
         _check_id(owner, "owner")
         _check_id(session_id, "session_id")
         self._bind_loop()
-        wait = self._acquire_timeout if timeout is _DEFAULT else timeout
+        wait = (
+            self._acquire_timeout
+            if timeout is _DEFAULT
+            else limit_seconds("timeout", timeout, allow_zero=True)
+        )
         k = (owner, session_id)
         while True:
             entry = self._entries.get(k)
