@@ -63,6 +63,10 @@ collect_ignore = (
         "test_errors_taxonomy.py",
         "test_preflight.py",
         "test_seatbelt_profile.py",
+        "test_aio_agent_results.py",
+        "test_aio_agent_recovery.py",
+        "test_aio_agent_schema_tools.py",
+        "test_agent_replay_public_errors.py",
     ]
     if sys.platform == "win32"
     else []
