@@ -71,12 +71,50 @@ Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/
   `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
   (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
   properties, so an index setter on `Array.prototype` neither sees nor replaces them.
+- **`max_buffer_bytes` now covers resizable buffers.** V8 allocates a resizable `ArrayBuffer`
+  (`new ArrayBuffer(n, {maxByteLength})`), a growable `SharedArrayBuffer`, and the copy `transfer()` makes of
+  a resizable buffer from its own page allocator, not the embedder's, so the cap never saw them: a guest could
+  commit gigabytes under a cap of a few hundred megabytes, and filling the buffer was a `max_memory` kill
+  instead of the promised catchable `RangeError`. The bridge now charges their committed bytes to the same
+  budget at construction, `resize`/`grow` and `transfer*`, through one op that keys each buffer by a private
+  symbol and holds it weakly; when a charge would exceed the cap the op forces a GC, gives collected buffers'
+  bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget; the
+  allocator does the same cheap sweep before refusing a fixed-length buffer, and the bookkeeping is bounded
+  (it is swept as it doubles and capped). Resizable buffers are charged in whole OS pages, which is what V8
+  commits for them (a one-byte resizable buffer costs a page). `instanceof`, subclassing, `Symbol.species`
+  and the prototype objects are unchanged.
+- **A refused allocation no longer leaves the runtime terminated.** With `max_heap_size` set, an
+  `ArrayBuffer` the buffer cap refused was reported to the guest as a `RangeError` but also marked the
+  runtime as over its heap limit, so every later command failed with `RuntimeTerminated`. Only a JS heap
+  that really is at its limit terminates now, and a refusal no longer stays flagged after V8's final retry
+  (a later real heap overflow used to be taken for a refusal, and V8 then aborted the process). `WebAssembly.Memory`
+  remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
+- **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
+  `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's
+  stderr capture file under `RLIMIT_FSIZE` (1 MiB), and deno_core's `op_print` unwraps the flush of the
+  failed write, so the worker aborted (SIGABRT). The worker no longer lets the engine echo console output;
+  `on_console` and `capture_console` are unaffected.
+- **Captured console output carries no control or escape characters.** `execute()` (and the agent layer's
+  `ExecutionResult`) cleaned error text but returned `stdout`/`stderr` with raw ANSI/C1 sequences; they now
+  follow the same rule (newlines and tabs stay), and both also drop the Unicode bidirectional controls that
+  reorder a line and the invisible format characters (zero-width joiners and spaces, the BOM, soft hyphen,
+  line and paragraph separators, variation selectors, TAG characters) that carry text a reader never sees
+  but a model does. Emoji sequences lose their joiners and skin-tone modifiers and render as their parts.
+  An `on_console` callback still receives the guest's text raw; sanitise it before printing.
 
 ### Fixed
 
 - Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
   the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
   even when the guest's error was still being read at that point.
+- The runtime stays usable after a module evaluation times out (or waits on a top-level `await` that never
+  settles): later commands, timeouts and `TerminationHandle.terminate()` are served as usual, and the idle
+  runtime thread does not spin. Known limit: after that, a *new* module stuck on a top-level `await` is no
+  longer reported at once; it waits for its timeout (forever without one). See the modules guide.
+- After a deadline has fired, a later `TerminationHandle.terminate()` reports its own reason instead of the
+  earlier timeout's, also when it lands while the timed-out call is still returning.
+- Evaluating a module again after its first evaluation timed out or was terminated explains that, instead
+  of failing with `Uncaught null`.
 
 ### Changed
 

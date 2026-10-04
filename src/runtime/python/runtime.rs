@@ -402,11 +402,10 @@ impl TerminationHandle {
     /// contract. A blocked synchronous `eval()` on the owning thread returns
     /// an error shortly after this call returns.
     fn terminate(&self) {
-        self.termination
-            .ensure_reason("Terminated via TerminationHandle from another thread");
         // Flag REQUESTED first (as `RuntimeHandle::terminate` does) so the
         // runtime thread treats the aborted execution as a real termination.
-        self.termination.request();
+        self.termination
+            .request_with_reason("Terminated via TerminationHandle from another thread");
         self.termination.terminate_execution();
     }
 
