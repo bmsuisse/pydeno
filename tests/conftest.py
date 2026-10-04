@@ -69,6 +69,13 @@ collect_ignore = (
         "test_aio_agent_schema_tools.py",
         "test_agent_replay_public_errors.py",
         "test_http_fetch_agent.py",
+        "test_front_door.py",
+        "test_front_door_async.py",
+        "test_front_door_probes.py",
+        "test_front_door_review.py",
+        "test_front_door_isolation.py",
+        "test_front_door_budgets.py",
+        "test_front_door_refusals.py",
     ]
     if sys.platform == "win32"
     else []

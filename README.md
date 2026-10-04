@@ -28,13 +28,17 @@ deck, a loop that calls your tools. That code is untrusted by construction. `pyd
 program run it and get the result back, behind a boundary that holds even if the code is hostile.
 
 ```python
-from pydeno import IsolatedRuntime, RuntimeConfig
+from pydeno import Pydeno
 
-with IsolatedRuntime(RuntimeConfig(timeout=2.0), sandbox="require") as rt:
-    rt.bind_function("lookup", lambda sku: {"A1": 3.5}[sku])   # the only thing the guest can call
-    print(rt.eval("lookup('A1') * 2"))                          # 7.0
-    rt.eval("new Array(2 ** 32 - 1).fill(0)")                   # WorkerCrashed. Your process is fine.
+with Pydeno() as pool, pool.checkout() as session:     # OS sandbox required, limits on, warm workers
+    session.feed_run("const prices = {A1: 3.5}")
+    session.feed_run("prices[sku] * await rate()",      # 7.0: state persists between feeds
+                     inputs={"sku": "A1"}, external_lookup={"rate": lambda: 2})
+    session.feed_run("new Array(2 ** 32 - 1).fill(0)")  # PydenoCrashedError. Your process is fine.
 ```
+
+If you know [Monty][monty], you know `Pydeno`: the same `Pydeno` / `checkout` / `feed_run` /
+`feed_start` / `dump` shape, for JavaScript. See the [front-door guide](docs/guides/quickstart-pydeno.md).
 
 ## Why pydeno
 
@@ -52,6 +56,36 @@ with IsolatedRuntime(RuntimeConfig(timeout=2.0), sandbox="require") as rt:
 ```bash
 pip install pydeno     # or: uv pip install pydeno     (Python 3.10+, macOS or Linux)
 ```
+
+**Start here: `Pydeno`.** A pool of pre-started, OS-sandboxed workers; each session gets one, used
+once. Secure and fast by default, shaped like Monty:
+
+```python
+from pydeno import Pydeno
+
+with Pydeno() as pool:
+    with pool.checkout() as session:
+        session.feed_run("const x = 20")
+        print(session.feed_run("x + 1"))                                    # 21
+        print(session.feed_run("await lookup(7)", external_lookup={"lookup": lambda i: i * 6}))  # 42
+```
+
+```python
+from pydeno import AsyncPydeno
+
+async with AsyncPydeno() as pool:
+    async with pool.checkout() as session:
+        await session.feed_run("1 + 1")                                     # 2
+```
+
+Defaults: `sandbox="require"` (no silent downgrade; `pydeno.sandbox_status()` explains a refusal),
+jitless V8, host errors redacted, 30 s per feed, 512 MiB, 1000 external calls per session, and a
+worker never serves two sessions. The [front-door guide](docs/guides/quickstart-pydeno.md) maps every
+Monty name and limit.
+
+### Advanced: the building blocks
+
+`Pydeno` is built from these, which stay available unchanged.
 
 **Tools the guest can call**, with a total budget:
 
@@ -263,6 +297,7 @@ than 0.4.5).
 
 | | |
 |---|---|
+| `Pydeno`: check out a session from a warm pool | **~0.1 ms**; with its first `feed_run("1 + 1")` ~1.4 ms; another feed ~0.4 ms; exit ~0.05 ms (see the [front-door guide](docs/guides/quickstart-pydeno.md#performance)) |
 | Create an `IsolatedRuntime` and evaluate | **~15 ms** with the spare worker used soon after it starts, ~30-45 ms after it has sat idle, ~70-105 ms without |
 | Move a 2 MB structured result across the boundary | **~18 ms** each way (native codec) |
 | `import pydeno` | **~19 ms** (the isolation stack loads on first use) |
