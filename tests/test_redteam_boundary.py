@@ -38,6 +38,7 @@ from pydeno import (
     PydenoError,
     PydenoRuntimeError,
     SessionPool,
+    StaleJournal,
     WorkerCrashed,
 )
 
@@ -386,6 +387,185 @@ class TestSessionPool:
                 r = await sb.execute("try { await big(0) } catch (e) { return e.name }")
                 assert r.result == "ToolBudgetError"
         assert len(ran) == 4
+
+
+_LOOP = (
+    "let n = 0; for (let i = 0; i < %d; i++) { try { await %s(i); n++ } catch { break } }"
+    " return n"
+)
+
+
+class _GateStore(InMemoryJournalStore):
+    """Stalls the first `get` or `set` of a key with the given suffix until `gate` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate: asyncio.Event | None = None
+        self.op = ""
+        self.suffix = ""
+
+    async def _wait(self, op: str, key: str) -> None:
+        gate = self.gate
+        if gate is not None and op == self.op and key.endswith(self.suffix):
+            self.gate = None
+            await gate.wait()
+
+    async def get(self, key: str) -> bytes | None:
+        value = await super().get(key)
+        await self._wait("get", key)
+        return value
+
+    async def set(self, key: str, value: bytes, *, ttl: float | None) -> None:
+        await self._wait("set", key)
+        await super().set(key, value, ttl=ttl)
+
+    def stall(self, op: str, suffix: str) -> asyncio.Event:
+        self.gate, self.op, self.suffix = asyncio.Event(), op, suffix
+        return self.gate
+
+
+class TestSessionPoolConsistency:
+    """The pool's live sessions, leases and stored journals stay one session with one budget,
+    also when calls on the same session overlap."""
+
+    async def test_get_during_an_oversized_release_sees_the_spent_budget(self) -> None:
+        ran: list[int] = []
+
+        def big(i: int) -> str:
+            ran.append(i)
+            return "x" * 5000
+
+        def small(i: int) -> int:
+            ran.append(i)
+            return i
+
+        tools = {"big": big, "small": small}
+        kw = dict(max_tool_calls=6, max_journal_bytes=8000, sandbox=MODE)
+        store = InMemoryJournalStore()
+        async with SessionPool(store, KEY, tools, **kw) as pool:
+            async with pool.session("a", "s") as sb:
+                await sb.execute("await small(0)")
+            sb = await pool.get("a", "s")
+            await sb.execute(_LOOP % (9, "big"))
+            releasing = asyncio.ensure_future(pool.release("a", "s"))
+            await asyncio.sleep(0)
+            racer = await pool.get("a", "s")
+            await racer.execute(_LOOP % (9, "small"))
+            with contextlib.suppress(JournalTooLarge):
+                await releasing
+            await pool.release("a", "s")
+        assert len(ran) == 6
+
+    async def test_two_pools_sharing_a_store_share_one_budget(self) -> None:
+        ran: list[int] = []
+
+        def small(i: int) -> int:
+            ran.append(i)
+            return i
+
+        store = InMemoryJournalStore()
+        kw = dict(max_tool_calls=3, sandbox=MODE)
+        async with (
+            SessionPool(store, KEY, {"small": small}, **kw) as pa,
+            SessionPool(store, KEY, {"small": small}, **kw) as pb,
+        ):
+            async with pa.session("o", "s") as sb:
+                await sb.run("globalThis.who = 'a'")
+            for pool in (pb, pa, pb, pa):
+                async with pool.session("o", "s") as sb:
+                    await sb.execute(_LOOP % (9, "small"))
+            async with pa.session("o", "s") as sb:
+                assert sb.calls_remaining == 0
+        assert len(ran) == 3
+
+    async def test_a_live_session_older_than_the_store_is_not_persisted(self) -> None:
+        store = InMemoryJournalStore()
+        async with (
+            SessionPool(store, KEY, {}, sandbox=MODE) as pa,
+            SessionPool(store, KEY, {}, sandbox=MODE) as pb,
+        ):
+            sa = await pa.get("o", "s")
+            async with pb.session("o", "s") as sb:
+                await sb.run("globalThis.v = 'b'")
+            await sa.run("globalThis.v = 'a'")
+            with pytest.raises(StaleJournal):
+                await pa.release("o", "s")
+            async with pa.session("o", "s") as again:
+                assert await again.run("return v") == "b"
+
+    async def test_get_restoring_while_drop_runs_starts_over(self) -> None:
+        store = _GateStore()
+        async with SessionPool(
+            store, KEY, {}, idle_timeout=0.01, eviction_interval=1000, sandbox=MODE
+        ) as pool:
+            async with pool.session("o", "s") as sb:
+                await sb.run("globalThis.secret = 'kept'")
+            await asyncio.sleep(0.05)
+            await pool.evict_idle()
+            gate = store.stall("get", ":journal")
+            getting = asyncio.ensure_future(pool.get("o", "s"))
+            await asyncio.sleep(0.05)
+            await pool.drop("o", "s")
+            gate.set()
+            sb = await getting
+            assert await sb.run("return typeof secret") == "undefined"
+            assert pool.stats()["live"] == 1 and pool.stats()["leased"] == 1
+            await pool.release("o", "s")
+            async with pool.session("o", "s") as again:
+                assert again is sb
+
+    async def test_drop_wins_against_a_slow_release(self) -> None:
+        store = _GateStore()
+        async with SessionPool(store, KEY, {}, sandbox=MODE) as pool:
+            sb = await pool.get("o", "s")
+            await sb.run("globalThis.secret = 'dropped'")
+            gate = store.stall("set", ":journal")
+            releasing = asyncio.ensure_future(pool.release("o", "s"))
+            await asyncio.sleep(0.05)
+            dropping = asyncio.ensure_future(pool.drop("o", "s"))
+            await asyncio.sleep(0.1)
+            gate.set()
+            await asyncio.gather(releasing, dropping, return_exceptions=True)
+            async with pool.session("o", "s") as fresh:
+                assert await fresh.run("return typeof secret") == "undefined"
+
+    async def test_a_failed_release_keeps_the_spent_budget(self) -> None:
+        ran: list[int] = []
+
+        async def slow(i: int) -> int:
+            ran.append(i)
+            await asyncio.sleep(0.05)
+            return i
+
+        store = InMemoryJournalStore()
+        async with SessionPool(
+            store,
+            KEY,
+            {"slow": slow},
+            max_tool_calls=4,
+            idle_timeout=0.01,
+            eviction_interval=1000,
+            sandbox=MODE,
+        ) as pool:
+            sb = await pool.get("o", "s")
+            task = asyncio.ensure_future(sb.execute(_LOOP % (4, "slow")))
+            await asyncio.sleep(0.02)
+            with pytest.raises(RuntimeError, match="busy"):
+                await pool.release(
+                    "o", "s"
+                )  # a run is in progress: not a valid release
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.sleep(0.05)
+            await pool.evict_idle()
+            async with pool.session("o", "s") as again:
+                await again.execute(_LOOP % (4, "slow"))
+        assert len(ran) <= 4
+
+    @pytest.mark.parametrize("bad", ["s\ud800", "\udfff"])
+    async def test_ids_that_are_not_utf8_are_refused(self, bad: str) -> None:
+        async with SessionPool(InMemoryJournalStore(), KEY, {}, sandbox=MODE) as pool:
+            with pytest.raises(ValueError, match="session_id"):
+                await pool.get("o", bad)
 
 
 # ---------------------------------------------------------------------------

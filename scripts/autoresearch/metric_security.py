@@ -571,6 +571,8 @@ def captured_console_output_carries_no_terminal_escapes() -> bool:
         or "tab\tok" not in text
         or "visible é中\U0001f600 ok" not in text
     )
+
+
 # --- strict_eval: no code generation from strings, however the guest reaches a compiler ------------------
 # Run after the guest has tampered with the constructor chain (replaced `Function`, `eval` and
 # `Function.prototype.constructor`, subclassed `Function`), so a compiler reached through any alias
@@ -1373,6 +1375,119 @@ def front_dump_cannot_be_bound_to_a_tenant() -> bool:
                     pass
             s2.load_session(state, associated_data=b"tenant-a")
             return s2.feed_run("owner") != "a"
+
+
+_C_LOOP = (
+    "let n = 0; for (let i = 0; i < %d; i++) { try { await %s(i); n++ } catch { break } }"
+    " return n"
+)
+
+
+@_c_probe
+def pool_overlapping_get_and_oversized_release_budget_mismatch() -> bool:
+    """A `get` overlapping the release of an oversized journal must see the same spent budget."""
+    from pydeno import InMemoryJournalStore, JournalTooLarge, SessionPool
+
+    ran: list[int] = []
+    tools = {
+        "big": lambda i: ran.append(i) or "x" * 5000,
+        "small": lambda i: ran.append(i) or i,
+    }
+
+    async def go() -> bool:
+        async with SessionPool(
+            InMemoryJournalStore(),
+            _C_KEY,
+            tools,
+            max_tool_calls=6,
+            max_journal_bytes=8000,
+            sandbox="require",
+        ) as pool:
+            async with pool.session("a", "s") as sb:
+                await sb.execute("await small(0)")
+            sb = await pool.get("a", "s")
+            await sb.execute(_C_LOOP % (9, "big"))
+            releasing = _c_asyncio.ensure_future(pool.release("a", "s"))
+            await _c_asyncio.sleep(0)
+            racer = await pool.get("a", "s")
+            await racer.execute(_C_LOOP % (9, "small"))
+            try:
+                await releasing
+            except JournalTooLarge:
+                pass
+            await pool.release("a", "s")
+        return len(ran) > 6
+
+    return _c_asyncio.run(go())
+
+
+@_c_probe
+def pool_two_instances_on_one_store_budget_mismatch() -> bool:
+    """Two pools over one store (sequential use, as behind a load balancer) must not each hand
+    out the session's whole budget."""
+    from pydeno import InMemoryJournalStore, SessionPool
+
+    ran: list[int] = []
+    tools = {"small": lambda i: ran.append(i) or i}
+
+    async def go() -> bool:
+        store = InMemoryJournalStore()
+        kw = dict(max_tool_calls=3, sandbox="require")
+        async with (
+            SessionPool(store, _C_KEY, tools, **kw) as pa,
+            SessionPool(store, _C_KEY, tools, **kw) as pb,
+        ):
+            async with pa.session("o", "s") as sb:
+                await sb.run("return 0")
+            for pool in (pb, pa, pb, pa):
+                try:
+                    async with pool.session("o", "s") as sb:
+                        await sb.execute(_C_LOOP % (9, "small"))
+                except Exception:  # noqa: BLE001, S110 - a refusal is fine
+                    pass
+        return len(ran) > 3
+
+    return _c_asyncio.run(go())
+
+
+@_c_probe
+def pool_failed_release_budget_mismatch() -> bool:
+    """A release that fails (here: a run still in progress) must not leave a live session that
+    eviction later forgets with its spending."""
+    from pydeno import InMemoryJournalStore, SessionPool
+
+    ran: list[int] = []
+
+    async def slow(i):  # type: ignore[no-untyped-def]
+        ran.append(i)
+        await _c_asyncio.sleep(0.05)
+        return i
+
+    async def go() -> bool:
+        async with SessionPool(
+            InMemoryJournalStore(),
+            _C_KEY,
+            {"slow": slow},
+            max_tool_calls=4,
+            idle_timeout=0.01,
+            eviction_interval=1000,
+            sandbox="require",
+        ) as pool:
+            sb = await pool.get("o", "s")
+            task = _c_asyncio.ensure_future(sb.execute(_C_LOOP % (4, "slow")))
+            await _c_asyncio.sleep(0.02)
+            try:
+                await pool.release("o", "s")
+            except Exception:  # noqa: BLE001, S110
+                pass
+            await _c_asyncio.gather(task, return_exceptions=True)
+            await _c_asyncio.sleep(0.05)
+            await pool.evict_idle()
+            async with pool.session("o", "s") as again:
+                await again.execute(_C_LOOP % (4, "slow"))
+        return len(ran) > 4
+
+    return _c_asyncio.run(go())
 
 
 # 4. text pydeno writes for the host ---------------------------------------------------------------------------
