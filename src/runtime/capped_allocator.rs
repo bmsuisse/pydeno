@@ -17,6 +17,7 @@
 //! which is why the budget is shared (`Arc`) rather than owned by the allocator.
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,11 +67,41 @@ fn layout(len: usize) -> Option<Layout> {
     Layout::from_size_align(len.max(1), ALIGN).ok()
 }
 
+thread_local! {
+    /// What the runtime on this thread wants run before a reservation is refused: the bridge's
+    /// sweep of resizable buffers V8 has collected, whose bytes the budget still holds. V8 calls
+    /// the allocator on the isolate thread, and when it gets `null` back it collects garbage and
+    /// asks again, so the handles of dropped resizable buffers are empty by the retry; without
+    /// this hook a fixed-length allocation could fail on bytes nobody holds any more.
+    static SWEEPER: RefCell<Option<Box<dyn Fn(&Budget)>>> = const { RefCell::new(None) };
+}
+
+/// Install the refusal-path sweeper for the runtime on this thread (one runtime per thread).
+pub fn set_thread_sweeper(sweeper: Box<dyn Fn(&Budget)>) {
+    SWEEPER.with(|slot| *slot.borrow_mut() = Some(sweeper));
+}
+
+/// Reserve `len`, sweeping once and retrying before refusing.
+fn reserve_or_sweep(budget: &Budget, len: usize) -> bool {
+    if budget.reserve(len) {
+        return true;
+    }
+    // `try_borrow`: the sweeper is never installed re-entrantly, but a refusal must not panic.
+    SWEEPER.with(|slot| {
+        if let Ok(slot) = slot.try_borrow() {
+            if let Some(sweeper) = slot.as_ref() {
+                sweeper(budget);
+            }
+        }
+    });
+    budget.reserve(len)
+}
+
 fn take(budget: &Budget, len: usize, zeroed: bool) -> *mut c_void {
     let Some(layout) = layout(len) else {
         return ptr::null_mut();
     };
-    if !budget.reserve(len) {
+    if !reserve_or_sweep(budget, len) {
         return ptr::null_mut();
     }
     // SAFETY: `layout` has a non-zero size.

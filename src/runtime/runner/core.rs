@@ -280,8 +280,23 @@ impl RuntimeCoreState {
             // Must precede *any* script: the sync op path reads the limits
             // from OpState, and console capture / bootstrap logging call ops.
             op_state.put(serialization_limits);
+            let tracked = SharedBuffers::default();
+            if buffer_budget.is_some() {
+                // A fixed-length allocation V8 refuses on our budget retries after a GC: let
+                // it find the bytes of collected resizable buffers released first. Only a weak
+                // reference crosses into the thread-local, so the hook can never reach V8
+                // handles after OpState (and with it the isolate) is gone.
+                let weak = Rc::downgrade(&tracked);
+                crate::runtime::capped_allocator::set_thread_sweeper(Box::new(move |budget| {
+                    if let Some(table) = weak.upgrade() {
+                        if let Ok(mut table) = table.try_borrow_mut() {
+                            table.sweep(budget);
+                        }
+                    }
+                }));
+            }
             op_state.put(BufferBudget(buffer_budget));
-            op_state.put(SharedBuffers::default());
+            op_state.put(tracked);
         }
 
         if inspector_enabled {
