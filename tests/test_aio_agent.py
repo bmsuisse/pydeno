@@ -127,28 +127,31 @@ class TestBasics:
     ) -> None:
         var: contextvars.ContextVar[str] = contextvars.ContextVar("v", default="-")
         seen: list[str] = []
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        entered = asyncio.Event()
+        release = threading.Event()
 
         def slow() -> str:
+            assert threading.get_ident() != loop_thread
             seen.append(var.get())
-            time.sleep(0.4)
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(10), "event loop did not release the host tool"
             return threading.current_thread().name
 
         async with AsyncAgentSandbox({"slow": slow}) as sb:
             var.set("request-1")
-            lags: list[float] = []
-
-            async def heartbeat() -> None:
-                while True:
-                    t = time.monotonic()
-                    await asyncio.sleep(0.01)
-                    lags.append(time.monotonic() - t - 0.01)
-
-            hb = asyncio.create_task(heartbeat())
-            name = await sb.run("return await slow()")
-            hb.cancel()
+            task = asyncio.create_task(sb.run("return await slow()"))
+            try:
+                await asyncio.wait_for(entered.wait(), 10)
+                # The loop must run while the tool is still blocked. Scheduler latency is
+                # irrelevant to this guarantee, unlike a maximum-heartbeat-gap assertion.
+                assert not task.done()
+            finally:
+                release.set()
+                name = await task
             assert seen == ["request-1"]
             assert name != threading.current_thread().name
-            assert max(lags) < 0.15, max(lags)
 
     async def test_budget(self) -> None:
         async with AsyncAgentSandbox(TOOLS, max_tool_calls=1) as sb:

@@ -235,16 +235,24 @@ impl Runtime {
         let op_id = py
             .detach(|| handle.register_op(name.clone(), mode, handler))
             .map_err(context("Op registration failed"))?;
-        let bridge = match mode {
-            PythonOpMode::Sync => "__host_op_sync__",
-            PythonOpMode::Async => "__host_op_async__",
+        let mode = match mode {
+            PythonOpMode::Sync => "sync",
+            PythonOpMode::Async => "async",
         };
+        // The helper defines an own property and throws on a global it cannot
+        // replace (an accessor, a read-only value), instead of the sloppy-mode
+        // assignment that a guest-planted setter or read-only global swallowed.
+        let name_literal = serde_json::to_string(&name)
+            .map_err(|err| PyRuntimeError::new_err(format!("Invalid binding name: {err}")))?;
         let script =
-            format!("globalThis.{name} = (...args) => {bridge}({op_id}, ...args); void 0;");
+            format!("__pydeno_bind_function({name_literal}, {op_id}, \"{mode}\"); void 0;");
 
-        // Expose only after the binding script succeeded, so a failed binding
-        // leaves the handler registered but not dispatchable.
-        self.eval(py, &script)?;
+        // Expose only after the binding script succeeded; a refused binding
+        // drops the handler it registered.
+        if let Err(err) = self.eval(py, &script) {
+            let _ = py.detach(|| handle.set_op_exposure(op_id, false));
+            return Err(err);
+        }
         py.detach(|| handle.set_op_exposure(op_id, true))
             .map_err(context("Op registration failed"))?;
         Ok(op_id)
@@ -272,30 +280,41 @@ impl Runtime {
             .cast::<PyDict>()
             .map_err(|_| PyRuntimeError::new_err("bind_object expects a dict with string keys"))?;
 
-        let mut bindings = Vec::with_capacity(dict.len());
         let tokens = PyDict::new(py);
-        // Registration releases the GIL; retain the original entries so another
-        // Python thread cannot invalidate PyDict's live iterator while we wait.
-        let entries: Vec<_> = dict.iter().collect();
-        for (key, value) in entries {
-            let key: String = key.extract()?;
-            if value.is_callable() {
-                let handler = value.unbind();
-                let mode = Self::detect_mode(py, &handler)?;
-                let op_id = py
-                    .detach(|| handle.register_op(format!("{name}.{key}"), mode, handler))
-                    .map_err(context("Op registration failed"))?;
-                tokens.set_item(&key, op_id)?;
-                bindings.push(BoundObjectProperty::Op { key, op_id, mode });
-            } else {
-                let value = python_to_js_value(value, &serialization_limits)?;
-                bindings.push(BoundObjectProperty::Value { key, value });
+        let mut registered: Vec<OpToken> = Vec::new();
+        let result = (|| -> PyResult<()> {
+            let mut bindings = Vec::with_capacity(dict.len());
+            // Registration releases the GIL; retain the original entries so another
+            // Python thread cannot invalidate PyDict's live iterator while we wait.
+            let entries: Vec<_> = dict.iter().collect();
+            for (key, value) in entries {
+                let key: String = key.extract()?;
+                if value.is_callable() {
+                    let handler = value.unbind();
+                    let mode = Self::detect_mode(py, &handler)?;
+                    let op_id = py
+                        .detach(|| handle.register_op(format!("{name}.{key}"), mode, handler))
+                        .map_err(context("Op registration failed"))?;
+                    registered.push(op_id);
+                    tokens.set_item(&key, op_id)?;
+                    bindings.push(BoundObjectProperty::Op { key, op_id, mode });
+                } else {
+                    let value = python_to_js_value(value, &serialization_limits)?;
+                    bindings.push(BoundObjectProperty::Value { key, value });
+                }
             }
-        }
 
-        // The runner exposes the ops only once `__pydeno_bind_object` installed them.
-        py.detach(|| handle.bind_object(name, bindings))
-            .map_err(context("Failed to bind object"))?;
+            // The runner exposes the ops only once `__pydeno_bind_object` installed them.
+            py.detach(|| handle.bind_object(name.clone(), bindings))
+                .map_err(context("Failed to bind object"))
+        })();
+        if let Err(err) = result {
+            // Nothing was exposed; drop every handler this call registered.
+            for op_id in registered {
+                let _ = py.detach(|| handle.set_op_exposure(op_id, false));
+            }
+            return Err(err);
+        }
         Ok(tokens.unbind())
     }
 

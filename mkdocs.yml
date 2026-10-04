@@ -45,9 +45,14 @@ nav:
           - Modules: guides/modules.md
           - Agent sessions: guides/agent-sessions.md
           - Command line: guides/cli.md
+          - Network access (http_fetch): guides/http-fetch.md
+          - "Pydeno: the front door": guides/quickstart-pydeno.md
           - pydantic-ai code mode: guides/pydantic-ai.md
           - Upgrading: guides/upgrading.md
           - Advanced:
+              - Agent sessions: guides/agent-sessions.md
+              - Bindings: guides/bindings.md
+              - Modules: guides/modules.md
               - Isolated runtime: guides/advanced/isolation.md
               - Async isolated runtime: guides/advanced/async.md
               - Async agent sessions and pool: guides/advanced/async-agent-sessions.md
@@ -66,6 +71,7 @@ nav:
   - Reference:
       - Error kinds: reference/error-kinds.md
       - Pre-check and sandbox status: reference/preflight-and-status.md
+  - Alternatives: alternatives.md
   - Roadmap to 1.0: roadmap.md
   - API Reference:
       - pydeno Module: api/pydeno.md
@@ -77,6 +83,7 @@ nav:
       - Architecture: contributing/architecture.md
       - Upstream provenance: contributing/upstream-divergence.md
       - Supply-chain security: contributing/supply-chain.md
+      - Autoresearch loops: contributing/autoresearch.md
 
 plugins:
   - search

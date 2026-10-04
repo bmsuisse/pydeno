@@ -1,15 +1,18 @@
 //! [`RuntimeCoreState`]: the V8 isolate and everything that lives beside it on
 //! the runtime thread.
 
-use super::convert::{caught_call_error, global_helper, CallError, Converter};
+use super::convert::{
+    capture_stream_prototype, caught_call_error, global_helper, CallError, Converter,
+};
 use super::termination::{TerminationController, Watchdog, WatchdogToken};
 use super::FunctionCallResult;
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::error::{JsExceptionDetails, RuntimeError, RuntimeResult};
 use crate::runtime::handle::BoundObjectProperty;
+use crate::runtime::inspector::{InspectorConnectionState, InspectorMetadata};
+#[cfg(feature = "inspector")]
 use crate::runtime::inspector::{
-    InspectorConnectionState, InspectorMetadata, InspectorRegistration,
-    InspectorRegistrationParams, InspectorServer,
+    InspectorRegistration, InspectorRegistrationParams, InspectorServer,
 };
 use crate::runtime::js_value::{JSValue, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
@@ -146,6 +149,7 @@ impl Drop for OwnedSnapshot {
     }
 }
 
+#[cfg(feature = "inspector")]
 struct InspectorRuntimeState {
     _server: InspectorServer,
     registration: InspectorRegistration,
@@ -154,6 +158,11 @@ struct InspectorRuntimeState {
     has_waited: bool,
     connection_state: InspectorConnectionState,
 }
+
+/// Never constructed: a build without the `inspector` feature refuses an
+/// inspector config before the runtime exists.
+#[cfg(not(feature = "inspector"))]
+enum InspectorRuntimeState {}
 
 /// Parse an absolute specifier, or resolve a bare one against `pydeno://runtime/`.
 fn module_specifier(specifier: &str) -> RuntimeResult<ModuleSpecifier> {
@@ -253,6 +262,12 @@ impl RuntimeCoreState {
         let mut snapshot_source = snapshot.map(OwnedSnapshot::new);
         let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
 
+        #[cfg(not(feature = "inspector"))]
+        if inspector.is_some() {
+            return Err(RuntimeError::internal(
+                crate::runtime::inspector::INSPECTOR_UNAVAILABLE,
+            ));
+        }
         let inspector_enabled = inspector.is_some();
         let mut js_runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![extension],
@@ -334,6 +349,9 @@ impl RuntimeCoreState {
             });
         }
 
+        #[cfg(not(feature = "inspector"))]
+        let inspector_state: Option<InspectorRuntimeState> = None;
+        #[cfg(feature = "inspector")]
         let inspector_state = match inspector {
             Some(cfg) => {
                 let connection_state = InspectorConnectionState::default();
@@ -365,6 +383,11 @@ impl RuntimeCoreState {
             None => None,
         };
 
+        let stream_prototype = {
+            deno_core::scope!(scope, js_runtime);
+            capture_stream_prototype(scope).map(Rc::new)
+        };
+
         Ok(Self {
             js_runtime,
             registry,
@@ -376,6 +399,7 @@ impl RuntimeCoreState {
                 next_fn_id: Default::default(),
                 limits: serialization_limits,
                 streams: Rc::new(JsStreamRegistry::new()),
+                stream_prototype,
             },
             pending_calls: Default::default(),
             next_pending_call_id: Default::default(),
@@ -389,6 +413,20 @@ impl RuntimeCoreState {
         })
     }
 
+    #[cfg(not(feature = "inspector"))]
+    pub(super) fn inspector_info(&self) -> Option<(InspectorMetadata, InspectorConnectionState)> {
+        self.inspector_state.as_ref().map(|state| match *state {})
+    }
+
+    #[cfg(not(feature = "inspector"))]
+    pub(super) fn ensure_inspector_ready(&mut self) -> RuntimeResult<()> {
+        if let Some(state) = &self.inspector_state {
+            match *state {}
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "inspector")]
     pub(super) fn inspector_info(&self) -> Option<(InspectorMetadata, InspectorConnectionState)> {
         self.inspector_state.as_ref().map(|state| {
             (
@@ -398,6 +436,7 @@ impl RuntimeCoreState {
         })
     }
 
+    #[cfg(feature = "inspector")]
     pub(super) fn ensure_inspector_ready(&mut self) -> RuntimeResult<()> {
         if let Some(state) = self.inspector_state.as_mut() {
             if state.has_waited {
@@ -521,11 +560,11 @@ impl RuntimeCoreState {
         if let Some(watchdog) = watchdog {
             let (fired, duration) = self.resolve_watchdog(watchdog);
             if fired {
+                // The deadline passed, whatever the call produced meanwhile: a guest error whose
+                // conversion ran into the deadline (a looping `cause` getter, say) is reported as
+                // the timeout it is, not as the guest's error.
                 let message = format!("{context} timed out after {}ms", duration.as_millis());
-                return match result {
-                    Err(err) if !runtime_error_indicates_termination(&err) => Err(err),
-                    _ => Err(RuntimeError::timeout(message)),
-                };
+                return Err(RuntimeError::timeout(message));
             }
         }
         result
@@ -669,6 +708,11 @@ impl RuntimeCoreState {
                 registry.expose(token);
             }
             return Ok(());
+        }
+        // Refused: the handlers were never reachable; drop them rather than keep them for the
+        // runtime's lifetime.
+        for token in op_tokens {
+            registry.revoke(token);
         }
         match try_catch.exception() {
             Some(exception) => Err(js_error(JsError::from_v8_exception(try_catch, exception))),

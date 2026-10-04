@@ -16,6 +16,80 @@
   (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
   code in an `AgentSandbox` session that keeps its state between calls and returns the
   `ExecutionResult` fields with output and result caps.
+- **`Pydeno` / `AsyncPydeno`: one front door, shaped like Monty.** `with Pydeno() as pool:`,
+  `with pool.checkout(limits=...) as session:`, `session.feed_run(code, inputs=, external_lookup=,
+  print_callback=)` (the feed's trailing expression is its result; state persists), `feed_start` with a
+  `PydenoSnapshot` at every external call (`resume`, `resume_auto`, `dump`), `dump` / `load_session` /
+  `load_snapshot` (signed, replayed deterministically on a fresh worker), `worker_pid`, `PydenoLimits`
+  (Monty's `ResourceLimits` mapped onto pydeno's limits) and typed errors (`PydenoError`,
+  `PydenoRuntimeError`, `PydenoSyntaxError`, `PydenoCrashedError`, `PydenoTimeoutError`, which is a
+  `TimeoutError`; `classify_error` sees through them). Secure by default: `sandbox="require"` with no
+  silent downgrade, jitless V8, host errors redacted, every limit set, single-use workers from a warm
+  `SandboxPool`. `benches_py/alternatives_bench.py pydeno-front` measures it.
+- `AgentSandbox(runtime=...)` / `AsyncAgentSandbox(runtime=...)`: run a session on an already-built
+  runtime (a pool checkout); its seed (and frozen clock, if any) become the session's.
+- Faster sessions: a `Pydeno` worker arrives with the session's setup pre-installed (checkout does no
+  worker round trip, about 0.1 ms), and `AgentSandbox.run()` / `execute()` (and `feed_run`) drive the
+  worker from the calling thread, which enforces every limit also while a tool runs (tools are answered
+  on the session's own threads, never shared with another session). Journals are unchanged: a dump
+  from either path replays on the other.
+- Session tool threads are capped per pool (`Pydeno(max_tool_threads=128)`, clamped to a process
+  ceiling of 512; caps are upper bounds drawn from that ceiling, not reservations, and `Pydeno()` warns
+  when the open pools' caps add up to more). A refused call is journaled and charged like a failed
+  tool call, fails generically for the guest, is logged once per session for the host, and raises
+  `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
+  gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
+- **Cargo feature `inspector`** (on by default, so the published wheels are unchanged). It gates the DevTools
+  inspector server and its network crates (`hyper`, `hyper-util`, `fastwebsockets`, `http`, `http-body-util`,
+  tokio's `net`). A `--no-default-features` build keeps `InspectorConfig` as a type, but `Runtime` with an
+  inspector configured raises `RuntimeError` ("built without inspector support"). `pydeno._pydeno._INSPECTOR_AVAILABLE`
+  reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
+  size and dependency difference. See `docs/guides/advanced/inspector.md`.
+
+Nothing changes for existing code except `python -m pydeno` (see Changed); see
+[`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+
+### Security
+
+- **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
+  installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
+  `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
+  Proxy namespace that swallowed `defineProperty`, an accessor returning a throwaway object, a read-only or
+  setter global, or a replaced `Array.prototype[Symbol.iterator]`, and the bind then installed nothing while
+  the host still received and exposed the op tokens. The bind now defines own data properties only, runs no
+  guest-replaceable built-in, and raises `Cannot bind '<name>': ...` (exposing no token) when the existing
+  global is an accessor, read-only, a Proxy, a function, a class instance, or frozen. An existing plain
+  object is still extended, a writable global (including a `var`) is still replaced, and an inherited
+  property is shadowed rather than written through. A built-in object (`Object.prototype`, `Math`,
+  `Array.prototype`, `%IteratorPrototype%`...) is refused as a namespace too, and the refusal's error carries a
+  pre-rendered stack so a guest `Error.prepareStackTrace` does not run inside the host's bind.
+- `ToolBridge.attach(..., namespace=None)` is all-or-nothing: when a later tool is refused, the tools this
+  call already bound are revoked before the error propagates.
+- The Python-stream helper `__pydeno_from_py_stream` is fixed in place like the other bridge globals (it was
+  defined after them and stayed writable), and the bridge builds streams with a captured `ReadableStream` and
+  a prototype-less source. A guest could otherwise run code inside a host `bind_object` (or any hand-over of a
+  Python stream), see every stream id and substitute its own value.
+- The `ReadableStream` polyfill keeps its state in a private WeakMap, so setters a guest plants on
+  `ReadableStream.prototype` no longer run (and receive the stream's source) when the bridge creates a stream.
+  Recognising a guest's `ReadableStream` result no longer uses `instanceof globalThis.ReadableStream` (a guest
+  `Symbol.hasInstance` or a replaced global could turn every object result into a stream); it checks the
+  prototype chain against the prototype captured at startup.
+- A refused bind's error has own `name`, `message`, `constructor` (`null`), `cause`, `stack` and
+  `Symbol.for("errorAdditionalPropertyKeys")` (everything deno_core reads when it converts the error, including
+  the `constructor` walk of its AggregateError check), so reading it runs no getter from a prototype or
+  constructor.
+  No deadline covers a bind, so a looping getter there used to block `bind_object` indefinitely (and an
+  `IsolatedRuntime` bind until the worker's hard deadline killed it). A non-extensible global object is
+  refused with the same clear error, and the handlers a refused bind registered are dropped instead of kept for
+  the runtime's lifetime.
+- The built-in set behind the namespace check is collected from the standard global names only, so objects a
+  host snapshot puts on the global object are bindable again (this was a regression in the previous change),
+  and now also covers `CallSite.prototype`, `%SegmentsPrototype%`, the iterator-helper prototypes and the
+  `ReadableStream` polyfill.
+- The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
+  `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
+  (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
+  properties, so an index setter on `Array.prototype` neither sees nor replaces them.
 
 ### Fixed
 
@@ -24,12 +98,38 @@
   and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be
   interpreted as an integer"); `max_memory=2**62` was enough, since it derives
   `max_buffer_bytes = 2**60`.
+- Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
+  the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
+  even when the guest's error was still being read at that point.
 
 ### Changed
 
 - **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
   positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
   [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+- Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
+  creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
+  and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s
+  ~8 ms; same profile, same self-test, falls back to `sandbox_init`); the worker never loads `ssl` (asyncio
+  imports it only optionally, and the worker has no network) and, on Python 3.14, never imports `typing`.
+- Lower warm-call overhead of `IsolatedRuntime` (#47): a warm `eval("1 + 1")` went from about 112 to 67 µs
+  (interleaved A/B, 30 rounds, medians; debug build of the extension on a loaded macOS arm64 machine, so
+  release numbers will differ). Where it came from:
+  - Reading the worker's CPU time on macOS no longer opens libSystem through a fresh `ctypes.CDLL` per call
+    (about 30 µs, done twice per command); `proc_pidinfo` and the timebase are resolved once, and
+    `_sandbox.usage(pid)` returns memory, CPU time and thread count from one kernel read (about 2 µs).
+  - A command's CPU baseline is the latest cached reading (the previous command's final check, or the idle
+    watchdog's, re-read if older than 0.5 s) instead of a fresh one, as `AsyncIsolatedRuntime` already did.
+    CPU time only grows, so an older baseline can only charge a command more, never less. The end-of-command
+    check is one reading for the memory ceiling, the thread cap and the idle baseline.
+  - The worker reads the next command on its main thread instead of handing it over from a reader thread.
+    The helper thread reads only while a command waits on host calls; a parent killed while a command runs
+    without one is caught by the worker's watchdog thread (it now always runs, and exits the worker when its
+    parent pid changes).
+  No limit, wire check or sandbox requirement changed.
+- `bind_function(name, ...)` now defines exactly the global property `name`. A dotted name such as `"a.b"`
+  used to be spliced into a script and assign `globalThis.a.b`; it now defines a property literally named
+  `"a.b"`. Use `bind_object` for a namespace.
 
 ## 0.7.0 — 2026-10-04
 
@@ -38,6 +138,12 @@ behaviour you have today, and [`docs/roadmap.md`](docs/roadmap.md) for where thi
 
 ### Added
 
+- **`SandboxPool`** and **`AsyncSandboxPool`**: isolated runtimes started ahead of time and handed out once.
+  `checkout()` returns a runtime whose worker has already passed its handshake and sandbox self-test in about
+  0.04 ms (a cold `IsolatedRuntime` is about 53 ms). A checked-out runtime is never returned to the pool;
+  replacements start in the background; an empty pool falls back to a cold start, never an error. Options the
+  worker receives at start-up are fixed per pool; parent-side ones (`SandboxPool.SESSION_OPTIONS`) can be set
+  per checkout. `benches_py/alternatives_bench.py pydeno-pool` measures it.
 - **`AsyncIsolatedRuntime`**: an asyncio-native isolated runtime. Pipes on the event loop, one shared
   supervisor task per loop, no thread per runtime; cancelling a call kills the worker. On macOS (1 to 64
   runtimes) it was 1.4 to 2 times faster and the worst event-loop stall fell from 116 to 335 ms to 1 to 12 ms.
@@ -59,6 +165,11 @@ behaviour you have today, and [`docs/roadmap.md`](docs/roadmap.md) for where thi
 
 ### Changed
 
+- Faster cold start of the isolation worker (about 59 to 55 ms on macOS arm64): the worker runs with `-S`
+  (no `site`, so no `.pth` file runs in it) and imports `pydeno` from the parent's own package directory, so
+  parent and worker always run the same code; the sandbox module no longer imports `ctypes.util` and
+  `platform` (`sandbox_init` and `proc_pidinfo` are looked up in the already loaded libSystem,
+  `os.uname()` replaces `platform.machine()`). A worker for a custom `python=` is started as before.
 - A JS `Map`, `WeakMap`, `WeakSet` or `Error` result now raises instead of becoming an empty dict.
 - `dump()` after a crash returns the last good journal instead of raising.
 - The worker's seccomp filter denies `memfd_create` (memory the RSS poll could not see).

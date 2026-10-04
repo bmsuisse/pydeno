@@ -30,14 +30,19 @@ import asyncio
 import base64
 import collections
 import collections.abc
+import concurrent.futures
+import contextvars
 import dataclasses
+import functools
 import hashlib
 import hmac
 import inspect
 import itertools
 import json
+import logging
 import math
 import os
+import queue
 import re
 import secrets
 import threading
@@ -49,7 +54,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ._isolated import _CONFIG_KEYS, IsolatedRuntime
+from ._isolated import (
+    _CONFIG_KEYS,
+    IsolatedRuntime,
+    _checked_console,
+    _clock_ms,
+    _seconds,
+)
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -112,6 +123,11 @@ _DECLARATION = re.compile(
     re.MULTILINE | re.ASCII,  # JavaScript identifiers are narrower than Unicode "\w"
 )
 _SETTLE = "__pydeno_agent_settle"
+# On a runtime prepared ahead of time: the worker's clock-freezing script as a function of the
+# instant, compiled before any session exists and called (then deleted) before the first run's
+# code. No guest code runs between the two.
+_FREEZER = "__pydeno_agent_freeze"
+_WARM_RUNS = 3
 _PERSIST = "__pydeno_agent_persist"
 _SAFE_ERROR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # Owned by the session because replay depends on them, or because the pause model needs them.
@@ -560,6 +576,26 @@ def _spec(name: str, func: Callable[..., Any]) -> _ToolSpec:
     return _ToolSpec(name, tuple(params), returns, doc, tuple(required_kw))
 
 
+# `inspect.signature` + type hints cost a few hundred microseconds; a tool's keyword-only
+# parameters never change, so they are read once per function.
+_REQUIRED_KW: weakref.WeakKeyDictionary[Any, tuple[str, ...]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _required_keyword_only(func: Callable[..., Any]) -> tuple[str, ...]:
+    try:
+        return _REQUIRED_KW[func]
+    except (KeyError, TypeError):
+        pass
+    found = _spec("tool", func).required_keyword_only
+    try:
+        _REQUIRED_KW[func] = found
+    except TypeError:  # not weakly referenceable: just not cached
+        pass
+    return found
+
+
 _PREAMBLE = """\
 You can run JavaScript in a sandbox. Write the code as the body of an async function:
 call tools with `await` and `return` the final result. Top-level `const`, `let`, `var`,
@@ -774,17 +810,107 @@ class _Core:
         self.closed = False
         self.pid = os.getpid()
         self.task: asyncio.Future[Any] | None = None
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(
-            target=self._serve, name="pydeno-agent-loop", daemon=True
-        )
-        self.thread.start()
+        # During a run driven on the caller's thread (`AgentSandbox._drive`): answers a tool call
+        # at once, there. None otherwise (calls then go through the loop, as `start` needs).
+        self.inline: Callable[[str, list[Any]], Any] | None = None
+        # JavaScript run before the next run's code (not journaled): see `_SessionBase._install`.
+        self.pending_js = ""
+        # The loop thread is started on first use: a session driven only by `run`/`execute` (and
+        # tools that return plain values) never needs it.
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.thread: threading.Thread | None = None
+        self._loop_lock = threading.Lock()
+        # The session's own thread for plain tools in runs driven by `_drive` (started lazily).
+        self.tools = _ToolThread(f"pydeno-agent-tool-{session_id}")
+        # A tool of this session is running (on its loop or its tool thread): closing then must
+        # not wait for either, since the tool may never return.
+        self.tool_busy = False
+        self._loop_budget: _ThreadBudget | None = None
+        # The last tool call refused for want of a thread (host-side detail), if any, and how
+        # many were (logged once, then counted).
+        self.refused: BaseException | None = None
+        self.refusals = 0
+
+    def ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """The session's loop, started on first use. It is counted against the session's
+        thread budget only once it serves a tool (`count_loop`, from `_run_tool`), so that a
+        refusal happens inside the call's own bookkeeping (journaled and charged like any failed
+        tool call) and never before it."""
+        with self._loop_lock:
+            if self.loop is None:
+                if self.closed:
+                    raise RuntimeError("the session is closed")
+                loop = asyncio.new_event_loop()
+                self.thread = threading.Thread(
+                    target=self._serve, name="pydeno-agent-loop", daemon=True
+                )
+                self.loop = loop
+                try:
+                    self.thread.start()
+                except BaseException:
+                    self.loop = None
+                    raise
+            return self.loop
+
+    def count_loop(self) -> None:
+        """On the loop thread, before its first tool: charge the loop thread to the session's
+        budget (a tool can wedge it). Raises `_ThreadsExhausted` if the budget is spent."""
+        if self._loop_budget is None:
+            budget = self.tools.budget
+            budget.acquire()
+            self._loop_budget = budget
+
+    def note_refusal(self, exc: BaseException) -> None:
+        """A tool call refused for want of a thread: tell the host once per session (the rest
+        are counted and reported when it closes); the guest is told nothing but that the call
+        failed. The record holds only host-side text."""
+        self.refused = exc
+        self.refusals += 1
+        if self.refusals == 1:
+            _log.warning(
+                "pydeno: session %d: a tool call was refused: %s", self.session_id, exc
+            )
+
+    def charge(self, name: str) -> None:
+        """One tool call against the session's budget (refused past it)."""
+        if self.max_tool_calls is not None and self.calls_made >= self.max_tool_calls:
+            raise ToolBudgetError(
+                f"tool call budget exhausted ({self.max_tool_calls} calls); refused {name!r}"
+            )
+        self.calls_made += 1
+
+    def check_catalog(self, name: Any) -> str:
+        if (
+            not isinstance(name, str)
+            or name not in self.catalog
+            or name not in self.discovered
+        ):
+            shown = name if isinstance(name, str) and len(name) <= 64 else "?"
+            raise _public(
+                ToolNotDiscoveredError(
+                    f"no tool {shown!r} has been found in this session: call "
+                    "search_tools(query) to find tools and describe_tool(name) to see how "
+                    "to call one, then call it"
+                )
+            )
+        return name
+
+    def freeze_first(self) -> None:
+        """Freeze the guest's clock before the first run (a runtime prepared ahead of time):
+        a command of its own, so it has run, completely, before any of the run's code is even
+        parsed. Cleared only once it succeeded; if it fails the worker is gone."""
+        if self.pending_js:
+            self.rt._request({"t": "eval", "code": self.pending_js})  # noqa: SLF001
+            self.pending_js = ""
 
     def _serve(self) -> None:
+        assert self.loop is not None
         asyncio.set_event_loop(self.loop)
         try:
             self.loop.run_forever()
         finally:
+            if self._loop_budget is not None:
+                self._loop_budget.release()
             try:
                 for task in asyncio.all_tasks(self.loop):
                     task.cancel()
@@ -802,11 +928,8 @@ class _Core:
     async def on_tool_call(self, name: str, args: list[Any]) -> Any:
         """A bound tool, as the guest sees it: charge the budget, hand the call to whoever drives
         the session, and wait for their answer."""
-        if self.max_tool_calls is not None and self.calls_made >= self.max_tool_calls:
-            raise ToolBudgetError(
-                f"tool call budget exhausted ({self.max_tool_calls} calls); refused {name!r}"
-            )
-        self.calls_made += 1
+        self.charge(name)
+        assert self.loop is not None
         future: asyncio.Future[Any] = self.loop.create_future()
         run = self.run
         with self.cond:
@@ -826,25 +949,15 @@ class _Core:
     async def on_catalog_call(self, name: Any, args: list[Any]) -> Any:
         """A catalog tool, called through the one hidden dispatcher. Refused, without charging
         the budget, unless it is a catalog tool the guest has already found."""
-        if (
-            not isinstance(name, str)
-            or name not in self.catalog
-            or name not in self.discovered
-        ):
-            shown = name if isinstance(name, str) and len(name) <= 64 else "?"
-            raise _public(
-                ToolNotDiscoveredError(
-                    f"no tool {shown!r} has been found in this session: call "
-                    "search_tools(query) to find tools and describe_tool(name) to see how "
-                    "to call one, then call it"
-                )
-            )
-        return await self.on_tool_call(name, args)
+        return await self.on_tool_call(self.check_catalog(name), args)
 
     async def execute(self, run: _Run, code: str) -> None:
         capture = OutputCapture(self.max_output_bytes)
         self.console.capture = capture
         try:
+            if self.pending_js:
+                await self.rt.eval_async(self.pending_js)
+                self.pending_js = ""
             value = await self.rt.eval_async(_wrap(code))
             # Over the cap, the run fails but the session goes on (the value is dropped here).
             bounded_result(value, self.max_result_bytes)
@@ -891,7 +1004,8 @@ class _Core:
         """Run a coroutine on the session's loop and wait for it, without hanging if the session
         is closed meanwhile."""
         try:
-            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            loop = self.ensure_loop()
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
         except RuntimeError:  # the loop is closed
             coro.close()
             raise RuntimeError("the session is closed") from None
@@ -899,7 +1013,7 @@ class _Core:
             try:
                 return future.result(0.25)
             except TimeoutError:
-                if not self.thread.is_alive():
+                if self.thread is None or not self.thread.is_alive():
                     raise RuntimeError("the session is closed") from None
 
     def call_on_loop(self, fn: Callable[..., Any], *args: Any) -> Any:
@@ -928,12 +1042,29 @@ class _Core:
                 return
             self.closed = True
             self.cond.notify_all()
+        if self.refusals > 1:
+            _log.warning(
+                "pydeno: session %d: %d tool calls were refused in all",
+                self.session_id,
+                self.refusals,
+            )
         try:
             self.rt.close()
         except Exception:  # noqa: BLE001, S110 - closing must not fail half-way
             pass
+        self.tools.close()
+        with self._loop_lock:
+            pass  # a loop being started right now has finished starting
         on_loop_thread = threading.current_thread() is self.thread
-        if self.loop.is_closed():
+        if self.loop is None or self.loop.is_closed():
+            return
+        if self.tool_busy:
+            # A tool (possibly wedged) holds the loop or the tool thread: stop the loop once it
+            # is free, and do not wait; both threads are daemons and belong to nobody else.
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except RuntimeError:
+                pass
             return
         if not on_loop_thread:
 
@@ -953,7 +1084,7 @@ class _Core:
             self.loop.call_soon_threadsafe(self.loop.stop)
         except RuntimeError:  # the loop already closed
             return
-        if not on_loop_thread:
+        if not on_loop_thread and self.thread is not None:
             self.thread.join(20)
 
 
@@ -981,7 +1112,8 @@ class _SessionBase:
         max_output_bytes: int,
         max_result_bytes: int,
         runtime_options: dict[str, Any],
-    ) -> tuple[RuntimeConfig, _ConsoleSink]:
+        adopted: bool = False,
+    ) -> tuple[RuntimeConfig | None, _ConsoleSink]:
         """Validate the arguments and set up the session's state. Pops ``config`` from
         `runtime_options`; returns the runtime config to start the worker with (its console goes
         to the returned sink) ."""
@@ -1025,11 +1157,11 @@ class _SessionBase:
                 "timeout=, max_pause=)"
             )
         config = runtime_options.pop("config", None)
-        if config is None:
+        if config is None and not adopted:
             config = RuntimeConfig()
-        if not isinstance(config, RuntimeConfig):
+        if not adopted and not isinstance(config, RuntimeConfig):
             raise TypeError("config must be a pydeno.RuntimeConfig")
-        if config.timeout is not None:
+        if config is not None and config.timeout is not None:
             raise ValueError(
                 f"RuntimeConfig.timeout is not supported by {who}: it would count the time "
                 f"a run is paused at a tool call. Use {who}(timeout=...)."
@@ -1071,8 +1203,16 @@ class _SessionBase:
         self._dead = False
         self._paused: ToolCall | None = None
         self._run: _Run | None = None
+        # JavaScript run before the prelude: freezes the clock of an adopted runtime (`runtime=`)
+        # that was started without one. Empty when the worker froze it at start-up.
+        self._clock_js = ""
+        # The same freeze, guarded so that it runs once, sent before the first run's code (not
+        # journaled) when the prelude was installed ahead of time (`preinstall`).
+        self._clock_pending = ""
 
         # Console output is collected per run; the caller's own `on_console` still sees it all.
+        if config is None:  # an adopted runtime (`runtime=`): it already has its config
+            return None, _ConsoleSink(None)
         sink = _ConsoleSink(config.on_console)
         rt_config = RuntimeConfig(
             **{key: getattr(config, key) for key in _CONFIG_KEYS},
@@ -1081,6 +1221,117 @@ class _SessionBase:
             snapshot=config.snapshot,
         )
         return rt_config, sink
+
+    # -- an adopted runtime (`runtime=`) --------------------------------------
+
+    @staticmethod
+    def _adopt_arguments(
+        who: str,
+        runtime: Any,
+        runtime_type: type,
+        clock: datetime | float | int | None,
+        random_seed: int | None,
+        runtime_options: Mapping[str, Any],
+    ) -> tuple[datetime | float | int | None, int]:
+        """Check a runtime given as ``runtime=`` before anything is set up; returns the clock and
+        random seed the session must use (the runtime's own, which replay depends on)."""
+        if not isinstance(runtime, runtime_type):
+            raise TypeError(f"runtime must be a pydeno.{runtime_type.__name__}")
+        if runtime_options:
+            raise TypeError(
+                f"{who}(runtime=...) takes an already-built runtime, whose options were fixed when "
+                f"it was made; drop {sorted(runtime_options)}"
+            )
+        if runtime.is_closed():
+            raise ValueError("runtime= is closed")
+        if runtime._token_to_hid and getattr(runtime, "_pydeno_prepared", None) is None:  # noqa: SLF001
+            raise ValueError(
+                "runtime= has been used already (it has bindings); give the session a fresh one"
+            )
+        if "console_hid" not in runtime._options:  # noqa: SLF001
+            raise ValueError(
+                "runtime= must route console output to the parent: build it with "
+                "RuntimeConfig(on_console=...) (or capture_console=True)"
+            )
+        seeds = [
+            flag
+            for flag in runtime._options["v8_flags"]  # noqa: SLF001
+            if flag.startswith("--random-seed=")
+        ]
+        if len(seeds) != 1:
+            raise ValueError(
+                "runtime= must be started with exactly one random_seed=, which replay depends on"
+            )
+        seed = int(seeds[0].split("=", 1)[1])
+        if random_seed is not None and random_seed != seed:
+            raise ValueError(
+                f"random_seed={random_seed} differs from the seed runtime= was started with"
+            )
+        frozen = runtime._options.get("clock_ms")  # noqa: SLF001
+        if frozen is not None:
+            if clock is not None and _clock_ms(clock) != frozen:
+                raise ValueError(
+                    "clock= differs from the clock runtime= was started with"
+                )
+            clock = frozen / 1000
+        return clock, seed
+
+    def _check_prepared(self, runtime: Any) -> None:
+        """A runtime prepared ahead of time (`preinstall`) serves one session, with exactly the
+        tools it was prepared for. Refused before anything changes hands."""
+        prepared = getattr(runtime, "_pydeno_prepared", None)
+        if prepared is None:
+            return
+        if prepared.slot.core is not None:
+            raise ValueError(
+                "runtime= has been used already; give the session a fresh one"
+            )
+        if (
+            prepared.names != tuple(self._tools)
+            or prepared.namespace != self._namespace
+            or self._catalog
+        ):
+            raise ValueError(
+                f"runtime= was prepared for other tools ({list(prepared.names)}); give the "
+                "session a fresh runtime"
+            )
+
+    def _install(
+        self,
+        runtime: Any,
+        sink: _ConsoleSink,
+        timeout: float | None,
+        max_pause: float | None,
+    ) -> None:
+        """Make an adopted runtime this session's: its console feeds the session's capture, the
+        session's deadlines replace the ones it was handed out with, and, if the worker was
+        started without a frozen clock, the session's clock is frozen before the prelude runs
+        (before any guest code: the same guarantee as the worker's own start-up freeze)."""
+        hid = runtime._options["console_hid"]  # noqa: SLF001
+        runtime._handlers[hid] = (_checked_console(sink), False)  # noqa: SLF001
+        runtime._apply_session(  # noqa: SLF001
+            {
+                "_request_timeout": _seconds(timeout),
+                "_max_host_wait": _seconds(max_pause),
+            }
+        )
+        self._redact = bool(runtime._redact)  # noqa: SLF001
+        prepared = getattr(runtime, "_pydeno_prepared", None)
+        if "clock_ms" not in runtime._options:  # noqa: SLF001
+            from ._worker import _FROZEN_CLOCK_JS  # noqa: PLC0415 - only for adopted runtimes
+
+            if prepared is None:
+                self._clock_js = _FROZEN_CLOCK_JS % {"ms": self._clock_ms}
+            else:
+                # Sent as a command of its own before the first run's (see `freeze_first`):
+                # the run's own script may fail before executing anything (a parse error, a
+                # frame over the cap), and the guest must still never see the real clock. It
+                # removes the freezer, leaving the global environment exactly as a session
+                # started any other way has it (replay depends on that).
+                self._clock_pending = (
+                    f'{{ const f = globalThis["{_FREEZER}"]; delete globalThis["{_FREEZER}"]; '
+                    f"f({int(self._clock_ms)}); }} undefined;"
+                )
 
     # -- introspection -------------------------------------------------------
 
@@ -1329,7 +1580,13 @@ class _SessionBase:
             raise JournalError(
                 f"the journal was recorded by pydeno {config['release']!r}, this is {made_by!r}"
             )
-        if bool(options.get("redact_host_errors", True)) != config["redact"]:
+        runtime = options.get("runtime")
+        redact = (
+            runtime._redact  # noqa: SLF001
+            if runtime is not None and hasattr(runtime, "_redact")
+            else options.get("redact_host_errors", True)
+        )
+        if bool(redact) != config["redact"]:
             raise JournalError(
                 "the journal was recorded with a different redact_host_errors setting"
             )
@@ -1365,6 +1622,314 @@ class _SessionBase:
                 "max_result_bytes", DEFAULT_MAX_RESULT_BYTES
             ),
         }
+
+
+class _InlineRun:
+    """One `AgentSandbox._drive`: its answering function, the caller's context, the order its
+    tool calls are answered in, and whether it is still the run in progress."""
+
+    __slots__ = ("active", "answer", "context", "order", "state")
+
+    def __init__(
+        self, answer: Callable[[ToolCall], Any] | None, session_id: int
+    ) -> None:
+        self.answer = answer
+        self.context = contextvars.copy_context()
+        # Tools see which session they are answering for, so they cannot drive or close it.
+        self.context.run(_TOOL_OF.set, session_id)
+        self.order = asyncio.Lock()
+        self.state = threading.Lock()
+        self.active = True
+
+    def end(self) -> None:
+        with self.state:
+            self.active = False
+
+
+# The session whose tool is running in this context (set only in a `_drive` run's tools).
+_TOOL_OF: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "pydeno_agent_tool_of", default=None
+)
+
+
+class _ThreadsExhausted(RuntimeError):
+    """Internal: a session thread could not start because a thread budget is spent. The host
+    hears about it (a log record, and `PydenoSession.feed_run` raises `ToolThreadLimitError` if the
+    feed then fails); the guest only sees its tool call fail like any other host error."""
+
+
+_log = logging.getLogger("pydeno")
+# What the guest sees for a tool call refused for want of a thread: exactly what a tool raising
+# a plain RuntimeError looks like under redaction, so it learns nothing about the host.
+_UNAVAILABLE = "host function failed"
+
+
+def _unavailable() -> RuntimeError:
+    exc = RuntimeError(_UNAVAILABLE)
+    exc._pydeno_public = True  # type: ignore[attr-defined] # the same text in every mode
+    return exc
+
+
+#: A thread budget that never refuses (threads bounded by construction, e.g. a console sink).
+_UNBOUNDED_LIMIT = 2**62
+
+
+class _ThreadBudget:
+    """A cap on the session threads (tool threads, and loop threads started for tools) alive at
+    once, for one pool (`Pydeno(max_tool_threads=...)`), chained to the process-wide ceiling.
+    A pool can never hold more than its own cap, so one tenant spending its share fails only
+    itself. Fork-safe: a fork()ed child starts from zero (it has none of the parent's threads)."""
+
+    def __init__(
+        self, limit: int, what: str, parent: _ThreadBudget | None = None
+    ) -> None:
+        self.limit = limit
+        self.what = what
+        self.parent = parent
+        self.count = 0
+        self.lock = threading.Lock()
+        _BUDGETS.add(self)
+
+    def acquire(self) -> None:
+        with self.lock:
+            if self.count >= self.limit:
+                raise _ThreadsExhausted(
+                    f"{self.what} already runs {self.limit} session tool threads (most likely "
+                    "stuck in tools whose runs were killed); no new one starts until some finish"
+                )
+            if self.parent is not None:
+                self.parent.acquire()
+            self.count += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self.count -= 1
+        if self.parent is not None:
+            self.parent.release()
+
+    def _after_fork(self) -> None:
+        self.lock = threading.Lock()
+        self.count = 0
+
+
+_BUDGETS: weakref.WeakSet[_ThreadBudget] = weakref.WeakSet()
+#: The process-wide ceiling on live session tool threads: the last resort behind each pool's own
+#: `max_tool_threads`. Each session holds at most two (its tool thread and its loop thread).
+MAX_TOOL_THREADS = 512
+_PROCESS_THREADS = _ThreadBudget(MAX_TOOL_THREADS, "this process")
+
+
+def _budgets_after_fork() -> None:
+    for budget in list(_BUDGETS):
+        budget._after_fork()  # noqa: SLF001
+
+
+os.register_at_fork(after_in_child=_budgets_after_fork)
+
+
+class _ToolThread:
+    """One session's own thread for its plain (synchronous) tools: started at the session's
+    first such call, never shared with another session and never reused by one, so a tool that
+    blocks forever, or that leaves thread-local state behind, affects only its own session.
+    One call at a time. `close()` lets it exit after the call in progress, without waiting."""
+
+    __slots__ = ("_closed", "_held", "_lock", "_name", "_queue", "_started", "budget")
+
+    def __init__(self, name: str, budget: _ThreadBudget | None = None) -> None:
+        self._name = name
+        self._queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._started = False
+        self._closed = False
+        #: What the thread counts against (a pool's budget, else the process ceiling).
+        self.budget = budget or _PROCESS_THREADS
+        self._held: _ThreadBudget | None = None
+
+    def submit(
+        self, fn: Callable[..., Any], *args: Any
+    ) -> concurrent.futures.Future[Any]:
+        """Raises `_ThreadsExhausted` if the thread must start and its budget is spent."""
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the session is closed")
+            if not self._started:
+                budget = self.budget
+                budget.acquire()
+                try:
+                    threading.Thread(
+                        target=self._serve, name=self._name, daemon=True
+                    ).start()
+                except BaseException:
+                    budget.release()
+                    raise
+                self._held = budget
+                self._started = True
+            self._queue.put((future, fn, args))
+        return future
+
+    def _serve(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                future, fn, args = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(fn(*args))
+                except BaseException as exc:  # noqa: BLE001 - delivered to whoever waits
+                    future.set_exception(exc)
+                del future, fn, args, item  # hold nothing of a finished call
+        finally:
+            held = self._held
+            if held is not None:
+                held.release()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._started:
+                self._queue.put(None)
+
+
+class _LazyLoop:
+    """The session's loop as the runtime's host-call loop, started only when the runtime first
+    schedules a call on it: a run that calls no tool starts no thread."""
+
+    __slots__ = ("_core",)
+
+    def __init__(self, core: _Core) -> None:
+        self._core = core
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._core.ensure_loop(), name)
+
+
+class _Slot:
+    """Where a runtime's tool shims find the session they belong to. Set when the session is
+    built, or, for a runtime prepared ahead of time (`preinstall`), when a session adopts it."""
+
+    __slots__ = ("core",)
+
+    def __init__(self) -> None:
+        self.core: _Core | None = None
+
+
+class _Shim:
+    """A tool as a sync session's runtime calls it (an asynchronous host function, so the guest
+    gets a promise, which the prelude's settle step needs). It returns the coroutine the runtime
+    runs on the loop the command was given: the tool loop during `AgentSandbox._drive` (which
+    answers it), the session's loop otherwise (which hands it to `start`/`resume`)."""
+
+    __slots__ = ("catalog", "name", "slot")
+
+    def __init__(self, slot: _Slot, name: str, catalog: bool = False) -> None:
+        self.slot = slot
+        self.name = name
+        self.catalog = catalog
+
+    def __call__(self, *args: Any) -> Any:
+        core = self.slot.core
+        if core is None:
+            raise RuntimeError("no session has adopted this runtime yet")
+        if self.catalog:
+            name: Any = args[0] if args else None
+            rest = list(args[1:])
+            if core.inline is not None:
+                return core.inline(core.check_catalog(name), rest)
+            return core.on_catalog_call(name, rest)
+        if core.inline is not None:
+            return core.inline(self.name, list(args))
+        return core.on_tool_call(self.name, list(args))
+
+
+async def _async_placeholder(*args: Any) -> Any:  # bound, then replaced by a `_Shim`
+    raise RuntimeError("unreachable")
+
+
+def _install_shims(
+    rt: IsolatedRuntime,
+    names: list[str],
+    namespace: str | None,
+    *,
+    catalog: bool,
+    slot: _Slot,
+) -> None:
+    """Bind a `_Shim` per tool (and the catalog dispatcher). Each is bound as an asynchronous
+    host function, then its handler entry is swapped for the shim, which the runtime calls as it
+    calls any asynchronous handler (awaiting what it returns on the session's loop, or, in a run
+    driven without a loop, taking a plain return value as the answer)."""
+    tokens: dict[str, int] = {}
+    if namespace is None:
+        for name in names:
+            tokens[name] = rt.bind_function(name, _async_placeholder)
+    elif names:
+        tokens.update(
+            rt.bind_object(namespace, dict.fromkeys(names, _async_placeholder))
+        )
+    if catalog:
+        tokens[_CATALOG_CALL] = rt.bind_function(_CATALOG_CALL, _async_placeholder)
+    for name, token in tokens.items():
+        hid = rt._token_to_hid[token]  # noqa: SLF001
+        rt._handlers[hid] = (  # noqa: SLF001
+            _Shim(slot, name, catalog=name == _CATALOG_CALL),
+            True,
+        )
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    names: tuple[str, ...]
+    namespace: str | None
+    slot: _Slot
+
+
+def preinstall(
+    rt: IsolatedRuntime, names: list[str], namespace: str | None = None
+) -> None:
+    """Install an `AgentSandbox`'s tool shims and prelude on a fresh runtime ahead of time (a
+    pool's filler does this), so that a session adopting it with ``runtime=`` and exactly these
+    tool names does no round trip to the worker. Nothing guest-visible depends on the session:
+    the shims answer no call until a session adopts the runtime, the clock is frozen by the
+    session before its first run's code, and the seed was fixed when the worker started."""
+    slot = _Slot()
+    _install_shims(rt, list(names), namespace, catalog=False, slot=slot)
+    rt.eval(_prepared_prelude(rt, names, namespace))
+    # A worker's first few runs are the slow ones (its event loop, the run wrapper and the settle
+    # step are cold): pay for them here, not in the session's first run. They leave no state:
+    # the wrapper declares nothing and calls no tool.
+    for _ in range(_WARM_RUNS):
+        rt._request(  # noqa: SLF001
+            {"t": "eval_async", "code": _wrap("return 0;"), "timeout": None},
+            soft_timeout=None,
+        )
+    rt._pydeno_prepared = _Prepared(tuple(names), namespace, slot)  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+def _prepared_prelude(rt: Any, names: list[str], namespace: str | None) -> str:
+    """The session prelude, plus (for a worker started without a frozen clock) the freezing
+    script as a function, for the adopting session to call with its own instant."""
+    script = _prelude(list(names), namespace, None)
+    if "clock_ms" in rt._options:  # noqa: SLF001
+        return script
+    from ._worker import _FROZEN_CLOCK_JS  # noqa: PLC0415
+
+    body = _FROZEN_CLOCK_JS.replace("%(ms)d", "ms")
+    return (
+        script
+        + f'\nObject.defineProperty(globalThis, "{_FREEZER}", '
+        + f"{{ value: (ms) => {{ {body} }}, configurable: true, writable: false, enumerable: false }});\n"
+        # What the freeze touches is built lazily by V8 (Intl's formatter, Temporal): build it
+        # now rather than in the session's first run. Nothing observable changes.
+        + "void (typeof Intl !== 'undefined' && Intl.DateTimeFormat && "
+        + "Object.getOwnPropertyDescriptor(Intl.DateTimeFormat.prototype, 'format'));\n"
+        + "void (typeof Temporal !== 'undefined' && Temporal.Now && Temporal.Instant.fromEpochMilliseconds(0));\n"
+        + "undefined;"
+    )
 
 
 class AgentSandbox(_SessionBase):
@@ -1404,6 +1969,15 @@ class AgentSandbox(_SessionBase):
         max_result_bytes: Cap on a run's result as compact JSON. A larger result makes the run
             `Failed` with ``error_type == "ResultTooLarge"``; the session stays usable. Default
             1 MiB. Recorded in the journal (it decides outcomes, so replay needs the same one).
+        runtime: Run on this already-built `IsolatedRuntime` (a `SandboxPool` checkout, say)
+            instead of starting one. The session takes it over and closes it with itself. It must
+            be fresh (nothing bound), route console output to the parent (built with an
+            ``on_console`` or ``capture_console=True``) and have been started with a
+            ``random_seed``, which becomes the session's; a frozen ``clock`` it was started with
+            becomes the session's too, and without one the session freezes the guest's clock
+            before any guest code runs. ``timeout`` and ``max_pause`` replace its deadlines; its
+            other options (``sandbox``, ``max_memory``, ``redact_host_errors``, ...) are what it
+            was built with, so no ``runtime_options`` may be passed with it.
         **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
             ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
             count the time paused at a tool call. ``config.on_console`` still gets every console
@@ -1424,8 +1998,18 @@ class AgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+        runtime: IsolatedRuntime | None = None,
         **runtime_options: Any,
     ) -> None:
+        if runtime is not None:
+            clock, random_seed = self._adopt_arguments(
+                "AgentSandbox",
+                runtime,
+                IsolatedRuntime,
+                clock,
+                random_seed,
+                runtime_options,
+            )
         rt_config, sink = self._configure(
             tools,
             max_tool_calls=max_tool_calls,
@@ -1437,16 +2021,26 @@ class AgentSandbox(_SessionBase):
             max_output_bytes=max_output_bytes,
             max_result_bytes=max_result_bytes,
             runtime_options=runtime_options,
+            adopted=runtime is not None,
         )
         self._lock = threading.Lock()
-        rt = IsolatedRuntime(
-            rt_config,
-            clock=self._clock_ms / 1000,
-            random_seed=self._random_seed,
-            request_timeout=timeout,
-            max_host_wait=max_pause,
-            **runtime_options,
-        )
+        if runtime is None:
+            rt = IsolatedRuntime(
+                rt_config,
+                clock=self._clock_ms / 1000,
+                random_seed=self._random_seed,
+                request_timeout=timeout,
+                max_host_wait=max_pause,
+                **runtime_options,
+            )
+        else:
+            rt = runtime
+            self._check_prepared(rt)  # a refusal leaves it with the caller
+            try:
+                self._install(rt, sink, timeout, max_pause)
+            except BaseException:
+                rt.close()
+                raise
         try:
             self._core = _Core(
                 rt,
@@ -1460,6 +2054,7 @@ class AgentSandbox(_SessionBase):
         except BaseException:
             rt.close()
             raise
+        self._core.pending_js = self._clock_pending
         self._finalizer = weakref.finalize(self, self._core.shutdown)
         try:
             self._bind()
@@ -1469,28 +2064,24 @@ class AgentSandbox(_SessionBase):
 
     def _bind(self) -> None:
         core = self._core
-
-        def shim_for(name: str) -> Callable[..., Any]:
-            async def shim(*args: Any) -> Any:
-                return await core.on_tool_call(name, list(args))
-
-            shim.__name__ = name
-            return shim
-
-        shims = {name: shim_for(name) for name in self._tools}
-        if self._namespace is None:
-            for name, shim in shims.items():
-                core.rt.bind_function(name, shim)
-        elif shims:
-            core.rt.bind_object(self._namespace, shims)
-        if self._catalog:
-
-            async def catalog_call(name: Any = None, *args: Any) -> Any:
-                return await core.on_catalog_call(name, list(args))
-
-            core.rt.bind_function(_CATALOG_CALL, catalog_call)
+        prepared = getattr(core.rt, "_pydeno_prepared", None)
+        if prepared is not None:
+            # Shims and prelude were installed when the worker was started (`preinstall`): the
+            # session only has to become the one they call.
+            prepared.slot.core = core
+            return
+        slot = _Slot()
+        slot.core = core
+        _install_shims(
+            core.rt,
+            list(self._tools),
+            self._namespace,
+            catalog=bool(self._catalog),
+            slot=slot,
+        )
         core.rt.eval(
-            _prelude(
+            self._clock_js
+            + _prelude(
                 list(self._tools),
                 self._namespace,
                 self._catalog_ns if self._catalog else None,
@@ -1500,7 +2091,10 @@ class AgentSandbox(_SessionBase):
     # -- running -------------------------------------------------------------
 
     def _enter(self) -> None:
-        if threading.current_thread() is self._core.thread:
+        if (
+            threading.current_thread() is self._core.thread
+            or _TOOL_OF.get() == self._core.session_id
+        ):
             raise RuntimeError(
                 "an AgentSandbox cannot be driven from one of its own tools"
             )
@@ -1561,20 +2155,138 @@ class AgentSandbox(_SessionBase):
         on a closed session (or while paused) still raises, as `run` does."""
         return self._drive(code).to_result(max_error_bytes=self._max_output_bytes)
 
-    def _drive(self, code: str) -> Done | Failed:
+    def _drive(
+        self, code: str, answer: Callable[[ToolCall], Any] | None = None
+    ) -> Done | Failed:
+        """A run with every tool call answered, the command driven from the caller's thread.
+
+        The caller's thread runs the command's pump, which enforces the deadline, the CPU cap,
+        `max_pause` and the memory ceiling the whole time, also while a tool runs: tool calls
+        are answered off this thread, on the session's own loop (async tools) and the session's
+        own tool thread (plain ones), neither shared with any other session, one at a time in
+        the order the guest made them (by `answer(call)`, default the real tool, each call in a
+        fresh copy of the caller's context), and journaled exactly as `start`/`resume` journal
+        them (an observed `ToolCall`, then its answer). A tool that outlives a limit gets the worker
+        killed and the caller released at once; its late answer is discarded. A run that calls
+        no tool touches no other thread.
+        """
         self._enter()
         try:
-            step = self._start(code)
-            while isinstance(step, ToolCall):
-                try:
-                    result = self._call_tool(step)
-                except Exception as exc:  # noqa: BLE001 - the guest sees the failure
-                    step = self._resume(step, _MISSING, exc)
-                else:
-                    step = self._resume(step, result, None)
+            if not isinstance(code, str):
+                raise TypeError("code must be a string")
+            self._check_usable()
+            if self._paused is not None:
+                raise RuntimeError(
+                    "the session is paused at a tool call; resume it first"
+                )
+            core = self._core
+            rt = core.rt
+            run = _InlineRun(answer, core.session_id)
+            self._record(["run", code])
+            capture = OutputCapture(self._max_output_bytes)
+            core.console.capture = capture
+            core.inline = functools.partial(self._inline_call, run)
+            try:
+                core.freeze_first()
+                value = rt._request(  # noqa: SLF001 - `eval_async`, pumped on this thread
+                    {
+                        "t": "eval_async",
+                        "code": _wrap(code),
+                        "timeout": rt._soft_timeout,  # noqa: SLF001
+                    },
+                    soft_timeout=rt._soft_timeout,  # noqa: SLF001
+                    loop=_LazyLoop(core),  # type: ignore[arg-type]
+                )
+                # Over the cap, the run fails but the session goes on.
+                bounded_result(value, self._max_result_bytes)
+                final: Step = Done(value)
+            except Exception as exc:  # noqa: BLE001 - every failure is the run's outcome
+                final = Failed(exc)
+            except BaseException:
+                # KeyboardInterrupt and the like, mid-command: the worker cannot be left
+                # half-way through it. The run is lost (with what it spent), as after a crash.
+                run.end()
+                rt._kill()  # noqa: SLF001
+                self._mark_dead("WorkerCrashed")
+                core.shutdown()
+                raise
+            finally:
+                core.inline = None
+                core.console.capture = None
+            # From here on a tool still running (the worker was killed under it) changes nothing.
+            with run.state:
+                run.active = False
+                final = dataclasses.replace(
+                    final,
+                    stdout=capture.stdout,
+                    stderr=capture.stderr,
+                    truncated=capture.truncated,
+                )
+                step = self._observe(final)
+            assert not isinstance(step, ToolCall)
+            return step
         finally:
             self._lock.release()
-        return step
+
+    async def _inline_call(self, run: _InlineRun, name: str, args: list[Any]) -> Any:
+        """A tool call during `_drive`, on the tool loop. Charged and numbered as it arrives,
+        then answered strictly in arrival order (`run.lock` is first come, first served)."""
+        core = self._core
+        with run.state:
+            if not run.active:
+                raise RuntimeError("the run has ended")
+            core.charge(name)
+            call = ToolCall(name, tuple(args), next(core.ids), core.session_id)
+        async with run.order:
+            with run.state:
+                if not run.active:
+                    raise RuntimeError("the run has ended")
+                self._observe(call)
+            error: BaseException | None = None
+            value: Any = _MISSING
+            try:
+                value = self._check_result(call, await self._run_tool(run, call))
+            except Exception as exc:  # noqa: BLE001 - the guest sees the failure
+                value, error = _MISSING, exc
+            with run.state:
+                if not run.active:
+                    raise RuntimeError("the run has ended")
+                sent_value, sent = self._answer(call, value, error)
+        if sent is not None:
+            raise sent
+        return sent_value
+
+    async def _run_tool(self, run: _InlineRun, call: ToolCall) -> Any:
+        """On the session's loop. Each call gets a fresh copy of the caller's context, so what
+        one call sets is not seen by the next."""
+        loop = asyncio.get_running_loop()
+        core = self._core
+        if run.answer is not None:
+            fn, args = run.answer, (call,)
+        else:
+            fn, args = self._check_call(call)
+        context = run.context.copy()
+        try:
+            core.count_loop()
+        except _ThreadsExhausted as exc:
+            core.note_refusal(exc)
+            raise _unavailable() from None
+        core.tool_busy = True
+        try:
+            if inspect.iscoroutinefunction(fn):
+                # A task made inside the context runs in (a copy of) it.
+                return await context.run(loop.create_task, fn(*args))
+            try:
+                submitted = core.tools.submit(context.run, fn, *args)
+            except _ThreadsExhausted as exc:
+                core.note_refusal(exc)
+                raise _unavailable() from None
+            result = await asyncio.wrap_future(submitted)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            core.tool_busy = False
 
     def call(self, step: ToolCall) -> Any:
         """Run the real tool for a `ToolCall` (what `run` does for each one) and return its
@@ -1706,7 +2418,10 @@ class AgentSandbox(_SessionBase):
 
     def close(self) -> None:
         """Stop the worker and the session's thread. Idempotent; safe while paused."""
-        if threading.current_thread() is self._core.thread:
+        if (
+            threading.current_thread() is self._core.thread
+            or _TOOL_OF.get() == self._core.session_id
+        ):
             raise RuntimeError("a tool cannot close the session that is running it")
         self._paused = None
         self._finalizer()
@@ -1946,7 +2661,7 @@ def _normalize_tools(
         ToolBridge._check_name(name, what="tool name")  # noqa: SLF001
         if not callable(tool):
             raise TypeError(f"tool {name!r} is not callable")
-        required_kw = _spec(name, tool).required_keyword_only
+        required_kw = _required_keyword_only(tool)
         if required_kw:
             raise ValueError(
                 f"tool {name!r} has required keyword-only parameters {list(required_kw)}, "

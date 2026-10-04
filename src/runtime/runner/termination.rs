@@ -11,6 +11,15 @@ const TERMINATION_STATUS_RUNNING: u8 = 0;
 const TERMINATION_STATUS_REQUESTED: u8 = 1;
 const TERMINATION_STATUS_TERMINATED: u8 = 2;
 
+/// While a fired deadline is still armed, the watchdog re-issues `terminate_execution` this often.
+///
+/// One termination is not enough: when it stops a script, deno_core converts the resulting
+/// "execution terminated" error after *cancelling* the termination, and that conversion reads
+/// properties of the error (`constructor`, `name`, `cause`, `stack`...) whose prototype is the
+/// guest's `Error.prototype`. A getter there would otherwise run with no deadline left. Re-issuing
+/// cuts each such read short; the caller's `disarm` (and its cancel) ends the repeats.
+const REISSUE_INTERVAL: Duration = Duration::from_millis(20);
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -131,10 +140,30 @@ struct ArmedDeadline {
     fired: bool,
 }
 
+/// What the watchdog thread is doing, so `arm` wakes it only when it must.
+#[derive(Clone, Copy)]
+enum Parked {
+    /// Running (or about to run) its loop, which reads every armed entry afresh.
+    Busy,
+    /// Waiting with nothing armed: any new deadline needs a wake.
+    Forever,
+    /// Waiting to wake at this instant: only a deadline before it needs a wake.
+    Until(Instant),
+}
+
+struct Armed {
+    entries: Vec<ArmedDeadline>,
+    parked: Parked,
+}
+
 struct WatchdogState {
-    armed: Mutex<Vec<ArmedDeadline>>,
-    /// Signalled on `arm` (a sooner deadline may exist) and on shutdown.
-    /// `disarm` need not signal: removing an entry only pushes the wakeup later.
+    armed: Mutex<Armed>,
+    /// Signalled on `arm` when the new deadline is sooner than the one the thread
+    /// sleeps toward, and on shutdown. Every timed call arms and disarms, and a
+    /// wake per call costs the runtime thread two context switches and a
+    /// contended lock; a thread that already wakes earlier needs none, it
+    /// simply re-reads the entries then. `disarm` need not signal: removing an
+    /// entry only pushes the wakeup later.
     wake: Condvar,
     /// Read by the watchdog while it holds `armed`, so writers must hold
     /// `armed` too or the `wake` notification can be lost (see `Drop`).
@@ -158,7 +187,10 @@ pub(super) struct WatchdogToken {
 impl Watchdog {
     pub(super) fn spawn(termination: TerminationController) -> RuntimeResult<Self> {
         let state = Arc::new(WatchdogState {
-            armed: Mutex::new(Vec::new()),
+            armed: Mutex::new(Armed {
+                entries: Vec::new(),
+                parked: Parked::Busy,
+            }),
             wake: Condvar::new(),
             shutdown: Mutex::new(false),
             next_id: AtomicU64::new(0),
@@ -167,57 +199,83 @@ impl Watchdog {
 
         let handle = thread::Builder::new()
             .name("pydeno-watchdog".to_string())
-            .spawn(move || loop {
-                let mut armed = lock(&thread_state.armed);
-                if *lock(&thread_state.shutdown) {
-                    return;
-                }
+            .spawn(move || {
+                let mut last_terminate: Option<Instant> = None;
+                loop {
+                    let mut armed = lock(&thread_state.armed);
+                    if *lock(&thread_state.shutdown) {
+                        return;
+                    }
 
-                let now = Instant::now();
-                let mut any_fired = false;
-                for entry in armed.iter_mut().filter(|e| !e.fired && e.deadline <= now) {
-                    entry.fired = true;
-                    any_fired = true;
-                }
+                    let now = Instant::now();
+                    let mut any_fired = false;
+                    for entry in armed
+                        .entries
+                        .iter_mut()
+                        .filter(|e| !e.fired && e.deadline <= now)
+                    {
+                        entry.fired = true;
+                        any_fired = true;
+                    }
+                    let outstanding = armed.entries.iter().any(|entry| entry.fired);
+                    let reissue_due = outstanding
+                        && last_terminate
+                            .is_none_or(|at| now.saturating_duration_since(at) >= REISSUE_INTERVAL);
 
-                // One termination covers every deadline that just expired;
-                // report the one that expired first.
-                if any_fired {
-                    let reason = armed
+                    // One termination covers every deadline that just expired;
+                    // report the one that expired first.
+                    if any_fired || reissue_due {
+                        if any_fired {
+                            let reason = armed
+                                .entries
+                                .iter()
+                                .filter(|entry| entry.fired)
+                                .min_by_key(|entry| entry.deadline)
+                                .map(|entry| entry.reason.clone());
+                            if let Some(reason) = reason {
+                                termination.ensure_reason(reason);
+                            }
+                        }
+                        // Hold `armed` until `terminate_execution` is issued:
+                        // `disarm` reads `fired` under this lock and its caller
+                        // cancels the termination, so releasing earlier lets a late
+                        // terminate latch the isolate for the next, unrelated call.
+                        termination.terminate_execution();
+                        last_terminate = Some(now);
+                    }
+
+                    let mut next_deadline = armed
+                        .entries
                         .iter()
-                        .filter(|entry| entry.fired)
-                        .min_by_key(|entry| entry.deadline)
-                        .map(|entry| entry.reason.clone());
-                    // Hold `armed` until `terminate_execution` is issued:
-                    // `disarm` reads `fired` under this lock and its caller
-                    // cancels the termination, so releasing earlier lets a late
-                    // terminate latch the isolate for the next, unrelated call.
-                    if let Some(reason) = reason {
-                        termination.ensure_reason(reason);
+                        .filter(|entry| !entry.fired)
+                        .map(|entry| entry.deadline)
+                        .min();
+                    if outstanding {
+                        let reissue_at = now + REISSUE_INTERVAL;
+                        next_deadline =
+                            Some(next_deadline.map_or(reissue_at, |d| d.min(reissue_at)));
                     }
-                    termination.terminate_execution();
-                    drop(armed);
-                    continue;
-                }
-
-                let next_deadline = armed
-                    .iter()
-                    .filter(|entry| !entry.fired)
-                    .map(|entry| entry.deadline)
-                    .min();
-                let _guard = match next_deadline {
-                    None => thread_state
-                        .wake
-                        .wait(armed)
-                        .unwrap_or_else(PoisonError::into_inner),
-                    Some(deadline) => {
-                        thread_state
+                    // Recorded from the FINAL next deadline (after the re-issue
+                    // adjustment above), under the lock the wait releases
+                    // atomically, so an `arm` either sees it or runs before this
+                    // iteration read the entries: no deadline can be missed, and
+                    // a later deadline than the re-issue tick needs no wake.
+                    armed.parked = next_deadline.map_or(Parked::Forever, Parked::Until);
+                    let mut guard = match next_deadline {
+                        None => thread_state
                             .wake
-                            .wait_timeout(armed, deadline.saturating_duration_since(now))
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .0
-                    }
-                };
+                            .wait(armed)
+                            .unwrap_or_else(PoisonError::into_inner),
+                        Some(deadline) => {
+                            thread_state
+                                .wake
+                                .wait_timeout(armed, deadline.saturating_duration_since(now))
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .0
+                        }
+                    };
+                    guard.parked = Parked::Busy;
+                }
             })
             .map_err(|e| {
                 RuntimeError::internal(format!("Failed to spawn watchdog thread: {}", e))
@@ -232,14 +290,24 @@ impl Watchdog {
     /// Arm a deadline `duration` from now.
     pub(super) fn arm(&self, duration: Duration, reason: impl Into<String>) -> WatchdogToken {
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
-        lock(&self.state.armed).push(ArmedDeadline {
+        let deadline = Instant::now() + duration;
+        let mut armed = lock(&self.state.armed);
+        armed.entries.push(ArmedDeadline {
             id,
-            deadline: Instant::now() + duration,
+            deadline,
             reason: reason.into(),
             fired: false,
         });
-        // The new deadline may be sooner than what the thread sleeps toward.
-        self.state.wake.notify_one();
+        // Wake the thread only if it sleeps past the new deadline.
+        let wake = match armed.parked {
+            Parked::Busy => false,
+            Parked::Forever => true,
+            Parked::Until(at) => deadline < at,
+        };
+        drop(armed);
+        if wake {
+            self.state.wake.notify_one();
+        }
         WatchdogToken { id, duration }
     }
 
@@ -247,9 +315,10 @@ impl Watchdog {
     pub(super) fn disarm(&self, token: WatchdogToken) -> bool {
         let mut armed = lock(&self.state.armed);
         armed
+            .entries
             .iter()
             .position(|entry| entry.id == token.id)
-            .is_some_and(|index| armed.swap_remove(index).fired)
+            .is_some_and(|index| armed.entries.swap_remove(index).fired)
     }
 }
 

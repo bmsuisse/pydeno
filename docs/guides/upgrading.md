@@ -55,16 +55,29 @@ you have today.
 | `AgentSandbox.dump()` after a crash, timeout or kill **returns** the last good journal plus a `lost` record; it used to raise | `AgentSandbox` | Code that relied on the error to detect a dead session | Check `is_closed()`; `load()` charges the lost run's tool calls (no budget refund) |
 | `AgentSandbox` always routes `console.*` through the parent, and `Done`/`Failed` carry the console output (left out of equality) | `AgentSandbox` | A host that set `max_host_calls`: console calls now count against it | Raise the cap, or stop logging in a loop |
 | Messages pydeno writes itself (catalog guidance, wrong-argument `TypeError`) are not hidden by `redact_host_errors`; errors from host tools are still redacted | `AgentSandbox` | Code that matched on the generic "host function failed" text for those | Match on the error class |
+| The isolation worker starts with `-I -S` and imports `pydeno` from the parent's own package directory (no `site`, so no `.pth` or `sitecustomize` runs in the worker); a custom `python=` is started as before | `IsolatedRuntime` | Code that relied on a `.pth` file or `sitecustomize` taking effect inside the worker | Do that work in the parent, or pass what the worker needs through `bootstrap`/bound functions |
 | The worker's seccomp filter denies `memfd_create` | `IsolatedRuntime` (Linux) | Nobody running normal JavaScript | Nothing |
 | New: `AsyncIsolatedRuntime`, `AsyncAgentSandbox`, `SessionPool`, `ExecutionResult`, `SchemaTool` and the lazy catalog, `sandbox_status()`, `classify_error()`, `check_source()` | new | Adopters | See the [async guide](advanced/async.md), [async agent sessions](advanced/async-agent-sessions.md) and the [reference](../reference/error-kinds.md) |
 
 0.6.1 fixed a macOS-only bug: the sandboxed worker aborted at start on Python 3.10 to 3.12. If you are on
 0.6.0 there, upgrade.
 
-## 0.7.x to the next release (unreleased)
+## 0.7.x to the next release: the `Pydeno` front door
+
+**One thing changes behaviour: `python -m pydeno`** (the CLI rows below). `Pydeno` / `AsyncPydeno`
+and their sessions, snapshots, limits and errors are new names; every existing class keeps its
+behaviour, and the docs now lead with `Pydeno` and file the
+building blocks under "Advanced".
 
 | Change | Affects | Who notices | What to change |
 |---|---|---|---|
+| New: `Pydeno`, `AsyncPydeno`, `PydenoSession`, `AsyncPydenoSession`, `PydenoSnapshot`, `AsyncPydenoSnapshot`, `PydenoComplete`, `PydenoLimits` and the `PydenoError` family | new | Adopters | See the [front-door guide](quickstart-pydeno.md); a Monty user can keep their code's shape |
+| `AgentSandbox` / `AsyncAgentSandbox` accept `runtime=` (an already-built, fresh runtime, such as a pool checkout) | new, opt-in | Nobody unless passed | Nothing |
+| `classify_error()` sees through a `PydenoError` to the pydeno exception it wraps | new | Nobody | Nothing |
+| New: `Pydeno(max_tool_threads=...)` / `AsyncPydeno(max_tool_threads=...)` (default 128, clamped to the process ceiling of 512) and `ToolThreadLimitError`: per-pool cap on session tool threads (an upper bound, not a reservation) | new | Pools whose sessions hold many tool threads at once (many concurrent sessions calling externals, or externals that never return); processes with more than four default pools open (a `RuntimeWarning`) | Raise or lower the caps so they fit the ceiling, or give externals their own timeouts |
+| `AgentSandbox.run()` / `execute()` drive the worker from the calling thread, which keeps enforcing every limit; tool calls are answered on the session's own threads (a tool thread for plain functions, its loop thread for coroutine functions; started at its first tool call, never shared with another session), in the order the guest made them, as before, each call in a fresh copy of the caller's context, instead of on the calling thread | `AgentSandbox` | Tools that read the caller's **thread-local** state (`threading.local()`): they no longer see it. Tools see the caller's contextvars as before (a copy per call) | Keep per-call state in contextvars or closures, not thread-locals |
+| `AsyncAgentSandbox.run()` / `execute()` stop waiting for a tool once its run has ended (the supervisor killed the worker for `max_pause`, the CPU cap or memory): the call raises at once instead of when the tool returns; the tool is cancelled | `AsyncAgentSandbox` | Nobody, unless they waited for a slow tool to finish after its run was killed | Nothing |
+| `SandboxPool` builds its runtimes through an overridable core (`_core_type`, private) | internal | Nobody | Nothing |
 | `python -m pydeno` runs code in `IsolatedRuntime(sandbox="require")`; it used the in-process `Runtime` | the CLI | Scripts that ran `python -m pydeno` on a machine without the complete OS sandbox: they now exit with code 4 | Pass `--sandbox auto`, or `--no-sandbox` for code you trust; `pydeno.sandbox_status()` shows what is missing |
 | A positional argument is JavaScript to evaluate; it used to be a file name | the CLI | `python -m pydeno script.js` now evaluates the text `script.js` (a `ReferenceError`, exit code 1) | `python -m pydeno -f script.js` |
 | The result prints as JSON (`"text"` with quotes, `{"a": 1}`); it used to print Python's `str()` of it | the CLI | Scripts that parse the output | Parse it as JSON, or pass `--raw` for a plain string |

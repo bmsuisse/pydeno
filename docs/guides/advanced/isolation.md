@@ -325,14 +325,88 @@ tests needed). It never defines `window` or
 
 ## Start-up cost
 
-A worker costs about 55 ms to start (Python plus the imports), of which the sandbox is about 4 ms.
-`IsolatedRuntime` therefore keeps **one spare worker** started in the background: it has loaded
-everything and is waiting for its configuration, holds no data, is handed to exactly one runtime, and
-exits with its parent. Create-and-eval takes about 100 ms without it and about 15 ms with it when the
-spare is used soon after it started. On macOS it measured 30-45 ms after the spare had sat idle for
-more than ~0.2 s (the operating system is slow to wake an idle process; Linux was not measured).
+A new `IsolatedRuntime` costs about 55 ms before its first call (macOS arm64, median). Nearly all of
+it is the worker: starting Python, importing (`asyncio` and what it pulls in is about half), creating
+V8, applying the OS sandbox and running its self-test. The parent's share is under a millisecond.
+
+`IsolatedRuntime` keeps **one spare worker** started in the background: it has loaded everything and
+is waiting for its configuration, holds no data, is handed to exactly one runtime, and exits with its
+parent. It helps when runtimes are created with pauses in between (about 15 ms instead of 55 when the
+spare had time to finish importing); created back to back, each one still pays most of a cold start.
 Pass `prewarm=False` to turn it off. Jitless V8 (the default) makes compute-heavy code about
 1.5-2x slower; `jitless=False` trades that back for a larger attack surface.
+
+### A pool of ready workers: `SandboxPool`
+
+When you create a sandbox per request, use a pool. `SandboxPool` keeps `size` runtimes fully started:
+the worker has received its configuration, created V8, applied the OS sandbox and passed its self-test.
+`checkout()` hands one over in about 0.04 ms.
+
+```python
+from pydeno import RuntimeConfig, SandboxPool
+
+pool = SandboxPool(RuntimeConfig(timeout=5), size=4, sandbox="require")
+
+def handle(code: str) -> object:
+    with pool.checkout(max_host_calls=50) as rt:   # this runtime is yours alone
+        return rt.eval(code)                       # closing it kills its worker
+
+pool.close()   # or `with SandboxPool(...) as pool:`
+```
+
+The rules, which are what keep a pool as safe as a fresh runtime:
+
+- **Single use.** A checked-out runtime is never returned to the pool; closing it kills its worker.
+  No worker ever serves two sessions, so nothing one guest leaves behind reaches the next. A pooled
+  worker that dies while it waits (killed, out of memory) is discarded, never handed out.
+- **Same construction.** Each pooled runtime is an ordinary `IsolatedRuntime` built with the pool's
+  options: the same handshake, `sandbox="require"` check, self-test and limits, only earlier. The
+  constructor starts the first one itself, so invalid options, or a platform that cannot satisfy
+  `sandbox="require"`, fail there and not in the background.
+- **Exhaustion is a cold start, never an error.** If every pooled runtime is taken, `checkout()`
+  starts one on the spot. Replacements start in the background as soon as a runtime is handed out
+  (`max_concurrent_starts`, default 2, at a time); a replacement that fails to start is retried with
+  a backoff and shown in `stats()["last_error"]`.
+- **Options split in two.** What the worker receives when it starts (the `RuntimeConfig`, `sandbox`,
+  `jitless`, `v8_flags`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
+  use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
+  `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`, `max_inflight_host_calls`,
+  `write_stall_timeout`, `redact_host_errors`) can be set per checkout.
+
+Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
+a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports
+`ready`, `starting`, `checkouts` and `cold_starts`; `wait_ready()` blocks until the pool is full.
+
+A forked child never receives the parent's pooled workers: its copy of the pool forgets them and
+refills on its first checkout.
+
+For asyncio, `AsyncSandboxPool` does the same with `AsyncIsolatedRuntime` (it also accepts
+`handler_executor` per checkout). Pooled runtimes are bound to the loop the pool was started on:
+
+```python
+from pydeno import AsyncSandboxPool
+
+async with AsyncSandboxPool(size=4, sandbox="require") as pool:
+    async with pool.checkout() as rt:           # or: rt = await pool.checkout()
+        print(await rt.eval("Promise.resolve(42)"))
+```
+
+Measured on macOS arm64 (`benches_py/alternatives_bench.py pydeno` and `pydeno-pool`, median):
+
+| | Cold `IsolatedRuntime` | `SandboxPool` checkout |
+|---|---:|---:|
+| Hand-over | about 53 ms | 0.04 ms |
+| Hand-over and first `1 + 1` | about 53 ms | 0.4 to 1.8 ms |
+| Fresh sandbox and 10 small commands | about 55 ms | 7 ms |
+
+The first command after a checkout can cost up to about 1.7 ms rather than the 0.1 ms of a warm
+call: a process that has sat idle takes that long to be woken (the same happens to any idle runtime).
+
+**Not done, deliberately: forking workers from a template.** A pre-initialised template process that
+forks each worker would start one in a few milliseconds, but every worker would then share the
+template's address-space layout, so one leaked pointer would defeat ASLR in all of them. If it is ever
+added it will be opt-in. A worker written in Rust, without Python, is the other way to a faster cold
+start.
 
 ## Smaller global scope
 

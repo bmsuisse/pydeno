@@ -24,9 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import ctypes.util
 import os
-import platform
 import resource
 import socket
 import struct
@@ -81,11 +79,113 @@ _SEATBELT_PROFILE = """
 # before the profile is applied), and `kill(pid, 0)` still tells a running pid from an absent one.
 
 
-def _apply_seatbelt() -> bool:
-    name = ctypes.util.find_library("sandbox")
-    if not name:
+# Compiling the SBPL text is almost all of what `sandbox_init` costs (about 8 ms; applying the
+# compiled profile takes under 0.1 ms). `precompile_seatbelt()` does the compiling on a thread
+# while the worker is still importing (ctypes releases the GIL for the call, so it really runs
+# alongside), and `_apply_seatbelt` then only applies the result. The profile is the same text,
+# compiled by the same library `sandbox_init` uses for it; the self-test (`attest`) checks the
+# outcome either way, and any failure on this path falls back to `sandbox_init`.
+_SANDBOX_LIB = "/usr/lib/libsandbox.1.dylib"
+_precompiled: list[tuple[int, Callable[..., int], Callable[..., object]]] = []
+_precompile_thread: threading.Thread | None = None
+#: Which call put the Seatbelt profile in force: "precompiled", "sandbox_init", or "" (none yet).
+SEATBELT_PATH = ""
+#: Why the precompiled path was not used (library missing, the compiler's own error text, apply
+#: refused, ...), or "" if it was. Parent-side diagnostics only: it goes into the worker's start-up
+#: failure message, never to guest code.
+PRECOMPILE_ERROR = ""
+
+
+def _compile_seatbelt() -> None:
+    global PRECOMPILE_ERROR  # noqa: PLW0603
+    try:
+        lib = ctypes.CDLL(_SANDBOX_LIB)
+        compile_string = lib.sandbox_compile_string
+        sandbox_apply = lib.sandbox_apply
+        free_profile = lib.sandbox_free_profile
+        free_error = lib.sandbox_free_error
+    except (OSError, AttributeError) as exc:
+        PRECOMPILE_ERROR = f"libsandbox unavailable: {exc}"
+        return
+    compile_string.restype = ctypes.c_void_p
+    # The error is a malloc'd C string the caller frees, so it is taken as a raw pointer.
+    compile_string.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    sandbox_apply.restype = ctypes.c_int
+    sandbox_apply.argtypes = [ctypes.c_void_p]
+    free_profile.restype = None
+    free_profile.argtypes = [ctypes.c_void_p]
+    free_error.restype = None
+    free_error.argtypes = [ctypes.c_void_p]
+    err = ctypes.c_void_p()
+    profile = compile_string(_SEATBELT_PROFILE.encode(), None, ctypes.byref(err))
+    if err.value:
+        text = ctypes.string_at(err.value).decode("utf-8", "replace")
+        free_error(err)
+        if not profile:
+            PRECOMPILE_ERROR = f"profile did not compile: {text}"
+    if profile:
+        _precompiled.append((profile, sandbox_apply, free_profile))
+    elif not PRECOMPILE_ERROR:
+        PRECOMPILE_ERROR = "profile did not compile (no error text)"
+
+
+def precompile_seatbelt() -> None:
+    """Start compiling the Seatbelt profile in the background (macOS; a no-op elsewhere).
+
+    Only for a process that will call `apply()` soon: the worker calls it before its imports.
+    """
+    global _precompile_thread  # noqa: PLW0603
+    if sys.platform != "darwin" or _precompile_thread is not None:
+        return
+    _precompile_thread = threading.Thread(
+        target=_compile_seatbelt, name="pydeno-seatbelt-compile", daemon=True
+    )
+    _precompile_thread.start()
+
+
+def _apply_precompiled_seatbelt() -> bool:
+    """True only if the precompiled profile is now in force."""
+    global PRECOMPILE_ERROR  # noqa: PLW0603
+    thread = _precompile_thread
+    if thread is None:
         return False
-    lib = ctypes.CDLL(name)
+    thread.join(timeout=5.0)  # never seen to take more than ~10 ms
+    if thread.is_alive():
+        PRECOMPILE_ERROR = "compile still running after 5 s"
+        return False
+    if not _precompiled:
+        return False  # PRECOMPILE_ERROR says why
+    profile, sandbox_apply, free_profile = _precompiled.pop()
+    try:
+        rc = sandbox_apply(profile)
+    finally:
+        free_profile(profile)
+    if rc != 0:
+        PRECOMPILE_ERROR = f"sandbox_apply returned {rc}"
+        return False
+    return True
+
+
+def seatbelt_note() -> str:
+    """ " (precompile: ...)" when the precompiled path was not used, for failure messages."""
+    return f" (precompile: {PRECOMPILE_ERROR})" if PRECOMPILE_ERROR else ""
+
+
+def _apply_seatbelt() -> bool:
+    global SEATBELT_PATH  # noqa: PLW0603
+    if _apply_precompiled_seatbelt():
+        SEATBELT_PATH = "precompiled"
+        return True
+    # `sandbox_init` lives in libsystem_sandbox, which libSystem re-exports, so it is already
+    # loaded in every process. Looking it up there saves `ctypes.util` (and `shutil`, which it
+    # imports): about 4 ms of worker start-up, for a library search that always found the same one.
+    lib = ctypes.CDLL(None)
+    if not hasattr(lib, "sandbox_init"):
+        return False
     lib.sandbox_init.argtypes = [
         ctypes.c_char_p,
         ctypes.c_uint64,
@@ -93,7 +193,10 @@ def _apply_seatbelt() -> bool:
     ]
     err = ctypes.c_char_p()
     # flags=0: the first argument is a raw SBPL profile, not a named one.
-    return lib.sandbox_init(_SEATBELT_PROFILE.encode(), 0, ctypes.byref(err)) == 0
+    if lib.sandbox_init(_SEATBELT_PROFILE.encode(), 0, ctypes.byref(err)) != 0:
+        return False
+    SEATBELT_PATH = "sandbox_init"
+    return True
 
 
 # --------------------------------------------------------------------------- Linux
@@ -568,7 +671,7 @@ def _libc() -> ctypes.CDLL:
 
 
 def _apply_seccomp(*, allow_exec: bool = True) -> bool:
-    arch = platform.machine()
+    arch = _machine()
     if arch == "arm64":
         arch = "aarch64"
     if arch not in _AUDIT_ARCH:
@@ -685,8 +788,13 @@ class _CapData(ctypes.Structure):
     ]
 
 
+def _machine() -> str:
+    # What `platform.machine()` returns on POSIX, without importing `platform` into the worker.
+    return os.uname().machine
+
+
 def _arch_index() -> int | None:
-    machine = platform.machine()
+    machine = _machine()
     return {"x86_64": 0, "aarch64": 1, "arm64": 1}.get(machine)
 
 
@@ -1170,6 +1278,76 @@ class _TimebaseInfo(ctypes.Structure):
     _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
 
+# Resolved once, on first use: looking a symbol up through a fresh `ctypes.CDLL(None)` costs tens
+# of microseconds, and the parent reads these on every command it supervises.
+_proc_pidinfo: Callable[..., int] | None = None
+# Mach absolute-time units (darwin) or clock ticks (Linux) per second.
+_TICKS_PER_SECOND = 0.0
+_TASK_INFO_SIZE = ctypes.sizeof(_TaskInfo)
+
+
+def _darwin_task_info(pid: int) -> _TaskInfo | None:
+    """One `proc_pidinfo(PROC_PIDTASKINFO)` call: memory, CPU times and thread count together."""
+    global _proc_pidinfo, _TICKS_PER_SECOND  # noqa: PLW0603
+    fn = _proc_pidinfo
+    if fn is None:
+        libc = ctypes.CDLL(None)  # libproc is part of libSystem
+        base = _TimebaseInfo()
+        libc.mach_timebase_info(ctypes.byref(base))
+        # task times are in Mach absolute-time units, not nanoseconds
+        _TICKS_PER_SECOND = 1e9 * base.denom / base.numer
+        fn = libc.proc_pidinfo
+        fn.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        fn.restype = ctypes.c_int
+        _proc_pidinfo = fn
+    # A fresh structure per call: the parent samples from more than one thread.
+    info = _TaskInfo()
+    if fn(pid, 4, 0, ctypes.addressof(info), _TASK_INFO_SIZE) != _TASK_INFO_SIZE:
+        return None
+    return info
+
+
+def _linux_stat(pid: int) -> list[bytes]:
+    with open(f"/proc/{pid}/stat", "rb") as fh:
+        # the command name (field 2) may contain spaces and parentheses: split after it
+        return fh.read().rsplit(b")", 1)[1].split()
+
+
+def usage(pid: int) -> tuple[int | None, float | None, int | None]:
+    """`(rss_bytes, cpu_seconds, thread_count)` of `pid` from ONE kernel read, each None if it
+    cannot be read. What the parent samples as each command finishes."""
+    global _TICKS_PER_SECOND  # noqa: PLW0603
+    try:
+        if sys.platform.startswith("linux"):
+            fields = _linux_stat(pid)
+            if not _TICKS_PER_SECOND:
+                _TICKS_PER_SECOND = float(os.sysconf("SC_CLK_TCK"))
+            # The list starts at field 3: utime 14, stime 15, num_threads 20, rss 24 (pages).
+            return (
+                int(fields[21]) * os.sysconf("SC_PAGE_SIZE"),
+                (int(fields[11]) + int(fields[12])) / _TICKS_PER_SECOND,
+                int(fields[17]),
+            )
+        if sys.platform == "darwin":
+            info = _darwin_task_info(pid)
+            if info is None:
+                return (None, None, None)
+            return (
+                int(info.resident_size),
+                (info.total_user + info.total_system) / _TICKS_PER_SECOND,
+                int(info.threadnum),
+            )
+    except (OSError, ValueError, IndexError, TypeError, AttributeError):
+        pass
+    return (None, None, None)
+
+
 def cpu_seconds(pid: int) -> float | None:
     """CPU time (user + system, all threads) the process `pid` has consumed so far, or None.
 
@@ -1177,76 +1355,25 @@ def cpu_seconds(pid: int) -> float | None:
     runs a callback, and a guest can arrange for a callback to always be outstanding; CPU time
     only goes up when something is actually computing.
     """
-    try:
-        if sys.platform.startswith("linux"):
-            with open(f"/proc/{pid}/stat", "rb") as fh:
-                # the command name (field 2) may contain spaces and parentheses: split after it
-                fields = fh.read().rsplit(b")", 1)[1].split()
-            ticks = int(fields[11]) + int(fields[12])  # utime, stime (fields 14 and 15)
-            return ticks / os.sysconf("SC_CLK_TCK")
-        if sys.platform == "darwin":
-            global _libproc  # noqa: PLW0603
-            if _libproc is None:
-                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
-            info = _TaskInfo()
-            n = _libproc.proc_pidinfo(
-                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            if n != ctypes.sizeof(info):
-                return None
-            base = _TimebaseInfo()
-            ctypes.CDLL(None).mach_timebase_info(ctypes.byref(base))
-            # task times are in Mach absolute-time units, not nanoseconds
-            return (info.total_user + info.total_system) * base.numer / base.denom / 1e9
-    except (OSError, ValueError, IndexError, TypeError, AttributeError):
-        return None
-    return None
-
-
-_libproc: ctypes.CDLL | None = None
+    return usage(pid)[1]
 
 
 def thread_count(pid: int) -> int | None:
     """How many threads the process `pid` has, or None. A worker has about 13 on Linux and 17 on
     macOS; a guest that gets native code can start thousands within a second, well under a
     memory ceiling, and a handful of such workers exhausts the host's thread table."""
-    try:
-        if sys.platform.startswith("linux"):
-            with open(f"/proc/{pid}/stat", "rb") as fh:
-                fields = fh.read().rsplit(b")", 1)[1].split()
-            return int(
-                fields[17]
-            )  # num_threads is field 20; the list starts at field 3
-        if sys.platform == "darwin":
-            global _libproc  # noqa: PLW0603
-            if _libproc is None:
-                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
-            info = _TaskInfo()
-            n = _libproc.proc_pidinfo(
-                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            return int(info.threadnum) if n == ctypes.sizeof(info) else None
-    except (OSError, ValueError, IndexError, TypeError, AttributeError):
-        return None
-    return None
+    return usage(pid)[2]
 
 
 def rss_bytes(pid: int) -> int | None:
     """Resident memory of `pid` without spawning anything, or None if unreadable."""
-    global _libproc  # noqa: PLW0603
     try:
         if sys.platform.startswith("linux"):
             with open(f"/proc/{pid}/statm", "rb") as fh:
                 return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
         if sys.platform == "darwin":
-            if _libproc is None:
-                _libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
-            info = _TaskInfo()
-            # PROC_PIDTASKINFO = 4
-            n = _libproc.proc_pidinfo(
-                pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
-            )
-            return int(info.resident_size) if n == ctypes.sizeof(info) else None
+            info = _darwin_task_info(pid)
+            return None if info is None else int(info.resident_size)
     except (OSError, ValueError, TypeError, AttributeError):
         return None
     return None

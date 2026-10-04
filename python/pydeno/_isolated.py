@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import contextlib
 import functools
 import contextvars
 import inspect
@@ -38,7 +37,7 @@ import time
 import warnings
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -103,6 +102,11 @@ _IDLE_CPU_LIMIT_SECONDS = 2.0
 # Worker CPU may exceed wall-clock time (V8 collects garbage on other threads), so the CPU cap
 # is a multiple of the hard deadline rather than equal to it.
 _CPU_CAP_FACTOR = 2.0
+# A command's CPU baseline is the latest reading of the worker's CPU time (the previous command's
+# final sample, or the idle watchdog's), not a fresh one: CPU time only grows, so an older reading
+# can only charge the command MORE (the idle CPU since), never less. Older than this, it is read
+# afresh, so that charge stays bounded (a quarter-second watchdog tick, plus slack for a late one).
+_CPU_BASELINE_MAX_AGE = 2 * _IDLE_CHECK_SECONDS
 
 # Defaults for code you do not trust. Pass `None` to remove one; a sandbox that
 # silently has no limits until you remember to set them is not much of a sandbox.
@@ -269,6 +273,62 @@ def _seconds(value: float | int | timedelta | None) -> float | None:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
+# The options that only the parent enforces: none of them reaches the worker, so a worker started
+# ahead of time (`SandboxPool`) can be given them when it is handed out.
+SESSION_OPTIONS = (
+    "request_timeout",
+    "timeout_grace",
+    "max_host_calls",
+    "max_host_wait",
+    "max_inflight_host_calls",
+    "write_stall_timeout",
+    "redact_host_errors",
+)
+
+
+def _session_options(
+    *,
+    request_timeout: float | int | timedelta | None | Any = _DEFAULT,
+    timeout_grace: float | int = 2.0,
+    max_host_calls: int | None = None,
+    max_host_wait: float | int | timedelta | None | Any = _DEFAULT,
+    max_inflight_host_calls: int | None | Any = _DEFAULT,
+    write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
+    redact_host_errors: bool = True,
+) -> dict[str, Any]:
+    """The parent-side options, validated and normalised, as the runtime attributes that hold
+    them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
+    an option set at checkout means exactly what it means in the constructor."""
+    if max_host_calls is not None and max_host_calls < 0:
+        raise ValueError("max_host_calls must be non-negative")
+    max_inflight = (
+        DEFAULT_MAX_INFLIGHT_HOST_CALLS
+        if max_inflight_host_calls is _DEFAULT
+        else max_inflight_host_calls
+    )
+    if max_inflight is not None and max_inflight < 1:
+        raise ValueError("max_inflight_host_calls must be at least 1")
+    return {
+        "_request_timeout": (
+            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
+        ),
+        "_grace": float(timeout_grace),
+        "_max_host_calls": max_host_calls,
+        "_max_host_wait": (
+            DEFAULT_MAX_HOST_WAIT
+            if max_host_wait is _DEFAULT
+            else _seconds(max_host_wait)
+        ),
+        "_max_inflight": max_inflight,
+        "_stall": (
+            DEFAULT_WRITE_STALL_TIMEOUT
+            if write_stall_timeout is _DEFAULT
+            else _seconds(write_stall_timeout)
+        ),
+        "_redact": bool(redact_host_errors),
+    }
+
+
 class _Pump:
     """State of the one command in flight: its limits and its host callbacks.
 
@@ -282,6 +342,19 @@ class _Pump:
     - a cap on the **CPU the worker burns**, which is the one thing a guest cannot hide:
       computing costs CPU whether or not a callback is outstanding.
     """
+
+    __slots__ = (
+        "loop",
+        "hard",
+        "deadline",
+        "max_host_wait",
+        "cpu_cap",
+        "cpu_start",
+        "_outstanding",
+        "_paused_at",
+        "_paused_total",
+        "_lock",
+    )
 
     def __init__(
         self,
@@ -459,32 +532,20 @@ class IsolatedRuntime:
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
         self._soft_timeout = _seconds(config.timeout)
         self._max_memory = max_memory
-        # Three states: unset (soft timeout + grace, else a default ceiling), a number,
-        # or an explicit None meaning "no hard deadline".
-        self._request_timeout: float | None | Any = (
-            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
-        )
-        self._max_host_calls = max_host_calls
         self._host_calls = 0
-        self._max_host_wait = (
-            DEFAULT_MAX_HOST_WAIT
-            if max_host_wait is _DEFAULT
-            else _seconds(max_host_wait)
-        )
-        self._max_inflight = (
-            DEFAULT_MAX_INFLIGHT_HOST_CALLS
-            if max_inflight_host_calls is _DEFAULT
-            else max_inflight_host_calls
-        )
-        if self._max_inflight is not None and self._max_inflight < 1:
-            raise ValueError("max_inflight_host_calls must be at least 1")
-        self._stall = (
-            DEFAULT_WRITE_STALL_TIMEOUT
-            if write_stall_timeout is _DEFAULT
-            else _seconds(write_stall_timeout)
-        )
-        self._redact = bool(redact_host_errors)
-        self._grace = float(timeout_grace)
+        # `_request_timeout` has three states: unset (soft timeout + grace, else a default
+        # ceiling), a number, or an explicit None meaning "no hard deadline".
+        self._request_timeout: float | None | Any
+        for attr, value in _session_options(
+            request_timeout=request_timeout,
+            timeout_grace=timeout_grace,
+            max_host_calls=max_host_calls,
+            max_host_wait=max_host_wait,
+            max_inflight_host_calls=max_inflight_host_calls,
+            write_stall_timeout=write_stall_timeout,
+            redact_host_errors=redact_host_errors,
+        ).items():
+            setattr(self, attr, value)
         self._python = python or sys.executable
         seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
         self._options: dict[str, Any] = {
@@ -530,6 +591,12 @@ class IsolatedRuntime:
 
         self._idle_cpu_base: float | None = None
         self._idle_since = time.monotonic()
+        # The latest reading of the worker's CPU time and when it was taken: the next command's
+        # baseline (see `_CPU_BASELINE_MAX_AGE`). Written only by whoever holds `_lock`.
+        self._last_cpu: float | None = None
+        self._last_cpu_at = 0.0
+        # The CPU reading `_pump` took as the command's answer arrived (see `_request`).
+        self._end_cpu: float | None = None
 
         # A worker started ahead of time (Python up, everything imported, waiting for `init`)
         # saves most of the ~55 ms start-up. The default interpreter only: a custom `python=`
@@ -564,7 +631,8 @@ class IsolatedRuntime:
         if prewarm and python is None:
             _refill_spare()
         self._idle_since = time.monotonic()
-        self._idle_cpu_base = _sandbox.cpu_seconds(self._proc.pid)
+        self._idle_cpu_base = self._last_cpu = _sandbox.cpu_seconds(self._proc.pid)
+        self._last_cpu_at = time.monotonic()
         threading.Thread(
             target=_idle_watch,
             args=(weakref.ref(self),),
@@ -573,6 +641,12 @@ class IsolatedRuntime:
         ).start()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _apply_session(self, options: dict[str, Any]) -> None:
+        """Install `_session_options(...)` on a runtime nobody has used yet (a pool checkout)."""
+        for attr, value in options.items():
+            setattr(self, attr, value)
+        self._writer._stall = self._stall  # noqa: SLF001
 
     def _check_limits_can_be_enforced(self) -> None:
         """A limit that cannot be measured is a limit that is not there.
@@ -779,16 +853,15 @@ class IsolatedRuntime:
             return self._request_timeout  # a number, or None: the caller opted out
         return DEFAULT_REQUEST_TIMEOUT if soft is None else soft + self._grace
 
-    @contextlib.contextmanager
-    def _command_slot(self, soft_timeout: float | None) -> Iterator[None]:
-        """Hold the runtime for one command, but never wait for it forever.
+    def _acquire_slot(self, hard: float | None) -> None:
+        """Take the runtime for one command (the caller releases `_lock`), but never wait for it
+        forever. A plain method, not a context manager: this is on every command's path.
 
         Commands run one at a time. A host function that hands work to *another* thread which then
         calls back into this runtime waits on the lock its own command holds: the re-entrancy guard
         cannot see it (it is another thread), and the pump that enforces the deadline is the thread
         stuck in that host function, so nothing would ever time it out. Bounding the wait by the
         request's own deadline turns that deadlock into an error the guest can see."""
-        hard = self._hard_timeout(soft_timeout)
         wait = -1 if hard is None else hard + self._grace
         if not self._lock.acquire(timeout=wait):
             raise RuntimeTimeout(
@@ -796,10 +869,6 @@ class IsolatedRuntime:
                 "(a host function that waits on another thread which calls back into the "
                 "same runtime would deadlock)"
             )
-        try:
-            yield
-        finally:
-            self._lock.release()
 
     def _request(
         self,
@@ -814,12 +883,21 @@ class IsolatedRuntime:
             raise RuntimeError(
                 "this IsolatedRuntime belongs to the process that created it, not to a fork() of it"
             )
-        with self._command_slot(soft_timeout):
+        hard = self._hard_timeout(soft_timeout)
+        if not self._lock.acquire(
+            False
+        ):  # the usual case is a free runtime: no timed wait
+            self._acquire_slot(hard)
+        try:
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
             message["id"] = cmd_id = next(self._cmd_ids)
-            hard = self._hard_timeout(soft_timeout)
-            cpu_start = _sandbox.cpu_seconds(self._proc.pid)
+            cpu_start = self._last_cpu
+            if (
+                cpu_start is None
+                or time.monotonic() - self._last_cpu_at > _CPU_BASELINE_MAX_AGE
+            ):
+                cpu_start = _sandbox.cpu_seconds(self._proc.pid)
             pump = _Pump(
                 hard,
                 loop,
@@ -840,31 +918,41 @@ class IsolatedRuntime:
                 self._kill()
                 raise WorkerCrashed(self._describe_death("worker is gone")) from None
             self._capture = capture
+            self._end_cpu = None
             try:
                 return self._pump(cmd_id, pump)
             finally:
                 self._capture = None
                 # Where "idle" starts: what the worker burns from here on, with no command
-                # running, is the idle watchdog's business.
-                self._idle_since = time.monotonic()
-                self._idle_cpu_base = _sandbox.cpu_seconds(self._proc.pid)
+                # running, is the idle watchdog's business. The reading is the one the pump took
+                # as the answer arrived (`_check_memory`), or a fresh one if it never got that far.
+                now = self._idle_since = time.monotonic()
+                cpu = self._end_cpu
+                if cpu is None and not self._closed:
+                    cpu = _sandbox.cpu_seconds(self._proc.pid)
+                self._idle_cpu_base = cpu
+                if cpu is not None:
+                    self._last_cpu, self._last_cpu_at = cpu, now
+        finally:
+            self._lock.release()
 
     def _pump(self, cmd_id: int, pump: _Pump) -> Any:
-        last_check = time.monotonic()
+        monotonic = time.monotonic
+        read = self._reader.read
+        last_check = monotonic()
         remote: Exception | None = None
         try:
             while True:
                 try:
-                    poll = time.monotonic() + _POLL_SECONDS
-                    payload = self._reader.read(poll)
+                    payload = read(monotonic() + _POLL_SECONDS)
                 except TimeoutError:
                     self._supervise(pump)
-                    last_check = time.monotonic()
+                    last_check = monotonic()
                     continue
                 # The limits are enforced on a clock, not on silence. If they ran only when
                 # the pipe went quiet, a guest that never lets it go quiet (a loop of cheap
                 # host calls) would switch the hard deadline and memory ceiling off.
-                now = time.monotonic()
+                now = monotonic()
                 if now - last_check >= _POLL_SECONDS:
                     self._supervise(pump)
                     last_check = now
@@ -876,7 +964,7 @@ class IsolatedRuntime:
                 if kind == "call":
                     self._on_call(message, pump)
                 elif kind in ("result", "error") and message.get("id") == cmd_id:
-                    self._check_memory(force=True)
+                    self._end_cpu = self._check_memory(force=True)
                     if kind == "result":
                         return message.get("v")  # already decoded by `loads_decoded`
                     # Built here, raised after the guard below: a guest's own JavaScriptError is
@@ -923,13 +1011,14 @@ class IsolatedRuntime:
             if self._closed:
                 return
             try:
-                self._check_memory(force=True)
+                now_cpu = self._check_memory(force=True)
             except WorkerCrashed:
                 return  # `_check_memory` has already killed it
+            if now_cpu is not None:
+                self._last_cpu, self._last_cpu_at = now_cpu, time.monotonic()
             base = self._idle_cpu_base
             if base is None:
                 return
-            now_cpu = _sandbox.cpu_seconds(self._proc.pid)
             # A small flat allowance plus a thin trickle (1% of a core) that grows with idle time,
             # so a healthy worker that sits idle for days is never mistaken for a runaway one.
             allowed = _IDLE_CPU_LIMIT_SECONDS + 0.01 * (
@@ -953,38 +1042,41 @@ class IsolatedRuntime:
                 f"host callbacks kept the guest waiting for more than "
                 f"{pump.max_host_wait:g}s in one command (max_host_wait); worker killed"
             )
-        if pump.cpu_cap is not None and pump.cpu_start is not None:
-            now_cpu = _sandbox.cpu_seconds(self._proc.pid)
-            if now_cpu is not None and now_cpu - pump.cpu_start > pump.cpu_cap:
-                self._kill()
-                raise RuntimeTimeout(
-                    f"worker used more than {pump.cpu_cap:g}s of CPU in one command "
-                    f"and was killed"
-                )
-        self._check_memory()
+        # One reading for the CPU cap, the memory ceiling and the thread cap.
+        now_cpu = self._check_memory(force=True)
+        if (
+            pump.cpu_cap is not None
+            and pump.cpu_start is not None
+            and now_cpu is not None
+            and now_cpu - pump.cpu_start > pump.cpu_cap
+        ):
+            self._kill()
+            raise RuntimeTimeout(
+                f"worker used more than {pump.cpu_cap:g}s of CPU in one command "
+                f"and was killed"
+            )
 
-    def _check_memory(self, *, force: bool = False) -> None:
+    def _check_memory(self, *, force: bool = False) -> float | None:
         """Kill the worker if its RSS is over `max_memory` or it has far more threads than a
         worker has. Sampled, so a spike that ends between samples is only caught by the check
-        made as each command finishes."""
+        made as each command finishes. Returns the worker's CPU time from the same reading (None
+        if not sampled or unreadable)."""
         now = time.monotonic()
         if not force and now - self._last_rss_check < _RSS_EVERY_SECONDS:
-            return
+            return None
         self._last_rss_check = now
-        threads = _sandbox.thread_count(self._proc.pid)
+        rss, cpu, threads = _sandbox.usage(self._proc.pid)
         if threads is not None and threads > _MAX_WORKER_THREADS:
             self._kill_reason = f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
             self._kill()
             raise WorkerCrashed(self._kill_reason)
-        if self._max_memory is None:
-            return
-        rss = _sandbox.rss_bytes(self._proc.pid)
-        if rss is not None and rss > self._max_memory:
+        if self._max_memory is not None and rss is not None and rss > self._max_memory:
             self._kill_reason = (
                 f"worker used {rss} bytes, over max_memory={self._max_memory}; killed"
             )
             self._kill()
             raise WorkerCrashed(self._kill_reason)
+        return cpu
 
     @staticmethod
     def _remote_error(message: dict[str, Any]) -> Exception:
@@ -1410,11 +1502,33 @@ async def _call_guarded(handler: Callable[..., Any], args: list[Any]) -> Any:
         _IN_HOST_CALL.reset(token)
 
 
+# Where this `pydeno` package lives. The worker imports it from here, so parent and worker always
+# run the same code (an `-I` worker would otherwise import whichever `pydeno` its own `sys.path`
+# finds first, which need not be the parent's).
+_PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# `-S`: no `site`, so no `.pth` file runs in the worker and its `sys.path` is the standard library
+# plus this package's directory, *appended* so nothing next to `pydeno` can shadow a stdlib module.
+# pydeno has no runtime dependencies, so the worker needs nothing else. Saves the `site` import.
+_WORKER_BOOT = (
+    "import sys; sys.path.append({!r}); from pydeno._worker import main; main()".format(
+        _PACKAGE_PARENT
+    )
+)
+
+
+def _worker_argv(python: str) -> list[str]:
+    if python == sys.executable:
+        return [python, "-I", "-S", "-c", _WORKER_BOOT]
+    # Another interpreter may be another Python version, which cannot load this build's extension
+    # module: it runs the `pydeno` it has installed itself.
+    return [python, "-I", "-m", "pydeno._worker"]
+
+
 def _start_worker(python: str) -> tuple[subprocess.Popen[bytes], Any]:
     stderr = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close() / finalizer
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
-            [python, "-I", "-m", "pydeno._worker"],
+            _worker_argv(python),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,

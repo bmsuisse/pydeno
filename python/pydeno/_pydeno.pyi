@@ -637,6 +637,11 @@ SUGGESTED_FORCE_KILL_GRACE: float
 """A reasonable ``force_kill_grace`` (0.1s): ~28x the slowest measured polite
 kill, so a runtime that would have died politely always gets the chance to."""
 
+_INSPECTOR_AVAILABLE: bool
+"""Whether this build includes the DevTools inspector server (cargo feature
+``inspector``, on by default). Without it, ``RuntimeConfig(inspector=...)`` makes
+``Runtime()`` raise ``RuntimeError``."""
+
 class Runtime:
     """
     JavaScript runtime.
