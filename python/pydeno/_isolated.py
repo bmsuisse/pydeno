@@ -56,6 +56,7 @@ from ._pydeno import (
     RuntimeForceKilled,
     RuntimeTerminated,
     RuntimeTimeout,
+    _v8_flags_undone_by_engine,
 )
 
 __all__ = ["IsolatedRuntime", "WorkerCrashed"]
@@ -195,6 +196,14 @@ def _worker_v8_flags(
     if not isinstance(strict_eval, bool):
         raise TypeError("strict_eval must be a bool")
     v8_flags = list(v8_flags)
+    undone = _v8_flags_undone_by_engine([f for f in v8_flags if isinstance(f, str)])
+    if undone:
+        # deno_core's start-up sets these after the worker's flags and V8 keeps its value: refuse
+        # here, before a worker exists, rather than report a restriction that never applied.
+        raise ValueError(
+            f"these V8 flags cannot take effect: the engine's own start-up sets {undone} "
+            "afterwards and V8 keeps that value"
+        )
     if strict_eval:
         for flag in (_STRICT_EVAL_NAME, "freeze-flags-after-init"):
             if _bool_flag_setting(v8_flags, flag) is False:

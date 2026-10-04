@@ -33,14 +33,14 @@ const SET_BY_DENO_CORE: &[(&str, bool)] = &[
 ];
 
 /// The deno_core-controlled flag `flag` would change, if any. V8 spells a boolean flag
-/// `--name`, `--noname` or `--no-name`, with `_` and `-` interchangeable; any other form naming
-/// one of these (`--name=...`) is treated as a disagreement too, so nothing slips through.
+/// `--name`, `--noname` or `--no-name`, with `_` and `-` interchangeable. It refuses
+/// `--name=value` for a boolean flag by itself (that comes back unrecognised, and the worker then
+/// refuses to start), so that spelling is not a mention here.
 fn overridden_by_deno_core(flag: &str) -> Option<&'static str> {
-    let body = flag.trim_start_matches('-').replace('_', "-");
-    let (name, has_value) = match body.split_once('=') {
-        Some((name, _)) => (name.to_string(), true),
-        None => (body, false),
-    };
+    let name = flag.trim_start_matches('-').replace('_', "-");
+    if name.contains('=') {
+        return None;
+    }
     let (bare, negated) = match name.strip_prefix("no") {
         Some(rest)
             if SET_BY_DENO_CORE
@@ -54,8 +54,19 @@ fn overridden_by_deno_core(flag: &str) -> Option<&'static str> {
     SET_BY_DENO_CORE
         .iter()
         .find(|(n, _)| *n == bare)
-        .filter(|(_, value)| has_value || *value == negated)
+        .filter(|(_, value)| *value == negated)
         .map(|(n, _)| *n)
+}
+
+/// The flags in `flags` that deno_core's start-up would silently undo, by name. The parent calls
+/// this before it starts a worker, so a refused flag is a `ValueError` there, not a dead worker.
+#[pyfunction]
+pub fn _v8_flags_undone_by_engine(flags: Vec<String>) -> Vec<String> {
+    flags
+        .iter()
+        .filter_map(|flag| overridden_by_deno_core(flag))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Pass `flags` to V8. Returns the ones V8 did not recognise.
@@ -70,10 +81,7 @@ pub fn _set_v8_flags(flags: Vec<String>) -> PyResult<Vec<String>> {
             "V8 flags must be set before the first Runtime is created in this process",
         ));
     }
-    let undone: Vec<&str> = flags
-        .iter()
-        .filter_map(|flag| overridden_by_deno_core(flag))
-        .collect();
+    let undone = _v8_flags_undone_by_engine(flags.clone());
     if !undone.is_empty() {
         return Err(PyValueError::new_err(format!(
             "these V8 flags cannot take effect: the engine's own start-up sets {undone:?} \
@@ -98,7 +106,6 @@ mod tests {
             "--no-harmony-temporal",
             "--noharmony-temporal",
             "--no-harmony_temporal",
-            "--harmony-temporal=false",
             "--no-js-explicit-resource-management",
             "--validate-asm",
             "-no-enable-queue-microtask",
@@ -115,8 +122,13 @@ mod tests {
             "--jitless",
             "--freeze-flags-after-init",
             "--random-seed=4",
-            "--no-expose-wasm",
+            "--no-expose-gc",
             "--node-snapshot",
+            // V8 refuses `=value` on a boolean flag by itself (reported as unrecognised, so the
+            // worker refuses to start), so it needs no verdict here, agreeing or not.
+            "--harmony-temporal=false",
+            "--harmony-temporal=true",
+            "--validate-asm=false",
         ] {
             assert!(overridden_by_deno_core(flag).is_none(), "{flag}");
         }

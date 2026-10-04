@@ -52,9 +52,9 @@ def test_experimental_jit_only_and_stripped_features_stay_off(rt, expr: str) -> 
 def test_a_restriction_the_engine_would_undo_is_refused_not_reported_as_applied(
     flag: str,
 ) -> None:
-    with pytest.raises(Exception, match="cannot take effect"):
-        with IsolatedRuntime(RuntimeConfig(timeout=5), v8_flags=[flag]) as runtime:
-            runtime.eval("1")
+    # A ValueError from the constructor, before any worker is started (not a crashed worker).
+    with pytest.raises(ValueError, match="cannot take effect"):
+        IsolatedRuntime(RuntimeConfig(timeout=5), v8_flags=[flag], prewarm=False)
 
 
 def test_a_restriction_v8_honours_still_applies() -> None:
