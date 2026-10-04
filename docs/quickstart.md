@@ -58,6 +58,20 @@ Use [`pydeno.eval`][pydeno.eval] to evaluate JavaScript code directly:
 
 `pydeno.eval()` runs synchronously and returns the result immediately.
 
+## Run JavaScript from the command line
+
+The `pydeno` command evaluates an expression in the sandboxed worker and prints the result as JSON:
+
+```bash
+$ pydeno '[1, 2, 3].map(x => x * 2)'
+[2, 4, 6]
+$ echo 'Promise.resolve("done")' | pydeno --raw
+done
+```
+
+It exits non-zero on a JavaScript error, with the error on stderr. See [Command line](guides/cli.md)
+for `--timeout`, `--max-memory`, `--raw` and the exit codes.
+
 ## Share functions and data
 
 Bind Python callables or objects so they are visible from JavaScript:

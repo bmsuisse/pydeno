@@ -79,6 +79,12 @@ Defaults: `sandbox="require"` (`pydeno.sandbox_status()` explains a refusal), ji
 30 s per feed, 512 MiB, 1000 external calls per session, and a worker never serves two sessions. The
 [front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit.
 
+From a shell, the same sandboxed worker ([command line guide][guide-cli]):
+
+```bash
+pydeno '[1, 2, 3].map(x => x * 2)'     # prints [2, 4, 6]; exit code 1 on a JavaScript error
+```
+
 ## Code mode for AI agents
 
 Code mode lets the model write one program that calls your tools, instead of one tool call per turn. pydeno
@@ -98,7 +104,7 @@ with Pydeno() as pool, pool.checkout(limits={"max_feed_duration_secs": 10, "max_
 ```
 
 - **Approval flows:** `feed_start` returns a snapshot at **every** tool call; inspect `snapshot.function_name` and
-  `snapshot.args`, then `resume(value)` or `resume(error=...)`. `dump()` it and continue in another process.
+  `snapshot.args`, then `resume(value=...)` or `resume(error=...)`. `dump()` it and continue in another process.
 - **Typed declarations for your prompt:** your tools become `tools.*` functions with TypeScript stubs; JSON-Schema
   tools and a lazy tool catalog keep the prompt small even with hundreds of tools.
 - **Agent frameworks:** [`JSCodeMode`](docs/guides/pydantic-ai.md) is the JavaScript counterpart of pydantic-ai's
@@ -141,6 +147,28 @@ yet (it is planned before 1.0, see the [roadmap](docs/roadmap.md)). The in-proce
 hostile code: use `Pydeno` / `IsolatedRuntime`. Windows has no isolated worker. For multi-tenant use, put the
 whole process in a locked-down container or microVM ([deployment guidance](SECURITY.md)).
 Found a way out? Please report it privately, as described in [`SECURITY.md`](SECURITY.md).
+
+## Why pydeno is harder to break than most sandboxes
+
+Running untrusted JavaScript has a long history of sandboxes that were broken. The same few design mistakes
+keep appearing, and each one is something pydeno was built to avoid:
+
+| What such approaches miss | Why it gets broken | What pydeno does instead |
+|---|---|---|
+| **One in-process barrier.** The guest runs in your process behind language-level checks (wrapped objects, proxies, blocklists). | Every object, prototype and built-in that reaches the guest is a possible path back to the host. One missed object is a full escape, and new ones keep being found. | The guest never shares a process with your app. A worker with an empty environment runs under an **OS sandbox applied before the JavaScript engine exists**, and the parent treats everything the worker sends as untrusted input. |
+| **An engine isolate and nothing around it.** Separate heaps in one process. | An isolate separates JavaScript objects, not the process: an engine bug, a crash, a hang or a memory bomb lands in your process. | A crash, hang or memory blow-up kills a **disposable worker**. Deadlines and memory ceilings are enforced **from outside** by the parent, and `sandbox="require"` refuses to start unless every OS layer is in force. |
+| **A thin subprocess wrapper.** The guest and the protocol share a global scope and the same output stream, with no limits. | The guest can corrupt or forge the protocol, overwrite the code that serialises results, or hang the caller; there is no timeout, memory cap or output cap. | The protocol channel is separate from the guest's output. There is no `Deno`, `process` or `require`; serialisation is native code the guest cannot reach; the parent kills a worker that breaks a limit. These attacks are probes in `scripts/autoresearch/metric_security.py`. |
+| **Silent downgrade.** The sandbox quietly becomes "no sandbox" when a kernel feature is missing. | Nobody notices, so a hardened deployment can be running unconfined. | `sandbox="require"` is the default and **fails closed**. The worker proves its own confinement with a startup self-test (it tries to read, write, connect, spawn and signal, and refuses to start if any of them works). |
+| **No resource limits, or limits the guest can outlast.** | One loop, one allocation or one flood of output takes the host or the other tenants down. | Wall-clock, CPU, memory, buffer, call and output limits are enforced from outside, with hard kills; a guest that keeps calling your functions cannot hold a deadline open. |
+| **Host functions that can be tampered with.** The guest changes the scope before the host installs a tool. | The tool silently does nothing, or guest code runs during the install, and the host believes the tool is in place. | Binds **fail closed**: a tampered scope makes the bind raise, never silently do nothing. Tools are reachable only through unguessable capability tokens. |
+| **State shared across tenants.** Reused workers, shared pools and shared threads. | Data leaks between users, one tenant starves the others, or a restored session gets more than it should. | One worker per session, never reused; each session's tool threads are its own; per-pool caps; signed, owner-bound journals that cannot refund a spent budget. |
+| **Trusting the result.** Output goes straight to a terminal, a log or a model. | Escape sequences and invisible characters in console or error text attack whatever reads them. | Captured console and error text are bounded and stripped of control, escape and invisible characters, and host errors are redacted by default. |
+
+**What this does not mean.** pydeno is not unbreakable. It contains the engine, it does not shrink it: a V8 bug is
+contained in the worker, not prevented, and V8 is large. A small interpreter with a minimal trusted base has a real
+advantage for code that is mostly Python logic. pydeno has had no outside security review yet; it has had an
+independent review of every change that touches the boundary, and that process has repeatedly found real defects,
+including in fixes. We publish the misses as well as the catches in the [security report](docs/security-report.md).
 
 ## Speed
 
@@ -353,8 +381,8 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   environment and the machine's hardware ID; a complete sandbox that lets one through refuses to
   start. Each probe is also checked in reverse: it must report a breach in an unsandboxed process.
 - **Independent review, and what it found.** Three AI reviewers (each given a separate slice of the
-  sandbox and told to reproduce before reporting), GitHub Copilot, and research into how vm2,
-  SandboxJS, isolated-vm and Monty were attacked. The result is a findings table that lists the
+  sandbox and told to reproduce before reporting), GitHub Copilot, and research into how other
+  sandboxes were attacked. The result is a findings table that lists the
   misses as well as the catches, including a macOS leak of the host's environment, a bridge bug that
   let a guest abort the process, and a V8 x86_64 startup trap that only a native x86_64 run revealed.
   Read it in the **[security report](docs/security-report.md)**.
@@ -363,6 +391,7 @@ The sandbox is tested the way an attacker would try it: from inside, and against
 
 - [**FastMCP tool bridge**](examples/fastmcp_tool_bridge.py): expose FastMCP tools to sandboxed JS via `bind_function` and an in-process `fastmcp.Client`
 - [**pydantic-ai code mode (`JSCodeMode`)**](docs/guides/pydantic-ai.md): the JavaScript counterpart of pydantic-ai's Monty-based code mode. The agent gets one `run_javascript` tool; your other tools become typed `tools.*` functions the model's code calls with `await` and `Promise.all`, with retries, usage limits and approvals mapped onto pydantic-ai's own. Runs offline: [`examples/pydantic_ai_agent.py`](examples/pydantic_ai_agent.py). `pip install "pydeno[pydantic-ai]"`
+- [**`llm` plugin (`llm-pydeno`)**](integrations/llm-pydeno/README.md): a `PyDeno` toolbox for the [`llm`](https://llm.datasette.io/) CLI. One `run_javascript` tool runs the model's code in a sandboxed session that keeps state between calls and returns `stdout`, `stderr`, `result` and `error` with size caps. A separate package; `pydeno` does not depend on `llm`.
 - [**Agent sessions (`AgentSandbox`)**](docs/guides/agent-sessions.md): state across turns, pause and resume at every tool call (approval flows), a signed replay journal you can `dump()` and `load()`, and the tool descriptions and `.d.ts` for your prompt
 - [**ToolBridge**](examples/tool_bridge.py): several Python tools with a total call budget, typed errors the model's JS can branch on, and `console.log` routed back to Python
 - [**Monty + pydeno**](examples/monty_and_pydeno.py): the model's Python runs in [Monty][monty], its JavaScript in pydeno, both sandboxed, sharing one tool and one call budget; Python computes, a Vega-Lite chart is drawn in JS
@@ -405,3 +434,4 @@ this problem; the two sandboxes work well side by side.
 [pydeno-pypi]: https://pypi.org/project/pydeno/
 [pydeno-docs]: https://bmsuisse.github.io/pydeno/
 [workflows-tests]: https://github.com/bmsuisse/pydeno/actions/workflows/test.yml
+[guide-cli]: https://bmsuisse.github.io/pydeno/guides/cli/
