@@ -16,7 +16,8 @@ use crate::runtime::inspector::{
 use crate::runtime::js_value::{JSValue, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{
-    python_extension, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
+    python_extension, BufferBudget, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
+    SharedBuffers,
 };
 use crate::runtime::stats::{
     ActivitySummary, HeapSnapshot, RuntimeCallKind, RuntimeStatsSnapshot, RuntimeStatsState,
@@ -250,12 +251,15 @@ impl RuntimeCoreState {
             v8::CreateParams::default().heap_limits(initial_heap_size.unwrap_or(0), max)
         });
         // ArrayBuffer storage is off the JS heap, so `max_heap_size` never
-        // counts it; it has its own opt-in budget.
-        if let Some(cap) = max_buffer_bytes {
+        // counts it; it has its own opt-in budget. The budget is shared with the
+        // bridge (through OpState below), which charges the resizable buffers V8
+        // allocates past this allocator.
+        let buffer_budget = max_buffer_bytes.map(crate::runtime::capped_allocator::Budget::new);
+        if let Some(budget) = &buffer_budget {
             create_params = Some(
                 create_params
                     .unwrap_or_default()
-                    .array_buffer_allocator(crate::runtime::capped_allocator::new(cap)),
+                    .array_buffer_allocator(crate::runtime::capped_allocator::new(budget.clone())),
             );
         }
 
@@ -284,6 +288,23 @@ impl RuntimeCoreState {
             // Must precede *any* script: the sync op path reads the limits
             // from OpState, and console capture / bootstrap logging call ops.
             op_state.put(serialization_limits);
+            let tracked = SharedBuffers::default();
+            if buffer_budget.is_some() {
+                // A fixed-length allocation V8 refuses on our budget retries after a GC: let
+                // it find the bytes of collected resizable buffers released first. Only a weak
+                // reference crosses into the thread-local, so the hook can never reach V8
+                // handles after OpState (and with it the isolate) is gone.
+                let weak = Rc::downgrade(&tracked);
+                crate::runtime::capped_allocator::set_thread_sweeper(Box::new(move |budget| {
+                    if let Some(table) = weak.upgrade() {
+                        if let Ok(mut table) = table.try_borrow_mut() {
+                            table.sweep(budget);
+                        }
+                    }
+                }));
+            }
+            op_state.put(BufferBudget(buffer_budget.clone()));
+            op_state.put(tracked);
         }
 
         if inspector_enabled {
@@ -328,7 +349,18 @@ impl RuntimeCoreState {
 
         if let Some(heap_limit_bytes) = max_heap_size {
             let termination = termination.clone();
+            let budget = buffer_budget.clone();
             js_runtime.add_near_heap_limit_callback(move |current_limit, initial_limit| {
+                // V8 also invokes this as the last resort of a *failed external backing-store
+                // allocation* (an ArrayBuffer the budget refused), with the JS heap nowhere near
+                // its limit. Terminating then turned a catchable RangeError into a runtime that
+                // answered every later command with "Heap limit exceeded". The allocator flags
+                // its refusal right before V8 gets here; taking the flag means "not the heap":
+                // the limit goes back unchanged and V8 fails that allocation as it should. A
+                // heap that really is at its limit never sets the flag and terminates as before.
+                if budget.as_ref().is_some_and(|b| b.take_refusal()) {
+                    return current_limit;
+                }
                 if termination.request_with_reason("Heap limit exceeded") {
                     log::error!(
                         "V8 isolate is nearing its heap limit; terminating execution \
