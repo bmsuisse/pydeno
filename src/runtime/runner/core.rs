@@ -4,6 +4,7 @@
 use super::convert::{
     capture_stream_prototype, caught_call_error, global_helper, CallError, Converter,
 };
+use super::jobs::Responder;
 use super::termination::{TerminationController, Watchdog, WatchdogToken};
 use super::FunctionCallResult;
 use crate::runtime::config::RuntimeConfig;
@@ -596,7 +597,7 @@ impl RuntimeCoreState {
     }
 
     /// Resolve `watchdog` and, if it fired, turn the call's outcome into a timeout.
-    pub(super) fn apply_watchdog_result<T>(
+    pub(super) fn apply_watchdog_result<T: CallOutcome>(
         &mut self,
         result: RuntimeResult<T>,
         watchdog: Option<WatchdogToken>,
@@ -607,7 +608,11 @@ impl RuntimeCoreState {
             if fired {
                 // The deadline passed, whatever the call produced meanwhile: a guest error whose
                 // conversion ran into the deadline (a looping `cause` getter, say) is reported as
-                // the timeout it is, not as the guest's error.
+                // the timeout it is, not as the guest's error. A value converted meanwhile is
+                // dropped, so its handles go too.
+                if let Ok(outcome) = &result {
+                    self.discard(outcome);
+                }
                 let message = format!("{context} timed out after {}ms", duration.as_millis());
                 return Err(RuntimeError::timeout(message));
             }
@@ -616,7 +621,7 @@ impl RuntimeCoreState {
     }
 
     /// Run `f` under an execution-timeout watchdog and map a firing to a timeout.
-    pub(super) fn run_timed<T>(
+    pub(super) fn run_timed<T: CallOutcome>(
         &mut self,
         watchdog: Option<WatchdogToken>,
         context: &str,
@@ -624,6 +629,31 @@ impl RuntimeCoreState {
     ) -> RuntimeResult<T> {
         let result = f(self);
         self.apply_watchdog_result(result, watchdog, context)
+    }
+
+    /// Release the function and stream handles in an outcome nobody will receive.
+    pub(super) fn discard(&self, outcome: &impl CallOutcome) {
+        if let Some(value) = outcome.value() {
+            self.conv.release_handles(value);
+        }
+    }
+
+    /// Answer an async call; if its caller stopped waiting, release the handles in the value.
+    pub(super) fn send_result(&self, responder: Responder, result: RuntimeResult<JSValue>) {
+        if let Err(Ok(value)) = responder.send(result) {
+            self.discard(&value);
+        }
+    }
+
+    /// Answer a sync call; if its caller stopped waiting, release the handles in the value.
+    pub(super) fn send_sync_result<T: CallOutcome>(
+        &self,
+        responder: std::sync::mpsc::Sender<RuntimeResult<T>>,
+        result: RuntimeResult<T>,
+    ) {
+        if let Err(std::sync::mpsc::SendError(Ok(outcome))) = responder.send(result) {
+            self.discard(&outcome);
+        }
     }
 
     pub(super) fn finalize_termination(&mut self) -> RuntimeResult<()> {
@@ -1018,6 +1048,27 @@ impl RuntimeCoreState {
             RuntimeStatsSnapshot::new(heap, self.stats_state.snapshot(), activity, streams);
         snapshot.function_handles = self.conv.fn_registry.borrow().len() as u64;
         Ok(snapshot)
+    }
+}
+
+/// A call's successful outcome: the value it carries, whose handles must be released if the
+/// outcome is dropped instead of delivered.
+pub(super) trait CallOutcome {
+    fn value(&self) -> Option<&JSValue>;
+}
+
+impl CallOutcome for JSValue {
+    fn value(&self) -> Option<&JSValue> {
+        Some(self)
+    }
+}
+
+impl CallOutcome for FunctionCallResult {
+    fn value(&self) -> Option<&JSValue> {
+        match self {
+            FunctionCallResult::Immediate(value) => Some(value),
+            FunctionCallResult::Pending { .. } => None,
+        }
     }
 }
 

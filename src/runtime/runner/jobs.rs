@@ -181,7 +181,17 @@ impl JobCommon {
         if self.terminated_by_deadline {
             core.cancel_pending_termination();
         }
-        let _ = self.responder.send(result);
+        core.send_result(self.responder, result);
+    }
+}
+
+/// Whether `value` contains a function or stream handle.
+fn holds_handles(value: &JSValue) -> bool {
+    match value {
+        JSValue::Function { .. } | JSValue::JsStream { .. } => true,
+        JSValue::Array(items) | JSValue::Set(items) => items.iter().any(holds_handles),
+        JSValue::Object(map) => map.values().any(holds_handles),
+        _ => false,
     }
 }
 
@@ -279,7 +289,15 @@ impl RuntimeJob for PromiseJob {
                     conv.to_js_value(scope, result)
                 };
                 match (value, self.on_fulfilled.take()) {
-                    (Ok(value), Some(hook)) => hook(core, value),
+                    (Ok(value), Some(hook)) => {
+                        // The hook consumes the value; keep what it holds in case it fails.
+                        let held = holds_handles(&value).then(|| value.clone());
+                        let result = hook(core, value);
+                        if let (Err(_), Some(held)) = (&result, held) {
+                            core.conv.release_handles(&held);
+                        }
+                        result
+                    }
                     (other, _) => other,
                 }
             }

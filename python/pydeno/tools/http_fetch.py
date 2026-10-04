@@ -41,6 +41,7 @@ import asyncio
 import concurrent.futures
 import http.client
 import ipaddress
+import os
 import re
 import socket
 import ssl
@@ -480,8 +481,10 @@ _MAX_HEADER_VALUE = 1024
 DNS_THREADS = 8
 
 # Most lookups in flight at once in the process, running or waiting for a thread (at least
-# DNS_THREADS). A lookup counts until it finishes, not until its caller gives up, so stalled
-# lookups cannot pile up without bound; past this a call fails at once with `HttpFetchFailed`.
+# DNS_THREADS). A running lookup counts until it finishes, not until its caller gives up, so
+# stalled lookups cannot pile up without bound; one still waiting for a thread is cancelled when
+# its caller gives up. Past this a call fails at once with `HttpFetchFailed`. Read once, with
+# DNS_THREADS, when the first lookup creates the pool: set both before the first request.
 DNS_MAX_PENDING = 64
 
 
@@ -510,7 +513,8 @@ class _DnsPool:
         except BaseException:
             self._done()
             raise
-        # Released when the lookup itself ends, which may be long after its caller timed out.
+        # Released when the lookup ends (or is cancelled before it starts), which may be long
+        # after its caller timed out.
         future.add_done_callback(self._done)
         return future
 
@@ -529,6 +533,18 @@ def _dns() -> _DnsPool:
         if _dns_pool is None:
             _dns_pool = _DnsPool(DNS_THREADS, DNS_MAX_PENDING)
         return _dns_pool
+
+
+def _forget_parents_dns_pool() -> None:
+    # A forked child has none of the parent's lookup threads, only their bookkeeping (and maybe a
+    # lock held mid-update): start from nothing.
+    global _dns_pool, _dns_pool_lock  # noqa: PLW0603
+    _dns_pool = None
+    _dns_pool_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_parents_dns_pool)
 
 
 def _system_resolver(host: str, port: int) -> list[str]:
@@ -713,6 +729,9 @@ class HttpFetch:
             try:
                 answers = future.result(timeout=deadline.remaining())
             except concurrent.futures.TimeoutError:
+                # Frees the slot now if the lookup is still waiting for a thread; a running one
+                # cannot be stopped and keeps its slot until it ends.
+                future.cancel()
                 raise HttpFetchTimeout("the request timed out") from None
             except HttpFetchError:
                 raise

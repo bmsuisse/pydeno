@@ -1,12 +1,16 @@
-"""A result that fails to convert leaves no function or stream handle behind.
+"""A result the caller never receives leaves no function or stream handle behind.
 
 Converting a JS value registers each function and `ReadableStream` it meets, so Python can call or
-read it later. When a later part of the same value cannot be converted, the caller gets an error
-and never sees those ids, so nothing would ever release them: repeating the failing call would
-grow the runtime's registries without bound. The conversion is all or nothing.
+read it later. When the caller gets an error instead of the value (a later part cannot be
+converted, on either side of the boundary, or the deadline passed meanwhile) or has stopped
+waiting, it never sees those ids, so nothing else would release them: repeating the call would
+grow the runtime's registries without bound.
 """
 
 from __future__ import annotations
+
+import asyncio
+import gc
 
 import pytest
 
@@ -61,3 +65,46 @@ def test_successful_conversion_keeps_its_handles() -> None:
         value = rt.eval("({f: () => 41, g: [() => 1]})")
         assert handles(rt) == (2, 0)
         assert value["f"]() == 41
+
+
+def test_python_side_failure_releases_unwrapped_handles() -> None:
+    # Converts on the runtime thread, then fails in Python (the date is past year 9999).
+    with Runtime() as rt:
+        for _ in range(50):
+            with pytest.raises((ValueError, OverflowError, RuntimeError)):
+                rt.eval("[() => 1, new Date(8.64e15), () => 2, new ReadableStream()]")
+        gc.collect()
+        rt.eval("0")  # finalizers of handles wrapped before the failure have run by now
+        assert handles(rt) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_deadline_during_a_successful_conversion_releases_handles() -> None:
+    with Runtime() as rt:
+        rt.eval("globalThis.big = Array.from({length: 300000}, (_, i) => () => i); 0")
+        for _ in range(3):
+            with pytest.raises(Exception, match="timed out"):  # noqa: PT011
+                await rt.eval_async("Promise.resolve(big)", timeout=0.001)
+            assert handles(rt) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_result_of_an_abandoned_eval_async_is_released() -> None:
+    async def later() -> None:
+        await asyncio.sleep(0.03)
+
+    with Runtime() as rt:
+        rt.bind_function("later", later)
+        for _ in range(10):
+            task = asyncio.ensure_future(
+                rt.eval_async(
+                    "later().then(() => ({f: () => 1, s: new ReadableStream()}))"
+                )
+            )
+            await asyncio.sleep(0.005)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        await asyncio.sleep(0.2)
+        await rt.eval_async("later()")
+        assert handles(rt) == (0, 0)

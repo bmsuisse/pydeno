@@ -54,13 +54,23 @@ struct JsAsyncResultSetter {
     error_context: &'static str,
 }
 
+impl Drop for JsAsyncResultSetter {
+    /// A value still here was never delivered (the future was cancelled first, or the loop never
+    /// ran this setter): release its handles.
+    fn drop(&mut self) {
+        if let Some(Ok(value)) = self.result.take() {
+            self.handle.release_unowned_handles(&value);
+        }
+    }
+}
+
 #[pymethods]
 impl JsAsyncResultSetter {
     /// Execute the deferred conversion and resolve the Python `asyncio.Future`.
     fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
         let future = self.future.bind(py);
         if python_future_done(future)? || python_future_cancelled(future)? {
-            return Ok(());
+            return Ok(()); // `Drop` releases the handles in the unread value
         }
 
         let result = self

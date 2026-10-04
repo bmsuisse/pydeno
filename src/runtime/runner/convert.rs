@@ -180,6 +180,23 @@ impl Converter {
         Ok(func.call(scope, receiver, &v8_args))
     }
 
+    /// Release the function and stream handles in `value`, a converted value its caller will
+    /// never receive (the deadline passed, the caller stopped waiting, post-processing failed).
+    pub(super) fn release_handles(&self, value: &JSValue) {
+        let mut stack = vec![value];
+        while let Some(value) = stack.pop() {
+            match value {
+                JSValue::Function { id } => {
+                    self.fn_registry.borrow_mut().remove(id);
+                }
+                JSValue::JsStream { id } => self.streams.release(*id),
+                JSValue::Array(items) | JSValue::Set(items) => stack.extend(items),
+                JSValue::Object(map) => stack.extend(map.values()),
+                _ => {}
+            }
+        }
+    }
+
     /// Convert a V8 value to JSValue with circular reference detection and limits enforced.
     pub(super) fn to_js_value<'s>(
         &self,

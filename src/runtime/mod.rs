@@ -122,6 +122,28 @@ mod tests {
     }
 
     #[test]
+    fn deadline_during_a_successful_conversion_releases_its_handles() {
+        // The conversion itself can succeed after the deadline passed; the caller then gets the
+        // timeout, never the value, so the handles in that value must go too.
+        let handle = spawn(RuntimeConfig {
+            bootstrap_script: Some(
+                "globalThis.big = Array.from({length: 300000}, (_, i) => () => i);\
+                 globalThis.streams = Array.from({length: 2000}, () => new ReadableStream());"
+                    .to_string(),
+            ),
+            execution_timeout: Some(std::time::Duration::from_millis(1)),
+            ..RuntimeConfig::default()
+        });
+        for code in ["big", "[streams, big]"] {
+            for _ in 0..3 {
+                let err = handle.eval_sync(code).unwrap_err();
+                assert!(err.to_string().contains("timed out"), "{err}");
+                assert_eq!(handle_counts(&handle), (0, 0), "{code} left handles behind");
+            }
+        }
+    }
+
+    #[test]
     fn successful_conversion_keeps_its_handles() {
         let handle = spawn(RuntimeConfig::default());
         assert!(handle.eval_sync("({m: new Map()})").is_err());

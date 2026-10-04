@@ -195,6 +195,12 @@ def make(
     )
 
 
+def _wait_until_idle(pool: Any, seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + seconds
+    while pool.pending and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def blocked(tool: HttpFetch, url: str) -> str:
     with pytest.raises(HttpFetchBlocked) as info:
         tool(url)
@@ -896,29 +902,74 @@ class TestLimits:
                 outcome = "busy" if "lookups" in str(exc) else f"failed: {exc}"
             return outcome, time.monotonic() - started
 
+        pool = http_fetch_module._dns()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=100) as callers:
                 results = list(callers.map(call, range(100)))
-            pool = http_fetch_module._dns_pool
-            assert pool is not None
             outcomes = [r[0] for r in results]
             # Exactly the admitted lookups time out; everything else is refused at once.
             assert outcomes.count("timeout") == 4
             assert outcomes.count("busy") == 96
             assert all(t < 0.5 for o, t in results if o == "busy")
-            # Outstanding work stays bounded: 2 running, at most 2 queued.
-            assert pool.pending == 4
+            # Outstanding work stays bounded: the 2 stalled lookups still hold their slots; the 2
+            # that were queued were cancelled when their callers gave up.
+            assert pool.pending == 2
             assert pool.executor._work_queue.qsize() <= 2
             assert peak <= 2
         finally:
             release.set()
-        deadline = time.monotonic() + 5
-        while pool.pending and time.monotonic() < deadline:
-            time.sleep(0.01)
+            _wait_until_idle(pool)
         assert pool.pending == 0
         # Capacity returns once the stalled lookups finish.
         assert tool(url)["status"] == 200
         pool.executor.shutdown(wait=True)
+
+    def test_a_queued_lookup_is_cancelled_when_its_caller_gives_up(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(http_fetch_module, "DNS_THREADS", 1)
+        monkeypatch.setattr(http_fetch_module, "DNS_MAX_PENDING", 8)
+        monkeypatch.setattr(http_fetch_module, "_dns_pool", None)
+        release = threading.Event()
+        ran: list[str] = []
+
+        class Stalled(Resolver):
+            def __call__(self, host: str, port: int) -> list[str]:
+                release.wait(10)
+                ran.append(host)
+                return ["127.0.0.1"]
+
+        tool = make(["fetch.test"], Stalled(), timeout=0.2)
+        pool = http_fetch_module._dns()
+
+        def call() -> None:
+            with pytest.raises(HttpFetchTimeout):
+                tool("http://fetch.test/ok")
+
+        try:
+            callers = [threading.Thread(target=call) for _ in range(8)]
+            for t in callers:
+                t.start()
+            for t in callers:
+                t.join(5)
+            # One lookup runs (stalled); the 7 queued behind it were cancelled with their callers.
+            assert pool.pending == 1
+        finally:
+            release.set()
+            _wait_until_idle(pool)
+        assert pool.pending == 0
+        assert len(ran) == 1  # the cancelled lookups never ran
+        pool.executor.shutdown(wait=True)
+
+    def test_a_forked_child_starts_without_the_parents_lookups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Registered with os.register_at_fork: the child has none of the parent's threads.
+        monkeypatch.setattr(http_fetch_module, "_dns_pool", object())
+        monkeypatch.setattr(http_fetch_module, "_dns_pool_lock", threading.Lock())
+        http_fetch_module._forget_parents_dns_pool()
+        assert http_fetch_module._dns_pool is None
+        assert not http_fetch_module._dns_pool_lock.locked()
 
     def test_connection_refused(self) -> None:
         with socket.socket() as s:
