@@ -84,6 +84,7 @@ nav:
       - Upstream provenance: contributing/upstream-divergence.md
       - Supply-chain security: contributing/supply-chain.md
       - Autoresearch loops: contributing/autoresearch.md
+      - Strix pentest review: contributing/strix.md
 
 plugins:
   - search
