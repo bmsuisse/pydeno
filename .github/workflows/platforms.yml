@@ -9,10 +9,13 @@ name: Platforms
 # workflow until they are known-green; flip the flag when they are.
 on:
   # 41 jobs on scarce runners: run on `main` and on demand, not on every pull request (a
-  # busy queue starved the run that gates a release). Run it for a branch with
+  # busy queue starved the run that gates a release). Workflow edits still validate on PRs.
+  # Run it for any other branch with
   # `gh workflow run platforms.yml --ref <branch>`.
   push:
     branches: [main]
+  pull_request:
+    paths: [".github/workflows/platforms.yml"]
   workflow_dispatch:
 
 permissions:
@@ -71,6 +74,7 @@ jobs:
 
       # Same collect-then-run-then-check shape as test.yml: a collection error or a mass-skip must fail
       # the cell, and `check_test_report.py` needs the collect log to count what was never run.
+      # The 180-second collection watchdog matches test.yml and bounds stuck imports on slow runners.
       - name: Collect tests
         shell: bash
         run: |
