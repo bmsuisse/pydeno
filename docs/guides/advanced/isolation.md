@@ -503,8 +503,26 @@ surfaces as `WorkerCrashed` naming the flag.
 ## Proxies crossing the boundary
 
 A Proxy in a result, a stream chunk or a host-function argument crosses as its innermost target,
-found natively, and **none of its traps runs**. Running them would let guest code act in the middle
+found natively, and **none of that Proxy’s traps runs**. Running those traps would let guest code
+act in the middle
 of a conversion (grow a buffer after its size was checked, or answer `ownKeys` with `[]` while the
 engine walks the whole target). So `new Proxy({a: 1}, {get: () => 'x'})` arrives as `{"a": 1}`, a
 Proxy around an Array arrives as a list, and a revoked Proxy or one behind more than 64 others is
-refused.
+refused. A Proxy on an argument’s prototype chain can still run a `getPrototypeOf` trap
+during the bridge’s type checks.
+
+A Proxy around a function crosses as the underlying function; invoking its Python wrapper
+skips the Proxy’s `apply` trap.
+
+## Console callback deadlines
+
+In the synchronous isolated runtime, deadline checks happen between console callbacks. A
+single slow `on_console` or `print_callback` can therefore delay enforcement until it returns;
+the twice-deadline bound for console floods applies between calls. The async supervisor checks
+the deadline independently. Buffer output in host callbacks instead of blocking on a sink.
+
+## Duration type validation
+
+`RuntimeConfig.timeout` still follows the Rust binding’s numeric conversion rules, which can
+coerce booleans and float-like objects. The shared Python limit validators cover the other
+public duration/count arguments; they do not imply identical type validation for this field.

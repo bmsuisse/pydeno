@@ -145,8 +145,8 @@ and the red-team restrictions under Security; see
   their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
   before and turned the limit off without saying so (every comparison with NaN is false); Python's
   `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
-  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
-  wrong type raises `TypeError`, a bad value `ValueError`.
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Except for Rust-converted
+  `RuntimeConfig.timeout`, errors are uniform: a wrong type raises `TypeError`, a bad value `ValueError`.
 - **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
   host runs a tool, and console calls were treated the same way, so time spent handling a flood of
   `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`
