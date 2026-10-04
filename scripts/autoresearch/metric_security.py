@@ -180,6 +180,74 @@ def growable_shared_array_buffers_respect_max_buffer_bytes() -> bool:
         return out != ["RangeError"] * 2
 
 
+_COLLECTED_RESIZABLE_THEN_FIXED = """
+(() => {
+  const out = [];
+  try { { let a = new ArrayBuffer(200 * 2**20, {maxByteLength: 200 * 2**20}); a = null; }
+        out.push(new Uint8Array(100 * 2**20).length); } catch (e) { out.push(e.name); }
+  function build() { const b = new ArrayBuffer(0, {maxByteLength: 150 * 2**20}); b.resize(150 * 2**20); return b.byteLength; }
+  try { build(); build(); out.push(new Float64Array(16 * 2**20).length); } catch (e) { out.push(e.name); }
+  return out;
+})()
+"""
+
+
+@probe
+def collected_resizable_buffers_do_not_starve_fixed_allocations() -> bool:
+    """Charging resizable buffers must not make legitimate code fail: a resizable buffer the guest
+    dropped must give its bytes back before a fixed-length allocation (which V8 routes through the
+    allocator, not the bridge) is refused. Worked before the charge existed; a regression probe."""
+    expect = [100 * 2**20, 16 * 2**20]
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=TIMEOUT, max_buffer_bytes=255 * 2**20),
+        sandbox="require",
+        request_timeout=20,
+        max_memory=2**30,
+    ) as rt:
+        if rt.eval(_COLLECTED_RESIZABLE_THEN_FIXED) != expect:
+            return True
+    with Runtime(RuntimeConfig(max_buffer_bytes=255 * 2**20)) as rt:
+        return rt.eval(_COLLECTED_RESIZABLE_THEN_FIXED) != expect
+
+
+_TINY_RESIZABLE_LOOP_PROBE = """
+import json, resource, sys
+from pydeno import Runtime, RuntimeConfig
+with Runtime(RuntimeConfig(max_buffer_bytes=255 * 2**20)) as rt:
+    rt.eval("for (let i = 0; i < 100000; i++) new ArrayBuffer(1, {maxByteLength: 1});")  # warm
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rt.eval("for (let i = 0; i < 3000000; i++) new ArrayBuffer(1, {maxByteLength: 1});")
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss is bytes on macOS, KiB on Linux
+print(json.dumps((after - before) * scale))
+"""
+
+
+@probe
+def churning_tiny_resizable_buffers_does_not_grow_the_host() -> bool:
+    """Accounting for resizable buffers must not itself be a memory leak: three million tiny
+    resizable buffers that never approach the cap must leave the host within a small constant,
+    whatever bookkeeping the charge keeps per buffer. In a subprocess under a hard cap."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [sys.executable, "-c", _TINY_RESIZABLE_LOOP_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return True
+    if not out.stdout.strip():
+        return True
+    growth = int(float(out.stdout.strip().splitlines()[-1]))
+    if growth > 64 * 2**20:
+        print(f"    host grew by {growth / 2**20:.0f} MiB", file=sys.stderr)
+        return True
+    return False
+
+
 @probe
 def huge_result_is_refused_without_killing_the_parent() -> bool:
     with iso() as rt:
@@ -369,10 +437,13 @@ def captured_console_output_carries_no_terminal_escapes() -> bool:
     (`_clean`), it must not be able to carry escape or control sequences into that terminal."""
     with iso(capture_console=True) as rt:
         result = rt.execute(
-            "console.log('\\x1b[2J\\x1b]0;x\\x07', 'a\\rb', 'tab\\tok'); console.error('\\x9b1m'); 1"
+            "console.log('\\x1b[2J\\x1b]0;x\\x07', 'a\\rb', 'tab\\tok', 'bidi\\u202e\\u2066\\u200f\\u061c'); "
+            "console.error('\\x9b1m'); 1"
         )
     text = result.stdout + result.stderr
-    return bool(re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", text)) or "tab\tok" not in text
+    # Unicode bidirectional controls reorder what a terminal shows (a spoofed line), like ESC.
+    hostile = r"[\x00-\x08\x0b-\x1f\x7f-\x9f؜‎‏‪-‮⁦-⁩]"
+    return bool(re.search(hostile, text)) or "tab\tok" not in text
 
 
 # --- the host bridge: a guest must not interfere with a later host bind ----------------------------------
