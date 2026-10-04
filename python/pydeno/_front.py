@@ -1074,10 +1074,12 @@ _OPEN_POOLS_LOCK = threading.Lock()
 
 
 def _open_pool(budget: _ThreadBudget) -> None:
+    """Warn if this pool's cap takes the open pools past the ceiling, then count it as open.
+    Called before the pool starts anything: if the warning is raised as an error (``-W error``),
+    nothing has been registered or started."""
     ceiling = _PROCESS_THREADS.limit
     with _OPEN_POOLS_LOCK:
-        _OPEN_POOLS.add(budget)
-        total = sum(b.limit for b in _OPEN_POOLS)
+        total = sum(b.limit for b in _OPEN_POOLS) + budget.limit
     if total > ceiling:
         warnings.warn(
             f"the open pools' max_tool_threads add up to {total}, above the process ceiling "
@@ -1086,6 +1088,8 @@ def _open_pool(budget: _ThreadBudget) -> None:
             RuntimeWarning,
             stacklevel=4,
         )
+    with _OPEN_POOLS_LOCK:
+        _OPEN_POOLS.add(budget)
 
 
 def _close_pool(budget: _ThreadBudget) -> None:
@@ -1177,19 +1181,25 @@ class Pydeno:
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
         self._sandbox = sandbox
-        self._reaper = _Reaper()
-        weakref.finalize(self, self._reaper.stop)  # a pool dropped without close()
-        _open_pool(self._budget)
-        weakref.finalize(self, _close_pool, self._budget)
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
             "max_memory": self._limits.max_memory,
         }
+        _open_pool(
+            self._budget
+        )  # may warn (or raise, under -W error): before anything starts
         try:
+            self._reaper = _Reaper()
             self._pool = _Pool(_CONFIG, size=min_processes, **self._spawn)
         except WorkerCrashed as exc:
+            _close_pool(self._budget)
             raise _start_failure(exc, sandbox) from exc
+        except BaseException:
+            _close_pool(self._budget)
+            raise
+        weakref.finalize(self, _close_pool, self._budget)
+        weakref.finalize(self, self._reaper.stop)  # a pool dropped without close()
 
     def __enter__(self) -> Pydeno:
         return self

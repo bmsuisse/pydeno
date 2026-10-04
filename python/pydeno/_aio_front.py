@@ -135,11 +135,17 @@ class AsyncPydeno:
 
     async def start(self) -> AsyncPydeno:
         """Start the first worker (errors surface here) and the background refill."""
+        _open_pool(
+            self._budget
+        )  # may warn (or raise, under -W error): before anything starts
         try:
             await self._pool.start()
         except WorkerCrashed as exc:
+            _close_pool(self._budget)
             raise _start_failure(exc, self._sandbox) from exc
-        _open_pool(self._budget)
+        except BaseException:
+            _close_pool(self._budget)
+            raise
         weakref.finalize(self, _close_pool, self._budget)
         return self
 

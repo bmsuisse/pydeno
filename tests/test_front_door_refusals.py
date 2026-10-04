@@ -191,3 +191,76 @@ async def test_a_slow_console_sink_holds_up_only_its_own_session() -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
             for s in stuck:
                 await s.close()
+
+
+# ---------------------------------------------------------------------------
+# D6 / D7: the caps warning raised as an error leaves nothing behind
+# ---------------------------------------------------------------------------
+
+
+def _children() -> set[int]:
+    import subprocess
+
+    out = subprocess.run(
+        ["pgrep", "-P", str(os.getpid())], capture_output=True, text=True, check=False
+    ).stdout
+    return {int(pid) for pid in out.split()}
+
+
+def _open_pools() -> set[object]:
+    from pydeno import _front
+
+    with _front._OPEN_POOLS_LOCK:  # noqa: SLF001
+        return set(_front._OPEN_POOLS)  # noqa: SLF001
+
+
+def test_a_constructor_failing_on_the_caps_warning_leaves_nothing_behind() -> None:
+    import warnings
+
+    pools = [Pydeno(sandbox=MODE, min_processes=1) for _ in range(4)]  # 4 x 128 = 512
+    try:
+        before, children = _open_pools(), _children()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            for _ in range(3):
+                with pytest.raises(RuntimeWarning, match="not a reservation"):
+                    Pydeno(sandbox=MODE, min_processes=1)
+        assert _open_pools() == before
+        time.sleep(0.2)
+        assert _children() <= children  # no worker was started for the failed pools
+    finally:
+        for p in pools:
+            p.close()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with Pydeno(sandbox=MODE, min_processes=1, max_tool_threads=129) as later:
+            with later.checkout() as s:
+                assert s.feed_run("1 + 1") == 2
+
+
+async def test_an_async_pool_failing_on_the_caps_warning_leaves_nothing_behind() -> (
+    None
+):
+    import warnings
+
+    pools = [await AsyncPydeno(sandbox=MODE, min_processes=1).start() for _ in range(4)]
+    try:
+        before, children = _open_pools(), _children()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            for _ in range(3):
+                with pytest.raises(RuntimeWarning, match="not a reservation"):
+                    await AsyncPydeno(sandbox=MODE, min_processes=1).start()
+        assert _open_pools() == before
+        await asyncio.sleep(0.2)
+        assert _children() <= children  # the failed pools started no worker
+    finally:
+        for p in pools:
+            await p.close()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        async with AsyncPydeno(
+            sandbox=MODE, min_processes=1, max_tool_threads=129
+        ) as later:
+            async with later.checkout() as s:
+                assert await s.feed_run("1 + 1") == 2
