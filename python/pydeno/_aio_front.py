@@ -41,7 +41,6 @@ from ._aio_agent import AsyncAgentSandbox, apreinstall
 from ._front import (
     _CONFIG,
     _EXTERNAL,
-    _REFILL_DELAY,
     PydenoComplete,
     PydenoCrashedError,
     PydenoError,
@@ -68,6 +67,7 @@ from ._front import (
     _prepare,
     _Prepared,
     _Printer,
+    _REFILL_DELAY,
     _printer_for,
     _resolve_limits,
     _start_failure,
@@ -85,22 +85,22 @@ class _Pool(AsyncSandboxPool):
     """`AsyncSandboxPool`, except that every worker gets its own random seed and has run its
     first command (see `_front._Core`)."""
 
-    async def _new(self, session: dict[str, Any] | None = None) -> AsyncIsolatedRuntime:
-        if session is None and self._ready:
-            await asyncio.sleep(_REFILL_DELAY)  # see `_front._Core.new`
-        rt = await AsyncIsolatedRuntime.create(
+    def _build(self, session: dict[str, Any] | None = None) -> AsyncIsolatedRuntime:
+        return AsyncIsolatedRuntime(
             self._config,
             prewarm=False,
             random_seed=_fresh_seed(),
             **self._spawn,
             **(self._session if session is None else session),
         )
-        try:
-            await apreinstall(rt, [_EXTERNAL])  # off the checkout path, as in `Pydeno`
-        except BaseException:
-            await rt.close()
-            raise
-        return rt
+
+    async def _start_runtime(
+        self, rt: AsyncIsolatedRuntime, session: dict[str, Any] | None
+    ) -> None:
+        if session is None and self._ready:
+            await asyncio.sleep(_REFILL_DELAY)
+        await rt._start()
+        await apreinstall(rt, [_EXTERNAL])
 
 
 class AsyncPydeno:
@@ -115,6 +115,8 @@ class AsyncPydeno:
         self,
         *,
         min_processes: int = 2,
+        max_workers: int | None = None,
+        checkout_timeout: float = 30.0,
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
@@ -135,7 +137,13 @@ class AsyncPydeno:
             "strict_eval": strict_eval,
             "max_memory": self._limits.max_memory,
         }
-        self._pool = _Pool(_CONFIG, size=min_processes, **self._spawn)
+        self._pool = _Pool(
+            _CONFIG,
+            size=min_processes,
+            max_workers=max_workers,
+            checkout_timeout=checkout_timeout,
+            **self._spawn,
+        )
 
     async def start(self) -> AsyncPydeno:
         """Start the first worker (errors surface here) and the background refill."""
@@ -197,8 +205,13 @@ class AsyncPydeno:
             if seed is None and limits.max_memory == self._limits.max_memory:
                 return await self._pool.checkout()
             options = {**self._spawn, "max_memory": limits.max_memory}
-            return await AsyncIsolatedRuntime.create(
-                _CONFIG, random_seed=_fresh_seed() if seed is None else seed, **options
+            return await self._pool._new(
+                factory=lambda: AsyncIsolatedRuntime(
+                    _CONFIG,
+                    prewarm=False,
+                    random_seed=_fresh_seed() if seed is None else seed,
+                    **options,
+                )
             )
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
