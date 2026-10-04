@@ -123,6 +123,39 @@ def memory_bomb_is_killed_and_the_next_sandbox_works() -> bool:
         return rt.eval("1 + 1") != 2
 
 
+_RESIZABLE_BUFFER_GROWTH = """
+(() => {
+  const out = [];
+  for (const make of [
+    () => new ArrayBuffer(%(big)d, {maxByteLength: %(big)d}),                 // born over the cap
+    () => { const b = new ArrayBuffer(8, {maxByteLength: %(big)d}); b.resize(%(big)d); return b; },
+    () => new ArrayBuffer(8).transfer(8).transfer(%(big)d),               // grown through transfer
+  ]) {
+    try { out.push(make().byteLength); } catch (e) { out.push(e.name); }
+  }
+  return out;
+})()
+"""
+
+
+@probe
+def resizable_array_buffers_respect_max_buffer_bytes() -> bool:
+    """`max_buffer_bytes` promises a catchable RangeError for live ArrayBuffer bytes past the cap.
+    A resizable buffer (or one grown through `transfer`) must not be a way around it: V8 does not
+    route those backing stores through the embedder's allocator."""
+    cap = 64 * 2**20
+    code = _RESIZABLE_BUFFER_GROWTH % {"big": 4 * cap}
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=TIMEOUT, max_buffer_bytes=cap),
+        sandbox="require",
+        request_timeout=10,
+    ) as rt:
+        if rt.eval(code) != ["RangeError"] * 3 or rt.eval("1 + 1") != 2:
+            return True
+    with Runtime(RuntimeConfig(max_buffer_bytes=cap)) as rt:
+        return rt.eval(code) != ["RangeError"] * 3
+
+
 @probe
 def huge_result_is_refused_without_killing_the_parent() -> bool:
     with iso() as rt:
