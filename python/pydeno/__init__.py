@@ -65,6 +65,15 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
     )
     from ._status import Layer, SandboxStatus, sandbox_status
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
+    from .tools.http_fetch import (
+        AsyncHttpFetch,
+        HttpFetch,
+        HttpFetchBlocked,
+        HttpFetchError,
+        HttpFetchFailed,
+        HttpFetchTimeout,
+        http_fetch,
+    )
 
 # Everything below is imported on first use. `import pydeno` is then just the native module, which
 # keeps start-up small for plain `Runtime` users and for the isolation worker (which has no use for
@@ -109,6 +118,13 @@ _LAZY = {
     "Layer": "_status",
     "SandboxStatus": "_status",
     "sandbox_status": "_status",
+    "http_fetch": "tools.http_fetch",
+    "HttpFetch": "tools.http_fetch",
+    "AsyncHttpFetch": "tools.http_fetch",
+    "HttpFetchError": "tools.http_fetch",
+    "HttpFetchBlocked": "tools.http_fetch",
+    "HttpFetchTimeout": "tools.http_fetch",
+    "HttpFetchFailed": "tools.http_fetch",
 }
 
 
@@ -450,4 +466,11 @@ __all__ = [
     "ToolError",
     "ToolBudgetError",
     "ToolNotFoundError",
+    "http_fetch",
+    "HttpFetch",
+    "AsyncHttpFetch",
+    "HttpFetchError",
+    "HttpFetchBlocked",
+    "HttpFetchTimeout",
+    "HttpFetchFailed",
 ]

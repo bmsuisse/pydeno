@@ -347,6 +347,10 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
 - **Tool arguments are untrusted.** `ToolCall.args` and the arguments your tools receive are data
   the guest (and so, the model and whatever text it read) chose. Validate them in the tool, and
   show them to an approver as data, not as instructions.
+- **Network access is a tool.** The guest has no `fetch`; give it one with
+  [`http_fetch`](http-fetch.md), an allow-listed GET tool that refuses private, loopback and
+  metadata addresses (also through redirects and DNS rebinding) and caps size and time:
+  `AgentSandbox({"fetch_url": http_fetch(["api.example.com/v1/"])})`.
 - **Errors are redacted** by default: the guest learns a failing tool's exception class, not its
   message. Use `redact_host_errors=False` only for tools whose errors carry nothing sensitive.
 - **The budget** (`max_tool_calls`) counts every call over the session's life, across `start`,
