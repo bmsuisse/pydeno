@@ -12,6 +12,7 @@ taking pytest down with it.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import textwrap
@@ -535,6 +536,18 @@ INTRINSIC_NAMESPACES = {
     "reflect": "Reflect",
     "iterator-prototype": "Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()))",
     "typedarray-prototype": "Object.getPrototypeOf(Uint8Array.prototype)",
+    "global-object": "globalThis",
+    "array-unscopables": "Array.prototype[Symbol.unscopables]",
+    "intl-collator-prototype": "Intl.Collator.prototype",
+    # Reachable only through instances:
+    "segments-prototype": "Object.getPrototypeOf(new Intl.Segmenter().segment('a'))",
+    "callsite-prototype": (
+        "(() => { const saved = Error.prepareStackTrace;"
+        " Error.prepareStackTrace = (e, frames) => frames;"
+        " const frames = new Error().stack; Error.prepareStackTrace = saved;"
+        " return Object.getPrototypeOf(frames[0]) })()"
+    ),
+    "readablestream-prototype": "ReadableStream.prototype",
 }
 
 
@@ -546,3 +559,152 @@ def test_bind_object_refuses_an_intrinsic_namespace(make_rt, name: str) -> None:
         rt.bind_object("tools", {"zz_host_tool": lambda: 1})
     assert rt.eval("typeof ({}).zz_host_tool") == "undefined"
     assert rt.eval("typeof tools.zz_host_tool") == "undefined"
+
+
+# ---------------------------------------------------------------------------------------------
+# Second follow-up review.
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_snapshot_provided_namespace_is_not_mistaken_for_a_built_in() -> None:
+    """The built-in set was collected after a host snapshot was restored, so every object the
+    snapshot's bootstrap created counted as a built-in and could no longer be bound onto.
+    (`IsolatedRuntime` refuses snapshots, so this is `Runtime` only.)"""
+    from pydeno import Runtime, SnapshotBuilder
+
+    builder = SnapshotBuilder()
+    builder.execute_script("lib.js", "globalThis.myLib = {version: '1.0'};")
+    snapshot = builder.build()
+    with Runtime(RuntimeConfig(snapshot=snapshot, timeout=20.0)) as rt:
+        rt.bind_object("myLib", {"f": lambda: 1})
+        assert rt.eval("[myLib.version, myLib.f()]") == ["1.0", 1]
+        # ...and the built-in check still holds in the same runtime.
+        rt.eval("globalThis.tools = Object.prototype; 0")
+        with pytest.raises(Exception, match=_BIND_REFUSED):
+            rt.bind_object("tools", {"zz_host_tool": lambda: 1})
+        assert rt.eval("typeof ({}).zz_host_tool") == "undefined"
+
+
+# The polyfill `ReadableStream` kept its state in `this._queue = ...` assignments, so setters a
+# guest planted on `ReadableStream.prototype` ran inside a host bind and received the source.
+_POLYFILL_FIELDS = (
+    "_queue",
+    "_closed",
+    "_errored",
+    "_error",
+    "_pulling",
+    "_underlying",
+    "_controller",
+)
+
+
+async def test_a_stream_prototype_setter_does_not_run_inside_a_bind() -> None:
+    fields = ", ".join(repr(f) for f in _POLYFILL_FIELDS)
+    rt = _stream_runtime(
+        f"for (const f of [{fields}]) Object.defineProperty(ReadableStream.prototype, f, "
+        "{set(v) { hits++ }, get() {}, configurable: true})"
+    )
+    try:
+        source = rt.stream_from_async_iterable(
+            _two_chunks()
+        )  # kept alive while JS reads it
+        rt.bind_object("tools", {"s": source})
+        assert rt.eval("hits") == 0
+        result = await rt.eval_async(
+            "(async () => { const r = tools.s.getReader(); const out = [];"
+            " for (;;) { const {done, value} = await r.read(); if (done) break; out.push(value) }"
+            " return out.join('') })()"
+        )
+        assert result == "ab"
+    finally:
+        rt.close()
+
+
+# Converting a guest result to Python asked `value instanceof globalThis.ReadableStream`, which
+# runs a guest `Symbol.hasInstance` and follows a replaced global: every object could be made to
+# arrive as a stream.
+STREAM_BRAND_POISON = {
+    "has-instance-true": (
+        "Object.defineProperty(ReadableStream, Symbol.hasInstance, "
+        "{value: () => { hits++; return true }, configurable: true})"
+    ),
+    "global-replaced-with-object": "globalThis.ReadableStream = Object",
+}
+
+
+@pytest.mark.parametrize("name", list(STREAM_BRAND_POISON))
+def test_converting_a_result_does_not_ask_the_guest_what_a_stream_is(
+    make_rt, name: str
+) -> None:
+    rt = make_rt()
+    rt.eval("globalThis.hits = 0; " + STREAM_BRAND_POISON[name] + "; 0")
+    assert rt.eval("({a: 1})") == {"a": 1}
+    assert rt.eval("hits") == 0
+
+
+# deno_core reads `name` and `cause` of a thrown error through the prototype chain, so getters
+# planted there ran on the refusal error, inside the host's bind, and saw its message.
+ERROR_PROTO_POISON = {
+    "cause-getter": (
+        "Object.defineProperty(Error.prototype, 'cause', "
+        "{get() { seen.push(String(this.message)) }, configurable: true})"
+    ),
+    "name-getter": (
+        "Object.defineProperty(TypeError.prototype, 'name', "
+        "{get() { seen.push(String(this.message)); return 'TypeError' }, configurable: true})"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(ERROR_PROTO_POISON))
+def test_a_refused_bind_reads_no_error_property_through_the_prototype(
+    make_rt, name: str
+) -> None:
+    rt = make_rt()
+    rt.eval(
+        "globalThis.seen = []; " + ERROR_PROTO_POISON[name] + ";"
+        " globalThis.tools = new Proxy({}, {}); 0"
+    )
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"f": lambda: 1})
+    assert rt.eval("seen.length") == 0
+
+
+def test_a_non_extensible_global_object_is_refused_clearly(make_rt) -> None:
+    rt = make_rt()
+    rt.eval("Object.preventExtensions(globalThis); 0")
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"f": lambda: 1})
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_function("lookup", lambda: 1)
+
+
+# A refused bind left its handler registered for the runtime's lifetime.
+@pytest.mark.parametrize("path", ["bind_object", "bind_function"])
+def test_a_refused_bind_does_not_keep_its_handler(make_rt, path: str) -> None:
+    import gc
+    import weakref
+
+    class Handler:
+        def __call__(self) -> int:
+            return 1
+
+    rt = make_rt()
+    rt.eval(
+        "globalThis.tools = new Proxy({}, {});"
+        " Object.defineProperty(globalThis, 'lookup', {get() {}, configurable: true}); 0"
+    )
+    handler = Handler()
+    ref = weakref.ref(handler)
+    try:
+        if path == "bind_object":
+            rt.bind_object("tools", {"f": handler})
+        else:
+            rt.bind_function("lookup", handler)
+    except Exception as exc:
+        assert re.search(_BIND_REFUSED, str(exc)), exc
+    else:
+        raise AssertionError("the bind was not refused")
+    del handler
+    gc.collect()
+    assert ref() is None

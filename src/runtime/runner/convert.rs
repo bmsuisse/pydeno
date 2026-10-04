@@ -59,6 +59,8 @@ pub(super) struct Converter {
     pub(super) next_fn_id: Rc<RefCell<u32>>,
     pub(super) limits: SerializationLimits,
     pub(super) streams: Rc<JsStreamRegistry>,
+    /// `ReadableStream.prototype` as it was when the runtime was created, before any guest code.
+    pub(super) stream_prototype: Option<Rc<v8::Global<v8::Object>>>,
 }
 
 fn circular_check<'s>(
@@ -77,24 +79,54 @@ fn circular_check<'s>(
     Ok(())
 }
 
-pub(super) fn is_readable_stream(
+/// Read `globalThis.ReadableStream.prototype` once, at runtime creation (before guest code), so
+/// that recognising a stream later never consults the live global.
+pub(super) fn capture_stream_prototype(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> Option<v8::Global<v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "ReadableStream")?;
+    let ctor = global.get(scope, key.into())?.to_object(scope)?;
+    let key = v8::String::new(scope, "prototype")?;
+    let prototype = ctor.get(scope, key.into())?.to_object(scope)?;
+    Some(v8::Global::new(scope, prototype))
+}
+
+/// Whether `value` has the captured `ReadableStream.prototype` on its prototype chain.
+///
+/// Not `instanceof`: that would call a guest `Symbol.hasInstance` and follow whatever
+/// `globalThis.ReadableStream` is now. A Proxy anywhere on the chain counts as "no", because
+/// asking a Proxy for its prototype runs its `getPrototypeOf` trap.
+fn is_readable_stream(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
+    stream_prototype: Option<&v8::Global<v8::Object>>,
 ) -> bool {
-    if !value.is_object() {
+    let Some(stream_prototype) = stream_prototype else {
         return false;
+    };
+    let stream_prototype = v8::Local::new(scope, stream_prototype);
+    let mut current = value;
+    // Bounded: a prototype chain is short, and an object cannot be its own ancestor.
+    for _ in 0..64 {
+        if current.is_proxy() {
+            return false;
+        }
+        let Some(object) = current.to_object(scope) else {
+            return false;
+        };
+        let Some(prototype) = object.get_prototype(scope) else {
+            return false;
+        };
+        if !prototype.is_object() {
+            return false;
+        }
+        if prototype.strict_equals(stream_prototype.into()) {
+            return true;
+        }
+        current = prototype;
     }
-    let Some(key) = v8::String::new(scope, "ReadableStream") else {
-        return false;
-    };
-    let global = scope.get_current_context().global(scope);
-    let Some(ctor) = global
-        .get(scope, key.into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-    else {
-        return false;
-    };
-    value.instance_of(scope, ctor.into()).unwrap_or_default()
+    false
 }
 
 /// Look up the global JS helper function `name` (installed by the ops bootstrap).
@@ -320,7 +352,9 @@ impl Converter {
             }
             tracker.add_bytes(16)?;
             Ok(JSValue::Date(epoch_ms.round() as i64))
-        } else if value.is_object() && is_readable_stream(scope, value) {
+        } else if value.is_object()
+            && is_readable_stream(scope, value, self.stream_prototype.as_deref())
+        {
             let stream_id = self.streams.register_stream(scope, value);
             tracker.add_bytes(size_of::<u32>())?;
             Ok(JSValue::JsStream { id: stream_id })

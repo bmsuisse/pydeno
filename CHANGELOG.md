@@ -22,6 +22,18 @@
   defined after them and stayed writable), and the bridge builds streams with a captured `ReadableStream` and
   a prototype-less source. A guest could otherwise run code inside a host `bind_object` (or any hand-over of a
   Python stream), see every stream id and substitute its own value.
+- The `ReadableStream` polyfill keeps its state in a private WeakMap, so setters a guest plants on
+  `ReadableStream.prototype` no longer run (and receive the stream's source) when the bridge creates a stream.
+  Recognising a guest's `ReadableStream` result no longer uses `instanceof globalThis.ReadableStream` (a guest
+  `Symbol.hasInstance` or a replaced global could turn every object result into a stream); it checks the
+  prototype chain against the prototype captured at startup.
+- A refused bind's error has own `name`, `cause` and `stack`, so reading it runs no getter from
+  `Error.prototype`; a non-extensible global object is refused with the same clear error; and the handlers a
+  refused bind registered are dropped instead of kept for the runtime's lifetime.
+- The built-in set behind the namespace check is collected from the standard global names only, so objects a
+  host snapshot puts on the global object are bindable again (this was a regression in the previous change),
+  and now also covers `CallSite.prototype`, `%SegmentsPrototype%`, the iterator-helper prototypes and the
+  `ReadableStream` polyfill.
 - The bridge rebuilds host results without `Array.prototype.map`, `Object.entries`, `for...of`,
   `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`, and host arrays are created
   without `Array.prototype` index setters, so a guest that replaced them only affects its own code.

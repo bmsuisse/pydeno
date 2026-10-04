@@ -650,17 +650,22 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // accessor that hands back a throwaway object, a read-only global that ignores the assignment).
   // And they run no guest code: no `for...of`, no plain assignment that could hit a setter, no
   // lookups on a namespace that could be a Proxy.
-  // The error's `stack` is replaced with plain text before anyone reads it: formatting the real
-  // one would call a guest-installed `Error.prepareStackTrace` inside the host's bind.
+  // The host reads `name`, `message`, `cause` and `stack` of the error it gets back (deno_core's
+  // `JsError::from_v8_exception`). Each is an own data property here, so none of those reads walks
+  // the prototype chain into a getter the guest planted on `Error.prototype`, and `stack` is plain
+  // text, so formatting it never calls a guest `Error.prepareStackTrace` inside the host's bind.
   function refuseBind(name, why) {
     const message = "Cannot bind '" + name + "': " + why;
     const error = new TypeErrorCtor(message);
-    DefineProperty(error, "stack", {
-      __proto__: null,
-      value: "TypeError: " + message,
-      writable: true,
-      configurable: true,
-    });
+    const fields = ["name", "TypeError", "cause", undefined, "stack", "TypeError: " + message];
+    for (let index = 0; index < fields.length; index += 2) {
+      DefineProperty(error, fields[index], {
+        __proto__: null,
+        value: fields[index + 1],
+        writable: true,
+        configurable: true,
+      });
+    }
     throw error;
   }
 
@@ -668,6 +673,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   function installGlobal(name, value) {
     const desc = GetOwnPropertyDescriptor(globalThis, name);
     if (desc === undefined) {
+      if (!IsExtensible(globalThis)) {
+        refuseBind(name, "the global object is not extensible");
+      }
       DefineProperty(globalThis, name, {
         __proto__: null,
         value,
@@ -692,9 +700,22 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // run guest code during the install or discard it, so it is refused rather than guessed at.
   // Every built-in object a guest could point a namespace at (`Object.prototype`, `Math`,
   // `Array.prototype`, `%IteratorPrototype%`...): installing host tools on one of those would put
-  // them on every object, or on a shared built-in. Collected once, before any guest code: each
-  // global value, its own object-valued properties, and the `prototype` of every function among
-  // them, plus the prototypes only reachable through instances.
+  // them on every object, or on a shared built-in. Collected once, before any guest code, from the
+  // *standard* global names only: this script also runs after a host snapshot is restored, and
+  // the objects that snapshot's bootstrap put on the global object are the host's own namespaces,
+  // not built-ins. From each standard global: the value, its own object-valued properties (a
+  // constructor's `prototype`, `Intl.Collator`...) and theirs (`Intl.Collator.prototype`,
+  // `Array.prototype[Symbol.unscopables]`), plus the prototypes reachable only through instances.
+  const STANDARD_GLOBALS = [
+    "AggregateError", "Array", "ArrayBuffer", "AsyncDisposableStack", "Atomics", "BigInt",
+    "BigInt64Array", "BigUint64Array", "Boolean", "DataView", "Date", "DisposableStack", "Error",
+    "EvalError", "FinalizationRegistry", "Float16Array", "Float32Array", "Float64Array",
+    "Function", "Int16Array", "Int32Array", "Int8Array", "Intl", "Iterator", "JSON", "Map",
+    "Math", "Number", "Object", "Promise", "Proxy", "RangeError", "ReferenceError", "Reflect",
+    "RegExp", "Set", "SharedArrayBuffer", "String", "SuppressedError", "Symbol", "SyntaxError",
+    "Temporal", "TypeError", "URIError", "Uint16Array", "Uint32Array", "Uint8Array",
+    "Uint8ClampedArray", "WeakMap", "WeakRef", "WeakSet", "WebAssembly", "console",
+  ];
   const INTRINSICS = new WeakSet();
   function markIntrinsic(value, depth) {
     if (value === null || (typeof value !== "object" && typeof value !== "function")) {
@@ -715,8 +736,47 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       }
     }
   }
-  markIntrinsic(globalThis, 3);
+  markIntrinsic(globalThis, 0);
+  for (let index = 0; index < STANDARD_GLOBALS.length; index++) {
+    const desc = GetOwnPropertyDescriptor(globalThis, STANDARD_GLOBALS[index]);
+    if (desc !== undefined && HasOwn(desc, "value")) {
+      markIntrinsic(desc.value, 2);
+    }
+  }
+  // `CallSite.prototype`, only handed out to `Error.prepareStackTrace`.
+  function callSitePrototype() {
+    const saved = GetOwnPropertyDescriptor(Error, "prepareStackTrace");
+    let frames;
+    try {
+      DefineProperty(Error, "prepareStackTrace", {
+        __proto__: null,
+        value: (error, callSites) => callSites,
+        writable: true,
+        configurable: true,
+      });
+      frames = new Error().stack;
+    } finally {
+      if (saved === undefined) {
+        delete Error.prepareStackTrace;
+      } else {
+        DefineProperty(Error, "prepareStackTrace", saved);
+      }
+    }
+    return ArrayIsArray(frames) && frames.length > 0 ? GetPrototypeOf(frames[0]) : null;
+  }
+  const iteratorHelper = [][Symbol.iterator]();
   for (const hidden of [
+    callSitePrototype(),
+    typeof Intl === "object" && typeof Intl.Segmenter === "function"
+      ? GetPrototypeOf(new Intl.Segmenter().segment("a"))
+      : null,
+    typeof Intl === "object" && typeof Intl.Segmenter === "function"
+      ? GetPrototypeOf(new Intl.Segmenter().segment("a")[Symbol.iterator]())
+      : null,
+    typeof iteratorHelper.map === "function" ? GetPrototypeOf(iteratorHelper.map((x) => x)) : null,
+    typeof Iterator === "function" && typeof Iterator.from === "function"
+      ? GetPrototypeOf(Iterator.from({ next() { return { done: true }; } }))
+      : null,
     GetPrototypeOf([][Symbol.iterator]()),
     GetPrototypeOf(GetPrototypeOf([][Symbol.iterator]())),
     GetPrototypeOf(new Map()[Symbol.iterator]()),
@@ -808,72 +868,91 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
 
   if (typeof globalThis.ReadableStream !== "function") {
     // Note: This minimal polyfill does not implement backpressure or BYOB readers.
+    //
+    // Its state lives in a WeakMap, not in `this._queue = ...` properties: an assignment to the
+    // instance would run a setter the guest planted on `ReadableStream.prototype`, and the bridge
+    // constructs these streams inside a host bind. The state holders have no prototype for the
+    // same reason.
+    const streamState = new WeakMap();
+    const StateGet = uncurry(WeakMap.prototype.get);
+    const StateSet = uncurry(WeakMap.prototype.set);
+    const stateOf = (stream) => {
+      const state = StateGet(streamState, stream);
+      if (state === undefined) {
+        throw new TypeErrorCtor("not a ReadableStream");
+      }
+      return state;
+    };
+    const maybePull = async (state) => {
+      if (state.closed || state.pulling) {
+        return;
+      }
+      if (typeof state.underlying.pull === "function") {
+        state.pulling = true;
+        try {
+          await state.underlying.pull(state.controller);
+        } finally {
+          state.pulling = false;
+        }
+      }
+    };
     class PydenoReadableStream {
       constructor(underlying = {}) {
-        this._queue = [];
-        this._closed = false;
-        this._errored = false;
-        this._error = undefined;
-        this._pulling = false;
-        this._underlying = underlying;
-        this._controller = {
+        const state = {
+          __proto__: null,
+          queue: [],
+          closed: false,
+          errored: false,
+          error: undefined,
+          pulling: false,
+          underlying,
+          controller: undefined,
+        };
+        state.controller = {
           enqueue: (value) => {
-            if (this._closed) {
+            if (state.closed) {
               return;
             }
-            this._queue.push(value);
+            state.queue.push(value);
           },
           close: () => {
-            this._closed = true;
+            state.closed = true;
           },
           error: (reason) => {
-            this._errored = true;
-            this._error =
+            state.errored = true;
+            state.error =
               reason instanceof Error
                 ? reason
                 : new Error(String(reason ?? "ReadableStream error"));
-            this._closed = true;
+            state.closed = true;
           },
         };
+        StateSet(streamState, this, state);
         if (typeof underlying.start === "function") {
-          underlying.start(this._controller);
-        }
-      }
-
-      async _maybePull() {
-        if (this._closed || this._pulling) {
-          return;
-        }
-        if (typeof this._underlying.pull === "function") {
-          this._pulling = true;
-          try {
-            await this._underlying.pull(this._controller);
-          } finally {
-            this._pulling = false;
-          }
+          underlying.start(state.controller);
         }
       }
 
       getReader() {
-        const stream = this;
+        const state = stateOf(this);
         return {
           async read() {
-            if (stream._queue.length === 0 && !stream._closed) {
-              await stream._maybePull();
+            if (state.queue.length === 0 && !state.closed) {
+              await maybePull(state);
             }
-            if (stream._queue.length > 0) {
-              const value = stream._queue.shift();
+            if (state.queue.length > 0) {
+              const value = state.queue.shift();
               return { done: false, value };
             }
-            if (stream._errored) {
-              throw stream._error || new Error("ReadableStream error");
+            if (state.errored) {
+              throw state.error || new Error("ReadableStream error");
             }
             return { done: true, value: undefined };
           },
           async cancel(reason) {
-            stream._closed = true;
-            if (typeof stream._underlying.cancel === "function") {
-              await stream._underlying.cancel(reason);
+            state.closed = true;
+            if (typeof state.underlying.cancel === "function") {
+              await state.underlying.cancel(reason);
             }
           },
         };
@@ -886,6 +965,8 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // get its constructor called (with the stream id and the pull closure) when the host hands a
   // Python stream to JavaScript, which can happen inside a bind.
   const ReadableStreamCtor = globalThis.ReadableStream;
+  // Defined after the built-in scan above, and just as much a built-in for the namespace check.
+  markIntrinsic(ReadableStreamCtor, 1);
 
   // Called by `revive` directly and by the Rust converter through the fixed global below. The
   // underlying source has no prototype, so the constructor's reads of `start`, `type` or
