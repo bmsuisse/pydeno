@@ -30,6 +30,19 @@ from ._pydeno import (
 )
 
 if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
+    from ._aio_front import AsyncPydeno, AsyncPydenoSession, AsyncPydenoSnapshot
+    from ._front import (
+        Pydeno,
+        PydenoComplete,
+        PydenoCrashedError,
+        PydenoError,
+        PydenoLimits,
+        PydenoRuntimeError,
+        PydenoSession,
+        PydenoSnapshot,
+        PydenoSyntaxError,
+        PydenoTimeoutError,
+    )
     from ._agent import (
         AgentSandbox,
         Done,
@@ -71,6 +84,19 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
 # keeps start-up small for plain `Runtime` users and for the isolation worker (which has no use for
 # the parent-side machinery: subprocess, tempfile, asyncio, ...).
 _LAZY = {
+    "Pydeno": "_front",
+    "PydenoSession": "_front",
+    "PydenoSnapshot": "_front",
+    "PydenoComplete": "_front",
+    "PydenoLimits": "_front",
+    "PydenoError": "_front",
+    "PydenoRuntimeError": "_front",
+    "PydenoSyntaxError": "_front",
+    "PydenoCrashedError": "_front",
+    "PydenoTimeoutError": "_front",
+    "AsyncPydeno": "_aio_front",
+    "AsyncPydenoSession": "_aio_front",
+    "AsyncPydenoSnapshot": "_aio_front",
     "AgentSandbox": "_agent",
     "ToolCall": "_agent",
     "Done": "_agent",
@@ -391,6 +417,19 @@ def bind_object(name: str, obj: dict) -> dict[str, int]:
 
 
 __all__ = [
+    "Pydeno",
+    "AsyncPydeno",
+    "PydenoSession",
+    "AsyncPydenoSession",
+    "PydenoSnapshot",
+    "AsyncPydenoSnapshot",
+    "PydenoComplete",
+    "PydenoLimits",
+    "PydenoError",
+    "PydenoRuntimeError",
+    "PydenoSyntaxError",
+    "PydenoCrashedError",
+    "PydenoTimeoutError",
     "classify_error",
     "ErrorInfo",
     "check_source",
