@@ -73,7 +73,8 @@ def test_python_side_failure_releases_unwrapped_handles() -> None:
     # Converts on the runtime thread, then fails in Python (the date is past year 9999).
     with Runtime() as rt:
         for _ in range(50):
-            with pytest.raises((ValueError, OverflowError, RuntimeError)):
+            # Windows reports an out-of-range date as OSError, other platforms as ValueError/OverflowError.
+            with pytest.raises((ValueError, OverflowError, OSError, RuntimeError)):
                 rt.eval("[() => 1, new Date(8.64e15), () => 2, new ReadableStream()]")
         gc.collect()
         rt.eval("0")  # finalizers of handles wrapped before the failure have run by now
