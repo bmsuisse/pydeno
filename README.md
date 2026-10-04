@@ -2,9 +2,9 @@
 
 # pydeno
 
-### The JavaScript sandbox for AI agents' code mode: secure, fast, easy.
+### The sandbox for AI-written JavaScript: charts, graphs, 3D and rich UI libraries. Secure, fast, easy.
 
-Let a model write code, run it in a real V8 inside an OS-sandboxed worker, and get the result back, with the tools you choose as its only way out.
+Let a model write code, run it in a real V8 inside an OS-sandboxed worker, and get the result back, with the tools you choose as its only way out. Plain logic? Use Monty. Real JavaScript libraries? Use pydeno.
 
 [![Tests](https://github.com/bmsuisse/pydeno/actions/workflows/test.yml/badge.svg)][workflows-tests]
 [![PyPI](https://img.shields.io/pypi/v/pydeno.svg)][pydeno-pypi]
@@ -42,6 +42,10 @@ If you know [Monty][monty], you already know `Pydeno`: the same `Pydeno` / `chec
 `feed_start` / `dump` shape, for JavaScript. Where Monty runs a Python subset, pydeno runs **real, modern
 JavaScript** (V8, the engine behind Chrome and Node), so model-written code behaves like JavaScript and real
 libraries (Vega, ECharts, three.js, d3, pptxgenjs) run unmodified.
+
+**Which one?** Use Monty by default: for plain logic it is smaller, starts in microseconds and needs no
+process. Reach for pydeno when the code needs the JavaScript ecosystem: rich UI, charts, graphs, 3D and
+documents. They also work side by side (see the [comparison](docs/alternatives.md)).
 
 |  |  |
 |---|---|
