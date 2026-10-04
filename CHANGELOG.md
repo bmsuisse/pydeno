@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.0 — 2026-10-04
+
+Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change
+behaviour you have today, and [`docs/roadmap.md`](docs/roadmap.md) for where this is going.
+
+### Added
+
+- **`AsyncIsolatedRuntime`**: an asyncio-native isolated runtime. Pipes on the event loop, one shared
+  supervisor task per loop, no thread per runtime; cancelling a call kills the worker. On macOS (1 to 64
+  runtimes) it was 1.4 to 2 times faster and the worst event-loop stall fell from 116 to 335 ms to 1 to 12 ms.
+- **`AsyncAgentSandbox`** and **`SessionPool`**: async agent sessions, and a pool with a pluggable journal
+  store, TTL, per-owner cap, LRU and a rollback counter (a stale journal is refused). `InMemoryJournalStore`
+  is included; a Redis-protocol store is shown in the docs.
+- **`ExecutionResult`** from `AgentSandbox.execute()` and `IsolatedRuntime.execute()`: status, stdout, stderr,
+  result, error, error type, with ordered console capture capped by `max_output_bytes` and a result cap that
+  fails the run with `ResultTooLarge` while the session stays usable.
+- **Crash-safe journals**: `dump()` after a crash, timeout or kill returns the last good journal plus a `lost`
+  record; `load()` charges the lost run's tool calls, so a crash cannot refund a tool budget.
+- **JSON-Schema tools and a lazy tool catalog** (`SchemaTool`, `tools_catalog=`): only `search_tools` and
+  `describe_tool` are declared up front, the declared surface is constant-size, and an undiscovered tool is
+  refused with a typed error.
+- **`sandbox_status()`**, **`classify_error()`** (25 stable error kinds, only worker crashes are retryable) and
+  **`check_source()`** (an advisory pre-check, never a security boundary).
+- Docs: upgrade guide, error kinds, async guides, roadmap to 1.0, pinned size and SHA-256 for every vendored bundle.
+- A Platforms CI workflow: native Ubuntu (x86_64 and arm64), macOS (arm64 and Intel) and Windows, Python 3.10 to 3.14.
+
+### Changed
+
+- A JS `Map`, `WeakMap`, `WeakSet` or `Error` result now raises instead of becoming an empty dict.
+- `dump()` after a crash returns the last good journal instead of raising.
+- The worker's seccomp filter denies `memfd_create` (memory the RSS poll could not see).
+- The sandbox self-test refuses to run in an orphaned worker.
+
+### Fixed
+
+- A guest that caught a public pydeno error (wrong arity, unknown catalog tool) made its own session
+  unrestorable (`ReplayDivergence` on `load()`); replay no longer redacts a recorded error twice.
+- A tool call buffered from a worker that had already died could still run its tool.
+- Flaky memory-limit and loop-stall tests.
+
 ## 0.6.1 — 2026-10-04
 
 Hotfix.

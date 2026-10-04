@@ -44,6 +44,23 @@ The changelog says "no breaking changes: every new limit is opt-in and `Runtime`
 | Forked children forget the parent's workers; `eval_async` uses a thread of its own | `IsolatedRuntime` | Pre-fork servers that shared a runtime with children | Create the runtime after the fork |
 | New `AgentSandbox`, `pydeno.integrations.pydantic_ai`, optional extra `pydantic-ai` | new | Adopters | See [Agent sessions](agent-sessions.md) |
 
+## 0.6.x to 0.7.0
+
+Mostly additions (async classes, results, schema tools, diagnostics). Four things can change behaviour
+you have today.
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| A JS `Map`, `WeakMap`, `WeakSet` or `Error` crossing the boundary **raises** (`Cannot serialize ...`); it used to become an empty dict silently | both | Code that returned one of these and got `{}` | Convert first: `Object.fromEntries(map)`, `[...map]`, `{name: e.name, message: e.message}` |
+| `AgentSandbox.dump()` after a crash, timeout or kill **returns** the last good journal plus a `lost` record; it used to raise | `AgentSandbox` | Code that relied on the error to detect a dead session | Check `is_closed()`; `load()` charges the lost run's tool calls (no budget refund) |
+| `AgentSandbox` always routes `console.*` through the parent, and `Done`/`Failed` carry the console output (left out of equality) | `AgentSandbox` | A host that set `max_host_calls`: console calls now count against it | Raise the cap, or stop logging in a loop |
+| Messages pydeno writes itself (catalog guidance, wrong-argument `TypeError`) are not hidden by `redact_host_errors`; errors from host tools are still redacted | `AgentSandbox` | Code that matched on the generic "host function failed" text for those | Match on the error class |
+| The worker's seccomp filter denies `memfd_create` | `IsolatedRuntime` (Linux) | Nobody running normal JavaScript | Nothing |
+| New: `AsyncIsolatedRuntime`, `AsyncAgentSandbox`, `SessionPool`, `ExecutionResult`, `SchemaTool` and the lazy catalog, `sandbox_status()`, `classify_error()`, `check_source()` | new | Adopters | See the [async guide](advanced/async.md), [async agent sessions](advanced/async-agent-sessions.md) and the [reference](../reference/error-kinds.md) |
+
+0.6.1 fixed a macOS-only bug: the sandboxed worker aborted at start on Python 3.10 to 3.12. If you are on
+0.6.0 there, upgrade.
+
 ## Safe to bump?
 
 **From 0.4.x to 0.5.0** (`Runtime` users: nothing to change)
