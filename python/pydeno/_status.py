@@ -11,7 +11,7 @@ worker does before it creates its isolate, and nothing more:
    everything that applies one happens in a process that exits straight afterwards);
 2. in a second forked child hardened like a worker, read its resident memory, CPU time and thread count
    the way the supervisor reads a worker's (`/proc` on Linux, `proc_pidinfo` on macOS), because a
-   limit that cannot be measured never fires;
+   limit that cannot be measured never fires; then verify SIGKILL authority on that child;
 3. in the caller, ask the kernel for its Landlock ABI version (a version query changes nothing).
 
 It never raises, waits at most about a second even if a probe hangs, and reaps every child it
@@ -22,7 +22,8 @@ finish.
 
 `complete` is what `sandbox="require"` would accept: every layer in
 `_sandbox.REQUIRED_LAYERS` for this platform applied, the startup self-test found nothing the
-sandbox should have stopped, the worker's resource usage can be read, and (Linux) the process is
+sandbox should have stopped, the worker's resource usage can be read and the hardened probe can
+be terminated, and (Linux) the process is
 either not root or can drop root.
 """
 
@@ -82,6 +83,9 @@ class SandboxStatus:
     self_test: Layer  # the startup attestation found no forbidden operation working
     complete: bool
     warnings: list[str] = field(default_factory=list)
+    termination: Layer = field(
+        default_factory=lambda: Layer(False, "termination authority was not probed")
+    )
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -103,6 +107,8 @@ class SandboxStatus:
             + (
                 "COMPLETE, sandbox='require' will start."
                 if self.complete
+                else "INCOMPLETE, worker startup refuses in all sandbox modes."
+                if not self.termination.applied
                 else "INCOMPLETE, sandbox='require' would refuse to start."
             ),
             f"  applied in probe: {self.applied}; required here: {sorted(self.required) or 'nothing known'}",
@@ -133,6 +139,7 @@ _LAYER_FIELDS = (
     "no_new_privs",
     "privileges",
     "resource_probes",
+    "termination",
     "self_test",
 )
 
@@ -299,6 +306,13 @@ def _measure_resource_probes(deadline: float) -> tuple[dict[str, Any], str]:
             "cpu": _sandbox.cpu_seconds(pid),
             "threads": _sandbox.thread_count(pid),
         }
+        # Exercise SIGKILL on this disposable child rather than infer authority from uid or
+        # capability names. If denied, closing the control pipe still lets it exit normally.
+        try:
+            os.kill(pid, signal.SIGKILL)
+            result["termination"] = True
+        except OSError:
+            result["termination"] = False
     finally:
         os.close(ready_r)
         os.close(w)  # the child's select returns; it exits
@@ -509,6 +523,12 @@ def _sandbox_status() -> SandboxStatus:
         )
 
     res, res_note = _measure_resource_probes(_PROBE_DEADLINE)
+    termination = Layer(
+        res.get("termination") is True,
+        "SIGKILL of a hardened probe child succeeded"
+        if res.get("termination") is True
+        else res_note or "supervisor termination authority is unavailable",
+    )
     unreadable = [
         label
         for key, label in (
@@ -543,6 +563,7 @@ def _sandbox_status() -> SandboxStatus:
         and not _sandbox.missing_layers(applied)
         and self_test.applied
         and resource_probes.applied
+        and termination.applied
         and (not linux or privileges.applied)
     )
 
@@ -564,6 +585,10 @@ def _sandbox_status() -> SandboxStatus:
     if not resource_probes.applied:
         warns.append(
             "the worker's resource limits cannot be enforced here; sandbox='require' refuses to start"
+        )
+    if not termination.applied:
+        warns.append(
+            f"{termination.detail}; worker startup refuses in all sandbox modes"
         )
     if ran_probe and breaches:
         warns.append(
@@ -589,6 +614,7 @@ def _sandbox_status() -> SandboxStatus:
         no_new_privs=no_new_privs,
         privileges=privileges,
         resource_probes=resource_probes,
+        termination=termination,
         self_test=self_test,
         complete=complete,
         warnings=warns,

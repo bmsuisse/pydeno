@@ -365,7 +365,7 @@ def _start_failure(exc: BaseException, sandbox: str) -> PydenoCrashedError:
         " Run pydeno.sandbox_status() to see which OS sandbox layers this machine lacks. "
         "Pydeno(sandbox='auto') runs with whatever the platform offers, which is weaker "
         "containment for untrusted code (a documented risk, never the default)."
-        if sandbox == "require"
+        if sandbox == "require" and "termination authority" not in str(exc)
         else ""
     )
     return PydenoCrashedError(f"could not start a sandboxed worker: {exc}.{hint}", exc)

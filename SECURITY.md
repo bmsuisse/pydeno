@@ -88,6 +88,20 @@ with `sandbox_status()` and `sandbox="require"`; do not assume root or a contain
 grants access. This is a startup check, not a promise that later procfs or credential changes
 are harmless.
 
+## Supervisor termination authority
+
+Both isolated runtimes check signal permission against the actual worker after startup
+hardening, before accepting guest commands or handing the worker to a pool. If permission is
+missing, startup refuses in every sandbox mode with a non-retryable `sandbox_unavailable`
+error. The still-trusted worker receives a close command and is reaped.
+
+`sandbox_status().termination` additionally tests SIGKILL against a disposable hardened child.
+Missing authority makes `complete` false. These are startup checks: the supervisor must retain
+its signal permissions throughout each worker's lifetime. Signal zero on the actual worker
+checks current permission; it is not a proof against later credential changes or a host policy
+that distinguishes individual signal numbers. Validate custom host policies with the status
+probe and deployment tests as well.
+
 ## Deploying it: the outer boundary
 
 The in-process layers contain a V8 bug to the worker; they do not stop an attacker who chains it

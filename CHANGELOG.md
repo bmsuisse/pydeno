@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Refuse isolated worker startup when the supervisor lacks signal authority, in every sandbox
+  mode. `sandbox_status().termination` reports a hardened-child termination probe; refusal is
+  classified as non-retryable `sandbox_unavailable` (#71).
+
 - Bound the async parent's queued frame count as well as payload bytes (#65). Empty or tiny
   frames from a compromised worker now trigger backpressure while the consumer is idle.
 

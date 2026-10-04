@@ -72,6 +72,7 @@ with `Pydeno` and file the building blocks under "Advanced".
 
 | Change | Affects | Who notices | What to change |
 |---|---|---|---|
+| A supervisor without worker termination authority is refused in every sandbox mode | `IsolatedRuntime`, async and front doors | Startup raises non-retryable `sandbox_unavailable`, including `auto` and `off` | Restore signal permission to the hardened worker; changing sandbox mode cannot restore enforcement |
 | New: `Pydeno`, `AsyncPydeno`, `PydenoSession`, `AsyncPydenoSession`, `PydenoSnapshot`, `AsyncPydenoSnapshot`, `PydenoComplete`, `PydenoLimits` and the `PydenoError` family | new | Adopters | See the [front-door guide](quickstart-pydeno.md); a Monty user can keep their code's shape |
 | `AgentSandbox` / `AsyncAgentSandbox` accept `runtime=` (an already-built, fresh runtime, such as a pool checkout) | new, opt-in | Nobody unless passed | Nothing |
 | `classify_error()` sees through a `PydenoError` to the pydeno exception it wraps | new | Nobody | Nothing |
