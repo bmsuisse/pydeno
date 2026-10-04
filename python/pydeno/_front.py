@@ -1098,7 +1098,11 @@ def _close_pool(budget: _ThreadBudget) -> None:
 
 
 def _check_pool_arguments(
-    min_processes: int, sandbox: str, jitless: bool, dump_key: bytes | None
+    min_processes: int,
+    sandbox: str,
+    jitless: bool,
+    dump_key: bytes | None,
+    strict_eval: bool = False,
 ) -> bytes:
     # A session freezes the guest's clock with the worker's own script (`_SessionBase._install`):
     # import it now, not inside the first checkout.
@@ -1108,6 +1112,8 @@ def _check_pool_arguments(
         raise ValueError("sandbox must be 'require' (the default), 'auto' or 'off'")
     if not isinstance(jitless, bool):
         raise TypeError("jitless must be a bool")
+    if not isinstance(strict_eval, bool):
+        raise TypeError("strict_eval must be a bool")
     if (
         isinstance(min_processes, bool)
         or not isinstance(min_processes, int)
@@ -1147,6 +1153,10 @@ class Pydeno:
         jitless: Run V8 without its JIT compiler or WebAssembly (default True), which removes the
             largest class of V8 exploits. ``False`` is faster on heavy compute and is a risk you
             take explicitly.
+        strict_eval: Forbid code generation from strings in the guest (default False): ``eval``
+            and ``new Function`` throw ``EvalError``. Every worker of the pool gets it, and
+            `dump()` records it: a dump made with it loads only into a pool with it, and the
+            other way round. See `IsolatedRuntime(strict_eval=...)`.
         dump_key: The key `dump()` signs session state with (HMAC-SHA256, at least 16 bytes) and
             `load_session` / `load_snapshot` check. Default: a random key per `Pydeno`, so state
             loads only into the pool that dumped it; pass your own (from a secret store) to load
@@ -1173,10 +1183,13 @@ class Pydeno:
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
+        strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
     ) -> None:
-        self._key = _check_pool_arguments(min_processes, sandbox, jitless, dump_key)
+        self._key = _check_pool_arguments(
+            min_processes, sandbox, jitless, dump_key, strict_eval
+        )
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
@@ -1184,6 +1197,7 @@ class Pydeno:
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
+            "strict_eval": strict_eval,
             "max_memory": self._limits.max_memory,
         }
         _open_pool(

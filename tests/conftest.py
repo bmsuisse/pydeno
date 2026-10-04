@@ -56,6 +56,7 @@ collect_ignore = (
         "test_aio_isolated_runtime.py",
         "test_aio_agent.py",
         "test_session_pool.py",
+        "test_strict_eval.py",
         "test_sandbox_pool.py",
         "test_agent_execution_result.py",
         "test_agent_journal_recovery.py",

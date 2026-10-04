@@ -18,7 +18,7 @@ The rules that keep a pool as safe as a fresh runtime:
   background as soon as a runtime is handed out.
 
 Options split in two. Whatever the worker receives at start-up (the `RuntimeConfig`, `sandbox`,
-`jitless`, `v8_flags`, `clock`, `random_seed`, `max_memory`, console routing, ...) is fixed per
+`jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing, ...) is fixed per
 pool: use one pool per such configuration. The options that only the parent enforces
 (`SESSION_OPTIONS`: deadlines, host-call budgets, error redaction, ...) can be set per checkout.
 """
