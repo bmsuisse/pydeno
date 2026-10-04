@@ -48,6 +48,7 @@ nav:
           - Upgrading: guides/upgrading.md
           - Advanced:
               - Isolated runtime: guides/advanced/isolation.md
+              - Async isolated runtime: guides/advanced/async.md
               - WebAssembly: guides/advanced/webassembly.md
               - Snapshots: guides/advanced/snapshots.md
               - Inspector: guides/advanced/inspector.md
@@ -63,6 +64,7 @@ nav:
   - Reference:
       - Error kinds: reference/error-kinds.md
       - Pre-check and sandbox status: reference/preflight-and-status.md
+  - Roadmap to 1.0: roadmap.md
   - API Reference:
       - pydeno Module: api/pydeno.md
       - Runtime: api/runtime.md

@@ -91,10 +91,14 @@ choice, not a library feature, so build them around pydeno:
         --cap-drop all --security-opt no-new-privileges \
         --pids-limit 256 --memory 2g --cpus 2  your-image
 
-  For a PID and cgroup namespace around the worker (which pydeno does not create itself), pass a
-  wrapper as `IsolatedRuntime(python=...)`, a script that ends in `exec python "$@"` after
-  `bwrap --unshare-pid --unshare-cgroup ...` (untested here). The worker already runs in its own
-  session, so TIOCSTI is not reachable, and the seccomp filter denies it regardless.
+  **Do not wrap the worker** (for example `IsolatedRuntime(python="bwrap ... python")`). The parent
+  measures the process it started: behind a wrapper that is `bwrap` (1 MiB, one thread, no CPU time),
+  not the worker (hundreds of MiB, nine threads), so `max_memory`, the CPU cap and the thread cap all go
+  blind; the worker also loses its own empty-root layer, and `sandbox="require"` does not notice. Put
+  the **whole host process** inside the container, microVM or `systemd-run --user --scope -p
+  MemoryMax=... -p TasksMax=...` instead, so the outer limits wrap everything pydeno starts. The worker
+  already runs in its own session, so TIOCSTI is not reachable, and the seccomp filter denies it
+  regardless.
   Add gVisor (`--runtime runsc`) or a microVM (Firecracker, Kata) when a kernel boundary is
   required. pydeno's seccomp filter and Landlock apply inside any of them.
 

@@ -41,6 +41,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         typescript_stubs,
     )
     from ._errors import ErrorInfo, classify_error
+    from ._aio import AsyncIsolatedRuntime
     from ._isolated import IsolatedRuntime, WorkerCrashed
     from ._polyfills import WEB_POLYFILLS
     from ._preflight import Finding, PreflightResult, check_source
@@ -64,6 +65,7 @@ _LAZY = {
     "JournalError": "_agent",
     "describe_tools": "_agent",
     "typescript_stubs": "_agent",
+    "AsyncIsolatedRuntime": "_aio",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
     "WEB_POLYFILLS": "_polyfills",
@@ -369,6 +371,7 @@ __all__ = [
     "sandbox_status",
     "SandboxStatus",
     "Layer",
+    "AsyncIsolatedRuntime",
     "eval",
     "eval_async",
     "get_default_runtime",
