@@ -135,7 +135,7 @@ try:
                 return [chunk async for chunk in stream]
 
             out = asyncio.run(read())
-    print("OK", type(out).__name__)
+    print("OK", type(out).__name__, len(repr(out)))
 except Exception as exc:
     print("ERR", type(exc).__name__, str(exc)[:200].replace("\n", " "))
 print("TOOK", round(time.monotonic() - started, 2))
@@ -179,8 +179,79 @@ def test_a_proxy_around_a_huge_indexed_result_is_refused_up_front(
 def test_a_proxy_around_a_huge_indexed_argument_is_refused_up_front(expr: str) -> None:
     outcome, took = _child("eval", f"f({expr})")
     assert outcome.startswith("ERR"), outcome
-    assert "too large" in outcome, outcome
+    # The bridge's argument cap, or (a typed array reaching the host as bytes) the host's byte limit.
+    assert "too large" in outcome or "Serialization size" in outcome, outcome
     assert took < QUICK, (took, outcome)
+
+
+# --- round 2 of the review: traps that run during conversion ----------------------------------------------
+# Conversion now unwraps a Proxy natively to its innermost target and converts that, running no trap:
+# an `ownKeys` trap that grows a resizable buffer after any check, a Proxy that hides an Array from the
+# array branch, or one that answers `[]` while V8 lists its target to check the invariants, all had a
+# trap or a native listing the budget did not see.
+
+_GROWING = (
+    "(() => { const b = new ArrayBuffer(0, {maxByteLength: 2 ** 24}); const ta = new Int8Array(b);"
+    " return new Proxy(ta, {ownKeys(t) { b.resize(2 ** 24); return [] }}) })()"
+)
+_ROUND2 = {
+    "trap_grows_buffer": _GROWING,
+    "nested_trap_grows_buffer": f"new Proxy({_GROWING}, {{}})",
+    "proxy_around_array": "new Proxy(new Array(2 ** 22).fill(0), {})",
+    "empty_ownkeys_repeated": (
+        "(() => { const p = new Proxy(new Int8Array(2 ** 20 - 1), {ownKeys() { return [] }});"
+        " return Array(200).fill(p) })()"
+    ),
+}
+
+
+def _small_or_refused(outcome: str) -> bool:
+    if outcome.startswith("ERR"):
+        return True
+    return int(outcome.split()[2]) < 10_000
+
+
+@pytest.mark.parametrize("mode", ["eval", "async", "stream", "arg"])
+@pytest.mark.parametrize("name", sorted(_ROUND2))
+def test_a_proxy_trap_cannot_slip_work_past_the_budget(mode: str, name: str) -> None:
+    expr = _ROUND2[name]
+    source = {
+        "eval": expr,
+        "async": f"Promise.resolve({expr})",
+        "stream": expr,
+        "arg": f"f({expr})",
+    }[mode]
+    outcome, took = _child(
+        "stream" if mode == "stream" else "eval" if mode == "arg" else mode, source
+    )
+    assert took < QUICK, (took, outcome)
+    assert _small_or_refused(outcome), outcome
+
+
+def test_conversion_runs_no_proxy_trap() -> None:
+    with Runtime(RuntimeConfig(timeout=TIMEOUT)) as rt:
+        rt.bind_function("f", lambda *a: a[0])
+        rt.eval(
+            "globalThis.hits = 0; globalThis.trap = () => { hits++; return 'TRAP' }; 0"
+        )
+        handler = "{get: trap, ownKeys() { hits++; return ['a'] }, getOwnPropertyDescriptor() { hits++ }}"
+        assert rt.eval(f"new Proxy({{a: 1}}, {handler})") == {"a": 1}
+        assert rt.eval(f"f(new Proxy({{a: 1}}, {handler}))") == {"a": 1}
+        assert rt.eval(f"new Proxy([1, 2], {handler})") == [1, 2]
+        assert rt.eval("hits") == 0
+
+
+def test_a_revoked_proxy_and_a_deep_proxy_chain_are_refused_by_name() -> None:
+    with Runtime() as rt:
+        rt.bind_function("f", lambda *a: a[0])
+        revoked = "(() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy })()"
+        deep = "(() => { let p = {}; for (let i = 0; i < 100; i++) p = new Proxy(p, {}); return p })()"
+        for source in (revoked, f"f({revoked})"):
+            with pytest.raises(Exception, match="revoked Proxy"):
+                rt.eval(source)
+        for source in (deep, f"f({deep})"):
+            with pytest.raises(Exception, match="Proxy chain too deep"):
+                rt.eval(source)
 
 
 def test_a_proxy_around_a_huge_typed_array_is_refused_by_the_isolated_worker() -> None:
@@ -203,6 +274,7 @@ def test_small_proxied_values_still_convert() -> None:
         assert rt.eval("new Proxy(new String('ab'), {})") == {"0": "a", "1": "b"}
         assert rt.eval("f(new Proxy(new String('ab'), {}))") == {"0": "a", "1": "b"}
         assert rt.eval("f(new Proxy({a: 1}, {}))") == {"a": 1}
+        assert rt.eval("new Proxy([1, 2], {})") == [1, 2]  # its target, an array
 
 
 def _largest_accepted(rt: Runtime, template: str, high: int) -> int:
@@ -245,8 +317,10 @@ def test_a_raised_budget_does_not_bring_back_the_unbounded_listing() -> None:
     assert outcome.startswith("ERR"), outcome
     assert "elements" in outcome, outcome
     assert took < QUICK, (took, outcome)
+    # (A proxied typed array argument now crosses as its target's bytes, a copy within the raised
+    # budget; a boxed string is still listed, so it must still meet the fixed argument cap.)
     outcome, took = _child(
-        "eval", "f(new Proxy(new Int8Array(2 ** 24), {}))", budget=2**31
+        "eval", "f(new Proxy(new String('x'.repeat(2 ** 24)), {}))", budget=2**31
     )
     assert outcome.startswith("ERR"), outcome
     assert "too large" in outcome, outcome

@@ -455,30 +455,58 @@ fn to_js(result: Py<PyAny>, limits: &SerializationLimits) -> Result<JSValue, JsE
 /// not grow with a budget the caller raised for other reasons.
 pub(crate) const MAX_INDEXED_ELEMENTS: usize = 1 << 20;
 
-/// Proxy chains longer than this are treated as unbounded: nothing legitimate nests that deep,
-/// and listing the keys of a chain walks every link natively.
+/// Proxy chains longer than this are refused: nothing legitimate nests that deep.
 const MAX_PROXY_CHAIN: usize = 64;
 
-/// How many index properties listing `value`'s own keys produces without them being stored: a
-/// typed array's element count, or a boxed string's length, looking through any Proxy around it
-/// (a Proxy without an `ownKeys` trap forwards the listing to its target). `usize::MAX` for a
-/// Proxy chain too long to follow. Runs no guest code: a Proxy's target, a typed array's length
-/// and the type checks are native, and a `String` object's `length` is its own non-configurable
-/// data property, which nothing can shadow.
-pub(crate) fn indexed_length(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<'_, v8::Value>,
-) -> usize {
+/// The innermost target of `value` if it is a Proxy (else `value` itself), found natively.
+///
+/// A value crossing the boundary is converted as its target, and no trap runs: a trap could grow
+/// a resizable buffer after its size was checked, hide an Array from the metered array branch,
+/// or answer `ownKeys` with `[]` while V8 lists the whole target natively to check the
+/// invariants, and the converter cannot interrupt any of that. The target is exactly what the
+/// guest could have returned itself.
+pub(crate) fn proxy_target<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
     let mut current = value;
     let mut links = 0;
     while let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(current) {
         links += 1;
         if links > MAX_PROXY_CHAIN {
-            return usize::MAX;
+            return Err(format!(
+                "Cannot serialize a value behind more than {MAX_PROXY_CHAIN} Proxies \
+                 (Proxy chain too deep)"
+            ));
         }
-        // A revoked Proxy's target is null: nothing to list.
+        if proxy.is_revoked() {
+            return Err("Cannot serialize a revoked Proxy".to_string());
+        }
         current = proxy.get_target(scope);
     }
+    Ok(current)
+}
+
+/// `proxy_target` for the bridge's argument copy (`prepare` in the bridge script), which has no
+/// other way to see through a Proxy without running its traps.
+#[op2]
+fn op_pydeno_proxy_target<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<v8::Local<'s, v8::Value>, JsErrorBox> {
+    proxy_target(scope, value).map_err(JsErrorBox::type_error)
+}
+
+/// How many index properties listing `value`'s own keys produces without them being stored: a
+/// typed array's element count, or a boxed string's length. Callers unwrap a Proxy first
+/// (`proxy_target`). Runs no guest code: a typed array's length and the type checks are native,
+/// and a `String` object's `length` is its own non-configurable data property, which nothing can
+/// shadow.
+pub(crate) fn indexed_length(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> usize {
+    let current = value;
     if let Ok(typed_array) = v8::Local::<v8::TypedArray>::try_from(current) {
         return typed_array.length();
     }
@@ -495,7 +523,7 @@ pub(crate) fn indexed_length(
 }
 
 /// `indexed_length` for the bridge's argument copy (`prepare` in the bridge script), which has no
-/// other way to see through a Proxy.
+/// native way to read a boxed string's length.
 #[op2]
 fn op_pydeno_indexed_length<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
@@ -628,6 +656,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   const SetForEach = uncurry(Set.prototype.forEach);
   const SetAdd = uncurry(Set.prototype.add);
   const IndexedLength = ops.op_pydeno_indexed_length;
+  const ProxyTarget = ops.op_pydeno_proxy_target;
   const PromiseThen = uncurry(Promise.prototype.then);
   const DateCtor = Date;
   const SetCtor = Set;
@@ -676,6 +705,12 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   function prepare(value, path, depth) {
     const at = path === undefined ? "argument" : path;
     const level = depth === undefined ? 0 : depth;
+    // A Proxy crosses as its innermost target, found natively, and none of its traps runs: a trap
+    // could grow a buffer after its size was checked, or make `Object.entries` list a whole target
+    // natively while answering `[]`. Throws for a revoked Proxy or a chain too deep.
+    if (IsProxy(value)) {
+      value = ProxyTarget(value);
+    }
     if (typeof value === "function") {
       rejectFunction(at);
     }
@@ -1481,6 +1516,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
             op_pydeno_stream_pull_py(),
             op_pydeno_stream_cancel_py(),
             op_pydeno_indexed_length(),
+            op_pydeno_proxy_target(),
             op_pydeno_buffer_charge(),
         ]),
         js_files: std::borrow::Cow::Owned(vec![ExtensionFileSource::new(

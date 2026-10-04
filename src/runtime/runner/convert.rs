@@ -2,7 +2,7 @@
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
-use crate::runtime::ops::{indexed_length, MAX_INDEXED_ELEMENTS};
+use crate::runtime::ops::{indexed_length, proxy_target, MAX_INDEXED_ELEMENTS};
 use crate::runtime::stream::JsStreamRegistry;
 use deno_core::error::JsError;
 use deno_core::v8;
@@ -196,6 +196,14 @@ impl Converter {
     ) -> RuntimeResult<JSValue> {
         tracker.enter()?;
 
+        // A Proxy is converted as its innermost target, and none of its traps runs (see
+        // `ops::proxy_target`): each reference then costs what converting the target costs.
+        let value = if value.is_proxy() {
+            proxy_target(scope, value).map_err(RuntimeError::internal)?
+        } else {
+            value
+        };
+
         let result = if value.is_undefined() {
             tracker.add_bytes(0)?;
             Ok(JSValue::Undefined)
@@ -368,12 +376,14 @@ impl Converter {
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             circular_check(seen, obj)?;
 
-            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings, also behind
-            // a Proxy, have one virtual own property per element: listing them for a 16 MB
-            // `Int8Array` builds 16 million index strings in one native call that termination
-            // cannot interrupt. So before the listing: every element costs at least one byte of
-            // key, checked against the budget (not added: the walk below charges the real cost),
-            // and a fixed cap bounds the listing however large the budget is.
+            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings have one
+            // virtual own property per element: listing them for a 16 MB `Int8Array` builds 16
+            // million index strings in one native call that termination cannot interrupt. So
+            // before the listing: every element costs at least one byte of key, checked against
+            // the budget, and a fixed cap bounds the listing however large the budget is. The
+            // check is not added to the total, because the walk below charges each key and value
+            // as it converts them. Nothing runs between the check and the listing: `value` is not
+            // a Proxy (unwrapped above), and listing an ordinary object's keys calls no getter.
             let indexed = indexed_length(scope, value);
             tracker.check_room(indexed)?;
             if indexed > MAX_INDEXED_ELEMENTS {
