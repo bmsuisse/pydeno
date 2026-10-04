@@ -2,6 +2,7 @@
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::ops::{indexed_length, proxy_target, MAX_INDEXED_ELEMENTS};
 use crate::runtime::stream::JsStreamRegistry;
 use deno_core::error::JsError;
 use deno_core::v8;
@@ -195,6 +196,14 @@ impl Converter {
     ) -> RuntimeResult<JSValue> {
         tracker.enter()?;
 
+        // A Proxy is converted as its innermost target, and none of its traps runs (see
+        // `ops::proxy_target`): each reference then costs what converting the target costs.
+        let value = if value.is_proxy() {
+            proxy_target(scope, value).map_err(RuntimeError::internal)?
+        } else {
+            value
+        };
+
         let result = if value.is_undefined() {
             tracker.add_bytes(0)?;
             Ok(JSValue::Undefined)
@@ -209,8 +218,12 @@ impl Converter {
                 .to_number(scope)
                 .ok_or_else(|| RuntimeError::internal("Failed to convert value to number"))?
                 .value();
-            // NaN/±Infinity and non-integral values stay floats.
-            if num_val.is_finite() && num_val.fract() == 0.0 && num_val as i64 as f64 == num_val {
+            // NaN/±Infinity, non-integral values and anything outside i64 stay floats. Not
+            // `num_val as i64 as f64 == num_val`: the cast saturates, and `i64::MAX as f64` rounds
+            // back up to 2**63, so 2**63 came back as 2**63 - 1.
+            const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+            if num_val.is_finite() && num_val.fract() == 0.0 && (-TWO_63..TWO_63).contains(&num_val)
+            {
                 tracker.add_bytes(20)?;
                 Ok(JSValue::Int(num_val as i64))
             } else {
@@ -362,6 +375,24 @@ impl Converter {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             circular_check(seen, obj)?;
+
+            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings have one
+            // virtual own property per element: listing them for a 16 MB `Int8Array` builds 16
+            // million index strings in one native call that termination cannot interrupt. So
+            // before the listing: every element costs at least one byte of key, checked against
+            // the budget, and a fixed cap bounds the listing however large the budget is. The
+            // check is not added to the total, because the walk below charges each key and value
+            // as it converts them. Nothing runs between the check and the listing: `value` is not
+            // a Proxy (unwrapped above), and listing an ordinary object's keys calls no getter.
+            let indexed = indexed_length(scope, value);
+            tracker.check_room(indexed)?;
+            if indexed > MAX_INDEXED_ELEMENTS {
+                return Err(RuntimeError::internal(format!(
+                    "Cannot serialize a typed array or String object of more than \
+                     {MAX_INDEXED_ELEMENTS} elements (whatever max_serialization_bytes is); \
+                     return a Uint8Array over its buffer, or a slice"
+                )));
+            }
 
             let prop_names = obj
                 .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())

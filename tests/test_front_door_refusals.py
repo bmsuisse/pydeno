@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import threading
 import time
 
@@ -199,6 +200,20 @@ async def test_a_slow_console_sink_holds_up_only_its_own_session() -> None:
 
 
 def _children() -> set[int]:
+    if sys.platform.startswith("linux"):
+        from pathlib import Path
+
+        # Workers may be spawned from any thread. Read our own task children rather than
+        # requiring procps/pgrep in minimal Linux images or inspecting a dropped worker's uid.
+        paths = list(Path("/proc/self/task").glob("*/children"))
+        assert paths, "procfs must expose the supervisor's child process lists"
+        children = set()
+        for path in paths:
+            try:
+                children.update(int(pid) for pid in path.read_text().split())
+            except FileNotFoundError:
+                pass  # the owning thread exited during enumeration
+        return children
     import subprocess
 
     out = subprocess.run(

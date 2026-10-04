@@ -79,6 +79,22 @@ Defaults: `sandbox="require"` (`pydeno.sandbox_status()` explains a refusal), ji
 30 s per feed, 512 MiB, 1000 external calls per session, and a worker never serves two sessions. The
 [front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit.
 
+**One door, the same names as Monty.** `Pydeno` and `AsyncPydeno` are the default path for everything; you
+should not need another class to run untrusted code.
+
+| You want | Call |
+|---|---|
+| A sandboxed session, warm and fast | `pool.checkout(limits=...)` |
+| Run a snippet, state persists | `session.feed_run(code, inputs=..., external_lookup=...)` |
+| Pause at every tool call (approvals) | `session.feed_start(...)`, then `snapshot.resume(value=...)` / `resume(error=...)` |
+| Save and continue elsewhere | `session.dump()`, then `session.load_session(state)` / `load_snapshot(state, ...)` (signed, replayed) |
+| Bound it | `limits={"max_feed_duration_secs": ..., "max_memory": ...}` (safe defaults already on) |
+| Sync or async | `Pydeno` or `AsyncPydeno`, same methods |
+
+The [front-door guide](docs/guides/quickstart-pydeno.md) maps every Monty name and limit. The lower-level
+classes (`IsolatedRuntime`, `AgentSandbox`, `SandboxPool`) stay available under
+[Which runtime?](#which-runtime).
+
 From a shell, the same sandboxed worker ([command line guide][guide-cli]):
 
 ```bash

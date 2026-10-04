@@ -96,6 +96,31 @@ and the red-team restrictions under Security; see
     (zero-width joiners and spaces, variation selectors, soft hyphen, BOM, Unicode tags, ...) become
     `?`. **Behaviour change** for output that contained them.
 
+- **Large indexed values are checked before they are expanded.** A typed array other than
+  `Uint8Array`, or a boxed `String` (also behind a Proxy), returned as a result or stream chunk or
+  passed to a host function, was expanded into one key per element in a single native call before the
+  serialization budget (or the host-call argument cap) was checked. A 16 MB value took hundreds of
+  megabytes and ran several times past `timeout=`; a Proxy around one, passed to a host function in
+  plain `Runtime`, could run V8 out of memory. Such values are now refused at once; small ones convert
+  as before. Upgrade note: whatever `max_serialization_bytes` is, a typed array or `String` object of
+  more than 1,048,576 elements is refused as a result (return a `Uint8Array` over its buffer instead).
+- **A Proxy crosses the boundary as its target, and no trap runs.** In a result, stream chunk or
+  host-function argument, a Proxy's traps ran during conversion, so guest code could act mid-conversion:
+  an `ownKeys` trap could grow a resizable buffer after its size was checked (16 million keys listed
+  past the budget), a Proxy hid an Array from the metered array path, and `ownKeys() { return [] }`
+  made the engine walk the whole target for free at every reference. A Proxy is now unwrapped natively
+  to its innermost target, which is converted instead; a revoked Proxy or a chain of more than 64 is
+  refused. Upgrade note: a Proxy whose traps synthesise values now arrives as its target's data, and a
+  Proxy around an Array arrives as a list (it used to be a dict of indices).
+- **`v8_flags` that cannot take effect are refused.** deno_core's start-up switches on `Temporal`,
+  `Float16Array`, explicit resource management, source-phase and deferred imports and the native
+  `queueMicrotask` after the worker's flags, so a flag such as `--no-harmony-temporal` was undone
+  while `IsolatedRuntime.v8_flags` listed it. `IsolatedRuntime` now raises `ValueError` before it
+  starts a worker. Upgrade note: code that passed one of these flags gets an error instead of a silent
+  no-op; remove the flag, or use the opt-in `v8_flags=["--no-js-shipping"]`, which does switch these
+  features off (together with the other newest ones; see the isolation guide).
+- Numbers outside the 64-bit integer range now come back as floats (`2**63` used to return
+  `2**63 - 1`).
 - **Limit values are validated.** Durations (`request_timeout`, `max_host_wait`, `write_stall_timeout`,
   `RuntimeConfig.timeout`, per-call `timeout=`, `AgentSandbox` `timeout`/`max_pause`, `SessionPool`
   `ttl`/`counter_ttl`/`eviction_interval`/`idle_timeout`, `PydenoLimits` seconds) must be `None` or a

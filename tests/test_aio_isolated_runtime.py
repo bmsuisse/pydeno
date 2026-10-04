@@ -551,18 +551,27 @@ class TestCancellationAndClose:
         self,
     ) -> None:
         async with await _rt() as rt:
-            first = asyncio.ensure_future(
-                rt.eval(
-                    "new Promise(r => r(1)); let s = 0; for (let i = 0; i < 3e7; i++) s++; s"
-                )
-            )
-            await asyncio.sleep(0)
-            queued = asyncio.ensure_future(rt.eval("2"))
-            await asyncio.sleep(0.05)
-            queued.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await queued
-            assert await first == 30_000_000
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def hold() -> int:
+                entered.set()
+                await release.wait()
+                return 1
+
+            await rt.bind_function("hold", hold)
+            first = asyncio.ensure_future(rt.eval("hold()"))
+            try:
+                # Keep the first command active without racing a machine-dependent CPU loop
+                # against the runtime timeout. The second task must be waiting for the slot.
+                await asyncio.wait_for(entered.wait(), 5)
+                queued = asyncio.ensure_future(rt.eval("2"))
+                await asyncio.sleep(0)
+                queued.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await queued
+            finally:
+                release.set()
+            assert await first == 1
             assert not rt.is_closed()
             assert await rt.eval("3") == 3
 
