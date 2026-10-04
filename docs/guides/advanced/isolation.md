@@ -66,6 +66,7 @@ affected.
 | **OS sandbox** (`sandbox=`) | A guest that escapes V8 still has no filesystem, network, new processes, or other process to touch |
 | **No privileges** | A worker started as root becomes `nobody` with an empty capability set |
 | **`--jitless` V8** (`jitless=`) | No JIT compiler (the source of most V8 exploits) and no WebAssembly |
+| **Strict eval** (`strict_eval=True`, opt-in) | No code created at run time from strings: `eval` and `new Function` throw |
 | **Empty environment, UTC, no core dumps** | No host secrets, no host timezone/locale, no memory dumps |
 | **Untrusted-frame decoder** | A compromised worker cannot crash, stall or exhaust the parent |
 | **`max_host_calls`** | An endless stream of cheap host calls cannot dodge the deadline |
@@ -126,8 +127,67 @@ much smaller target. The cost is speed on hot compute loops (about 3x on a recur
 microbenchmark) and **no WebAssembly**. If you need either, pass `jitless=False`; the other layers
 still apply, and `max_memory` still bounds WebAssembly memory.
 
-`v8_flags=[...]` passes extra flags to the worker (for example
-`--disallow-code-generation-from-strings`). Unknown flags are an error, not ignored.
+`v8_flags=[...]` passes extra flags to the worker. Unknown flags are an error, not ignored.
+
+### Strict eval: no code from strings
+
+```python
+IsolatedRuntime(config, strict_eval=True)       # also AsyncIsolatedRuntime, SandboxPool,
+Pydeno(strict_eval=True)                        # AgentSandbox, AsyncPydeno, ...
+```
+
+`strict_eval=True` forbids code generation from strings in the guest. `eval("...")`, indirect
+`(0, eval)(...)`, `new Function(...)` and the async, generator and async-generator function
+constructors all throw `EvalError: Code generation from strings disallowed for this context`,
+however the guest reaches them: through `(function(){}).constructor`, `[].constructor.constructor`,
+`Reflect.construct(Function, ...)`, a subclass of `Function`, or an alias of `eval` taken before
+shadowing it. The host's own `eval` / `execute` of a script, the bootstrap, and modules the host
+registers still run. It is off by default.
+
+It is V8's `--disallow-code-generation-from-strings`, appended after the hardening flags and frozen
+with them (`--freeze-flags-after-init`), so the guest cannot switch it back on. With
+`strict_eval=True`, `v8_flags` that switch either flag off (`--no-disallow-code-generation-from-strings`,
+`--no-freeze-flags-after-init`) are refused; `rt.strict_eval` says whether it is in force.
+
+**What it buys.** Code you trust cannot be made to turn data into code at run time: a string
+from a tool result, a user, or a model's output that reaches an `eval` or `new Function` in that
+code (yours, or a library's) throws instead of running. It is a guard for trusted code against
+injection, a hardening of the guest's behaviour, and **not a boundary against hostile guest code**:
+a guest that wants to run code it builds from data can ship its own interpreter written in
+JavaScript, which needs no `eval`. Against hostile code the boundary is the worker process and the
+OS sandbox, as everywhere else on this page.
+
+**What it does not buy.**
+
+- It removes **no engine code**. The parser, interpreter and every builtin are still there, and the
+  guest's own script is compiled as before. The OS sandbox and the process boundary stay the
+  containment.
+- **WebAssembly is not covered.** With `jitless=False` the guest can still compile and run Wasm
+  bytes in strict mode. With the default `jitless=True` there is no `WebAssembly` at all.
+- **`import()`** is not code generation to V8. It is the module loader's decision in either mode:
+  pydeno refuses every specifier the host did not register. A host resolver/loader that returns
+  source text chosen by the guest would create code from data despite strict mode.
+- **`setTimeout("code")`** never compiles its string anyway: `WEB_POLYFILLS` ignores a string
+  argument, and a bare isolate has no `setTimeout`.
+
+**It is a worker-spawn option.** A pool gives it to every worker it starts (including the cold
+starts) and refuses it per checkout. A session records it in its journal (only when it is on, so a
+default journal is unchanged), and loading a journal into a session with the other setting raises
+`JournalError` (`PydenoError` at the front door) before any guest code runs.
+
+**Libraries.** Measured on the vendored set: ECharts server-side rendering, d3, turf, three.js
+(with `GLTFExporter`), dagre and pptxgenjs work unchanged. Vega and Vega-Lite compile their
+expressions with `Function` and fail with `EvalError`; with Vega's CSP-safe expression interpreter
+(`vendor/libs/vega-interpreter-2.3.2.bundle.js`, loaded after Vega) they work:
+
+```javascript
+// load vega, vega-lite, then the interpreter bundle (it sets vega.expressionInterpreter)
+const runtime = vega.parse(vegaLite.compile(spec).spec, null, {ast: true});
+const view = new vega.View(runtime, {renderer: 'none', expr: vega.expressionInterpreter});
+const svg = await view.toSVG();
+```
+
+The interpreter needs `setTimeout` to exist when it loads (use `WEB_POLYFILLS`).
 
 ### Frozen clock and seeded random
 
@@ -171,8 +231,13 @@ trusted. Ordinary JavaScript errors and soft timeouts leave it usable.
 | Limit | Bounds | Effect |
 |---|---|---|
 | `max_heap_size` | the JS heap | the runtime is terminated |
-| `max_buffer_bytes` | live `ArrayBuffer` / `SharedArrayBuffer` bytes | a catchable `RangeError` |
+| `max_buffer_bytes` | live `ArrayBuffer` / `SharedArrayBuffer` bytes, resizable ones included (their committed size) | a catchable `RangeError` |
 | `max_memory` | worker RSS | the worker is killed |
+
+The resizable-buffer charge wraps the built-ins when the runtime starts. A host `SnapshotBuilder`
+bootstrap runs before that, so a native `ArrayBuffer` constructor or `resize`/`grow`/`transfer` it keeps a
+reference to (and hands to the guest) is not charged. Snapshot code is host code; do not expose such a
+reference to guest code. (`IsolatedRuntime` refuses snapshots.)
 
 ## What works across the boundary
 
@@ -294,9 +359,8 @@ start (`require`).
 
 Security that breaks the code people run gets switched off, so the sandbox is tested against real
 libraries (`tests/test_isolated_libraries.py`, bytes pinned under `vendor/libs/`): pptxgenjs, three.js
-with `GLTFExporter`, Vega-Lite, dagre, with the same results as the plain
-`Runtime`. A wider hand check (not vendored) also passed for lodash, date-fns, d3, ECharts (server-side
-SVG), mathjs, KaTeX, Handlebars, zod, Ajv, yaml, jsPDF, pdf-lib, docx, JSZip, fflate, crypto-js,
+with `GLTFExporter`, Vega-Lite, dagre, d3, turf, ECharts (server-side SVG), with the same results as
+the plain `Runtime`, and again under `strict_eval=True` (Vega with its expression interpreter). A wider hand check (not vendored) also passed for lodash, date-fns, mathjs, KaTeX, Handlebars, zod, Ajv, yaml, jsPDF, pdf-lib, docx, JSZip, fflate, crypto-js,
 decimal.js, luxon, Prettier, Terser, Cytoscape, Tailwind CSS v4's `compile`, and more. Libraries that
 need a real DOM or canvas (mermaid rendering, Chart.js drawing) load but cannot draw.
 
@@ -368,7 +432,7 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   (`max_concurrent_starts`, default 2, at a time); a replacement that fails to start is retried with
   a backoff and shown in `stats()["last_error"]`.
 - **Options split in two.** What the worker receives when it starts (the `RuntimeConfig`, `sandbox`,
-  `jitless`, `v8_flags`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
+  `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
   `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`, `max_inflight_host_calls`,
   `write_stall_timeout`, `redact_host_errors`) can be set per checkout.

@@ -65,7 +65,7 @@ finally:
 - **Every option** of `IsolatedRuntime` is accepted with the same meaning and default
   (`max_memory=1 GiB`, `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`,
   `max_inflight_host_calls`, `write_stall_timeout`, `redact_host_errors=True`, `sandbox`,
-  `empty_root`, `jitless`, `v8_flags`, `clock`, `random_seed`, `python`, `prewarm`), plus
+  `empty_root`, `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `python`, `prewarm`), plus
   `handler_executor`. `rt.sandbox`, `rt.sandbox_extras` and `rt.v8_flags` report what is in force.
 - **`eval` and `eval_module` await promises** (they are `IsolatedRuntime.eval_async` and
   `eval_module_async`; `rt.eval_async` / `rt.eval_module_async` are aliases, so code written for
@@ -105,7 +105,8 @@ class (`tests/test_aio_isolated_runtime.py`, with the same hostile fake workers)
 - a capability token the worker reuses, or a token map that does not match what was bound, ends the
   session; a call for a handler id it was never given ends the session; a call that was already in
   flight when the host revoked its capability gets an error, not a kill;
-- the hard deadline (paused while a host function runs), `max_host_wait`, the per-command CPU cap
+- the hard deadline (paused while a host function runs; console output pauses it only within one
+  deadline per command, and not at all beyond that), `max_host_wait`, the per-command CPU cap
   (twice the hard deadline), the memory ceiling, the thread cap (64), idle-CPU supervision,
   `max_host_calls`, the runtime-wide `max_inflight_host_calls`, the write-stall timeout, error-text
   sanitising, `redact_host_errors`, argument checks on module resolvers/loaders and `on_console`,

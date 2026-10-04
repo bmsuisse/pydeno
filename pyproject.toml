@@ -34,6 +34,10 @@ dynamic = ["version"]
 # `pydeno.integrations.pydantic_ai` (JSCodeMode); plain pydeno has no runtime dependencies.
 pydantic-ai = ["pydantic-ai-slim>=2.46,<3"]
 
+[project.scripts]
+# `pydeno 'expr'`: evaluate JavaScript in a sandboxed worker (`pydeno._cli`).
+pydeno = "pydeno._cli:main"
+
 [project.urls]
 Homepage = "https://github.com/bmsuisse/pydeno"
 Repository = "https://github.com/bmsuisse/pydeno"
