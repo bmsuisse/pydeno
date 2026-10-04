@@ -49,7 +49,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ._isolated import _CONFIG_KEYS, IsolatedRuntime
+from ._isolated import (
+    _CONFIG_KEYS,
+    IsolatedRuntime,
+    _checked_console,
+    _clock_ms,
+    _seconds,
+)
 from ._pydeno import JsUndefined, RuntimeConfig, undefined
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -1071,6 +1077,9 @@ class _SessionBase:
         self._dead = False
         self._paused: ToolCall | None = None
         self._run: _Run | None = None
+        # JavaScript run before the prelude: freezes the clock of an adopted runtime (`runtime=`)
+        # that was started without one. Empty when the worker froze it at start-up.
+        self._clock_js = ""
 
         # Console output is collected per run; the caller's own `on_console` still sees it all.
         sink = _ConsoleSink(config.on_console)
@@ -1081,6 +1090,85 @@ class _SessionBase:
             snapshot=config.snapshot,
         )
         return rt_config, sink
+
+    # -- an adopted runtime (`runtime=`) --------------------------------------
+
+    @staticmethod
+    def _adopt_arguments(
+        who: str,
+        runtime: Any,
+        runtime_type: type,
+        clock: datetime | float | int | None,
+        random_seed: int | None,
+        runtime_options: Mapping[str, Any],
+    ) -> tuple[datetime | float | int | None, int]:
+        """Check a runtime given as ``runtime=`` before anything is set up; returns the clock and
+        random seed the session must use (the runtime's own, which replay depends on)."""
+        if not isinstance(runtime, runtime_type):
+            raise TypeError(f"runtime must be a pydeno.{runtime_type.__name__}")
+        if runtime_options:
+            raise TypeError(
+                f"{who}(runtime=...) takes an already-built runtime, whose options were fixed when "
+                f"it was made; drop {sorted(runtime_options)}"
+            )
+        if runtime.is_closed():
+            raise ValueError("runtime= is closed")
+        if runtime._token_to_hid:  # noqa: SLF001
+            raise ValueError(
+                "runtime= has been used already (it has bindings); give the session a fresh one"
+            )
+        if "console_hid" not in runtime._options:  # noqa: SLF001
+            raise ValueError(
+                "runtime= must route console output to the parent: build it with "
+                "RuntimeConfig(on_console=...) (or capture_console=True)"
+            )
+        seeds = [
+            flag
+            for flag in runtime._options["v8_flags"]  # noqa: SLF001
+            if flag.startswith("--random-seed=")
+        ]
+        if len(seeds) != 1:
+            raise ValueError(
+                "runtime= must be started with exactly one random_seed=, which replay depends on"
+            )
+        seed = int(seeds[0].split("=", 1)[1])
+        if random_seed is not None and random_seed != seed:
+            raise ValueError(
+                f"random_seed={random_seed} differs from the seed runtime= was started with"
+            )
+        frozen = runtime._options.get("clock_ms")  # noqa: SLF001
+        if frozen is not None:
+            if clock is not None and _clock_ms(clock) != frozen:
+                raise ValueError(
+                    "clock= differs from the clock runtime= was started with"
+                )
+            clock = frozen / 1000
+        return clock, seed
+
+    def _install(
+        self,
+        runtime: Any,
+        sink: _ConsoleSink,
+        timeout: float | None,
+        max_pause: float | None,
+    ) -> None:
+        """Make an adopted runtime this session's: its console feeds the session's capture, the
+        session's deadlines replace the ones it was handed out with, and, if the worker was
+        started without a frozen clock, the session's clock is frozen before the prelude runs
+        (before any guest code: the same guarantee as the worker's own start-up freeze)."""
+        hid = runtime._options["console_hid"]  # noqa: SLF001
+        runtime._handlers[hid] = (_checked_console(sink), False)  # noqa: SLF001
+        runtime._apply_session(  # noqa: SLF001
+            {
+                "_request_timeout": _seconds(timeout),
+                "_max_host_wait": _seconds(max_pause),
+            }
+        )
+        self._redact = bool(runtime._redact)  # noqa: SLF001
+        if "clock_ms" not in runtime._options:  # noqa: SLF001
+            from ._worker import _FROZEN_CLOCK_JS  # noqa: PLC0415 - only for adopted runtimes
+
+            self._clock_js = _FROZEN_CLOCK_JS % {"ms": self._clock_ms}
 
     # -- introspection -------------------------------------------------------
 
@@ -1329,7 +1417,13 @@ class _SessionBase:
             raise JournalError(
                 f"the journal was recorded by pydeno {config['release']!r}, this is {made_by!r}"
             )
-        if bool(options.get("redact_host_errors", True)) != config["redact"]:
+        runtime = options.get("runtime")
+        redact = (
+            runtime._redact  # noqa: SLF001
+            if runtime is not None and hasattr(runtime, "_redact")
+            else options.get("redact_host_errors", True)
+        )
+        if bool(redact) != config["redact"]:
             raise JournalError(
                 "the journal was recorded with a different redact_host_errors setting"
             )
@@ -1404,6 +1498,15 @@ class AgentSandbox(_SessionBase):
         max_result_bytes: Cap on a run's result as compact JSON. A larger result makes the run
             `Failed` with ``error_type == "ResultTooLarge"``; the session stays usable. Default
             1 MiB. Recorded in the journal (it decides outcomes, so replay needs the same one).
+        runtime: Run on this already-built `IsolatedRuntime` (a `SandboxPool` checkout, say)
+            instead of starting one. The session takes it over and closes it with itself. It must
+            be fresh (nothing bound), route console output to the parent (built with an
+            ``on_console`` or ``capture_console=True``) and have been started with a
+            ``random_seed``, which becomes the session's; a frozen ``clock`` it was started with
+            becomes the session's too, and without one the session freezes the guest's clock
+            before any guest code runs. ``timeout`` and ``max_pause`` replace its deadlines; its
+            other options (``sandbox``, ``max_memory``, ``redact_host_errors``, ...) are what it
+            was built with, so no ``runtime_options`` may be passed with it.
         **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
             ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
             count the time paused at a tool call. ``config.on_console`` still gets every console
@@ -1424,8 +1527,18 @@ class AgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+        runtime: IsolatedRuntime | None = None,
         **runtime_options: Any,
     ) -> None:
+        if runtime is not None:
+            clock, random_seed = self._adopt_arguments(
+                "AgentSandbox",
+                runtime,
+                IsolatedRuntime,
+                clock,
+                random_seed,
+                runtime_options,
+            )
         rt_config, sink = self._configure(
             tools,
             max_tool_calls=max_tool_calls,
@@ -1439,14 +1552,22 @@ class AgentSandbox(_SessionBase):
             runtime_options=runtime_options,
         )
         self._lock = threading.Lock()
-        rt = IsolatedRuntime(
-            rt_config,
-            clock=self._clock_ms / 1000,
-            random_seed=self._random_seed,
-            request_timeout=timeout,
-            max_host_wait=max_pause,
-            **runtime_options,
-        )
+        if runtime is None:
+            rt = IsolatedRuntime(
+                rt_config,
+                clock=self._clock_ms / 1000,
+                random_seed=self._random_seed,
+                request_timeout=timeout,
+                max_host_wait=max_pause,
+                **runtime_options,
+            )
+        else:
+            rt = runtime
+            try:
+                self._install(rt, sink, timeout, max_pause)
+            except BaseException:
+                rt.close()
+                raise
         try:
             self._core = _Core(
                 rt,
@@ -1490,7 +1611,8 @@ class AgentSandbox(_SessionBase):
 
             core.rt.bind_function(_CATALOG_CALL, catalog_call)
         core.rt.eval(
-            _prelude(
+            self._clock_js
+            + _prelude(
                 list(self._tools),
                 self._namespace,
                 self._catalog_ns if self._catalog else None,

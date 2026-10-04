@@ -277,6 +277,8 @@ class SandboxPool:
 
     #: The options `checkout()` accepts: the ones only the parent enforces.
     SESSION_OPTIONS = SESSION_OPTIONS
+    # What builds and holds the runtimes; a subclass may build them differently (`_Core.new`).
+    _core_type: type[_Core] = _Core
 
     def __init__(
         self,
@@ -291,7 +293,9 @@ class SandboxPool:
         _session_options(
             **session
         )  # a bad default fails now, not at the first checkout
-        core = _Core(config, spawn, session, size, min(size, max_concurrent_starts))
+        core = self._core_type(
+            config, spawn, session, size, min(size, max_concurrent_starts)
+        )
         core.ready.append(core.new())
         core.start_fillers()
         self._core = core

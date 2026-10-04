@@ -249,7 +249,8 @@ class AsyncAgentSandbox(_SessionBase):
 
     Takes exactly `AgentSandbox`'s arguments (``runtime_options`` go to `AsyncIsolatedRuntime`,
     which also accepts ``handler_executor``: synchronous tools and the console capture run there,
-    or on its shared pool). Constructing the object validates them and starts nothing; start the
+    or on its shared pool; ``runtime=`` takes an `AsyncIsolatedRuntime`, started or not, such as
+    an `AsyncSandboxPool` checkout, on the same terms as `AgentSandbox`'s). Constructing the object validates them and starts nothing; start the
     worker with ``async with AsyncAgentSandbox(...) as sb`` or
     ``sb = await AsyncAgentSandbox.create(...)``.
 
@@ -281,8 +282,18 @@ class AsyncAgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
+        runtime: AsyncIsolatedRuntime | None = None,
         **runtime_options: Any,
     ) -> None:
+        if runtime is not None:
+            clock, random_seed = self._adopt_arguments(
+                "AsyncAgentSandbox",
+                runtime,
+                AsyncIsolatedRuntime,
+                clock,
+                random_seed,
+                runtime_options,
+            )
         rt_config, sink = self._configure(
             tools,
             max_tool_calls=max_tool_calls,
@@ -298,14 +309,20 @@ class AsyncAgentSandbox(_SessionBase):
         self._executor = runtime_options.get("handler_executor")
         self._busy = False
         self._started = False
-        rt = AsyncIsolatedRuntime(
-            rt_config,
-            clock=self._clock_ms / 1000,
-            random_seed=self._random_seed,
-            request_timeout=timeout,
-            max_host_wait=max_pause,
-            **runtime_options,
-        )
+        if runtime is None:
+            rt = AsyncIsolatedRuntime(
+                rt_config,
+                clock=self._clock_ms / 1000,
+                random_seed=self._random_seed,
+                request_timeout=timeout,
+                max_host_wait=max_pause,
+                **runtime_options,
+            )
+        else:
+            # No I/O here: a failure leaves the runtime with the caller, who still owns it.
+            rt = runtime
+            self._executor = runtime._handler_executor  # noqa: SLF001
+            self._install(rt, sink, timeout, max_pause)
         self._core = _Core(
             rt,
             next(_SESSION_IDS),
@@ -363,7 +380,8 @@ class AsyncAgentSandbox(_SessionBase):
 
                 await core.rt.bind_function(_CATALOG_CALL, catalog_call)
             await core.rt.eval(
-                _prelude(
+                self._clock_js
+                + _prelude(
                     list(self._tools),
                     self._namespace,
                     self._catalog_ns if self._catalog else None,
