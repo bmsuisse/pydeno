@@ -6,8 +6,11 @@ for zero bytes, allowing unbounded parent allocation. This is a defense-in-depth
 not a demonstrated JavaScript escape.
 
 The async reader now pauses at 1,024 frames, or the existing byte high watermark. It resumes
-only below 512 frames AND the byte low watermark. Either threshold can overshoot by one bounded
-transport delivery. At 1,024 empty frames the deque overhead is small relative to the 32 MiB
+only below 512 frames AND the byte low watermark, or when the queue is empty and the consumer
+needs input to finish a partial frame. Either threshold can overshoot by one bounded transport
+delivery: CPython's pipe transport reads at most 256 KiB, or 65,536 empty frames (roughly 0.5 MiB
+of deque entries). Other loop implementations may have different delivery bounds.
+At 1,024 empty frames the deque overhead is small relative to the 32 MiB
 payload watermark. Oversized-frame validation remains unchanged.
 
 Touched functions for independent security review: `_aio._FrameReader.data_received` and

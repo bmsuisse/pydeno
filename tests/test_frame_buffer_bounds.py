@@ -182,3 +182,22 @@ async def test_idle_runtime_flood_is_bounded_and_supervised(
             await runtime.close()
         else:
             runtime.close()
+
+
+def test_empty_queue_resumes_to_finish_a_partial_frame(monkeypatch):
+    monkeypatch.setattr(_aio, "_READ_HIGH_FRAMES", 4)
+    monkeypatch.setattr(_aio, "_READ_LOW_FRAMES", 2)
+    monkeypatch.setattr(_aio, "_READ_LOW_WATER", 50)
+    reader = _aio._FrameReader()
+    transport = Transport()
+    reader.connection_made(transport)
+    reader.data_received(struct.pack("<I", 0) * 4 + struct.pack("<I", 100) + b"x" * 50)
+    assert transport.paused
+    for _ in range(4):
+        assert reader.pop() == b""
+    assert not reader.frames
+    assert not transport.paused, (
+        "an empty queue needs more input to complete its partial frame"
+    )
+    reader.data_received(b"x" * 50)
+    assert reader.pop() == b"x" * 100

@@ -96,6 +96,8 @@ _READ_HIGH_WATER = 2 * _wire.MAX_FRAME_BYTES + 8
 _READ_LOW_WATER = _wire.MAX_FRAME_BYTES
 # Payload bytes do not account for deque entries and bytes objects (empty frames cost zero).
 # As with the byte watermark, the current transport delivery may overshoot this threshold.
+# CPython's pipe transport reads at most 256 KiB per delivery: up to 65,536 empty frames
+# (roughly 0.5 MiB of deque entries) beyond the point where a pause becomes necessary.
 _READ_HIGH_FRAMES = 1024
 _READ_LOW_FRAMES = 512
 _HANDSHAKE_SECONDS = 30.0
@@ -359,8 +361,13 @@ class _FrameReader(asyncio.Protocol):
         if (
             self._paused
             and self.error is None
-            and self._queued + len(self._buf) < _READ_LOW_WATER
-            and len(self.frames) < _READ_LOW_FRAMES
+            and (
+                not self.frames  # an unfinished frame needs input when nothing can be popped
+                or (
+                    self._queued + len(self._buf) < _READ_LOW_WATER
+                    and len(self.frames) < _READ_LOW_FRAMES
+                )
+            )
         ):
             self._paused = False
             if self._transport is not None:
