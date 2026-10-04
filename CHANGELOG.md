@@ -4,6 +4,18 @@
 
 ### Added
 
+- **`pydeno` command** (`[project.scripts]`, same as `python -m pydeno`): evaluates JavaScript from an
+  argument, `-c`, `-f FILE` or stdin and prints the result as JSON (`--raw` for plain strings). Runs in
+  `IsolatedRuntime(sandbox="require")`; `--timeout` (default 30 s), `--max-memory`, `--sandbox auto`,
+  `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
+  unavailable, 5 other runtime failure, 6 result has no JSON form; the error and its `classify_error`
+  kind go to stderr. Input is read up to 16 MiB (bounded, so `-f /dev/zero` cannot fill memory),
+  guest output is stripped of control, format and other invisible characters, and integers past
+  2^53 - 1 print as JSON strings. See [`docs/guides/cli.md`](docs/guides/cli.md).
+- **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
+  (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
+  code in an `AgentSandbox` session that keeps its state between calls and returns the
+  `ExecutionResult` fields with output and result caps.
 - **`Pydeno` / `AsyncPydeno`: one front door, shaped like Monty.** `with Pydeno() as pool:`,
   `with pool.checkout(limits=...) as session:`, `session.feed_run(code, inputs=, external_lookup=,
   print_callback=)` (the feed's trailing expression is its result; state persists), `feed_start` with a
@@ -27,8 +39,28 @@
   tool call, fails generically for the guest, is logged once per session for the host, and raises
   `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
   gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
+- **`strict_eval=True`: no code generation from strings in the guest** (#42). On `IsolatedRuntime`,
+  `AsyncIsolatedRuntime`, `SandboxPool` / `AsyncSandboxPool` (a spawn option: fixed per pool, refused
+  per checkout), `AgentSandbox` / `AsyncAgentSandbox` and `Pydeno` / `AsyncPydeno`. `eval`, `new
+  Function` and the async/generator function constructors throw `EvalError` however the guest reaches
+  them; the host's own scripts still run. It appends V8's `--disallow-code-generation-from-strings`
+  after the hardening flags, frozen with them. Sessions record it in their journal (only when on, so
+  default journals are unchanged) and refuse to load a journal under the other setting. It does not
+  cover WebAssembly with `jitless=False`, and it guards trusted code against injected strings rather
+  than containing hostile code (a guest can ship its own interpreter); see the isolation guide. Off
+  by default.
+- `vendor/libs/vega-interpreter-2.3.2.bundle.js` (BSD-3-Clause, 5 KB): Vega's CSP-safe expression
+  interpreter, so Vega and Vega-Lite render under `strict_eval=True`. The library tests now also run
+  d3, turf and ECharts SSR, and every library under strict eval.
+- **Cargo feature `inspector`** (on by default, so the published wheels are unchanged). It gates the DevTools
+  inspector server and its network crates (`hyper`, `hyper-util`, `fastwebsockets`, `http`, `http-body-util`,
+  tokio's `net`). A `--no-default-features` build keeps `InspectorConfig` as a type, but `Runtime` with an
+  inspector configured raises `RuntimeError` ("built without inspector support"). `pydeno._pydeno._INSPECTOR_AVAILABLE`
+  reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
+  size and dependency difference. See `docs/guides/advanced/inspector.md`.
 
-Nothing changes for existing code except the red-team restrictions under Security below; see
+Nothing changes for existing code except `python -m pydeno` (see Changed) and the red-team
+restrictions under Security below; see
 [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
@@ -50,7 +82,7 @@ Nothing changes for existing code except the red-team restrictions under Securit
   - Front door: the syntax check after a failed feed uses captured intrinsics; `dump` / `load_session` /
     `load_snapshot` take `associated_data=`; a refused answer no longer uses up a snapshot; `feed_start`
     surfaces snapshots only for the feed's declared functions.
-  - Captured console output, error messages, the default printer and the CLI replace control characters,
+  - Captured console output, error messages and the default printer replace control characters,
     bidirectional overrides and zero-width characters with `?`. **Behaviour change** for output that
     contained them.
 
@@ -96,12 +128,20 @@ Nothing changes for existing code except the red-team restrictions under Securit
 
 ### Fixed
 
+- `IsolatedRuntime` and `AsyncIsolatedRuntime` raise `ValueError` for a `max_memory` (or a
+  `RuntimeConfig` limit) above 2^53 - 1. Such a value used to reach the worker as a tagged object
+  and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be
+  interpreted as an integer"); `max_memory=2**62` was enough, since it derives
+  `max_buffer_bytes = 2**60`.
 - Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
   the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
   even when the guest's error was still being read at that point.
 
 ### Changed
 
+- **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
+  positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
+  [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 - Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
   creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
   and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s

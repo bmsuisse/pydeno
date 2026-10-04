@@ -59,6 +59,7 @@ from ._agent import (
     AgentSandbox,
     Done,
     Failed,
+    JournalError,
     ToolCall,
     _error_class,
     _open_journal,
@@ -1120,7 +1121,11 @@ def _close_pool(budget: _ThreadBudget) -> None:
 
 
 def _check_pool_arguments(
-    min_processes: int, sandbox: str, jitless: bool, dump_key: bytes | None
+    min_processes: int,
+    sandbox: str,
+    jitless: bool,
+    dump_key: bytes | None,
+    strict_eval: bool = False,
 ) -> bytes:
     # A session freezes the guest's clock with the worker's own script (`_SessionBase._install`):
     # import it now, not inside the first checkout.
@@ -1130,6 +1135,8 @@ def _check_pool_arguments(
         raise ValueError("sandbox must be 'require' (the default), 'auto' or 'off'")
     if not isinstance(jitless, bool):
         raise TypeError("jitless must be a bool")
+    if not isinstance(strict_eval, bool):
+        raise TypeError("strict_eval must be a bool")
     if (
         isinstance(min_processes, bool)
         or not isinstance(min_processes, int)
@@ -1169,6 +1176,10 @@ class Pydeno:
         jitless: Run V8 without its JIT compiler or WebAssembly (default True), which removes the
             largest class of V8 exploits. ``False`` is faster on heavy compute and is a risk you
             take explicitly.
+        strict_eval: Forbid code generation from strings in the guest (default False): ``eval``
+            and ``new Function`` throw ``EvalError``. Every worker of the pool gets it, and
+            `dump()` records it: a dump made with it loads only into a pool with it, and the
+            other way round. See `IsolatedRuntime(strict_eval=...)`.
         dump_key: The key `dump()` signs session state with (HMAC-SHA256, at least 16 bytes) and
             `load_session` / `load_snapshot` check. Default: a random key per `Pydeno`, so state
             loads only into the pool that dumped it; pass your own (from a secret store) to load
@@ -1195,10 +1206,13 @@ class Pydeno:
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
+        strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
     ) -> None:
-        self._key = _check_pool_arguments(min_processes, sandbox, jitless, dump_key)
+        self._key = _check_pool_arguments(
+            min_processes, sandbox, jitless, dump_key, strict_eval
+        )
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
@@ -1206,6 +1220,7 @@ class Pydeno:
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
+            "strict_eval": strict_eval,
             "max_memory": self._limits.max_memory,
         }
         _open_pool(
@@ -1298,7 +1313,9 @@ class Pydeno:
     def _load(
         self, state: bytes, limits: _Limits, associated_data: bytes = b""
     ) -> AgentSandbox:
-        seed = _journal_seed(state, self._key, associated_data)
+        seed = _journal_seed(
+            state, self._key, self._spawn["strict_eval"], associated_data
+        )
         rt = self._runtime(limits, seed)
         try:
             agent = AgentSandbox.load(
@@ -1317,11 +1334,23 @@ class Pydeno:
         return agent
 
 
-def _journal_seed(state: bytes, key: bytes, associated_data: bytes = b"") -> int:
+def _journal_seed(
+    state: bytes, key: bytes, strict_eval: bool, associated_data: bytes = b""
+) -> int:
+    """The state's random seed, checked before a worker is started for it (also its
+    ``strict_eval``, which `AgentSandbox.load` checks again on the worker it gets)."""
     try:
         journal = _open_journal(state, key, associated_data, DEFAULT_MAX_JOURNAL_BYTES)
     except Exception as exc:  # noqa: BLE001
         raise _load_failure(exc) from exc
+    recorded = journal["config"].get("strict_eval", False)
+    if recorded != strict_eval:
+        raise _load_failure(
+            JournalError(
+                f"the journal was recorded with strict_eval={recorded}; load it into a "
+                f"session with strict_eval={recorded}, not {strict_eval}"
+            )
+        )
     seed = journal["config"].get("random_seed")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31:
         raise PydenoError("cannot load this state: it has no valid random seed")
