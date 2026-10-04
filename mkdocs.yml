@@ -45,6 +45,7 @@ nav:
           - Modules: guides/modules.md
           - Agent sessions: guides/agent-sessions.md
           - pydantic-ai code mode: guides/pydantic-ai.md
+          - Upgrading: guides/upgrading.md
           - Advanced:
               - Isolated runtime: guides/advanced/isolation.md
               - Async isolated runtime: guides/advanced/async.md
@@ -61,6 +62,9 @@ nav:
       - Serverless Runtime: use-cases/serverless-runtime.md
       - Workflow Orchestration: use-cases/workflow.md
   - Security report: security-report.md
+  - Reference:
+      - Error kinds: reference/error-kinds.md
+      - Pre-check and sandbox status: reference/preflight-and-status.md
   - Roadmap to 1.0: roadmap.md
   - API Reference:
       - pydeno Module: api/pydeno.md
