@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Bound the async parent's queued frame count as well as payload bytes (#65). Empty or tiny
+  frames from a compromised worker now trigger backpressure while the consumer is idle.
+
 ### Added
 
 - **`SandboxPool`** and **`AsyncSandboxPool`**: isolated runtimes started ahead of time and handed out once.

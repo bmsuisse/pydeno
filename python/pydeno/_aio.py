@@ -94,6 +94,10 @@ _SAMPLE_CHUNK = 64
 # frames between commands). Above one maximal frame, so a single legitimate frame always fits.
 _READ_HIGH_WATER = 2 * _wire.MAX_FRAME_BYTES + 8
 _READ_LOW_WATER = _wire.MAX_FRAME_BYTES
+# Payload bytes do not account for deque entries and bytes objects (empty frames cost zero).
+# As with the byte watermark, the current transport delivery may overshoot this threshold.
+_READ_HIGH_FRAMES = 1024
+_READ_LOW_FRAMES = 512
 _HANDSHAKE_SECONDS = 30.0
 _CLOSE_GRACE_SECONDS = 1.0
 # Frames already buffered are handled without suspending; yield to the loop every so many so that
@@ -331,7 +335,10 @@ class _FrameReader(asyncio.Protocol):
             self.frames.append(bytes(buf[_HEADER.size : end]))
             self._queued += length
             del buf[:end]
-        if self._queued + len(buf) > _READ_HIGH_WATER:
+        if (
+            self._queued + len(buf) > _READ_HIGH_WATER
+            or len(self.frames) >= _READ_HIGH_FRAMES
+        ):
             self._pause()
         self.wake()
 
@@ -353,6 +360,7 @@ class _FrameReader(asyncio.Protocol):
             self._paused
             and self.error is None
             and self._queued + len(self._buf) < _READ_LOW_WATER
+            and len(self.frames) < _READ_LOW_FRAMES
         ):
             self._paused = False
             if self._transport is not None:
