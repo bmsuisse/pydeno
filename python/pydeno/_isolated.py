@@ -253,6 +253,62 @@ def _seconds(value: float | int | timedelta | None) -> float | None:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
+# The options that only the parent enforces: none of them reaches the worker, so a worker started
+# ahead of time (`SandboxPool`) can be given them when it is handed out.
+SESSION_OPTIONS = (
+    "request_timeout",
+    "timeout_grace",
+    "max_host_calls",
+    "max_host_wait",
+    "max_inflight_host_calls",
+    "write_stall_timeout",
+    "redact_host_errors",
+)
+
+
+def _session_options(
+    *,
+    request_timeout: float | int | timedelta | None | Any = _DEFAULT,
+    timeout_grace: float | int = 2.0,
+    max_host_calls: int | None = None,
+    max_host_wait: float | int | timedelta | None | Any = _DEFAULT,
+    max_inflight_host_calls: int | None | Any = _DEFAULT,
+    write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
+    redact_host_errors: bool = True,
+) -> dict[str, Any]:
+    """The parent-side options, validated and normalised, as the runtime attributes that hold
+    them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
+    an option set at checkout means exactly what it means in the constructor."""
+    if max_host_calls is not None and max_host_calls < 0:
+        raise ValueError("max_host_calls must be non-negative")
+    max_inflight = (
+        DEFAULT_MAX_INFLIGHT_HOST_CALLS
+        if max_inflight_host_calls is _DEFAULT
+        else max_inflight_host_calls
+    )
+    if max_inflight is not None and max_inflight < 1:
+        raise ValueError("max_inflight_host_calls must be at least 1")
+    return {
+        "_request_timeout": (
+            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
+        ),
+        "_grace": float(timeout_grace),
+        "_max_host_calls": max_host_calls,
+        "_max_host_wait": (
+            DEFAULT_MAX_HOST_WAIT
+            if max_host_wait is _DEFAULT
+            else _seconds(max_host_wait)
+        ),
+        "_max_inflight": max_inflight,
+        "_stall": (
+            DEFAULT_WRITE_STALL_TIMEOUT
+            if write_stall_timeout is _DEFAULT
+            else _seconds(write_stall_timeout)
+        ),
+        "_redact": bool(redact_host_errors),
+    }
+
+
 class _Pump:
     """State of the one command in flight: its limits and its host callbacks.
 
@@ -442,32 +498,20 @@ class IsolatedRuntime:
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
         self._soft_timeout = _seconds(config.timeout)
         self._max_memory = max_memory
-        # Three states: unset (soft timeout + grace, else a default ceiling), a number,
-        # or an explicit None meaning "no hard deadline".
-        self._request_timeout: float | None | Any = (
-            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
-        )
-        self._max_host_calls = max_host_calls
         self._host_calls = 0
-        self._max_host_wait = (
-            DEFAULT_MAX_HOST_WAIT
-            if max_host_wait is _DEFAULT
-            else _seconds(max_host_wait)
-        )
-        self._max_inflight = (
-            DEFAULT_MAX_INFLIGHT_HOST_CALLS
-            if max_inflight_host_calls is _DEFAULT
-            else max_inflight_host_calls
-        )
-        if self._max_inflight is not None and self._max_inflight < 1:
-            raise ValueError("max_inflight_host_calls must be at least 1")
-        self._stall = (
-            DEFAULT_WRITE_STALL_TIMEOUT
-            if write_stall_timeout is _DEFAULT
-            else _seconds(write_stall_timeout)
-        )
-        self._redact = bool(redact_host_errors)
-        self._grace = float(timeout_grace)
+        # `_request_timeout` has three states: unset (soft timeout + grace, else a default
+        # ceiling), a number, or an explicit None meaning "no hard deadline".
+        self._request_timeout: float | None | Any
+        for attr, value in _session_options(
+            request_timeout=request_timeout,
+            timeout_grace=timeout_grace,
+            max_host_calls=max_host_calls,
+            max_host_wait=max_host_wait,
+            max_inflight_host_calls=max_inflight_host_calls,
+            write_stall_timeout=write_stall_timeout,
+            redact_host_errors=redact_host_errors,
+        ).items():
+            setattr(self, attr, value)
         self._python = python or sys.executable
         seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
         self._options: dict[str, Any] = {
@@ -556,6 +600,12 @@ class IsolatedRuntime:
         ).start()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _apply_session(self, options: dict[str, Any]) -> None:
+        """Install `_session_options(...)` on a runtime nobody has used yet (a pool checkout)."""
+        for attr, value in options.items():
+            setattr(self, attr, value)
+        self._writer._stall = self._stall  # noqa: SLF001
 
     def _check_limits_can_be_enforced(self) -> None:
         """A limit that cannot be measured is a limit that is not there.
@@ -1393,11 +1443,33 @@ async def _call_guarded(handler: Callable[..., Any], args: list[Any]) -> Any:
         _IN_HOST_CALL.reset(token)
 
 
+# Where this `pydeno` package lives. The worker imports it from here, so parent and worker always
+# run the same code (an `-I` worker would otherwise import whichever `pydeno` its own `sys.path`
+# finds first, which need not be the parent's).
+_PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# `-S`: no `site`, so no `.pth` file runs in the worker and its `sys.path` is the standard library
+# plus this package's directory, *appended* so nothing next to `pydeno` can shadow a stdlib module.
+# pydeno has no runtime dependencies, so the worker needs nothing else. Saves the `site` import.
+_WORKER_BOOT = (
+    "import sys; sys.path.append({!r}); from pydeno._worker import main; main()".format(
+        _PACKAGE_PARENT
+    )
+)
+
+
+def _worker_argv(python: str) -> list[str]:
+    if python == sys.executable:
+        return [python, "-I", "-S", "-c", _WORKER_BOOT]
+    # Another interpreter may be another Python version, which cannot load this build's extension
+    # module: it runs the `pydeno` it has installed itself.
+    return [python, "-I", "-m", "pydeno._worker"]
+
+
 def _start_worker(python: str) -> tuple[subprocess.Popen[bytes], Any]:
     stderr = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close() / finalizer
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
-            [python, "-I", "-m", "pydeno._worker"],
+            _worker_argv(python),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,

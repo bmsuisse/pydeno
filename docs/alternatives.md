@@ -29,11 +29,13 @@ is the better trade.
 
 One machine (macOS 26, arm64, Python 3.14), median of 15 runs, 95th percentile in brackets, milliseconds.
 pydeno 0.7.0 with the OS sandbox required, Monty 1.0.0 (pool checkout), denobox 0.1a2 on Deno 2.9.7.
-Reproduce with `python benches_py/alternatives_bench.py pydeno|monty|denobox`.
+Reproduce with `python benches_py/alternatives_bench.py pydeno|pydeno-pool|monty|denobox`.
 
 | | New sandbox + first call | Warm call (`1 + 1`) | Fresh sandbox + 10 small commands |
 |---|---:|---:|---:|
 | pydeno | 59 (212) | 0.10 (0.15) | 58 (63) |
+| pydeno, unreleased: cold start | 53 (56) | 0.09 (0.13) | 54 (56) |
+| pydeno, unreleased: `SandboxPool` checkout | 0.43 (1.74) | 0.09 (0.14) | 6.9 (8.3) |
 | denobox | 12.7 (15.3) | 0.03 (0.07) | 13.6 (14.2) |
 | Monty | 0.04 (23.9) | 0.01 (0.02) | 0.18 (0.81) |
 
@@ -42,7 +44,9 @@ What that says, plainly:
 - **pydeno is the slowest to start**, by a wide margin against Monty (an interpreter in your process) and
   by about 4.5 times against denobox. The 59 ms is a Python worker process starting, applying the OS sandbox and
   running its self-test. If you create a sandbox per request, that matters; keep one per session (or use
-  `SessionPool`) and it does not.
+  `SessionPool`) and it does not. If you need a fresh sandbox per request, `SandboxPool` (not yet released)
+  keeps started, single-use workers ready: the checkout alone takes 0.04 ms, a burst larger than the pool
+  falls back to cold starts. See [A pool of ready workers](guides/advanced/isolation.md#a-pool-of-ready-workers-sandboxpool).
 - **Per call, all three are far below anything a model call costs.** The warm numbers are tens to hundreds of
   microseconds.
 - This measures the machinery with a trivial expression. It says nothing about how fast each engine runs real
@@ -103,7 +107,7 @@ and, for hosted ones, a network dependency. If your threat model needs a VM boun
 
 ## What pydeno cannot do
 
-- Start as fast as an in-process interpreter.
+- Start a *cold* sandbox as fast as an in-process interpreter (a pool hides it, at the cost of idle processes).
 - Offer a small, auditable trusted code base.
 - Be isolated on Windows (the in-process runtime only, which does not contain hostile code).
 - Claim an independent security review (not yet).

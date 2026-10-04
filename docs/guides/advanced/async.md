@@ -76,6 +76,9 @@ finally:
   contextvars** (request ids, tracing spans), as with `asyncio.to_thread`.
 - A host function may not call back into **its own** runtime (that would wait on the command it is
   part of); it raises `RuntimeError` in the guest. Calling a *different* runtime is fine.
+- **A sandbox per request?** `AsyncSandboxPool` keeps started, single-use runtimes ready, so a
+  checkout costs microseconds instead of a cold start (see
+  [A pool of ready workers](isolation.md#a-pool-of-ready-workers-sandboxpool)).
 
 ## Cancellation
 

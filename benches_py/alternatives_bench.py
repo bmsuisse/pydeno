@@ -1,8 +1,9 @@
 """Startup and call latency of pydeno, Monty and denobox, measured the same way.
 
-    python benches_py/alternatives_bench.py pydeno     # needs pydeno
-    python benches_py/alternatives_bench.py monty      # needs pydantic-monty
-    python benches_py/alternatives_bench.py denobox    # needs denobox (and `deno` on PATH)
+    python benches_py/alternatives_bench.py pydeno       # needs pydeno
+    python benches_py/alternatives_bench.py pydeno-pool  # pydeno.SandboxPool checkouts
+    python benches_py/alternatives_bench.py monty        # needs pydantic-monty
+    python benches_py/alternatives_bench.py denobox      # needs denobox (and `deno` on PATH)
 
 Three numbers per tool, each the median (p95 in brackets) in milliseconds:
 
@@ -66,6 +67,56 @@ def bench_pydeno(n: int, calls: int) -> None:
     summarise("pydeno IsolatedRuntime (OS sandbox required)", new, warm, ten)
 
 
+def bench_pydeno_pool(n: int, calls: int) -> None:
+    """`SandboxPool`: single-use workers started ahead of time. The pool is given time to refill
+    between iterations (not timed), so these are checkouts from a warm pool; a back-to-back burst
+    that outruns the refill is reported separately, because that is when it degrades to cold
+    starts."""
+    from pydeno import SandboxPool
+
+    new, checkout, warm, ten = [], [], [], []
+    with SandboxPool(sandbox="require", size=4) as pool:
+        for _ in range(n):
+            pool.wait_ready(30)
+            t = time.perf_counter()
+            rt = pool.checkout()
+            checkout.append((time.perf_counter() - t) * 1000)
+            rt.eval("1 + 1")
+            new.append((time.perf_counter() - t) * 1000)
+            rt.close()
+        pool.wait_ready(30)
+        with pool.checkout() as rt:
+            for _ in range(calls):
+                warm.append(timed(lambda: rt.eval("1 + 1")))
+        for _ in range(n):
+            pool.wait_ready(30)
+            t = time.perf_counter()
+            with pool.checkout() as rt:
+                rt.eval("var x = 0")
+                for _ in range(10):
+                    rt.eval("x = x + 1; x")
+            ten.append((time.perf_counter() - t) * 1000)
+        summarise("pydeno SandboxPool (warm checkout + 1 + 1)", new, warm, ten)
+        print(
+            f"| pydeno SandboxPool checkout alone | {statistics.median(checkout):.3f} "
+            f"({pct(checkout, 0.95):.3f}) | | |"
+        )
+        # A burst of 3 x size sessions, back to back, each running `1 + 1`.
+        pool.wait_ready(30)
+        burst = []
+        before = pool.stats()["cold_starts"]
+        for _ in range(12):
+            t = time.perf_counter()
+            with pool.checkout() as rt:
+                rt.eval("1 + 1")
+            burst.append((time.perf_counter() - t) * 1000)
+        cold = pool.stats()["cold_starts"] - before
+        print(
+            f"| pydeno SandboxPool burst of 12 (size 4; {cold} cold) | "
+            f"{statistics.median(burst):.2f} ({pct(burst, 0.95):.2f}) | | |"
+        )
+
+
 def bench_monty(n: int, calls: int) -> None:
     from pydantic_monty import Monty
 
@@ -118,9 +169,12 @@ def main() -> None:
         f"{platform.platform()}, Python {platform.python_version()}, {which}",
         file=sys.stderr,
     )
-    {"pydeno": bench_pydeno, "monty": bench_monty, "denobox": bench_denobox}[which](
-        n, calls
-    )
+    {
+        "pydeno": bench_pydeno,
+        "pydeno-pool": bench_pydeno_pool,
+        "monty": bench_monty,
+        "denobox": bench_denobox,
+    }[which](n, calls)
 
 
 if __name__ == "__main__":

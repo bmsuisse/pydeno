@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`SandboxPool`** and **`AsyncSandboxPool`**: isolated runtimes started ahead of time and handed out once.
+  `checkout()` returns a runtime whose worker has already passed its handshake and sandbox self-test in about
+  0.04 ms (a cold `IsolatedRuntime` is about 53 ms). A checked-out runtime is never returned to the pool;
+  replacements start in the background; an empty pool falls back to a cold start, never an error. Options the
+  worker receives at start-up are fixed per pool; parent-side ones (`SandboxPool.SESSION_OPTIONS`) can be set
+  per checkout. `benches_py/alternatives_bench.py pydeno-pool` measures it.
+
+### Changed
+
+- Faster cold start of the isolation worker (about 59 to 55 ms on macOS arm64): the worker runs with `-S`
+  (no `site`, so no `.pth` file runs in it) and imports `pydeno` from the parent's own package directory, so
+  parent and worker always run the same code; the sandbox module no longer imports `ctypes.util` and
+  `platform` (`sandbox_init` and `proc_pidinfo` are looked up in the already loaded libSystem,
+  `os.uname()` replaces `platform.machine()`). A worker for a custom `python=` is started as before.
+
 ## 0.7.0 — 2026-10-04
 
 Async, results, diagnostics. See [`docs/guides/upgrading.md`](docs/guides/upgrading.md) for what can change
