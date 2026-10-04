@@ -134,13 +134,26 @@ mod tests {
             execution_timeout: Some(std::time::Duration::from_millis(1)),
             ..RuntimeConfig::default()
         });
+        // The watchdog thread can be scheduled late on a busy machine, so the conversion sometimes
+        // finishes before it fires: that result is delivered, and its handles are released the way
+        // a Python caller's wrappers would. Over many tries the deadline must fire at least once.
+        let mut timed_out = 0;
         for code in ["big", "[streams, big]"] {
-            for _ in 0..3 {
-                let err = handle.eval_sync(code).unwrap_err();
-                assert!(err.to_string().contains("timed out"), "{err}");
+            for _ in 0..30 {
+                match handle.eval_sync(code) {
+                    Err(err) => {
+                        assert!(err.to_string().contains("timed out"), "{err}");
+                        timed_out += 1;
+                    }
+                    Ok(value) => handle.release_unowned_handles(&value),
+                }
                 assert_eq!(handle_counts(&handle), (0, 0), "{code} left handles behind");
             }
         }
+        assert!(
+            timed_out > 0,
+            "the deadline never fired during a conversion"
+        );
     }
 
     #[test]

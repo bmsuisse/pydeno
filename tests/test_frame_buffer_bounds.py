@@ -46,6 +46,14 @@ def test_tiny_frame_flood_pauses_and_resumes_without_losing_frames(payload):
     assert reader.pop() == b"ok"
 
 
+def _reading(transport):
+    """`transport.is_reading()`, or None where the transport cannot say (Python 3.10 pipes)."""
+    try:
+        return transport.is_reading()
+    except NotImplementedError:
+        return None
+
+
 async def test_idle_pipe_reader_stops_buffering_an_empty_frame_flood():
     read_fd, write_fd = os.pipe()
     os.set_blocking(write_fd, False)
@@ -57,15 +65,22 @@ async def test_idle_pipe_reader_stops_buffering_an_empty_frame_flood():
             lambda: reader, pipe
         )
         chunk = struct.pack("<I", 0) * 4096
-        for _ in range(128):
+        stable = 0
+        previous = -1
+        for _ in range(256):
             try:
                 os.write(write_fd, chunk)
             except BlockingIOError:
                 pass
             await asyncio.sleep(0.001)
-            if not transport.is_reading():
+            if _reading(transport) is False:
                 break
-        assert not transport.is_reading(), (
+            # Python 3.10's pipe transport cannot say whether it is reading: no growth is the signal.
+            stable = stable + 1 if len(reader.frames) == previous else 0
+            previous = len(reader.frames)
+            if _reading(transport) is None and stable >= 8:
+                break
+        assert _reading(transport) in (False, None), (
             "idle worker output must trigger backpressure"
         )
         queued = len(reader.frames)
@@ -79,7 +94,7 @@ async def test_idle_pipe_reader_stops_buffering_an_empty_frame_flood():
         assert len(reader.frames) == queued
         while reader.frames:
             assert reader.pop() == b""
-        assert transport.is_reading()
+        assert _reading(transport) in (True, None)
     finally:
         if transport is not None:
             transport.close()
