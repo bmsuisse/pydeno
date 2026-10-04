@@ -149,6 +149,11 @@ Two places where this class is *stricter* than `IsolatedRuntime`:
 - Like `IsolatedRuntime`: POSIX only, values cross as plain data, no streams, snapshots or
   inspector.
 
+## Agent sessions
+
+`AsyncAgentSandbox` and `SessionPool` build pausable, durable agent sessions on this runtime: see
+[Async agent sessions and the session pool](async-agent-sessions.md).
+
 ## Import
 
 ```python

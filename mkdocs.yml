@@ -49,6 +49,7 @@ nav:
           - Advanced:
               - Isolated runtime: guides/advanced/isolation.md
               - Async isolated runtime: guides/advanced/async.md
+              - Async agent sessions and pool: guides/advanced/async-agent-sessions.md
               - WebAssembly: guides/advanced/webassembly.md
               - Snapshots: guides/advanced/snapshots.md
               - Inspector: guides/advanced/inspector.md
