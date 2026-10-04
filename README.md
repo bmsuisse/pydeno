@@ -388,14 +388,13 @@ The sandbox is tested the way an attacker would try it: from inside, and against
   Read it in the **[security report](docs/security-report.md)**.
 - **An autonomous pentest agent, run against the source.** Before 0.8 we ran [Strix][strix] (an
   open-source AI pentest agent) as a white-box review of a clean export of the code, in standard
-  mode, locally, with no outside host reachable and a hard budget cap. It reported four weaknesses (three
-  medium, one low) and **no host escape and no capability-token bypass** in the paths it reviewed.
-  Two matched findings our own reviewers had already made (terminal output, and a session budget
-  across two pools that share one store); the other two were new (an unbounded DNS queue in
-  `HttpFetch`, and a failed value conversion that kept registered handles). All four are fixed or
-  documented in 0.8, with a regression test for each. This is one more reviewer, not a proof: it
-  read the code and did not exercise the native layer, so the OS-level checks above still carry that
-  part. We plan to run it on a schedule and on changes to the sandbox code.
+  mode, locally, with no outside host reachable and a hard budget cap. It found no host escape and
+  no capability-token bypass in the paths it reviewed. What it did report went through the same path
+  as every other review finding: a failing test first, the smallest fix, a review by a different
+  model. Its findings are not published; that is deliberate for a public repository. It is one more
+  reviewer, not a proof: it read the code and did not exercise the native layer, so the OS-level
+  checks above still carry that part. It is set up to run on a schedule
+  ([how](docs/contributing/strix.md)).
 - **A probe battery that must stay at zero.** `scripts/autoresearch/metric_security.py` runs hostile
   guests and hostile callers (limits, tampered binds, forged journals, oversized values, terminal
   escapes) and has to report zero violations before anything merges to the release branch.
