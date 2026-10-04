@@ -58,6 +58,7 @@ from ._agent import (
     AgentSandbox,
     Done,
     Failed,
+    JournalError,
     ToolCall,
     _error_class,
     _open_journal,
@@ -70,6 +71,7 @@ from ._agent import (
     preinstall,
 )
 from ._isolated import IsolatedRuntime, WorkerCrashed
+from ._limits import limit_int, limit_seconds
 from ._pydeno import JavaScriptError, JsUndefined, RuntimeConfig, RuntimeTimeout
 from ._result import _STDOUT_LEVELS, ResultTooLarge, format_console_arg
 from ._schema import _JS_RESERVED
@@ -169,16 +171,10 @@ class _Limits:
 
 
 def _positive(name: str, value: Any, kind: type = float) -> Any:
-    if value is None:
-        return None
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float) if kind is float else int)
-        or not math.isfinite(value)
-        or value <= 0
-    ):
-        raise ValueError(f"{name} must be a positive {kind.__name__} or None")
-    return value
+    """A positive limit or None: `TypeError` for a wrong type, `ValueError` for a bad value."""
+    if kind is float:
+        return limit_seconds(name, value)
+    return limit_int(name, value, minimum=1)
 
 
 def _resolve_limits(*layers: Mapping[str, Any] | None) -> _Limits:
@@ -203,12 +199,7 @@ def _resolve_limits(*layers: Mapping[str, Any] | None) -> _Limits:
     suspensions = merged.get("max_suspensions")
     if suspensions is None:
         suspensions = DEFAULT_LIMITS["max_suspensions"]
-    if (
-        isinstance(suspensions, bool)
-        or not isinstance(suspensions, int)
-        or suspensions < 0
-    ):
-        raise ValueError("max_suspensions must be a non-negative int")
+    suspensions = limit_int("max_suspensions", suspensions, minimum=0)
     _positive("max_total_sleep_secs", merged.get("max_total_sleep_secs"))
     return _Limits(
         timeout=float(min(caps)) if caps else None,
@@ -813,11 +804,45 @@ class _Printer:
         callback("stdout" if level in _STDOUT_LEVELS else "stderr", text)
 
 
+#: What the default printer writes to the host's stdout/stderr per feed before it stops.
+DEFAULT_PRINT_LIMIT_BYTES = 1024 * 1024
+
+
+class _CappedDefaultPrint:
+    """The default printer for one feed: `_default_print` until `DEFAULT_PRINT_LIMIT_BYTES` of
+    UTF-8 have been written, then one ``[truncated]`` line and nothing more. A guest could
+    otherwise write without limit to the host's stdout (measured: ~150 MB in 2 s), which is often a
+    log pipeline. An explicit ``print_callback`` gets everything and is not capped."""
+
+    __slots__ = ("_left", "_done")
+
+    def __init__(self) -> None:
+        self._left = DEFAULT_PRINT_LIMIT_BYTES
+        self._done = False
+
+    def __call__(self, stream: str, text: str) -> None:
+        if self._done:
+            return
+        size = len(text.encode("utf-8", "replace"))
+        if size <= self._left:
+            self._left -= size
+            _default_print(stream, text)
+            return
+        # Leave room for the newline that ends the cut line, so the total stays within the cap.
+        cut = max(0, self._left - 1)
+        head = text.encode("utf-8", "replace")[:cut].decode("utf-8", "ignore")
+        self._done = True
+        _default_print(
+            stream, head + ("\n" if head and not head.endswith("\n") else "")
+        )
+        _default_print(stream, "[truncated]\n")
+
+
 def _printer_for(
     print_callback: Callable[[str, str], Any] | None,
 ) -> Callable[[str, str], Any]:
     if print_callback is None:
-        return _default_print
+        return _CappedDefaultPrint()
     if not callable(print_callback):
         raise TypeError("print_callback must be a callable (stream, text)")
     return print_callback
@@ -1050,12 +1075,7 @@ class _Reaper:
 
 
 def _tool_budget(max_tool_threads: int) -> _ThreadBudget:
-    if (
-        isinstance(max_tool_threads, bool)
-        or not isinstance(max_tool_threads, int)
-        or max_tool_threads < 1
-    ):
-        raise ValueError("max_tool_threads must be a positive int")
+    max_tool_threads = limit_int("max_tool_threads", max_tool_threads, minimum=1)
     ceiling = _PROCESS_THREADS.limit
     if max_tool_threads > ceiling:
         warnings.warn(
@@ -1098,7 +1118,11 @@ def _close_pool(budget: _ThreadBudget) -> None:
 
 
 def _check_pool_arguments(
-    min_processes: int, sandbox: str, jitless: bool, dump_key: bytes | None
+    min_processes: int,
+    sandbox: str,
+    jitless: bool,
+    dump_key: bytes | None,
+    strict_eval: bool = False,
 ) -> bytes:
     # A session freezes the guest's clock with the worker's own script (`_SessionBase._install`):
     # import it now, not inside the first checkout.
@@ -1108,12 +1132,11 @@ def _check_pool_arguments(
         raise ValueError("sandbox must be 'require' (the default), 'auto' or 'off'")
     if not isinstance(jitless, bool):
         raise TypeError("jitless must be a bool")
-    if (
-        isinstance(min_processes, bool)
-        or not isinstance(min_processes, int)
-        or min_processes < 1
-    ):
-        raise ValueError("min_processes must be a positive int")
+    if not isinstance(strict_eval, bool):
+        raise TypeError("strict_eval must be a bool")
+    if min_processes is None:
+        raise TypeError("min_processes must be a positive int")
+    limit_int("min_processes", min_processes, minimum=1)
     if dump_key is None:
         return secrets.token_bytes(32)
     if not isinstance(dump_key, (bytes, bytearray)) or len(dump_key) < 16:
@@ -1147,6 +1170,10 @@ class Pydeno:
         jitless: Run V8 without its JIT compiler or WebAssembly (default True), which removes the
             largest class of V8 exploits. ``False`` is faster on heavy compute and is a risk you
             take explicitly.
+        strict_eval: Forbid code generation from strings in the guest (default False): ``eval``
+            and ``new Function`` throw ``EvalError``. Every worker of the pool gets it, and
+            `dump()` records it: a dump made with it loads only into a pool with it, and the
+            other way round. See `IsolatedRuntime(strict_eval=...)`.
         dump_key: The key `dump()` signs session state with (HMAC-SHA256, at least 16 bytes) and
             `load_session` / `load_snapshot` check. Default: a random key per `Pydeno`, so state
             loads only into the pool that dumped it; pass your own (from a secret store) to load
@@ -1173,10 +1200,13 @@ class Pydeno:
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
+        strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
     ) -> None:
-        self._key = _check_pool_arguments(min_processes, sandbox, jitless, dump_key)
+        self._key = _check_pool_arguments(
+            min_processes, sandbox, jitless, dump_key, strict_eval
+        )
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
@@ -1184,6 +1214,7 @@ class Pydeno:
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
+            "strict_eval": strict_eval,
             "max_memory": self._limits.max_memory,
         }
         _open_pool(
@@ -1274,7 +1305,7 @@ class Pydeno:
         return agent
 
     def _load(self, state: bytes, limits: _Limits) -> AgentSandbox:
-        seed = _journal_seed(state, self._key)
+        seed = _journal_seed(state, self._key, self._spawn["strict_eval"])
         rt = self._runtime(limits, seed)
         try:
             agent = AgentSandbox.load(
@@ -1292,11 +1323,21 @@ class Pydeno:
         return agent
 
 
-def _journal_seed(state: bytes, key: bytes) -> int:
+def _journal_seed(state: bytes, key: bytes, strict_eval: bool) -> int:
+    """The state's random seed, checked before a worker is started for it (also its
+    ``strict_eval``, which `AgentSandbox.load` checks again on the worker it gets)."""
     try:
         journal = _open_journal(state, key, b"", DEFAULT_MAX_JOURNAL_BYTES)
     except Exception as exc:  # noqa: BLE001
         raise _load_failure(exc) from exc
+    recorded = journal["config"].get("strict_eval", False)
+    if recorded != strict_eval:
+        raise _load_failure(
+            JournalError(
+                f"the journal was recorded with strict_eval={recorded}; load it into a "
+                f"session with strict_eval={recorded}, not {strict_eval}"
+            )
+        )
     seed = journal["config"].get("random_seed")
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31:
         raise PydenoError("cannot load this state: it has no valid random seed")
@@ -1437,7 +1478,8 @@ class PydenoSession:
                 as an Error named after its class, its message redacted.
             print_callback: Gets the feed's console output as ``(stream, text)``, ``stream``
                 ``'stdout'`` (``log``/``info``/``debug``) or ``'stderr'``. Default: this
-                process's stdout/stderr, with control characters replaced.
+                process's stdout/stderr, with control characters replaced, at most 1 MiB per
+                feed (then one ``[truncated]`` line). A callback you pass is not capped.
 
         Raises:
             PydenoRuntimeError: the code threw (the session survives).

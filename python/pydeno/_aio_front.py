@@ -118,10 +118,13 @@ class AsyncPydeno:
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
+        strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
     ) -> None:
-        self._key = _check_pool_arguments(min_processes, sandbox, jitless, dump_key)
+        self._key = _check_pool_arguments(
+            min_processes, sandbox, jitless, dump_key, strict_eval
+        )
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
@@ -129,6 +132,7 @@ class AsyncPydeno:
         self._spawn = {
             "sandbox": sandbox,
             "jitless": jitless,
+            "strict_eval": strict_eval,
             "max_memory": self._limits.max_memory,
         }
         self._pool = _Pool(_CONFIG, size=min_processes, **self._spawn)
@@ -217,7 +221,7 @@ class AsyncPydeno:
         return agent
 
     async def _load(self, state: bytes, limits: _Limits) -> AsyncAgentSandbox:
-        seed = _journal_seed(state, self._key)
+        seed = _journal_seed(state, self._key, self._spawn["strict_eval"])
         rt = await self._runtime(limits, seed)
         try:
             return await AsyncAgentSandbox.load(

@@ -4,6 +4,18 @@
 
 ### Added
 
+- **`pydeno` command** (`[project.scripts]`, same as `python -m pydeno`): evaluates JavaScript from an
+  argument, `-c`, `-f FILE` or stdin and prints the result as JSON (`--raw` for plain strings). Runs in
+  `IsolatedRuntime(sandbox="require")`; `--timeout` (default 30 s), `--max-memory`, `--sandbox auto`,
+  `--no-sandbox` (warns on stderr). Exit codes: 1 JavaScript error, 2 usage, 3 timeout, 4 OS sandbox
+  unavailable, 5 other runtime failure, 6 result has no JSON form; the error and its `classify_error`
+  kind go to stderr. Input is read up to 16 MiB (bounded, so `-f /dev/zero` cannot fill memory),
+  guest output is stripped of control, format and other invisible characters, and integers past
+  2^53 - 1 print as JSON strings. See [`docs/guides/cli.md`](docs/guides/cli.md).
+- **`llm-pydeno`**, an [`llm`](https://llm.datasette.io/) tool plugin in `integrations/llm-pydeno/`
+  (a separate package; `pydeno` gains no dependency): a `PyDeno` toolbox whose `run_javascript` runs
+  code in an `AgentSandbox` session that keeps its state between calls and returns the
+  `ExecutionResult` fields with output and result caps.
 - **`Pydeno` / `AsyncPydeno`: one front door, shaped like Monty.** `with Pydeno() as pool:`,
   `with pool.checkout(limits=...) as session:`, `session.feed_run(code, inputs=, external_lookup=,
   print_callback=)` (the feed's trailing expression is its result; state persists), `feed_start` with a
@@ -27,11 +39,55 @@
   tool call, fails generically for the guest, is logged once per session for the host, and raises
   `ToolThreadLimitError` (a `PydenoError`) if the feed then fails. A session dropped without `close()`
   gives its threads back. An `AsyncPydenoSession`'s console sink runs on the session's own thread.
+- **`strict_eval=True`: no code generation from strings in the guest** (#42). On `IsolatedRuntime`,
+  `AsyncIsolatedRuntime`, `SandboxPool` / `AsyncSandboxPool` (a spawn option: fixed per pool, refused
+  per checkout), `AgentSandbox` / `AsyncAgentSandbox` and `Pydeno` / `AsyncPydeno`. `eval`, `new
+  Function` and the async/generator function constructors throw `EvalError` however the guest reaches
+  them; the host's own scripts still run. It appends V8's `--disallow-code-generation-from-strings`
+  after the hardening flags, frozen with them. Sessions record it in their journal (only when on, so
+  default journals are unchanged) and refuse to load a journal under the other setting. It does not
+  cover WebAssembly with `jitless=False`, and it guards trusted code against injected strings rather
+  than containing hostile code (a guest can ship its own interpreter); see the isolation guide. Off
+  by default.
+- `vendor/libs/vega-interpreter-2.3.2.bundle.js` (BSD-3-Clause, 5 KB): Vega's CSP-safe expression
+  interpreter, so Vega and Vega-Lite render under `strict_eval=True`. The library tests now also run
+  d3, turf and ECharts SSR, and every library under strict eval.
+- **Cargo feature `inspector`** (on by default, so the published wheels are unchanged). It gates the DevTools
+  inspector server and its network crates (`hyper`, `hyper-util`, `fastwebsockets`, `http`, `http-body-util`,
+  tokio's `net`). A `--no-default-features` build keeps `InspectorConfig` as a type, but `Runtime` with an
+  inspector configured raises `RuntimeError` ("built without inspector support"). `pydeno._pydeno._INSPECTOR_AVAILABLE`
+  reports which build you have. A CI job builds it, runs the isolated-runtime suites against it, and prints the
+  size and dependency difference. See `docs/guides/advanced/inspector.md`.
 
-Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
+Nothing changes for existing code except `python -m pydeno` (see Changed) and the limit fixes under
+Security; see
+[`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 
 ### Security
 
+- **Limit values are validated.** Durations (`request_timeout`, `max_host_wait`, `write_stall_timeout`,
+  `RuntimeConfig.timeout`, per-call `timeout=`, `AgentSandbox` `timeout`/`max_pause`, `SessionPool`
+  `ttl`/`counter_ttl`/`eviction_interval`/`idle_timeout`, `PydenoLimits` seconds) must be `None` or a
+  finite number of seconds above zero and at most about 70 years (`threading.TIMEOUT_MAX / 4`);
+  `timeout_grace`, `SessionPool(acquire_timeout=)` and `get(timeout=)` may be 0. Counts (`max_memory`,
+  `max_host_calls`, `max_inflight_host_calls`, `max_tool_calls`, `max_journal_bytes`, output caps, pool
+  sizes, `max_sessions`, `max_per_owner`, `max_suspensions`, `max_tool_threads`) must be an int between
+  their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
+  before and turned the limit off without saying so (every comparison with NaN is false); Python's
+  `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
+  wrong type raises `TypeError`, a bad value `ValueError`.
+- **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
+  host runs a tool, and console calls were treated the same way, so time spent handling a flood of
+  `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`
+  (600 s by default). Console time now pauses the deadline for at most one hard deadline in total per
+  command: one slow write does not end a run, and a flood can at most double it. Console time while a
+  tool call is in flight is covered by that call's pause. Console calls are no longer refused by
+  `max_inflight_host_calls` (they are synchronous, never in flight) and still count toward
+  `max_host_calls`.
+- **`Pydeno`'s default printer is capped.** Without a `print_callback`, a feed's console output goes to
+  the host's stdout/stderr; it now stops after 1 MiB per feed with one `[truncated]` line (it was
+  unbounded: about 150 MB in 2 s measured). An explicit `print_callback` gets everything.
 - **A guest can no longer make a later bind silently inert.** `bind_object` (and so `ToolBridge.attach`)
   installed onto whatever `globalThis[name]` already was and walked its assignment list with `for...of`;
   `bind_function` assigned `globalThis.name = ...` in sloppy mode. Guest code that ran earlier could plant a
@@ -71,15 +127,61 @@ Nothing changes for existing code; see [`docs/guides/upgrading.md`](docs/guides/
   `Promise.prototype.then` or the global `Array.isArray`/`Date`/`Set`/`BigInt`. Arrays the bridge builds
   (host results, copied arguments, and the arrays the Rust converter creates) define their elements as own
   properties, so an index setter on `Array.prototype` neither sees nor replaces them.
+- **`max_buffer_bytes` now covers resizable buffers.** V8 allocates a resizable `ArrayBuffer`
+  (`new ArrayBuffer(n, {maxByteLength})`), a growable `SharedArrayBuffer`, and the copy `transfer()` makes of
+  a resizable buffer from its own page allocator, not the embedder's, so the cap never saw them: a guest could
+  commit gigabytes under a cap of a few hundred megabytes, and filling the buffer was a `max_memory` kill
+  instead of the promised catchable `RangeError`. The bridge now charges their committed bytes to the same
+  budget at construction, `resize`/`grow` and `transfer*`, through one op that keys each buffer by a private
+  symbol and holds it weakly; when a charge would exceed the cap the op forces a GC, gives collected buffers'
+  bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget; the
+  allocator does the same cheap sweep before refusing a fixed-length buffer, and the bookkeeping is bounded
+  (it is swept as it doubles and capped). Resizable buffers are charged in whole OS pages, which is what V8
+  commits for them (a one-byte resizable buffer costs a page). `instanceof`, subclassing, `Symbol.species`
+  and the prototype objects are unchanged.
+- **A refused allocation no longer leaves the runtime terminated.** With `max_heap_size` set, an
+  `ArrayBuffer` the buffer cap refused was reported to the guest as a `RangeError` but also marked the
+  runtime as over its heap limit, so every later command failed with `RuntimeTerminated`. Only a JS heap
+  that really is at its limit terminates now, and a refusal no longer stays flagged after V8's final retry
+  (a later real heap overflow used to be taken for a refusal, and V8 then aborted the process). `WebAssembly.Memory`
+  remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
+- **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
+  `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's
+  stderr capture file under `RLIMIT_FSIZE` (1 MiB), and deno_core's `op_print` unwraps the flush of the
+  failed write, so the worker aborted (SIGABRT). The worker no longer lets the engine echo console output;
+  `on_console` and `capture_console` are unaffected.
+- **Captured console output carries no control or escape characters.** `execute()` (and the agent layer's
+  `ExecutionResult`) cleaned error text but returned `stdout`/`stderr` with raw ANSI/C1 sequences; they now
+  follow the same rule (newlines and tabs stay), and both also drop the Unicode bidirectional controls that
+  reorder a line and the invisible format characters (zero-width joiners and spaces, the BOM, soft hyphen,
+  line and paragraph separators, variation selectors, TAG characters) that carry text a reader never sees
+  but a model does. Emoji sequences lose their joiners and skin-tone modifiers and render as their parts.
+  An `on_console` callback still receives the guest's text raw; sanitise it before printing.
 
 ### Fixed
 
+- `IsolatedRuntime` and `AsyncIsolatedRuntime` raise `ValueError` for a `max_memory` (or a
+  `RuntimeConfig` limit) above 2^53 - 1. Such a value used to reach the worker as a tagged object
+  and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be
+  interpreted as an integer"); `max_memory=2**62` was enough, since it derives
+  `max_buffer_bytes = 2**60`.
 - Timeouts are enforced when guest code customises `Error.prototype` or `Error`: the watchdog keeps stopping
   the isolate until a timed-out call has returned, and a call whose deadline fired reports `RuntimeTimeout`
   even when the guest's error was still being read at that point.
+- The runtime stays usable after a module evaluation times out (or waits on a top-level `await` that never
+  settles): later commands, timeouts and `TerminationHandle.terminate()` are served as usual, and the idle
+  runtime thread does not spin. Known limit: after that, a *new* module stuck on a top-level `await` is no
+  longer reported at once; it waits for its timeout (forever without one). See the modules guide.
+- After a deadline has fired, a later `TerminationHandle.terminate()` reports its own reason instead of the
+  earlier timeout's, also when it lands while the timed-out call is still returning.
+- Evaluating a module again after its first evaluation timed out or was terminated explains that, instead
+  of failing with `Uncaught null`.
 
 ### Changed
 
+- **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
+  positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
+  [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
 - Cold start of the isolation worker about 15 ms shorter on macOS arm64 (interleaved A/B, median of 120 cold
   creations, release build): the Seatbelt profile is compiled on a background thread while the worker imports
   and only applied afterwards (`sandbox_compile_string` + `sandbox_apply`, 0.1 ms instead of `sandbox_init`'s

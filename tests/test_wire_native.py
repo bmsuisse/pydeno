@@ -44,7 +44,11 @@ def _same(a: Any, b: Any) -> bool:
     if isinstance(a, (list, tuple)):
         return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b, strict=True))
     if isinstance(a, dict):
-        return list(a) == list(b) and all(_same(a[k], b[k]) for k in a)
+        # pairwise, not by lookup: a NaN key is not found again by a distinct NaN object
+        return len(a) == len(b) and all(
+            _same(k1, k2) and _same(v1, v2)
+            for (k1, v1), (k2, v2) in zip(a.items(), b.items(), strict=True)
+        )
     return a == b
 
 

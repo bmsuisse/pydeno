@@ -123,6 +123,10 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Escape sequences and native stack frames in crash messages | **Fixed.** |
 | A guest could kill the worker's only reply-reading thread by calling an async host function without awaiting it | **Fixed.** Found while building the agent-sessions layer. |
 | Decoder amplification: a 6 MB frame can become ~200 MB of Python objects | **Open.** Lower node budget planned. |
+| Non-finite limit values (NaN, infinity) were accepted and silently disabled the limit | **Fixed** (0.8). Validated at construction; probe `non_finite_limits_are_refused`. |
+| Console calls paused the hard deadline like tool calls, so a console flood stretched a run up to `max_host_wait` | **Fixed** (0.8). Console time pauses the deadline only within one deadline per command (a flood at most doubles a run); probe `console_flood_does_not_stretch_the_hard_deadline`. |
+| `Pydeno`'s default printer wrote guest console output to the host's stdout without limit (~150 MB in 2 s) | **Fixed** (0.8). 1 MiB per feed, then `[truncated]`; probe `default_printer_volume_is_capped_per_feed`. |
+| A `SandboxPool` / `Pydeno` that runs out of ready workers starts new ones without limit (cold starts) | **Open, by design** ("exhaustion is never an error"). An opt-in per-pool worker cap is proposed separately. |
 
 ### Guest surface
 
@@ -139,6 +143,12 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Bridge frames and `ext:` paths visible in stack traces | **Partly fixed** (strict mode); path filtering open. |
 | A huge source ignores `timeout=` while V8 parses it (plain `Runtime`; bounded by the frame cap in `IsolatedRuntime`) | **Open.** |
 | Prototype pollution persists across evals in one runtime | **By design.** One runtime per trust unit. |
+| A resizable `ArrayBuffer` (or growable `SharedArrayBuffer`, or the copy `transfer()` makes of one) was not counted by `max_buffer_bytes`: V8 takes those backing stores from its page allocator, not the embedder's, so 2 GiB could be committed under a 255 MiB cap and filling it was a `max_memory` kill instead of the promised `RangeError` | **Fixed.** The bridge charges their committed bytes to the same budget (constructor, `resize`/`grow`, `transfer*`), with weak handles and a GC-and-sweep when the cap is hit. `WebAssembly.Memory.grow` remains a sink the cap cannot see (not present under `--jitless`). |
+| A host `SnapshotBuilder` bootstrap that keeps a reference to the native `ArrayBuffer` constructor or `ArrayBuffer.prototype.resize` (or `SharedArrayBuffer.prototype.grow`, `transfer`) and exposes it to guest code lets the guest create or grow resizable buffers past the charge: snapshot code runs before the bridge wraps those built-ins | **By design (host code is trusted).** Do not hand a snapshot-captured native buffer constructor or method to the guest; `IsolatedRuntime` refuses snapshots. |
+| A refused buffer allocation left its refusal flagged after V8's final retry, so a later genuine heap overflow was taken for a refusal and V8 aborted the process (`FatalProcessOutOfMemory`, a few percent of runs) | **Fixed.** The attempt V8 makes right after the near-heap-limit callback consumed a refusal no longer flags again. |
+| `enable_console=True`: one `console.log` of a megabyte killed the worker (SIGABRT). Its stdout was the stderr capture file under `RLIMIT_FSIZE`, and deno_core's `op_print` unwraps the flush of the failed write | **Fixed.** The worker never lets the engine echo console output; `on_console` is unaffected. |
+| `execute()` returned console output with raw terminal escape sequences, while error text was already cleaned | **Fixed.** Same rule for both. |
+| Found by the autoresearch red team (`scripts/autoresearch/metric_security.py`, 28 probes, all passing): the probe battery pins each of the above and the deadline-bypass and refused-bind classes from the fourth review round | **Pinned.** |
 
 ### Round 3: review of the new code
 

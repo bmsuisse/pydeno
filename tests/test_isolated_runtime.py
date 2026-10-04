@@ -372,9 +372,11 @@ class TestContainment:
     @pytest.mark.parametrize(
         ("js", "jitless"),
         [
-            # The two sinks `max_buffer_bytes` cannot see: V8 reserves these pages
-            # through its own page allocator. Touched pages show up in RSS.
-            # Each holds the memory and then keeps the guest busy, so it is the polling
+            # Two sinks V8 fills through its own page allocator, past the embedder's
+            # ArrayBuffer allocator. WebAssembly memory `max_buffer_bytes` still cannot see;
+            # resizable buffers it now charges (the bridge does), so the cap is raised out
+            # of the way below to reach the RSS ceiling behind it. Touched pages show up in
+            # RSS. Each holds the memory and then keeps the guest busy, so it is the polling
             # watchdog that has to catch it: a command that merely returns afterwards races
             # the page being freed or compressed before the end-of-command check reads RSS.
             (
@@ -395,7 +397,10 @@ class TestContainment:
         if sys.platform not in ("linux", "darwin"):
             pytest.skip("RSS polling is implemented for Linux and macOS")
         rt = IsolatedRuntime(
-            RuntimeConfig(), max_memory=300 * MIB, request_timeout=30, jitless=jitless
+            RuntimeConfig(max_buffer_bytes=8192 * MIB),
+            max_memory=300 * MIB,
+            request_timeout=30,
+            jitless=jitless,
         )
         with pytest.raises(WorkerCrashed, match="max_memory"):
             rt.eval(js)

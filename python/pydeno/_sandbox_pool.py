@@ -18,8 +18,8 @@ The rules that keep a pool as safe as a fresh runtime:
   background as soon as a runtime is handed out.
 
 Options split in two. Whatever the worker receives at start-up (the `RuntimeConfig`, `sandbox`,
-`jitless`, `v8_flags`, `clock`, `random_seed`, `max_memory`, console routing, ...) is fixed per
-pool: use one pool per such configuration. The options that only the parent enforces
+`jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing, ...)
+is fixed per pool: use one pool per such configuration. The options that only the parent enforces
 (`SESSION_OPTIONS`: deadlines, host-call budgets, error redaction, ...) can be set per checkout.
 """
 
@@ -36,6 +36,7 @@ from typing import Any
 
 from ._aio import AsyncIsolatedRuntime
 from ._isolated import SESSION_OPTIONS, IsolatedRuntime, _session_options
+from ._limits import limit_int
 from ._pydeno import RuntimeConfig
 
 __all__ = ["AsyncSandboxPool", "SandboxPool", "SESSION_OPTIONS"]
@@ -64,15 +65,17 @@ def _split(
     return spawn, session
 
 
-def _check_sizes(size: int, max_concurrent_starts: int) -> None:
-    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
-        raise ValueError("size must be a positive integer")
-    if (
-        isinstance(max_concurrent_starts, bool)
-        or not isinstance(max_concurrent_starts, int)
-        or max_concurrent_starts < 1
+def _check_sizes(size: int, max_concurrent_starts: int) -> tuple[int, int]:
+    """Both as plain ints: `TypeError` for a wrong type (a bool, a float, None), `ValueError` below 1."""
+    checked = []
+    for name, value in (
+        ("size", size),
+        ("max_concurrent_starts", max_concurrent_starts),
     ):
-        raise ValueError("max_concurrent_starts must be a positive integer")
+        if value is None:
+            raise TypeError(f"{name} must be a positive int")
+        checked.append(limit_int(name, value, minimum=1))
+    return checked[0], checked[1]  # type: ignore[return-value]
 
 
 def _session_for(
@@ -288,7 +291,7 @@ class SandboxPool:
         max_concurrent_starts: int = DEFAULT_MAX_CONCURRENT_STARTS,
         **options: Any,
     ) -> None:
-        _check_sizes(size, max_concurrent_starts)
+        size, max_concurrent_starts = _check_sizes(size, max_concurrent_starts)
         spawn, session = _split(options, SESSION_OPTIONS)
         _session_options(
             **session
@@ -409,7 +412,7 @@ class AsyncSandboxPool:
         max_concurrent_starts: int = DEFAULT_MAX_CONCURRENT_STARTS,
         **options: Any,
     ) -> None:
-        _check_sizes(size, max_concurrent_starts)
+        size, max_concurrent_starts = _check_sizes(size, max_concurrent_starts)
         self._config = config
         self._spawn, self._session = _split(options, _ASYNC_SESSION_OPTIONS)
         # Constructing an AsyncIsolatedRuntime validates every option and starts nothing.
