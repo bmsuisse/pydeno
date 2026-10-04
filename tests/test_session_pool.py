@@ -21,6 +21,7 @@ from pydeno import (
     JournalStore,
     JournalTooLarge,
     PoolFull,
+    SchemaTool,
     SessionBusy,
     SessionPool,
     StaleJournal,
@@ -353,7 +354,9 @@ class TestCrashSafety:
                 assert await again.run("return n") == 2
                 assert again.calls_made == 1
 
-    async def test_a_run_that_kills_the_worker_is_not_persisted(self) -> None:
+    async def test_a_run_that_kills_the_worker_restores_the_last_good_state(
+        self,
+    ) -> None:
         async with pool(timeout=0.5) as p:
             async with p.session("alice", "s1") as sb:
                 await sb.run("globalThis.n = 1")
@@ -362,7 +365,9 @@ class TestCrashSafety:
                 step = await sb.start("while (true) {}")
                 assert sb.is_closed(), step
             async with p.session("alice", "s1") as again:
-                assert await again.run("return n") == 1  # the last stored state
+                # The last good run before the crash, not the last release.
+                assert await again.run("return n") == 2
+                assert again.lost_runs == 1
 
     async def test_cancel_while_running_releases_the_worker_and_the_lease(self) -> None:
         async with pool() as p:
@@ -434,6 +439,83 @@ class TestCrashSafety:
             assert await _gone(s.worker_pid)
         with pytest.raises(RuntimeError, match="closed"):
             await p.get("o", "0")
+
+
+class TestParityFeatures:
+    async def test_a_crash_while_paused_keeps_the_spent_budget(self) -> None:
+        store = InMemoryJournalStore()
+        async with pool(store, max_tool_calls=3) as p:
+            async with p.session("alice", "s1") as sb:
+                await sb.run("globalThis.n = await add(1, 1)")
+            async with p.session("alice", "s1") as sb:
+                step = await sb.start("globalThis.n = 99; await add(1, 1)")
+                assert isinstance(step, ToolCall)
+                os.kill(sb.worker_pid, signal.SIGKILL)
+                await sb.resume(step, 2)
+                assert sb.is_closed() and sb.calls_made == 2
+        async with pool(store) as p:  # another process: only the store is shared
+            async with p.session("alice", "s1") as again:
+                assert await again.run("return n") == 2  # the last good run
+                assert again.calls_made == 2 and again.calls_remaining == 1
+                assert again.lost_runs == 1
+
+    async def test_a_worker_dying_while_paused_and_unreleased(self) -> None:
+        async with pool(max_tool_calls=5) as p:
+            async with p.session("alice", "s1") as sb:
+                await sb.run("globalThis.n = 1")
+            sb = await p.get("alice", "s1")
+            await sb.start("globalThis.n = 2; await add(1, 1)")
+            os.kill(sb.worker_pid, signal.SIGKILL)
+            assert await _gone(sb.worker_pid)
+            await p.release("alice", "s1")
+            async with p.session("alice", "s1") as again:
+                assert await again.run("return n") == 1
+                assert again.calls_made == 1  # the call the lost run made stays spent
+
+    async def test_execute_and_console_through_the_pool(self) -> None:
+        async with pool(max_output_bytes=64, max_result_bytes=100) as p:
+            async with p.session("alice", "s1") as sb:
+                r = await sb.execute("console.log('hi'); return await add(1, 2)")
+                assert (r.status, r.stdout, r.result) == ("Succeeded", "hi\n", 3)
+                big = await sb.execute("return 'x'.repeat(500)")
+                assert big.error_type == "ResultTooLarge"
+            p._entries.clear()  # noqa: SLF001 - forget the live session: restore from the store
+            async with p.session("alice", "s1") as sb:
+                # The result cap came back from the journal (load refuses it as an option).
+                assert (await sb.execute("return 'x'.repeat(500)")).error_type == (
+                    "ResultTooLarge"
+                )
+
+    async def test_schema_tools_and_the_catalog_through_the_pool(self) -> None:
+        weather = SchemaTool(
+            "get_weather",
+            "Weather for a city.",
+            {"type": "object", "properties": {"city": {"type": "string"}}},
+            lambda args: {"city": args["city"], "temp": 20},
+        )
+        catalog = [
+            SchemaTool(
+                "translate_text",
+                "Translate text.",
+                {"type": "object", "properties": {"text": {"type": "string"}}},
+                lambda args: args["text"].upper(),
+            )
+        ]
+        store = InMemoryJournalStore()
+        async with SessionPool(store, KEY, [weather], tools_catalog=catalog) as p:
+            async with p.session("alice", "s1") as sb:
+                assert (
+                    await sb.run("return (await get_weather({city: 'Bern'})).temp")
+                    == 20
+                )
+                await sb.run("await search_tools('translate')")
+        async with SessionPool(store, KEY, [weather], tools_catalog=catalog) as p:
+            async with p.session("alice", "s1") as sb:
+                assert sb.discovered_tools == {"translate_text"}
+                assert (
+                    await sb.run("return await tools.translate_text({text: 'a'})")
+                    == "A"
+                )
 
 
 class TestStore:

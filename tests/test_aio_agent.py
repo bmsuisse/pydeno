@@ -217,9 +217,15 @@ class TestCancellation:
         assert await _gone(sb, 2.0)
         with pytest.raises(RuntimeError, match="gone"):
             await sb.run("1")
-        with pytest.raises(JournalError, match="gone"):
-            await sb.dump(KEY)
+        # The journal as of the last good run (none here), plus the lost run.
+        blob = await sb.dump(KEY)
         await sb.close()
+        restored = await AsyncAgentSandbox.load(blob, KEY, TOOLS)
+        try:
+            assert restored.lost_runs == 1
+            assert await restored.run("return 1") == 1
+        finally:
+            await restored.close()
 
     async def test_cancel_start_while_running(self) -> None:
         sb = await AsyncAgentSandbox.create(TOOLS)
@@ -307,8 +313,12 @@ class TestCancellation:
             os.kill(sb.worker_pid, signal.SIGKILL)
             assert await _gone(sb, 2.0)
             assert sb.is_closed()
-            with pytest.raises(JournalError):
-                await sb.dump(KEY)
+            blob = await sb.dump(KEY)  # died idle: nothing lost
+        restored = await AsyncAgentSandbox.load(blob, KEY, TOOLS)
+        try:
+            assert restored.lost_runs == 0
+        finally:
+            await restored.close()
 
 
 class TestJournal:

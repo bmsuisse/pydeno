@@ -26,20 +26,32 @@ async with AsyncAgentSandbox({"search": search, "lookup": lookup}, max_tool_call
 restored = await AsyncAgentSandbox.load(blob, key, tools, associated_data=b"tenant-42")
 ```
 
-Everything `AgentSandbox` does, with the same arguments, limits, errors and journal format
-(a journal dumped by one class loads in the other):
+Everything `AgentSandbox` does, with the same arguments, limits, results, errors and journal
+format (a journal dumped by one class loads in the other). The configuration, journal, crash
+recovery, result capture, schema-tool and catalog logic is one implementation shared by both
+classes; only the driving differs:
 
 | `AgentSandbox` | `AsyncAgentSandbox` |
 |---|---|
 | `AgentSandbox(tools, ...)` (starts the worker) | `AsyncAgentSandbox(tools, ...)` validates only; `async with` or `await AsyncAgentSandbox.create(tools, ...)` starts it |
-| `run`, `start`, `resume`, `dump` | the same names, as coroutines |
+| `run`, `execute`, `start`, `resume`, `call`, `dump` | the same names, as coroutines |
 | `AgentSandbox.load(...)` | `await AsyncAgentSandbox.load(...)` |
 | `with ...:` / `close()` | `async with ...:` / `await close()` |
 | one event-loop thread per session | none: shims, run task and caller share the caller's loop |
 
 - **Tools.** A coroutine function is awaited on the loop. A plain function runs on the shared handler
   pool of `AsyncIsolatedRuntime` (or the `handler_executor=` you pass), with the caller's
-  contextvars, so a blocking tool never stalls the loop.
+  contextvars, so a blocking tool never stalls the loop. `SchemaTool`s and MCP-style mappings
+  (one object argument), and a lazy `tools_catalog=` gated by `search_tools`/`describe_tool`
+  (`ToolNotDiscoveredError` before discovery), work exactly as in
+  [Agent sessions](../agent-sessions.md); `typescript_stubs()` and `describe_tools()` return the
+  same text as the sync class.
+- **Results.** `await sb.execute(code)` returns an `ExecutionResult` (`status`, `stdout`, `stderr`,
+  `result`, `error`, `error_type`, `truncated`), and every `Done`/`Failed` carries the run's console
+  output, bounded by `max_output_bytes` per stream (64 KiB) and `max_result_bytes` (1 MiB; over it
+  the run fails with `ResultTooLarge` and the session goes on). Console calls reach the session as
+  synchronous host calls on the handler pool, so they arrive in order and are all in before the
+  run's result.
 - **Nothing blocks the loop.** Worker start-up, resource sampling and reaping happen off the loop
   (see [the async runtime](async.md)); journals over 1 MiB are signed and parsed on a thread.
 - **One task at a time.** A second concurrent `run`/`start`/`resume`/`dump` on the same session, or a
@@ -62,8 +74,11 @@ the task holding it was cancelled. Closing a session that is running or paused k
 once instead of asking it to exit. Pending tool calls are cancelled, so no task is left waiting.
 `max_pause` still applies: a session nobody resumes gives its worker back after `max_pause` seconds.
 
-After a cancellation, `dump()` raises `JournalError` (the interrupted run cannot be replayed). Dump,
-or `SessionPool.release`, after each step you want to be able to return to.
+After a cancellation, as after a crash, a hard timeout, a memory kill or `max_pause`, `dump()`
+returns the journal as of the last run that ended with the worker alive, plus a `lost` record for
+the interrupted run. That run is never replayed; the tool calls it made stay charged on `load()`
+(dying refunds no budget). A worker that dies while the session is idle loses nothing; one that
+dies while it is paused loses that run the same way.
 
 A synchronous tool that is running on a thread when its run is cancelled keeps that thread until it
 returns (threads cannot be interrupted). The worker is killed regardless.
@@ -118,6 +133,10 @@ await pool.close()                 # or: async with SessionPool(...) as pool:
 - **`pool.session(owner, session_id)`** is `get` + `release` as an `async with` block. The release
   also happens when the block raises: a JavaScript error leaves the session valid, and a session
   whose worker died is not persisted.
+- `tools` takes whatever `AgentSandbox` takes (callables, `SchemaTool`s, MCP-style mappings) or an
+  `(owner, session_id) -> tools` function; `tools_catalog=` gives every session a lazy catalog, and
+  discovery survives a restore. `max_tool_calls`, `namespace` and `max_result_bytes` apply to new
+  sessions; a restored session takes them from its journal.
 - Owner and session ids are strings of up to 256 characters without `:` or control characters.
 
 ### Concurrency: serialised, or rejected with `SessionBusy`
@@ -163,12 +182,15 @@ out of the journal by keeping runs short, or raise the cap.
 
 A worker that crashed, hit a hard timeout or `max_memory`, or was killed from outside is noticed:
 
-- by `release`, which then writes nothing (the last good journal stays in the store);
+- by `release`, which stores the session's journal as of its last good run plus a `lost` record
+  charging the tool calls the lost run made (so a crash cannot refund budget);
 - by the next `get`, which restores the session from that journal on a fresh worker;
 - by the background sweep, which evicts it.
 
-What a session did after its last `release` is lost when its worker dies, by design: the journal
-is the unit of durability. Release after every turn you want to keep.
+The restored state is the last run that ended with the worker alive, even if that run was never
+released (the live session still held its journal). Only a process that dies itself loses what
+happened since its last `release`: the journal in the store is the unit of durability across
+processes, so release after every turn you want to keep.
 
 ### Eviction
 
@@ -212,17 +234,22 @@ store accordingly (TLS, authentication, a key prefix per environment via `key_pr
 ## API
 
 ```python
-AsyncAgentSandbox(tools, *, max_tool_calls=None, namespace=None, clock=None, random_seed=None,
-                  timeout=30.0, max_pause=600.0, max_journal_bytes=8 MiB,
+AsyncAgentSandbox(tools, *, max_tool_calls=None, namespace=None, tools_catalog=None, clock=None,
+                  random_seed=None, timeout=30.0, max_pause=600.0, max_journal_bytes=8 MiB,
+                  max_output_bytes=64 KiB, max_result_bytes=1 MiB,
                   **async_isolated_runtime_options)
 await AsyncAgentSandbox.create(tools, **options) -> AsyncAgentSandbox
-await sb.run(code) / await sb.start(code) / await sb.resume(step, value | error=exc)
+await sb.run(code) -> Any; await sb.execute(code) -> ExecutionResult
+await sb.start(code) / await sb.resume(step, value | error=exc) -> ToolCall | Done | Failed
+await sb.call(step) -> Any                       # the real tool for a ToolCall
 await sb.dump(key, *, associated_data=b"") -> bytes
-await AsyncAgentSandbox.load(blob, key, tools, *, max_journal_bytes=8 MiB, associated_data=b"", **options)
-await sb.close(); sb.is_closed(); sb.pending; sb.worker_pid
-sb.calls_made, sb.calls_remaining, sb.clock, sb.random_seed, sb.describe_tools(), sb.typescript_stubs()
+await AsyncAgentSandbox.load(blob, key, tools, *, max_journal_bytes=8 MiB, associated_data=b"",
+                             tools_catalog=None, **options)
+await sb.close(); sb.is_closed(); sb.pending; sb.worker_pid; sb.lost_runs
+sb.calls_made, sb.calls_remaining, sb.clock, sb.random_seed, sb.catalog_names, sb.discovered_tools
+sb.describe_tools(), sb.typescript_stubs()
 
-SessionPool(store, key, tools, *, ttl=3600, max_sessions=1000, max_per_owner=None,
+SessionPool(store, key, tools, *, tools_catalog=None, ttl=3600, max_sessions=1000, max_per_owner=None,
             max_journal_bytes=8 MiB, max_tool_calls=None, namespace=None, idle_timeout=ttl,
             acquire_timeout=30.0, eviction_interval=5.0, counter_ttl=None,
             key_prefix="pydeno:session:", **sandbox_options)

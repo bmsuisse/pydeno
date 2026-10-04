@@ -1,16 +1,18 @@
 """`AsyncAgentSandbox`: `AgentSandbox` for an asyncio event loop.
 
-The same session (tools, budget, pause/resume at tool calls, frozen clock, seeded `Math.random`,
-signed journal, deterministic replay), on `AsyncIsolatedRuntime` instead of `IsolatedRuntime`:
+The same session (tools, schema tools, the lazy catalog, budget, pause/resume at tool calls,
+results with console capture, frozen clock, seeded `Math.random`, signed journal with crash
+recovery, deterministic replay), on `AsyncIsolatedRuntime` instead of `IsolatedRuntime`. All of
+that logic is `_agent._SessionBase`, shared with `AgentSandbox`; this module only drives it:
 
 * no thread per session. `AgentSandbox` owns an event-loop thread per session (its tools' shims
   run there); this class runs its shims, its run task and its caller on the caller's loop, and the
   worker is supervised by the one supervisor task `AsyncIsolatedRuntime` keeps per loop;
 * every method is a coroutine, so nothing blocks the loop: synchronous tools run on the shared
   handler thread pool, large journals are signed and parsed on the codec thread;
-* cancelling the task that awaits `start`, `resume` or `run` SIGKILLs the worker before the
-  `CancelledError` propagates, and closes the session. `close()` (and `async with`) end a session
-  that is running or paused at a tool call the same way.
+* cancelling the task that awaits `start`, `resume`, `run` or `execute` SIGKILLs the worker before
+  the `CancelledError` propagates, and closes the session. `close()` (and `async with`) end a
+  session that is running or paused at a tool call the same way.
 
 Journals are byte-for-byte the format `AgentSandbox` writes: one written here loads there and the
 other way round. Everything the guest sends is untrusted data, exactly as for `AgentSandbox`.
@@ -20,23 +22,20 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import collections.abc
 import contextvars
+import dataclasses
 import inspect
 import itertools
-import json
-import secrets
-from collections.abc import Callable, Generator, Mapping
-from datetime import datetime, timezone
+from collections.abc import Callable, Mapping
+from datetime import datetime
 from typing import Any
 
 from . import _aio
 from ._agent import (
-    _JOURNAL_FORMAT,
-    _MAC_LEN,
-    _MAGIC,
+    _CATALOG_CALL,
     _MAX_ABANDONED_CALLS,
     _MISSING,
-    _OWNED_OPTIONS,
     _SESSION_IDS,
     DEFAULT_MAX_JOURNAL_BYTES,
     DEFAULT_MAX_PAUSE,
@@ -44,215 +43,35 @@ from ._agent import (
     Done,
     Failed,
     JournalError,
-    ReplayDivergence,
     Step,
     ToolCall,
-    _normalize_tools as _check_tools,
-    _decode,
-    _encode,
-    _error_class,
-    _open,
-    _outcome,
-    _parse,
+    ToolNotDiscoveredError,
+    _ConsoleSink,
+    _open_journal,
     _prelude,
+    _public,
+    _replay_plan,
     _Run,
-    _seal,
+    _seal_journal,
+    _SessionBase,
     _wrap,
-    describe_tools,
-    typescript_stubs,
 )
 from ._aio import AsyncIsolatedRuntime
 from ._isolated import WorkerCrashed
-from ._pydeno import RuntimeConfig
-from ._snapshot_auth import _engine_version
-from ._tools import ToolBridge, ToolBudgetError
+from ._result import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_RESULT_BYTES,
+    ExecutionResult,
+    OutputCapture,
+    bounded_result,
+)
+from ._tools import ToolBudgetError
 
 __all__ = ["AsyncAgentSandbox"]
 
 # Journals bigger than this are serialised, signed, verified and parsed on the codec thread, not on
 # the loop (8 MiB of JSON is tens of milliseconds of CPU).
 _OFFLOAD_BYTES = 1024 * 1024
-
-
-# ---------------------------------------------------------------------------
-# pieces shared by both session classes' logic (kept free of any I/O)
-# ---------------------------------------------------------------------------
-
-
-def _settings(
-    tools: Mapping[str, Callable[..., Any]],
-    max_tool_calls: int | None,
-    namespace: str | None,
-    clock: datetime | float | int | None,
-    random_seed: int | None,
-    max_journal_bytes: int,
-    runtime_options: Mapping[str, Any],
-    who: str,
-) -> tuple[dict[str, Callable[..., Any]], int, int]:
-    """`AgentSandbox.__init__`'s validation: (checked tools, clock in ms, random seed)."""
-    checked = _check_tools(tools)
-    if max_tool_calls is not None and (
-        not isinstance(max_tool_calls, int)
-        or isinstance(max_tool_calls, bool)
-        or max_tool_calls < 0
-    ):
-        raise ValueError("max_tool_calls must be a non-negative int or None")
-    if namespace is not None:
-        ToolBridge._check_name(namespace, what="namespace")  # noqa: SLF001
-    owned = _OWNED_OPTIONS & runtime_options.keys()
-    if owned:
-        raise TypeError(
-            f"{who} sets {sorted(owned)} itself (use clock=, random_seed=, timeout=, max_pause=)"
-        )
-    config = runtime_options.get("config")
-    if isinstance(config, RuntimeConfig) and config.timeout is not None:
-        raise ValueError(
-            f"RuntimeConfig.timeout is not supported by {who}: it would count the time a run is "
-            f"paused at a tool call. Use {who}(timeout=...)."
-        )
-    if clock is None:
-        clock = datetime.now(timezone.utc)
-    if isinstance(clock, datetime):
-        if clock.tzinfo is None:
-            clock = clock.replace(tzinfo=timezone.utc)
-        clock_ms = int(clock.timestamp() * 1000)
-    elif isinstance(clock, (int, float)) and not isinstance(clock, bool):
-        clock_ms = int(clock * 1000)
-    else:
-        raise ValueError("clock must be a datetime, epoch seconds, or None (now)")
-    if random_seed is None:
-        random_seed = secrets.randbelow(2**31)
-    if not isinstance(max_journal_bytes, int) or max_journal_bytes <= 0:
-        raise ValueError("max_journal_bytes must be a positive int")
-    return checked, clock_ms, random_seed
-
-
-def _answer(
-    value: Any, error: BaseException | None, redact: bool
-) -> tuple[list[Any], Any, BaseException | None]:
-    """A tool answer as (journal record, value to send, error to send): exactly what a replay of
-    that record will send, so the live run and its replay cannot differ."""
-    if (value is _MISSING) == (error is None):
-        raise TypeError("resume() takes exactly one of value= or error=")
-    if error is not None:
-        if not isinstance(error, Exception):
-            raise TypeError("error must be an Exception instance")
-        name = type(error).__name__
-        message = "host function failed" if redact else str(error)
-        return ["ans", "e", name, message], None, _error_class(name)(message)
-    encoded = _encode(
-        value
-    )  # a TypeError here is the caller's to fix; nothing was answered
-    return ["ans", "v", encoded], _decode(encoded), None
-
-
-def _seal_journal(
-    config: dict[str, Any],
-    records: list[list[Any]],
-    key: bytes,
-    associated_data: bytes,
-) -> bytes:
-    payload = json.dumps(
-        {"format": _JOURNAL_FORMAT, "config": config, "records": records},
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode()
-    return _seal(payload, key, associated_data)
-
-
-def _open_journal(blob: bytes, key: bytes, associated_data: bytes) -> dict[str, Any]:
-    return _parse(_open(blob, key, associated_data))
-
-
-def _check_journal(
-    journal: dict[str, Any],
-    tools: Mapping[str, Callable[..., Any]],
-    options: Mapping[str, Any],
-) -> dict[str, Callable[..., Any]]:
-    """`AgentSandbox.load`'s checks, made before any worker starts."""
-    config = journal["config"]
-    made_by = _engine_version().decode(errors="replace")
-    if config["release"] != made_by:
-        raise JournalError(
-            f"the journal was recorded by pydeno {config['release']!r}, this is {made_by!r}"
-        )
-    if bool(options.get("redact_host_errors", True)) != config["redact"]:
-        raise JournalError(
-            "the journal was recorded with a different redact_host_errors setting"
-        )
-    checked = _check_tools(tools)
-    if list(checked) != config["tools"]:
-        raise JournalError(
-            f"the journal was recorded with tools {config['tools']}, not {list(checked)}"
-        )
-    for owned in ("clock", "random_seed", "max_tool_calls", "namespace"):
-        if owned in options:
-            raise TypeError(f"{owned} comes from the journal")
-    return checked
-
-
-def _replay_plan(
-    records: list[list[Any]],
-) -> Generator[tuple[Any, ...], Step, None]:
-    """`AgentSandbox._replay` without the driving: yields each input to apply, either
-    ``("run", code)`` or ``("ans", tool_call, value, error)``, is sent the step it produced, and
-    raises `ReplayDivergence` the moment an outcome differs from the recorded one. A sync or an
-    async session can drive it."""
-    step: Step | None = None
-    pending: tuple[str, Any] | None = None
-    for index, record in enumerate(records):
-        op = record[0]
-        if op == "run":
-            if pending is not None or isinstance(step, ToolCall):
-                raise JournalError(
-                    f"record {index}: a run starts before the last one ended"
-                )
-            pending = ("run", record[1])
-        elif op == "ans":
-            if pending is not None or not isinstance(step, ToolCall):
-                raise JournalError(
-                    f"record {index}: an answer with no tool call to answer"
-                )
-            pending = ("ans", record)
-        else:  # "obs"
-            if pending is None:
-                raise JournalError(
-                    f"record {index}: an outcome with no input before it"
-                )
-            kind, input_ = pending
-            pending = None
-            if kind == "run":
-                step = yield ("run", input_)
-            else:
-                assert isinstance(step, ToolCall)
-                if input_[1] == "v":
-                    step = yield ("ans", step, _decode(input_[2]), None)
-                else:
-                    step = yield (
-                        "ans",
-                        step,
-                        _MISSING,
-                        _error_class(input_[2])(input_[3]),
-                    )
-            got_kind, got_digest = _outcome(step)
-            if (got_kind, got_digest) != (record[1], record[2]):
-                detail = (
-                    f"{got_kind} {step.name!r}"
-                    if isinstance(step, ToolCall)
-                    else got_kind
-                )
-                raise ReplayDivergence(
-                    f"replay diverged at journal record {index}: recorded a {record[1]}, "
-                    f"got a different {detail} (the guest read something nondeterministic, "
-                    "or the journal does not belong to this code and these tools)"
-                )
-    if pending is not None:
-        raise JournalError("the journal ends with an input that has no outcome")
-
-
-# ---------------------------------------------------------------------------
-# the session
-# ---------------------------------------------------------------------------
 
 
 class _AsyncRun(_Run):
@@ -269,11 +88,24 @@ class _Core:
     its worker)."""
 
     def __init__(
-        self, rt: AsyncIsolatedRuntime, session_id: int, max_tool_calls: int | None
+        self,
+        rt: AsyncIsolatedRuntime,
+        session_id: int,
+        max_tool_calls: int | None,
+        *,
+        console: _ConsoleSink,
+        max_output_bytes: int,
+        max_result_bytes: int,
+        catalog: frozenset[str],
     ) -> None:
         self.rt = rt
         self.session_id = session_id
         self.max_tool_calls = max_tool_calls
+        self.console = console
+        self.max_output_bytes = max_output_bytes
+        self.max_result_bytes = max_result_bytes
+        self.catalog = catalog
+        self.discovered: set[str] = set()
         self.calls_made = 0
         self.ids = itertools.count(1)
         self.run: _AsyncRun | None = None
@@ -301,20 +133,58 @@ class _Core:
             run.wake.set()
         return await future
 
+    async def on_catalog_call(self, name: Any, args: list[Any]) -> Any:
+        """See `_agent._Core.on_catalog_call`."""
+        if (
+            not isinstance(name, str)
+            or name not in self.catalog
+            or name not in self.discovered
+        ):
+            shown = name if isinstance(name, str) and len(name) <= 64 else "?"
+            raise _public(
+                ToolNotDiscoveredError(
+                    f"no tool {shown!r} has been found in this session: call "
+                    "search_tools(query) to find tools and describe_tool(name) to see how "
+                    "to call one, then call it"
+                )
+            )
+        return await self.on_tool_call(name, args)
+
     async def execute(self, run: _AsyncRun, code: str) -> None:
+        capture = OutputCapture(self.max_output_bytes)
+        self.console.capture = capture
+        cancelled = False
         try:
-            final: Step = Done(await self.rt.eval(_wrap(code)))
+            value = await self.rt.eval(_wrap(code))
+            # Over the cap, the run fails but the session goes on (the value is dropped here).
+            bounded_result(value, self.max_result_bytes)
+            final: Step = Done(value)
         except asyncio.CancelledError:
-            self.finish(run, Failed(WorkerCrashed("the run was cancelled")))
-            raise
+            cancelled = True
+            final = Failed(WorkerCrashed("the run was cancelled"))
         except Exception as exc:  # noqa: BLE001 - every failure is the run's outcome
             final = Failed(exc)
-        self.finish(run, final)
+        finally:
+            # Console calls are synchronous host calls: every one was answered before the
+            # command's result arrived.
+            self.console.capture = None
+        self.finish(
+            run,
+            dataclasses.replace(
+                final,
+                stdout=capture.stdout,
+                stderr=capture.stderr,
+                truncated=capture.truncated,
+            ),
+        )
+        if cancelled:
+            raise asyncio.CancelledError
 
     def finish(self, run: _AsyncRun, final: Step) -> None:
         if run.final is not None:
             return
         run.final = final
+        # Calls still unanswered now belong to nobody (see `_agent._Core.execute`).
         run.events = collections.deque(
             e for e in run.events if not isinstance(e, ToolCall)
         )
@@ -369,20 +239,28 @@ class _Core:
         if self.run is not None:
             self.run.wake.set()
 
+    def shutdown(self) -> None:
+        """`_SessionBase._observe`'s hook: the worker died during a run."""
+        self.kill("the session's worker is gone")
 
-class AsyncAgentSandbox:
+
+class AsyncAgentSandbox(_SessionBase):
     """`AgentSandbox` for asyncio: the same session, driven by coroutines on the caller's loop.
 
     Takes exactly `AgentSandbox`'s arguments (``runtime_options`` go to `AsyncIsolatedRuntime`,
-    which also accepts ``handler_executor``: synchronous tools run there, or on its shared pool).
-    Constructing the object validates them and starts nothing; start the worker with
-    ``async with AsyncAgentSandbox(...) as sb`` or ``sb = await AsyncAgentSandbox.create(...)``.
+    which also accepts ``handler_executor``: synchronous tools and the console capture run there,
+    or on its shared pool). Constructing the object validates them and starts nothing; start the
+    worker with ``async with AsyncAgentSandbox(...) as sb`` or
+    ``sb = await AsyncAgentSandbox.create(...)``.
 
-    Semantics, limits and errors are `AgentSandbox`'s. The differences are what asyncio implies:
+    Semantics, limits, results, journals and errors are `AgentSandbox`'s. The differences are
+    what asyncio implies:
 
-    * cancelling a `start`, `resume` or `run` that is in progress kills the worker and closes the
-      session (V8 cannot be interrupted mid-command, and a worker left running would answer the
-      next command with the previous one's frames); the `CancelledError` propagates;
+    * cancelling a `start`, `resume`, `run` or `execute` that is in progress kills the worker and
+      closes the session (V8 cannot be interrupted mid-command, and a worker left running would
+      answer the next command with the previous one's frames); the `CancelledError` propagates,
+      and `dump()` then returns the journal as of the last good run plus a ``lost`` record, as
+      after a crash;
     * `close()` on a session that is running or paused at a tool call kills the worker at once
       rather than asking it to exit;
     * a session belongs to the event loop it was started on;
@@ -391,53 +269,58 @@ class AsyncAgentSandbox:
 
     def __init__(
         self,
-        tools: Mapping[str, Callable[..., Any]],
+        tools: Mapping[str, Any] | collections.abc.Sequence[Any],
         *,
         max_tool_calls: int | None = None,
         namespace: str | None = None,
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
         timeout: float | None = DEFAULT_TIMEOUT,
         max_pause: float | None = DEFAULT_MAX_PAUSE,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         **runtime_options: Any,
     ) -> None:
-        self._tools, self._clock_ms, self._random_seed = _settings(
+        rt_config, sink = self._configure(
             tools,
-            max_tool_calls,
-            namespace,
-            clock,
-            random_seed,
-            max_journal_bytes,
-            runtime_options,
-            "AsyncAgentSandbox",
+            max_tool_calls=max_tool_calls,
+            namespace=namespace,
+            tools_catalog=tools_catalog,
+            clock=clock,
+            random_seed=random_seed,
+            max_journal_bytes=max_journal_bytes,
+            max_output_bytes=max_output_bytes,
+            max_result_bytes=max_result_bytes,
+            runtime_options=runtime_options,
         )
-        self._namespace = namespace
-        self._max_tool_calls = max_tool_calls
-        self._max_journal_bytes = max_journal_bytes
-        self._redact = bool(runtime_options.get("redact_host_errors", True))
         self._executor = runtime_options.get("handler_executor")
-        self._records: list[list[Any]] | None = []
-        self._journal_size = 0
-        self._dead = False
         self._busy = False
         self._started = False
-        self._paused: ToolCall | None = None
-        self._run: _AsyncRun | None = None
         rt = AsyncIsolatedRuntime(
+            rt_config,
             clock=self._clock_ms / 1000,
             random_seed=self._random_seed,
             request_timeout=timeout,
             max_host_wait=max_pause,
             **runtime_options,
         )
-        self._core = _Core(rt, next(_SESSION_IDS), max_tool_calls)
+        self._core = _Core(
+            rt,
+            next(_SESSION_IDS),
+            max_tool_calls,
+            console=sink,
+            max_output_bytes=max_output_bytes,
+            max_result_bytes=max_result_bytes,
+            catalog=frozenset(self._catalog),
+        )
 
     # -- lifecycle -----------------------------------------------------------
 
     @classmethod
     async def create(
-        cls, tools: Mapping[str, Callable[..., Any]], **options: Any
+        cls, tools: Mapping[str, Any] | collections.abc.Sequence[Any], **options: Any
     ) -> AsyncAgentSandbox:
         """Construct a session and start its worker, without blocking the event loop."""
         session = cls(tools, **options)
@@ -473,7 +356,19 @@ class AsyncAgentSandbox:
                     await core.rt.bind_function(name, shim)
             elif shims:
                 await core.rt.bind_object(self._namespace, shims)
-            await core.rt.eval(_prelude(list(self._tools), self._namespace))
+            if self._catalog:
+
+                async def catalog_call(name: Any = None, *args: Any) -> Any:
+                    return await core.on_catalog_call(name, list(args))
+
+                await core.rt.bind_function(_CATALOG_CALL, catalog_call)
+            await core.rt.eval(
+                _prelude(
+                    list(self._tools),
+                    self._namespace,
+                    self._catalog_ns if self._catalog else None,
+                )
+            )
         except BaseException:
             self._dead = True
             core.kill("the session failed to start")
@@ -491,40 +386,11 @@ class AsyncAgentSandbox:
         await core.rt.close()
 
     def _abort(self, why: str) -> None:
-        self._dead = True
-        self._paused = None
+        """A cancellation: the run in progress is lost, with what it spent (see `dump`)."""
+        self._mark_dead("WorkerCrashed")
         self._core.kill(why)
 
     # -- introspection -------------------------------------------------------
-
-    @property
-    def tool_names(self) -> tuple[str, ...]:
-        return tuple(self._tools)
-
-    @property
-    def calls_made(self) -> int:
-        """Tool calls the guest has made so far (across all runs)."""
-        return self._core.calls_made
-
-    @property
-    def calls_remaining(self) -> int | None:
-        if self._max_tool_calls is None:
-            return None
-        return max(0, self._max_tool_calls - self._core.calls_made)
-
-    @property
-    def clock(self) -> datetime:
-        """The guest's frozen clock."""
-        return datetime.fromtimestamp(self._clock_ms / 1000, tz=timezone.utc)
-
-    @property
-    def random_seed(self) -> int:
-        return self._random_seed
-
-    @property
-    def pending(self) -> ToolCall | None:
-        """The tool call the session is paused at, if any (also after `load`)."""
-        return self._paused
 
     @property
     def worker_pid(self) -> int | None:
@@ -539,17 +405,14 @@ class AsyncAgentSandbox:
             return True
         proc = self._core.rt._proc  # noqa: SLF001
         if proc is not None and proc.poll() is not None:
-            self._dead = True
+            # Died while idle (nothing to lose), or with a run begun since the last checkpoint
+            # (paused at a tool call, or ended by the death but not yet observed): that run is lost.
+            begun = self._core.calls_made > self._checkpoint_calls or (
+                self._records is not None and len(self._records) > self._checkpoint
+            )
+            self._mark_dead("WorkerCrashed" if begun else None)
             return True
         return False
-
-    def describe_tools(self) -> str:
-        """See the module-level `describe_tools`."""
-        return describe_tools(self._tools, namespace=self._namespace)
-
-    def typescript_stubs(self) -> str:
-        """See the module-level `typescript_stubs`."""
-        return typescript_stubs(self._tools, namespace=self._namespace)
 
     # -- running -------------------------------------------------------------
 
@@ -603,6 +466,18 @@ class AsyncAgentSandbox:
         """`start` the code and answer every tool call with the real tool (awaited if it is a
         coroutine function, on the handler thread pool if it is a plain one); return the result
         or raise what the run failed with. See `AgentSandbox.run`."""
+        step = await self._drive(code)
+        if isinstance(step, Failed):
+            raise step.error
+        return step.value
+
+    async def execute(self, code: str) -> ExecutionResult:
+        """`run` the code, but return an `ExecutionResult` instead of raising. See
+        `AgentSandbox.execute`."""
+        step = await self._drive(code)
+        return step.to_result(max_error_bytes=self._max_output_bytes)
+
+    async def _drive(self, code: str) -> Done | Failed:
         self._enter()
         try:
             step = await self._start(code)
@@ -616,18 +491,25 @@ class AsyncAgentSandbox:
                 else:
                     step = await self._resume(step, result, None)
         except asyncio.CancelledError:
-            self._abort("run() was cancelled; the worker was killed")
+            self._abort("the run was cancelled; the worker was killed")
             raise
         finally:
             self._busy = False
-        if isinstance(step, Failed):
-            raise step.error
-        return step.value
+        return step
+
+    async def call(self, step: ToolCall) -> Any:
+        """Run the real tool for a `ToolCall` and return its result (see `AgentSandbox.call`)."""
+        self._check_call(step)
+        return await self._call_tool(step)
 
     async def _call_tool(self, call: ToolCall) -> Any:
-        tool = self._tools[call.name]
-        if inspect.iscoroutinefunction(tool):
-            result = await tool(*call.args)
+        if self._dead:
+            # A host-call frame the dead worker had already buffered can still arrive after another
+            # task noticed the death. Its tool was never part of the recorded run: do not run it.
+            raise WorkerCrashed("the worker died while the run was in progress")
+        fn, args = self._check_call(call)
+        if inspect.iscoroutinefunction(fn):
+            result = await fn(*args)
         else:
             # A plain function may block (a database driver, `requests`): never on the loop. It
             # sees the caller's contextvars, as with `asyncio.to_thread`.
@@ -635,26 +517,12 @@ class AsyncAgentSandbox:
             result = await asyncio.get_running_loop().run_in_executor(
                 self._executor or _aio._pool("handlers"),  # noqa: SLF001
                 context.run,
-                tool,
-                *call.args,
+                fn,
+                *args,
             )
             if inspect.isawaitable(result):
                 result = await result
-        try:
-            _encode(result)
-        except TypeError as exc:
-            raise TypeError(
-                f"tool {call.name!r} returned a value the sandbox cannot hold"
-            ) from exc
-        return result
-
-    def _check_usable(self) -> None:
-        if self._dead:
-            raise RuntimeError(
-                "the session's worker is gone (crashed, killed or timed out)"
-            )
-        if self._core.closed:
-            raise RuntimeError("the session is closed")
+        return self._check_result(call, result)
 
     async def _start(self, code: str) -> Step:
         if not isinstance(code, str):
@@ -673,74 +541,22 @@ class AsyncAgentSandbox:
     async def _resume(
         self, step: ToolCall, value: Any, error: BaseException | None
     ) -> Step:
-        if not isinstance(step, ToolCall):
-            raise TypeError("resume() takes the ToolCall the session is paused at")
-        self._check_usable()
-        if (
-            self._paused is None
-            or step._session != self._core.session_id  # noqa: SLF001
-            or step.call_id != self._paused.call_id
-        ):
-            raise RuntimeError(
-                "that tool call is not the one this session is paused at"
-            )
-        record, sent_value, sent_error = _answer(value, error, self._redact)
-        self._record(record)
+        sent_value, sent = self._answer(step, value, error)
         run = self._run
-        assert run is not None
-        self._paused = None
-        self._core.answer(run, step.call_id, sent_value, sent_error)
+        assert isinstance(run, _AsyncRun)
+        self._core.answer(run, step.call_id, sent_value, sent)
         return self._observe(await self._core.next_step(run))
-
-    def _observe(self, step: Step) -> Step:
-        kind, digest = _outcome(step)
-        self._record(["obs", kind, digest])
-        if isinstance(step, ToolCall):
-            self._paused = step
-        else:
-            self._paused = None
-            if self._core.rt.is_closed():
-                # The worker is gone (crash, hard timeout, memory kill, `max_pause`).
-                self._dead = True
-                self._core.kill("the session's worker is gone")
-        return step
-
-    def _record(self, record: list[Any]) -> None:
-        if self._records is None:
-            return
-        self._journal_size += len(json.dumps(record, separators=(",", ":")))
-        if self._journal_size > self._max_journal_bytes:
-            self._records = None  # free it; `dump` explains
-            return
-        self._records.append(record)
 
     # -- durability ----------------------------------------------------------
 
     async def dump(self, key: bytes, *, associated_data: bytes = b"") -> bytes:
         """The session's journal, HMAC-SHA256-signed with `key`. See `AgentSandbox.dump`; the
-        bytes are interchangeable with it."""
+        bytes are interchangeable with it. After the worker died (a crash, a timeout, a kill, a
+        cancellation) it is the journal as of the last good run plus a ``lost`` record."""
         self._enter()
         try:
             self.is_closed()  # notices a worker that died behind the session's back
-            if self._dead:
-                raise JournalError(
-                    "the session's worker is gone; its last run cannot be replayed (dump after "
-                    "each step you want to be able to return to)"
-                )
-            if self._records is None:
-                raise JournalError(
-                    f"the journal grew past max_journal_bytes={self._max_journal_bytes}"
-                )
-            config = {
-                "clock_ms": self._clock_ms,
-                "random_seed": self._random_seed,
-                "max_tool_calls": self._max_tool_calls,
-                "namespace": self._namespace,
-                "tools": list(self._tools),
-                "release": _engine_version().decode(errors="replace"),
-                "redact": self._redact,
-            }
-            records = list(self._records)
+            config, records = self._journal()
             if self._journal_size > _OFFLOAD_BYTES:
                 return await asyncio.get_running_loop().run_in_executor(
                     _aio._pool("codec"),  # noqa: SLF001
@@ -759,47 +575,34 @@ class AsyncAgentSandbox:
         cls,
         blob: bytes,
         key: bytes,
-        tools: Mapping[str, Callable[..., Any]],
+        tools: Mapping[str, Any] | collections.abc.Sequence[Any],
         *,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         associated_data: bytes = b"",
+        tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
         **options: Any,
     ) -> AsyncAgentSandbox:
         """Rebuild a session from a journal (`dump()` output of this class or of `AgentSandbox`)
         by replaying it on a fresh worker. See `AgentSandbox.load`."""
-        if not isinstance(blob, (bytes, bytearray)):
-            raise TypeError("blob must be bytes")
-        if len(blob) > max_journal_bytes * 2 + len(_MAGIC) + _MAC_LEN + 4096:
-            raise JournalError("journal is larger than max_journal_bytes allows")
-        blob = bytes(blob)
-        if len(blob) > _OFFLOAD_BYTES:
+        if isinstance(blob, (bytes, bytearray)) and len(blob) > _OFFLOAD_BYTES:
             journal = await asyncio.get_running_loop().run_in_executor(
                 _aio._pool("codec"),  # noqa: SLF001
                 _open_journal,
-                blob,
+                bytes(blob),
                 key,
                 associated_data,
+                max_journal_bytes,
             )
         else:
-            journal = _open_journal(blob, key, associated_data)
-        tools = _check_journal(journal, tools, options)
-        config = journal["config"]
-        session = cls(
-            tools,
-            max_tool_calls=config["max_tool_calls"],
-            namespace=config["namespace"],
-            clock=config["clock_ms"] / 1000,
-            random_seed=config["random_seed"],
-            max_journal_bytes=max_journal_bytes,
-            **options,
+            journal = _open_journal(blob, key, associated_data, max_journal_bytes)
+        entries, arguments = cls._load_arguments(
+            journal, tools, tools_catalog, max_journal_bytes, options
         )
+        session = cls(entries, **arguments, **options)
         try:
             await session._open()
             await session._replay(journal["records"])
-        except JournalError:
-            await session.close()
-            raise
-        except (ValueError, TypeError, OverflowError) as exc:
+        except (ValueError, TypeError, OverflowError) as exc:  # as AgentSandbox.load
             await session.close()
             raise JournalError(f"malformed journal: {type(exc).__name__}") from None
         except asyncio.CancelledError:
@@ -812,10 +615,14 @@ class AsyncAgentSandbox:
 
     async def _replay(self, records: list[list[Any]]) -> None:
         plan = _replay_plan(records)
+        step: Step | None = None
         try:
             request = next(plan)
             while True:
-                if request[0] == "run":
+                if request[0] == "lost":
+                    self._replay_lost(request[1])
+                    step = None
+                elif request[0] == "run":
                     step = await self._start(request[1])
                 else:
                     step = await self._resume(request[1], request[2], request[3])
