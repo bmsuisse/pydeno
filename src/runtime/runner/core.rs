@@ -529,11 +529,11 @@ impl RuntimeCoreState {
         if let Some(watchdog) = watchdog {
             let (fired, duration) = self.resolve_watchdog(watchdog);
             if fired {
+                // The deadline passed, whatever the call produced meanwhile: a guest error whose
+                // conversion ran into the deadline (a looping `cause` getter, say) is reported as
+                // the timeout it is, not as the guest's error.
                 let message = format!("{context} timed out after {}ms", duration.as_millis());
-                return match result {
-                    Err(err) if !runtime_error_indicates_termination(&err) => Err(err),
-                    _ => Err(RuntimeError::timeout(message)),
-                };
+                return Err(RuntimeError::timeout(message));
             }
         }
         result

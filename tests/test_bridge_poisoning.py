@@ -794,6 +794,119 @@ def test_a_looping_getter_cannot_stall_a_bind_on_the_isolated_worker() -> None:
         assert rt.eval("1 + 1") == 2
 
 
+# deno_core's AggregateError check reads `constructor` (and its `name`) from the thrown error and
+# up its prototype chain with ordinary [[Get]]s, so getters planted there ran inside a refused
+# bind too, and a constructor named 'AggregateError' made it read `errors` as well.
+CONSTRUCTOR_CHAIN_POISON = {
+    "typeerror-prototype-constructor": (
+        "Object.defineProperty(TypeError.prototype, 'constructor', "
+        "{get() { hits.push('TE.ctor'); return TypeError }, configurable: true})"
+    ),
+    "error-prototype-constructor": (
+        "Object.defineProperty(Error.prototype, 'constructor', "
+        "{get() { hits.push('E.ctor'); return Error }, configurable: true})"
+    ),
+    "object-prototype-constructor": (
+        "Object.defineProperty(Object.prototype, 'constructor', "
+        "{get() { hits.push('O.ctor'); return Object }, configurable: true})"
+    ),
+    "typeerror-name": (
+        "Object.defineProperty(TypeError, 'name', "
+        "{get() { hits.push('TE.name'); return 'TypeError' }, configurable: true})"
+    ),
+    "error-name": (
+        "Object.defineProperty(Error, 'name', "
+        "{get() { hits.push('E.name'); return 'Error' }, configurable: true})"
+    ),
+    "object-name": (
+        "Object.defineProperty(Object, 'name', "
+        "{get() { hits.push('O.name'); return 'Object' }, configurable: true})"
+    ),
+    "fake-aggregate-errors": (
+        "Object.defineProperty(TypeError.prototype, 'constructor', "
+        "{value: {name: 'AggregateError'}, configurable: true});"
+        "Object.defineProperty(TypeError.prototype, 'errors', "
+        "{get() { hits.push('errors'); return [] }, configurable: true})"
+    ),
+    "error-prototype-tostring": (
+        "Error.prototype.toString = function () { hits.push('toString'); return 'x' }"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(CONSTRUCTOR_CHAIN_POISON))
+def test_a_refused_bind_reads_nothing_up_the_constructor_chain(
+    make_rt, name: str
+) -> None:
+    rt = make_rt()
+    rt.eval(
+        "globalThis.hits = []; " + CONSTRUCTOR_CHAIN_POISON[name] + ";"
+        " globalThis.tools = new Proxy({}, {}); 0"
+    )
+    with pytest.raises(Exception, match=_BIND_REFUSED):
+        rt.bind_object("tools", {"f": lambda: 1})
+    assert rt.eval("hits") == []
+
+
+LOOPING_CONSTRUCTOR_CHAIN = {
+    "typeerror-prototype-constructor": (
+        "Object.defineProperty(TypeError.prototype, 'constructor', "
+        "{get() { for (;;) {} }, configurable: true})"
+    ),
+    "error-prototype-constructor": (
+        "Object.defineProperty(Error.prototype, 'constructor', "
+        "{get() { for (;;) {} }, configurable: true})"
+    ),
+    "typeerror-name": (
+        "Object.defineProperty(TypeError, 'name', {get() { for (;;) {} }, configurable: true})"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(LOOPING_CONSTRUCTOR_CHAIN))
+def test_a_looping_constructor_getter_cannot_stall_a_bind_on_runtime(name: str) -> None:
+    import time
+
+    setup = (
+        LOOPING_CONSTRUCTOR_CHAIN[name] + "; globalThis.tools = new Proxy({}, {}); 0"
+    )
+    script = _HANG_SCRIPT.replace(
+        "try:\n", "import time\nt = time.monotonic()\ntry:\n", 1
+    )
+    script += "print(time.monotonic() - t)\n"
+    start = time.monotonic()
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", script.format(setup=setup)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError("bind_object was still blocked after 30 s") from None
+    lines = done.stdout.split()
+    assert lines and lines[0] == "refused", (done.stdout, done.stderr[-400:])
+    assert float(lines[-1]) < 1.2
+    assert time.monotonic() - start < 20
+
+
+@pytest.mark.parametrize("name", list(LOOPING_CONSTRUCTOR_CHAIN))
+def test_a_looping_constructor_getter_cannot_stall_a_bind_on_the_isolated_worker(
+    name: str,
+) -> None:
+    import time
+
+    with IsolatedRuntime(RuntimeConfig(timeout=3.0)) as rt:
+        rt.eval(
+            LOOPING_CONSTRUCTOR_CHAIN[name]
+            + "; globalThis.tools = new Proxy({}, {}); 0"
+        )
+        start = time.monotonic()
+        with pytest.raises(Exception, match=_BIND_REFUSED):
+            rt.bind_object("tools", {"f": lambda: 1})
+        assert time.monotonic() - start < 1.2
+
+
 # `prepare` and `revive` filled fresh arrays with `out[index] = ...`, which runs an index setter
 # a guest planted on `Array.prototype` instead of storing the element.
 _INDEX_POISON = (

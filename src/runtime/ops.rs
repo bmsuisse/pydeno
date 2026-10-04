@@ -653,21 +653,24 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   // accessor that hands back a throwaway object, a read-only global that ignores the assignment).
   // And they run no guest code: no `for...of`, no plain assignment that could hit a setter, no
   // lookups on a namespace that could be a Proxy.
-  // The host converts the error it gets back with deno_core's `JsError::from_v8_exception`, which
-  // reads `name` and `message` (serde), `cause`, `stack`, and `Symbol.for(
-  // "errorAdditionalPropertyKeys")` (then each key it lists, and that value's `toString()`). Each
-  // is an own data property here, so none of those reads walks the prototype chain into a getter
-  // the guest planted on `Error.prototype` -- no deadline covers a bind, so a looping getter there
-  // would block the host. `stack` is plain text, so it is never formatted (no guest
-  // `Error.prepareStackTrace`, and no CallSite frames to read). The rest of the conversion
-  // (`is_instance_of_error`, the AggregateError check, the V8 message) walks prototypes natively
-  // without calling into JavaScript, and a TypeError has no `errors`.
+  // The host converts the error it gets back with deno_core's `JsError::from_v8_exception`. Its
+  // ordinary [[Get]]s on the error are: `name` and `message` (serde), `cause`, `stack`,
+  // `Symbol.for("errorAdditionalPropertyKeys")` (then each key it lists, and that value's
+  // `toString()`), and, in the AggregateError check, `constructor` and that constructor's `name`,
+  // repeated up the prototype chain (and `errors` when the name says AggregateError). Every one of
+  // those is an own data property here, so no read reaches a getter the guest planted on a
+  // prototype or constructor -- no deadline covers a bind, so a looping getter would block the
+  // host. `constructor` is `null`: deno_core stops the AggregateError walk as soon as it is not an
+  // object, before it looks at any prototype. `stack` is plain text, so it is never formatted (no
+  // guest `Error.prepareStackTrace`, no CallSite frames to read). The remaining steps
+  // (`is_instance_of_error`, the V8 message) walk prototypes natively without calling JavaScript.
   function refuseBind(name, why) {
     const message = "Cannot bind '" + name + "': " + why;
     const error = new TypeErrorCtor(message);
     const fields = [
       "name", "TypeError",
       "message", message,
+      "constructor", null,
       "cause", undefined,
       "stack", "TypeError: " + message,
       ErrorAdditionalPropertyKeys, undefined,
