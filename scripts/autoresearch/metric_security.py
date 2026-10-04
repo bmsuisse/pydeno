@@ -132,6 +132,66 @@ def huge_result_is_refused_without_killing_the_parent() -> bool:
             return rt.eval("1 + 1") != 2 if not rt.is_closed() else False
 
 
+# --- strict_eval: no code generation from strings, however the guest reaches a compiler ------------------
+# Run after the guest has tampered with the constructor chain (replaced `Function`, `eval` and
+# `Function.prototype.constructor`, subclassed `Function`), so a compiler reached through any alias
+# still has to refuse.
+_STRICT_TAMPER = (
+    "globalThis.__F = Function; globalThis.__real = {e: eval, ind: (0, eval), self: globalThis};"
+    "globalThis.eval = function (s) { return 'shadow' };"
+    "globalThis.Function = function () { return () => 'shadow' };"
+    "Object.defineProperty(__F.prototype, 'constructor', {value: __F, writable: true})"
+)
+_STRICT_ATTACKS = (
+    "new __F('return 1')()",
+    "__F('return 1')()",
+    "(function () {}).constructor('return 1')()",
+    "(() => {}).constructor('return 1')()",
+    "typeof Object.getPrototypeOf(async function () {}).constructor('return 1')",
+    "typeof Object.getPrototypeOf(function* () {}).constructor('yield 1')",
+    "typeof Object.getPrototypeOf(async function* () {}).constructor('yield 1')",
+    "Reflect.construct(__F, ['return 1'])()",
+    "Reflect.apply(__F, null, ['return 1'])()",
+    "[].constructor.constructor('return 1')()",
+    "({}).constructor.constructor('return 1')()",
+    "class X extends __F {}; new X('return 1')()",
+    "__F.prototype.call.call(__F, null, 'return 1')()",
+    "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(() => {}), 'constructor').value('return 1')()",
+    # indirect eval through aliases taken before the guest shadowed `eval`
+    "__real.e('1 + 1')",
+    "(0, __real.ind)('1 + 1')",
+    "__real.self.__real.e.call(null, '1 + 1')",
+    "[__real.e][0]('1 + 1')",
+)
+
+
+@probe
+def strict_eval_refuses_every_string_compiler() -> bool:
+    with iso(strict_eval=True) as rt:
+        rt.eval(_STRICT_TAMPER + "; 0")
+        for code in _STRICT_ATTACKS:
+            try:
+                rt.eval(code)
+            except Exception as exc:  # noqa: BLE001
+                if "Code generation from strings disallowed" not in str(exc):
+                    return True  # failed for another reason: not proof that strict mode held
+                continue
+            return True  # compiled and ran a string
+        return False
+
+
+@probe
+def strict_eval_is_frozen_with_the_hardening_flags() -> bool:
+    with iso(strict_eval=True) as rt:
+        flags = rt.v8_flags
+        return not (
+            rt.strict_eval
+            and flags[-1] == "--disallow-code-generation-from-strings"
+            and "--freeze-flags-after-init" in flags
+            and "--jitless" in flags
+        )
+
+
 # --- the host bridge: a guest must not interfere with a later host bind ----------------------------------
 def _bind_probe(setup: str, kind: str, runtime) -> bool:  # type: ignore[no-untyped-def]
     """True if guest setup made a host bind silently do nothing (or run guest code) yet return normally."""

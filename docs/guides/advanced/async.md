@@ -65,7 +65,7 @@ finally:
 - **Every option** of `IsolatedRuntime` is accepted with the same meaning and default
   (`max_memory=1 GiB`, `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`,
   `max_inflight_host_calls`, `write_stall_timeout`, `redact_host_errors=True`, `sandbox`,
-  `empty_root`, `jitless`, `v8_flags`, `clock`, `random_seed`, `python`, `prewarm`), plus
+  `empty_root`, `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `python`, `prewarm`), plus
   `handler_executor`. `rt.sandbox`, `rt.sandbox_extras` and `rt.v8_flags` report what is in force.
 - **`eval` and `eval_module` await promises** (they are `IsolatedRuntime.eval_async` and
   `eval_module_async`; `rt.eval_async` / `rt.eval_module_async` are aliases, so code written for
