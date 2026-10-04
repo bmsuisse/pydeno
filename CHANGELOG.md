@@ -52,8 +52,13 @@
   symbol and holds it weakly; when a charge would exceed the cap the op forces a GC, gives collected buffers'
   bytes back and retries, so churn through short-lived resizable buffers does not exhaust the budget; the
   allocator does the same cheap sweep before refusing a fixed-length buffer, and the bookkeeping is bounded
-  (it is swept as it doubles and capped). `instanceof`, subclassing, `Symbol.species` and the prototype
-  objects are unchanged. `WebAssembly.Memory`
+  (it is swept as it doubles and capped). Resizable buffers are charged in whole OS pages, which is what V8
+  commits for them (a one-byte resizable buffer costs a page). `instanceof`, subclassing, `Symbol.species`
+  and the prototype objects are unchanged.
+- **A refused allocation no longer leaves the runtime terminated.** With `max_heap_size` set, an
+  `ArrayBuffer` the buffer cap refused was reported to the guest as a `RangeError` but also marked the
+  runtime as over its heap limit, so every later command failed with `RuntimeTerminated`. Only a JS heap
+  that really is at its limit terminates now. `WebAssembly.Memory`
   remains a sink the cap cannot see (`IsolatedRuntime` has no WebAssembly under `--jitless`).
 - **A guest could kill an `IsolatedRuntime` worker with one large `console.log`** when the host set
   `enable_console=True`: the engine echoed console output to the worker's stdout, which is the parent's
@@ -63,7 +68,10 @@
 - **Captured console output carries no control or escape characters.** `execute()` (and the agent layer's
   `ExecutionResult`) cleaned error text but returned `stdout`/`stderr` with raw ANSI/C1 sequences; they now
   follow the same rule (newlines and tabs stay), and both also drop the Unicode bidirectional controls that
-  reorder a line. An `on_console` callback still receives the guest's text raw; sanitise it before printing.
+  reorder a line and the invisible format characters (zero-width joiners and spaces, the BOM, soft hyphen,
+  line and paragraph separators, variation selectors, TAG characters) that carry text a reader never sees
+  but a model does. Emoji sequences lose their joiners and skin-tone modifiers and render as their parts.
+  An `on_console` callback still receives the guest's text raw; sanitise it before printing.
 
 ### Fixed
 
