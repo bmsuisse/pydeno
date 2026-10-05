@@ -387,6 +387,10 @@ def _default_gate_threads() -> int:
     return value if 0 < value <= MAX_GATE_THREADS else 32
 
 
+# Replaced in the child before any child thread can use a private pool's fallback.
+_GATE_FORK_LOCK = threading.Lock()
+
+
 class _GatePool:
     """The threads that run sync gates for async callers: one pool for the whole process.
 
@@ -403,17 +407,20 @@ class _GatePool:
         self._reset()
 
     def _reset(self) -> None:
-        self.pid = os.getpid()
         self.jobs: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.threads = 0
         self.idle = 0
         self.pending = 0  # queued jobs no thread has taken yet
+        # Publish ownership only after the queue and counters are ready.
+        self.pid = os.getpid()
 
     def _check_fork(self) -> None:
         if self.pid != os.getpid():
-            # A fork child cannot acquire a mutex another parent thread held.
-            self.lock = threading.Lock()
-            self._reset()
+            with _GATE_FORK_LOCK:
+                if self.pid != os.getpid():
+                    # A fork child cannot acquire a mutex another parent thread held.
+                    self.lock = threading.Lock()
+                    self._reset()
 
     def submit(
         self, fn: Callable[..., Any], *args: Any
@@ -457,6 +464,16 @@ class _GatePool:
 
 
 _GATE_POOL = _GatePool()
+
+
+def _after_gate_fork() -> None:
+    global _GATE_FORK_LOCK
+    _GATE_FORK_LOCK = threading.Lock()
+    _GATE_POOL._check_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_gate_fork)
 
 
 def set_gate_threads(count: int) -> None:

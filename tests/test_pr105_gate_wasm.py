@@ -115,6 +115,9 @@ assert held.wait(2)
 child = os.fork()
 if child == 0:
     signal.alarm(3)
+    # The global pool is reset by after_in_child, before starting child threads.
+    assert pool.pid == os.getpid()
+    assert pool.threads == pool.idle == pool.pending == 0
     if os.environ.get("CONFIGURE_GATE_FIRST") == "1":
         _gate.set_gate_threads(2)
     value = pool.submit(lambda: 42).result(timeout=2)
@@ -133,5 +136,73 @@ finally:
             timeout=10,
             check=False,
             env={**os.environ, "CONFIGURE_GATE_FIRST": str(int(configure_first))},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_private_gate_pool_concurrent_child_reset_does_not_drop_job():
+        probe = """
+import os
+import signal
+import threading
+from pydeno import _gate
+pool = _gate._GatePool()
+pool.size = 1
+parent_started = threading.Event()
+parent_release = threading.Event()
+def parent_gate():
+    parent_started.set()
+    parent_release.wait(8)
+pool.submit(parent_gate)
+assert parent_started.wait(2)
+child = os.fork()
+if child == 0:
+    signal.alarm(5)
+    published = threading.Event()
+    finish_reset = threading.Event()
+    second_started = threading.Event()
+    second_submitted = threading.Event()
+    original_queue = _gate.queue.SimpleQueue
+    resets = []
+    def paused_queue():
+        # Pause at the real queue constructor in _reset, after PID publication on base.
+        resets.append(1)
+        published.set()
+        assert finish_reset.wait(2)
+        return original_queue()
+    _gate.queue.SimpleQueue = paused_queue
+    futures = {}
+    def first():
+        futures[1] = pool.submit(lambda: 41)
+    def second():
+        second_started.set()
+        futures[2] = pool.submit(lambda: 42)
+        second_submitted.set()
+    one = threading.Thread(target=first)
+    one.start()
+    assert published.wait(2)
+    two = threading.Thread(target=second)
+    two.start()
+    assert second_started.wait(2)
+    second_submitted.wait(0.2)
+    finish_reset.set()
+    one.join(2)
+    two.join(2)
+    assert not one.is_alive() and not two.is_alive()
+    assert futures[1].result(timeout=1) == 41
+    assert futures[2].result(timeout=1) == 42
+    assert len(resets) == 1
+    os._exit(0)
+try:
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, status
+finally:
+    parent_release.set()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         assert result.returncode == 0, result.stderr
