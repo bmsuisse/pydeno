@@ -1,0 +1,152 @@
+name: Lab 45 (throwaway, native seccomp verification)
+
+# Throwaway branch for #45: native x86_64 and aarch64 runs of the syscall trace, the container
+# matrix, the security metric and a paired start-up timing. Deleted when #45 is done.
+on:
+  push:
+    branches: [lab/45-native]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-45
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      trace: ${{ steps.p.outputs.trace }}
+      matrix: ${{ steps.p.outputs.matrix }}
+      metric: ${{ steps.p.outputs.metric }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: p
+        run: |
+          for f in trace matrix metric; do
+            if [ -f "lab/$f" ]; then echo "$f=yes" >> "$GITHUB_OUTPUT"; else echo "$f=no" >> "$GITHUB_OUTPUT"; fi
+          done
+
+  wheels:
+    name: wheels (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, runner: ubuntu-latest}
+          - {arch: aarch64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --find-interpreter
+          manylinux: 2_28
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: dist/*.whl
+
+  trace:
+    name: trace ${{ matrix.image }} (${{ matrix.arch }})
+    if: needs.plan.outputs.trace == 'yes'
+    needs: [plan, wheels]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["python:3.10-slim", "python:3.14-slim", "ubuntu:22.04", "almalinux:9", "fedora:latest"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheels
+      - name: trace
+        run: |
+          mkdir -p out
+          docker run --rm --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            -v "$PWD":/src:ro -v "$PWD/wheels":/wheels:ro -v "$PWD/out":/out \
+            -e TRACE_TAG="$(cat lab/trace)" -e TRACE_TESTS="$(cat lab/trace-tests 2>/dev/null || true)" \
+            "${{ matrix.image }}" sh /src/lab/trace_inner.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-${{ matrix.arch }}-${{ strategy.job-index }}
+          path: out/
+
+  matrix:
+    name: ${{ matrix.image }} / ${{ matrix.profile }} (${{ matrix.arch }})
+    if: needs.plan.outputs.matrix == 'yes'
+    needs: [plan, wheels]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 45
+    env:
+      CONTAINER_RUNTIME: docker
+      EXTRA_RUN_ARGS: --security-opt apparmor=unconfined
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        profile: [default]
+        image:
+          - python:3.10-slim
+          - python:3.11-slim
+          - python:3.12-slim
+          - python:3.13-slim
+          - python:3.14-slim
+          - debian:bookworm
+          - debian:trixie
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - fedora:latest
+          - almalinux:9
+          - amazonlinux:2023
+        include:
+          - {arch: x86_64, image: "python:3.10-slim", profile: no-landlock}
+          - {arch: x86_64, image: "python:3.10-slim", profile: no-seccomp}
+          - {arch: x86_64, image: "python:3.14-slim", profile: no-landlock}
+          - {arch: x86_64, image: "python:3.14-slim", profile: no-seccomp}
+          - {arch: aarch64, image: "python:3.10-slim", profile: no-landlock}
+          - {arch: aarch64, image: "python:3.10-slim", profile: no-seccomp}
+          - {arch: aarch64, image: "python:3.14-slim", profile: no-landlock}
+          - {arch: aarch64, image: "python:3.14-slim", profile: no-seccomp}
+          - {arch: x86_64, image: "ubuntu:24.04", profile: none}
+          - {arch: aarch64, image: "ubuntu:24.04", profile: none}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheels
+      - name: suites
+        run: |
+          if [ -s lab/matrix-targets ]; then export PYTEST_TARGETS="$(cat lab/matrix-targets)"; else unset PYTEST_TARGETS; fi
+          scripts/linux_matrix.sh wheels "${{ matrix.image }}" "${{ matrix.profile }}"
+
+  metric:
+    name: metric_security + timing ${{ matrix.image }} (${{ matrix.arch }})
+    if: needs.plan.outputs.metric == 'yes'
+    needs: [plan, wheels]
+    runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["python:3.10-slim", "python:3.14-slim"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: wheels
+      - name: metric and paired timing
+        run: |
+          docker run --rm --security-opt apparmor=unconfined \
+            -v "$PWD":/src:ro -v "$PWD/wheels":/wheels:ro \
+            "${{ matrix.image }}" sh /src/lab/metric_inner.sh
