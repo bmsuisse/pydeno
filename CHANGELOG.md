@@ -109,6 +109,17 @@ boundary; the sandbox is.
   is held over to a later command. Measured on macOS arm64 (release build, paired runs): a warm
   `eval_async` about 237 to 150 microseconds, a warm `feed_run` about 220 to 140 microseconds,
   checkout plus 11 feeds about 4.4 to 3.4 ms. The synchronous paths are unchanged.
+- **Large reply frames are copied once, not twice, in the host's frame readers** (#66). The sync
+  and async readers took a payload out of the reassembly buffer as `bytes(buf[start:end])`, which
+  first builds a payload-sized `bytearray` slice; payloads of 64 KiB and more are now copied
+  through a memoryview released before the buffer is resized. Smaller frames, the sync single-read
+  fast path, the 16 MiB cap and all frame checks are unchanged, and a payload is still owned `bytes`.
+  Measured on macOS arm64 (release build, one native extension, 9 interleaved fresh-process rounds,
+  medians): reading 16 MiB frames, Python-heap peak 52.1 to 35.3 MB and peak RSS 69.8 to 53.0 MB,
+  reader CPU 17.6 to 12.3 ms (async) and 27.8 to 22.8 ms (sync) per three frames. End to end, a
+  16 MiB `eval` reply has a Python-heap peak of 52.1 to 35.3 MB, and 1 to 16 MiB replies use about
+  2 to 4 percent less host CPU; the process's peak RSS for such a call is unchanged, because a later
+  phase sets it. Small frames, warm `eval`, host calls and `feed_run` are unchanged within noise.
 - **Clearer limit and diagnostics wording** (#84). Agent sessions name the argument the caller passed
   (`timeout`, `max_pause`) when they reject a value; `-0.0` is stored as `0.0`; the docs describe
   how the Proxy, console-deadline and default-printer limits behave (console time in the synchronous
