@@ -6,7 +6,8 @@ The `kind` strings are a public contract: lowercase, only ever added to, and lis
 
 **Retry rule (one rule for every kind).** `retryable` is true only when the failure was
 environmental or transient, so running the *same work* again on a *fresh* runtime could plausibly
-succeed: the worker process died or failed to start, or a gate could not reach a decision. A deadline, a memory overrun, a CPU cap or a
+succeed: the worker process died or failed to start, a capped pool had no free worker slot in
+time (`checkout_timeout`; nothing ran), or a gate could not reach a decision. A deadline, a memory overrun, a CPU cap or a
 spent budget is a property of the work under the limits it was given; the same code fails the same
 way again, so those are `retryable=False`. Where a larger limit would let the work finish,
 `retry_with_larger_limits` says so (`timeout=`, `max_memory=`, `max_calls=`, ...): that is a
@@ -93,6 +94,11 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
         True,
         False,
         "The worker process died, hung or failed to start.",
+    ),
+    "checkout_timeout": (
+        True,
+        False,
+        "A pool with max_workers had no free worker slot within checkout_timeout.",
     ),
     "terminated": (False, False, "The runtime was terminated on request."),
     "force_killed": (
@@ -299,6 +305,11 @@ _ROWS: list[Row] = [
         lambda e, t, a: (
             _is(e, "pydeno._pydeno", "RuntimeTimeout") and bool(_HOST_WAIT.fullmatch(t))
         ),
+    ),
+    # A `TimeoutError` subclass: before both `timeout` rows. Nothing ran; capacity is transient.
+    (
+        "checkout_timeout",
+        lambda e, t, a: _is(e, "pydeno._sandbox_pool", "CheckoutTimeout"),
     ),
     ("timeout", lambda e, t, a: _is(e, "pydeno._pydeno", "RuntimeTimeout")),
     ("tool_budget", lambda e, t, a: _is(e, "pydeno._tools", "ToolBudgetError")),
