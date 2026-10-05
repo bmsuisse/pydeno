@@ -650,3 +650,188 @@ async def test_async_pydeno_gate_timeout() -> None:
             with pytest.raises(GateUnavailable, match="gate_timeout"):
                 await session.feed_run("1")
             assert session.worker_pid is not None
+
+
+# ---------------------------------------------------------------------------
+# review round 2: the scanner fails closed end to end, and the hooks' edges
+# ---------------------------------------------------------------------------
+
+FEED_BYPASSES = {
+    # run as a feed (the body of an async function): each one called the tool before
+    "await-regex": 'await /`/\nsecretTool("await-regex")\n// `',
+    "html-comment": 'let x = 1 <!-- `\nsecretTool("html")\n// `',
+    "function-expression": 'let y = function(){} / secretTool("fn") / 2; y',
+    "await-object": 'await {} / secretTool("obj") / 1',
+    "octal-escape": 'globalThis["secr\\145tTool"]("octal")',
+    "eval-await-regex": 'await /`/\nconst r = eval("secretTool(1)")\n// `\nr',
+}
+SCRIPT_BYPASSES = {
+    "hashbang": '#! `\nglobalThis.hit = eval("6*7")\n// `',
+    "html-comment": 'var a = 1 <!-- `\nglobalThis.hit = eval("7*7")\n// `',
+    "octal-escape": 'globalThis.hit = globalThis["\\145val"]("8*8")',
+    "reflect": 'globalThis.hit = Reflect.get(globalThis, "eval")("1")',
+}
+STRICT = SourcePolicy(
+    forbid_eval=True, forbid_function=True, forbidden_globals={"secretTool"}
+)
+
+
+def test_known_bypasses_are_denied_through_pydeno() -> None:
+    called: list[object] = []
+
+    def secret_tool(*args: object) -> str:
+        called.append(args)
+        return "SECRET"
+
+    with Pydeno(sandbox=MODE, gate=static_gate(STRICT), min_processes=1) as pool:
+        for name, code in FEED_BYPASSES.items():
+            with pool.checkout() as session:
+                with pytest.raises(GateDenied):
+                    session.feed_run(code, external_lookup={"secretTool": secret_tool})
+                assert session.feed_run("1 + 1") == 2, name
+    assert called == []
+
+
+def test_known_bypasses_are_denied_through_isolated_runtime() -> None:
+    with IsolatedRuntime(gate=static_gate(STRICT)) as rt:
+        for code in SCRIPT_BYPASSES.values():
+            with pytest.raises(GateDenied):
+                rt.eval(code)
+    with IsolatedRuntime() as rt:  # the same shapes really run without the gate
+        for code in SCRIPT_BYPASSES.values():
+            rt.eval("globalThis.hit = undefined")
+            rt.eval(code)
+            assert rt.eval("globalThis.hit") is not None
+
+
+async def test_a_slow_sync_gate_does_not_stall_the_event_loop() -> None:
+    def slow(source: str, context: GateContext) -> Verdict:
+        time.sleep(0.5)
+        return ALLOW
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    async with AsyncIsolatedRuntime(gate=slow) as rt:
+        task = asyncio.ensure_future(ticker())
+        try:
+            assert await rt.eval("1 + 1") == 2
+        finally:
+            task.cancel()
+    assert ticks >= 15  # the loop kept running while the gate slept on its thread
+
+
+async def test_a_hung_sync_gate_is_abandoned_at_its_timeout_in_async_classes() -> None:
+    release = threading.Event()
+
+    def hangs(source: str, context: GateContext) -> Verdict:
+        release.wait(10)
+        return ALLOW
+
+    try:
+        async with AsyncIsolatedRuntime(gate=hangs, gate_timeout=0.2) as rt:
+            started = time.monotonic()
+            with pytest.raises(GateUnavailable, match="gate_timeout"):
+                await rt.eval("1")
+            assert time.monotonic() - started < 2
+    finally:
+        release.set()
+
+
+def test_async_classes_refuse_an_unbounded_gate_timeout() -> None:
+    for build in (
+        lambda: AsyncIsolatedRuntime(gate=NO_EVAL, gate_timeout=None),
+        lambda: AsyncAgentSandbox({}, gate=NO_EVAL, gate_timeout=None),
+        lambda: AsyncPydeno(sandbox=MODE, gate=NO_EVAL, gate_timeout=None),
+    ):
+        with pytest.raises(ValueError, match="gate_timeout"):
+            build()
+    # The sync classes accept it: a sync gate cannot be interrupted anyway.
+    with IsolatedRuntime(gate=NO_EVAL, gate_timeout=None) as rt:
+        assert rt.eval("1") == 1
+
+
+async def test_async_gate_check_refuses_an_unbounded_timeout() -> None:
+    from pydeno import async_gate_check
+
+    with pytest.raises(ValueError, match="timeout"):
+        await async_gate_check(NO_EVAL, "1", timeout=None)
+
+
+def test_a_closed_session_or_runtime_does_not_call_the_gate() -> None:
+    rec = Recorder()
+    sb = AgentSandbox({}, gate=rec)
+    sb.close()
+    for method in (sb.run, sb.execute, sb.start):
+        with pytest.raises(RuntimeError):
+            method("return 1")
+    rt = IsolatedRuntime(gate=rec)
+    rt.close()
+    with pytest.raises(Exception, match="closed"):
+        rt.eval("1")
+    assert rec.calls == []
+
+
+async def test_a_closed_async_session_does_not_call_the_gate() -> None:
+    rec = Recorder()
+    async with AsyncAgentSandbox({}, gate=rec) as sb:
+        pass
+    with pytest.raises(RuntimeError):
+        await sb.run("return 1")
+    assert rec.calls == []
+
+
+async def test_loader_refusals_belong_to_the_command_that_imported() -> None:
+    async def gate(source: str, context: GateContext) -> Verdict:
+        if context.mode == "module_loader":
+            await asyncio.sleep(0.2)  # a slow verdict, while another command waits
+        return Verdict("DENY" not in source, "marked", ("marked",))
+
+    async with AsyncIsolatedRuntime(gate=gate) as rt:
+        await rt.set_module_resolver(lambda spec, ref: spec)
+        await rt.set_module_loader(lambda spec: "export const v = 'DENY';")
+        importing = rt.eval("import('loaded:bad').then(() => 1)")
+        plain = rt.eval("2")
+        first, second = await asyncio.gather(importing, plain, return_exceptions=True)
+        assert isinstance(first, GateDenied)
+        assert second == 2
+
+
+async def test_a_refused_import_the_guest_catches_is_still_raised() -> None:
+    async with AsyncIsolatedRuntime(gate=Recorder()) as rt:
+        await rt.set_module_resolver(lambda spec, ref: spec)
+        await rt.set_module_loader(lambda spec: "export const v = 'DENY';")
+        with pytest.raises(GateDenied):
+            await rt.eval("import('loaded:x').then(() => 'ran', () => 'caught')")
+        assert await rt.eval("1") == 1
+
+
+def test_a_loader_refusal_keeps_its_cause() -> None:
+    def broken(source: str, context: GateContext) -> Verdict:
+        if context.mode == "module_loader":
+            raise ConnectionError("classifier down")
+        return ALLOW
+
+    with IsolatedRuntime(gate=broken) as rt:
+        rt.set_module_resolver(lambda spec, ref: spec)
+        rt.set_module_loader(lambda spec: "export const v = 1;")
+        with pytest.raises(GateUnavailable) as info:
+            rt.eval_module("loaded:x")
+        assert isinstance(info.value.__cause__, ConnectionError)
+
+
+def test_sandbox_pool_passes_the_gate_to_its_runtimes() -> None:
+    from pydeno import SandboxPool
+
+    rec = Recorder()
+    with SandboxPool(size=1, sandbox=MODE, gate=rec) as pool:
+        with pool.checkout() as rt:
+            assert rt.eval("1 + 1") == 2
+            with pytest.raises(GateDenied):
+                rt.eval("'DENY'")
+    assert [c.entry_point for _, c in rec.calls] == ["IsolatedRuntime.eval"] * 2

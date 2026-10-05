@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import gc
 import hashlib
@@ -574,55 +575,100 @@ FULL = SourcePolicy(
 )
 
 
+#: The opt-in, tokenizer-based mode (best effort; see the guide's list of known bypasses).
+PRECISE = dataclasses.replace(FULL, ignore_strings_and_comments=True)
+BOTH_MODES = pytest.mark.parametrize(
+    "policy", [FULL, PRECISE], ids=["default", "precise"]
+)
+
+
 def rules(code: str, policy: SourcePolicy = FULL) -> list[str]:
     return [f.rule for f in check_source(code, policy=policy).findings]
 
 
 @pytest.mark.parametrize(
-    ("code", "expected"),
+    ("code", "default", "precise"),
     [
-        ("eval('1')", ["forbidden-eval"]),
-        ("(0, eval)('1')", ["forbidden-eval"]),
-        ("globalThis.eval('1')", ["forbidden-eval"]),
-        ("setTimeout('alert(1)', 10)", ["forbidden-string-timer"]),
-        ("setInterval(`x`, 10)", ["forbidden-string-timer"]),
-        ("setTimeout(() => 1, 10)", []),
-        ("new Function('return 1')", ["forbidden-function-constructor"]),
-        ("Function('return 1')()", ["forbidden-function-constructor"]),
-        ("(async () => {}).constructor('x')", ["forbidden-function-constructor"]),
-        ("x['constructor']('a')", ["forbidden-function-constructor"]),
-        ("x.constructor === Array", []),
-        ("import('m')", ["forbidden-dynamic-import"]),
-        ("obj.import('m')", []),
-        ("WebAssembly.instantiate(b)", ["forbidden-webassembly"]),
-        ("process.env", ["forbidden-global"]),
-        ("globalThis.process", ["forbidden-global"]),
-        ("self['require']('fs')", ["forbidden-global"]),
-        ("obj.process", []),
-        ("secretTool()", ["forbidden-identifier"]),
-        ("tools.secretTool()", ["forbidden-identifier"]),
-        ("tools['secretTool']()", ["forbidden-identifier"]),
-        ("const x = 1 + 2", []),
+        ("eval('1')", ["forbidden-eval"], ["forbidden-eval"]),
+        ("(0, eval)('1')", ["forbidden-eval"], ["forbidden-eval"]),
+        ("globalThis.eval('1')", ["forbidden-eval"], ["forbidden-eval"]),
+        (
+            "setTimeout('alert(1)', 10)",
+            ["forbidden-string-timer"],
+            ["forbidden-string-timer"],
+        ),
+        (
+            "setInterval(`x`, 10)",
+            ["forbidden-string-timer"],
+            ["forbidden-string-timer"],
+        ),
+        ("setTimeout(() => 1, 10)", [], []),
+        (
+            "new Function('return 1')",
+            ["forbidden-function-constructor"],
+            ["forbidden-function-constructor"],
+        ),
+        (
+            "Function('return 1')()",
+            ["forbidden-function-constructor"],
+            ["forbidden-function-constructor"],
+        ),
+        (
+            "(async () => {}).constructor('x')",
+            ["forbidden-function-constructor"],
+            ["forbidden-function-constructor"],
+        ),
+        (
+            "x['constructor']('a')",
+            ["forbidden-function-constructor"],
+            ["forbidden-function-constructor"],
+        ),
+        # The default mode reports every `constructor` but a class's own method definition.
+        ("x.constructor === Array", ["forbidden-function-constructor"], []),
+        ("class A { constructor(x) { this.x = x } }", [], []),
+        ("class A { m() {}\n  // set up\n  constructor() {} }", [], []),
+        ("import('m')", ["forbidden-dynamic-import"], ["forbidden-dynamic-import"]),
+        ("obj.import('m')", [], []),
+        (
+            "WebAssembly.instantiate(b)",
+            ["forbidden-webassembly"],
+            ["forbidden-webassembly"],
+        ),
+        ("process.env", ["forbidden-global"], ["forbidden-global"]),
+        ("globalThis.process", ["forbidden-global"], ["forbidden-global"]),
+        ("self['require']('fs')", ["forbidden-global"], ["forbidden-global"]),
+        # A forbidden global's name is reported anywhere by default (it may be an alias's).
+        ("obj.process", ["forbidden-global"], []),
+        ("secretTool()", ["forbidden-identifier"], ["forbidden-identifier"]),
+        ("tools.secretTool()", ["forbidden-identifier"], ["forbidden-identifier"]),
+        ("tools['secretTool']()", ["forbidden-identifier"], ["forbidden-identifier"]),
+        ("const x = 1 + 2", [], []),
     ],
     ids=lambda v: v if isinstance(v, str) else None,
 )
-def test_policy_rules(code: str, expected: list[str]) -> None:
-    assert rules(code) == expected
+def test_policy_rules(code: str, default: list[str], precise: list[str]) -> None:
+    assert rules(code) == default
+    assert rules(code, PRECISE) == precise
 
 
 @pytest.mark.parametrize(
-    "code",
+    ("code", "rule"),
     [
-        "// eval('1')\n1",
-        "/* new Function('x') */ 1",
-        "'eval(1)' + \"import('x')\" + `WebAssembly`",
-        "/eval\\(/.test(s)",
-        "const s = `process.env ${1 + 1}`",
+        ("// eval('1')\n1", "forbidden-eval"),
+        ("/* new Function('x') */ 1", "forbidden-function-constructor"),
+        ("'eval(1)' + \"x\"", "forbidden-eval"),
+        ("/eval\\(/.test(s)", "forbidden-eval"),
+        ("const s = `process.env ${1 + 1}`", "forbidden-global"),
     ],
     ids=["line-comment", "block-comment", "strings", "regex", "template-text"],
 )
-def test_comments_strings_and_regexes_are_not_code(code: str) -> None:
-    assert rules(code) == []
+def test_strings_and_comments_count_by_default_and_not_in_precise_mode(
+    code: str, rule: str
+) -> None:
+    """Failing closed: the default scan reads the whole text, so a name in a string or a comment
+    is reported too. Only the opt-in precise mode skips them."""
+    assert rule in rules(code)
+    assert rules(code, PRECISE) == []
 
 
 @pytest.mark.parametrize(
@@ -654,8 +700,11 @@ def test_comments_strings_and_regexes_are_not_code(code: str) -> None:
         "substitution",
     ],
 )
-def test_the_scanner_reads_what_the_engine_reads(code: str) -> None:
-    assert "forbidden-eval" in rules(code)
+@BOTH_MODES
+def test_escapes_and_unicode_spaces_do_not_hide_names(
+    code: str, policy: SourcePolicy
+) -> None:
+    assert "forbidden-eval" in rules(code, policy)
 
 
 @pytest.mark.parametrize(
@@ -671,19 +720,25 @@ def test_the_scanner_reads_what_the_engine_reads(code: str) -> None:
     ],
     ids=["object", "postfix", "keyword-property", "of", "control", "block", "arrow"],
 )
-def test_regex_or_division_cannot_hide_code_from_the_policy(code: str) -> None:
+@BOTH_MODES
+def test_regex_or_division_cannot_hide_code_from_the_policy(
+    code: str, policy: SourcePolicy
+) -> None:
     """Each line runs `eval` in the engine; a scanner that took the `/` the other way would see
     a regex or a string where the engine sees code."""
     with pydeno.Runtime() as rt:
         rt.eval(code)
         assert rt.eval("hit") == 1
-    assert "forbidden-eval" in rules(code)
+    assert "forbidden-eval" in rules(code, policy)
 
 
-def test_names_the_engine_does_not_treat_as_eval_are_not_eval() -> None:
+@BOTH_MODES
+def test_names_the_engine_does_not_treat_as_eval_are_not_eval(
+    policy: SourcePolicy,
+) -> None:
     # Fullwidth letters and a zero-width joiner make different identifiers in JavaScript.
-    assert rules("ｅｖａｌ('1')") == []
-    assert rules("ev‍al('1')") == []
+    assert rules("ｅｖａｌ('1')", policy) == []
+    assert rules("ev‍al('1')", policy) == []
 
 
 def test_policy_messages_are_the_documented_templates() -> None:
@@ -746,6 +801,13 @@ def test_max_source_bytes_is_checked_first() -> None:
     assert check_source("x" * 10, policy=policy).ok
 
 
+def test_a_policy_caps_source_at_one_mib_by_default() -> None:
+    assert SourcePolicy().max_source_bytes == 1024 * 1024
+    big = "x" * (1024 * 1024 + 1)
+    assert rules(big, SourcePolicy()) == ["source-too-large"]
+    assert check_source(big, policy=SourcePolicy(max_source_bytes=None)).ok
+
+
 def test_policy_fields_are_validated() -> None:
     with pytest.raises(TypeError):
         SourcePolicy(forbidden_identifiers="eval")  # type: ignore[arg-type]
@@ -753,6 +815,8 @@ def test_policy_fields_are_validated() -> None:
         SourcePolicy(forbidden_globals={1})  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         SourcePolicy(forbid_eval="yes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        SourcePolicy(ignore_strings_and_comments=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         SourcePolicy(max_source_bytes=0)
     with pytest.raises(ValueError):
@@ -949,6 +1013,12 @@ def test_static_gate_labels_are_the_rules_and_check_gives_the_findings() -> None
 # ---------------------------------------------------------------------------
 
 COMPUTED = SourcePolicy(forbid_computed_global_access=True)
+COMPUTED_PRECISE = SourcePolicy(
+    forbid_computed_global_access=True, ignore_strings_and_comments=True
+)
+COMPUTED_MODES = pytest.mark.parametrize(
+    "policy", [COMPUTED, COMPUTED_PRECISE], ids=["default", "precise"]
+)
 
 
 @pytest.mark.parametrize(
@@ -978,10 +1048,27 @@ COMPUTED = SourcePolicy(forbid_computed_global_access=True)
         "template-with-empty-substitution",
     ],
 )
-def test_computed_global_access_is_flagged(code: str) -> None:
-    findings = check_source(code, policy=COMPUTED).findings
+@COMPUTED_MODES
+def test_computed_global_access_is_flagged(code: str, policy: SourcePolicy) -> None:
+    findings = check_source(code, policy=policy).findings
     assert [f.rule for f in findings] == ["forbidden-computed-global-access"]
     assert findings[0].text == POLICY_MESSAGES["forbidden-computed-global-access"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "Reflect.get(globalThis, k)",
+        "const {[k]: e} = globalThis",
+        "Object.values(globalThis)",
+        "const g = globalThis; g[k]",
+        "globalThis['Math']",
+        "f(this)",
+    ],
+    ids=["reflect", "destructure", "values", "alias", "literal-key", "this-argument"],
+)
+def test_the_default_mode_also_flags_globals_used_as_values(code: str) -> None:
+    assert "forbidden-computed-global-access" in rules(code, COMPUTED)
 
 
 @pytest.mark.parametrize(
@@ -990,31 +1077,44 @@ def test_computed_global_access_is_flagged(code: str) -> None:
         "obj[k]",
         "arr[i + 1]",
         "rows[0][col]",
-        "globalThis['Math']",
-        "globalThis[`Math`]",
-        "globalThis[0]",
         "x.self[k]",
         "globalThis.cache[k]",
-        "// globalThis[k]\n1",
-        "'globalThis[k]'",
+        "globalThis.Math.max(1, 2)",
+        "this.x = 1",
         "const [a, b] = pair",
     ],
     ids=[
         "object",
         "array",
         "nested",
-        "string-key",
-        "template-key",
-        "number",
         "property-named-self",
         "global-property",
-        "comment",
-        "string",
+        "dotted",
+        "this-property",
         "destructuring",
     ],
 )
-def test_ordinary_bracket_access_is_not_flagged(code: str) -> None:
-    assert check_source(code, policy=COMPUTED).findings == []
+@COMPUTED_MODES
+def test_ordinary_bracket_access_is_not_flagged(
+    code: str, policy: SourcePolicy
+) -> None:
+    assert check_source(code, policy=policy).findings == []
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "globalThis['Math']",
+        "globalThis[`Math`]",
+        "globalThis[0]",
+        "// globalThis[k]\n1",
+        "'globalThis[k]'",
+    ],
+    ids=["string-key", "template-key", "number", "comment", "string"],
+)
+def test_literal_keys_strings_and_comments_pass_only_in_precise_mode(code: str) -> None:
+    assert rules(code, COMPUTED_PRECISE) == []
+    assert rules(code, COMPUTED) == ["forbidden-computed-global-access"]
 
 
 def test_computed_global_access_is_off_by_default() -> None:

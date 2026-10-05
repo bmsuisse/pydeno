@@ -2312,6 +2312,50 @@ def gate_bypass_runs_refused_code() -> bool:
     return False
 
 
+@probe
+def static_gate_misread_shapes_run_forbidden_code() -> bool:
+    # Shapes that once made a tokenizer-based scan read code as a regex, a template, a comment or
+    # a string, or hid a name in an escape or a computed key. The default policy scan reads the
+    # whole decoded text, so each must be denied; none may set `hit`.
+    from pydeno import GateDenied, SourcePolicy, Verdict, static_gate
+
+    gate = static_gate(
+        SourcePolicy(
+            forbid_eval=True,
+            forbid_function=True,
+            forbid_dynamic_import=True,
+            forbid_computed_global_access=True,
+        )
+    )
+    shapes = (
+        '#! `\nglobalThis.hit = eval("1")\n// `',
+        'var a = 1 <!-- `\nglobalThis.hit = eval("1")\n// `',
+        'x = function(){} / (globalThis.hit = eval("1")) / 2',
+        'x = class {} / (globalThis.hit = eval("1")) / 2',
+        "f = x => {}\n/`/\nglobalThis.hit = eval(1)//`",
+        'globalThis.hit = globalThis["\\145val"]("1")',
+        'globalThis.hit = globalThis["\\ev\\al"]("1")',
+        'globalThis.hit = globalThis[("eval")]("1")',
+        'globalThis.hit = Reflect.get(globalThis, "eval")("1")',
+        'const {["ev" + "al"]: e} = globalThis; globalThis.hit = e("1")',
+        'const {constructor: F} = function(){}; globalThis.hit = F("return 1")()',
+        "globalThis.hit = \\u{0000000065}val('1')",
+    )
+    probe_code = "typeof hit"
+    for code in shapes:
+        with iso(
+            gate=lambda s, c: Verdict(True, "") if s == probe_code else gate(s, c)
+        ) as rt:
+            try:
+                rt.eval(code)
+                return True
+            except GateDenied:
+                pass
+            if rt.eval(probe_code) != "undefined":
+                return True
+    return False
+
+
 def main() -> None:
     violations = []
     for name, fn in PROBES.items():
