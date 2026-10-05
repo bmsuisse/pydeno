@@ -946,3 +946,48 @@ def test_a_constructor_name_built_at_run_time_is_stopped_by_strict_eval() -> Non
             with pytest.raises(PydenoRuntimeError, match="EvalError"):
                 session.feed_run(code)  # the gate cannot see it; the engine refuses it
             assert session.feed_run("typeof hit") == "undefined"
+
+
+def test_dynamic_import_after_html_close_comment_reaches_allowlisted_loader() -> None:
+    # PortSwigger's 2020 NiceScript bypass: `-->` is an Annex B script comment.
+    # A working control prevents a syntax error from masquerading as a gate denial.
+    loaded: list[str] = []
+
+    def loader(specifier: str) -> str:
+        loaded.append(specifier)
+        return "export const value = 42;"
+
+    with IsolatedRuntime(request_timeout=2) as rt:
+        rt.set_module_resolver(
+            lambda spec, ref: spec if spec == "loaded:html-close" else None
+        )
+        rt.set_module_loader(loader)
+        assert (
+            asyncio.run(
+                rt.eval_async("import\n-->\n('loaded:html-close').then(m => m.value)")
+            )
+            == 42
+        )
+    assert loaded == ["loaded:html-close"]
+
+
+def test_gate_denies_html_close_comment_import_before_loader_runs() -> None:
+    loaded: list[str] = []
+
+    def loader(specifier: str) -> str:
+        loaded.append(specifier)
+        return "export const value = 42;"
+
+    gate = static_gate(SourcePolicy(forbid_dynamic_import=True))
+    with IsolatedRuntime(gate=gate, request_timeout=2) as rt:
+        rt.set_module_resolver(
+            lambda spec, ref: spec if spec == "loaded:html-close" else None
+        )
+        rt.set_module_loader(loader)
+        with pytest.raises(GateDenied) as denied:
+            asyncio.run(
+                rt.eval_async("import\n-->\n('loaded:html-close').then(m => m.value)")
+            )
+        assert "forbidden-dynamic-import" in denied.value.labels
+        assert loaded == []
+        assert rt.eval("1 + 1") == 2

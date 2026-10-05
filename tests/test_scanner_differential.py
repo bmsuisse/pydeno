@@ -567,3 +567,11 @@ def test_one_mib_of_ordinary_code_scans_well_under_100_ms() -> None:
     code = _sized(_ORDINARY, _MIB)
     for mode in ("default", "precise-rules", "plain"):
         assert _raw_scan(code, POLICIES.get(mode)) < 0.1, mode
+
+
+def test_html_close_comment_dynamic_import_matches_reference() -> None:
+    # https://portswigger.net/research/attacking-and-defending-javascript-sandboxes
+    code = "import\n-->\n('loaded:html-close').then(m => m.value)"
+    assert_same_everywhere(code)
+    result = native(code, SourcePolicy(forbid_dynamic_import=True))
+    assert {finding.rule for finding in result.findings} == {"forbidden-dynamic-import"}
