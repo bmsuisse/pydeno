@@ -221,6 +221,32 @@ journaled); re-entering, closing or dumping a session from its own tool; context
 and other embedded forms, trailing-dot and confusable hosts); weird callables as tools (partials,
 bound methods, classes, async generators, builtins).
 
+### 0.9: the seccomp allow-list (#45), how it was derived and checked
+
+- **Derived by tracing, natively.** `scripts/trace_worker_syscalls.py` ran real workers under
+  `strace` through a built-in workload (both engine modes, WebAssembly, modules, async host calls,
+  a deadline, a memory kill) and ten isolation test files, on GitHub's native x86_64 and aarch64
+  runners, in Debian 13 (Python 3.10 and 3.14), Ubuntu 22.04, AlmaLinux 9 and Fedora images
+  (glibc 2.34 to 2.43). About 520 sandboxed workers per image. A worker made 39 to 44 distinct
+  syscalls after its sandbox was up; the union over every trace is 46 names, all on the allow-list
+  or argument-checked, except the self-test's own probes and `pkey_alloc` (V8 on x86_64 asks for
+  memory protection keys and carries on without them; it stays `EPERM`). `uname` and `pkey_alloc`
+  appear only on x86_64, `epoll_wait` only on x86_64 (`epoll_pwait` on aarch64).
+- **Re-traced under the new filter.** The same traces with the allow-list in force: the only
+  refusals a healthy worker met were the self-test's probes (a non-thread `clone`, `kill` of the
+  parent, `socket`, a datagram `socketpair`), `clone3` (`ENOSYS`, glibc falls back to `clone`) and
+  `pkey_alloc`. Nothing on the default-deny path.
+- **What the native runs caught.** CPython's `subprocess` calls glibc's `vfork()`, which on x86_64
+  is the `vfork` syscall itself (aarch64 has none and goes through `clone`): with `vfork` on the
+  kill list, a library that tried to start a program killed the worker on x86_64 and failed
+  politely on aarch64. `fork` and `vfork` are `EPERM` now; `execve` is still killed, since it can
+  only follow a fork the filter never allows. This is the second x86_64-only difference after
+  `uname`, and the reason sandbox changes are verified on native runners.
+- **Not traced:** the macOS sandbox (unchanged), architectures other than x86_64 and aarch64 (the
+  filter is not applied there), and kernels older than the runners' 6.17 and the local 6.15
+  (containers share the host kernel; the matrix simulates missing Landlock and seccomp, not older
+  kernels).
+
 ### Rejected after measuring
 
 - `--single-threaded`: no reduction in threads, +79% GC time. Not adopted.
@@ -273,6 +299,7 @@ Most agent-sized work is within a factor of two either way. If you trust the cod
 ```bash
 .venv/bin/python -m pytest tests -q          # the whole suite (macOS or Linux)
 scripts/linux_matrix.sh WHEELS IMAGE         # one Linux image, optionally under a degraded kernel
+scripts/trace_worker_syscalls.py --help      # what a real worker calls (strace, in a container)
 python benches_py/monty_three_bench.py       # the speed numbers above
 ```
 
