@@ -92,12 +92,34 @@
 
 ### Changed
 
+- **Faster async commands in the isolated worker** (#60). The worker keeps one event loop for its
+  whole life instead of building one per command, created before the OS sandbox goes up (no thread
+  starts). Each command still ends with the loop emptied: pending tasks are cancelled and finished,
+  and callbacks that a finished host call left queued run before the next command starts, so nothing
+  is held over to a later command. Measured on macOS arm64 (release build, paired runs): a warm
+  `eval_async` about 237 to 150 microseconds, a warm `feed_run` about 220 to 140 microseconds,
+  checkout plus 11 feeds about 4.4 to 3.4 ms. The synchronous paths are unchanged.
+- **Clearer limit and diagnostics wording** (#84). Agent sessions name the argument the caller passed
+  (`timeout`, `max_pause`) when they reject a value; `-0.0` is stored as `0.0`; the docs describe
+  how the Proxy, console-deadline and default-printer limits behave (console time in the synchronous
+  runtimes is only checked between console calls).
 - **`stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker**, with or
   without a cap: a cold start that fails to start (or, with a cap, a checkout that raised
   `CheckoutTimeout`) is no longer counted in either.
 
 ### Fixed
 
+- **A host function that re-enters its own runtime, or returns a stream source, no longer aborts the
+  process** (#58). Calling `rt.eval` (or any `Runtime` method) from inside a host function made
+  PyO3 raise a panic that was re-raised when the call returned and aborted the process, and a
+  returned `PyStreamSource` hit the same check. The guest now gets a catchable `RuntimeError`
+  ("this object cannot be used from the runtime thread, where host functions run; ...") with fixed
+  text, the panic detail goes to the log, and the runtime stays usable. `PyStreamSource` no longer
+  has to stay on the thread that made it. Keep a reference to a source until the guest has read it
+  (the finalizer cancels the stream); see the "Inside a host function" section of the runtime guide.
+- **Registered function and stream ids are never reused while live** (#89 follow-up). The ids are
+  32-bit counters; after a wrap a new registration could overwrite a live entry. Allocation now skips
+  live ids, and a wrapper that fails to build rolls its registration back without a double release.
 - **A stream source is refused by any runtime other than the one that created it** (#98). Stream
   ids are allocated per runtime, so a source from runtime B returned by runtime A's host function
   (or passed to A's functions, bound into A, or yielded by one of A's streams) was read through A's
