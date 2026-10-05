@@ -204,7 +204,7 @@ impl PyStreamSource {
 #[pymethods]
 impl PyStreamSource {
     #[pyo3(name = "close")]
-    fn close_py(&self) {
+    fn close_py(&self, py: Python<'_>) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -215,7 +215,7 @@ impl PyStreamSource {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(handle) = handle {
-            handle.cancel_py_stream_async(self.stream_id);
+            handle.cancel_py_stream(py, self.stream_id);
         }
     }
 
@@ -236,9 +236,9 @@ pub(crate) struct PyStreamFinalizer {
 
 #[pymethods]
 impl PyStreamFinalizer {
-    fn __call__(&self) {
+    fn __call__(&self, py: Python<'_>) {
         if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.cancel_py_stream_async(self.stream_id);
+            handle.cancel_py_stream(py, self.stream_id);
         }
     }
 }

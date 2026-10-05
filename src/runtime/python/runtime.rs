@@ -41,8 +41,9 @@ impl Runtime {
             .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))
     }
 
-    /// The blocking half of [`Runtime::close`], run with the GIL released.
-    fn close_blocking(mut runtime: RuntimeHandle) -> PyResult<()> {
+    /// The blocking half of [`Runtime::close`], run with the GIL released. Python stream
+    /// sources are cancelled by `close` itself, with the GIL, after this returns.
+    fn close_blocking(runtime: &mut RuntimeHandle) -> PyResult<()> {
         for stream_id in runtime.drain_tracked_js_stream_ids() {
             if runtime.is_shutdown() {
                 break;
@@ -50,9 +51,6 @@ impl Runtime {
             if let Err(err) = runtime.stream_release(stream_id) {
                 log::debug!("Runtime.close failed to release stream id {stream_id}: {err}");
             }
-        }
-        for stream_id in runtime.drain_tracked_py_stream_ids() {
-            runtime.cancel_py_stream_async(stream_id);
         }
         for fn_id in runtime.drain_tracked_function_ids() {
             if runtime.is_shutdown() {
@@ -175,7 +173,15 @@ impl Runtime {
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         match self.handle.borrow_mut().take() {
-            Some(runtime) => py.detach(move || Self::close_blocking(runtime)),
+            Some(mut runtime) => {
+                let closed = py.detach(|| Self::close_blocking(&mut runtime));
+                // On this thread, not on a background task: nothing of ours may still be
+                // waiting for the GIL when the interpreter finalizes.
+                for stream_id in runtime.drain_tracked_py_stream_ids() {
+                    runtime.cancel_py_stream(py, stream_id);
+                }
+                closed
+            }
             None => Ok(()),
         }
     }

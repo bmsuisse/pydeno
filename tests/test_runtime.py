@@ -1812,6 +1812,76 @@ class TestStreaming:
             runtime.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["runtime", "source"])
+    async def test_closing_runs_the_python_streams_aclose_on_its_loop(self, how):
+        """Closing the runtime (or the source) closes a suspended generator on its own loop."""
+        runtime = Runtime()
+        closed = asyncio.Event()
+
+        async def numbers():
+            try:
+                for i in range(1000):
+                    yield i
+            finally:
+                closed.set()
+
+        try:
+            py_stream = runtime.stream_from_async_iterable(numbers())
+            setter = runtime.eval("(stream) => { globalThis.py_numbers = stream; }")
+            setter(py_stream)
+            first = await runtime.eval_async(
+                "(async () => (await py_numbers.getReader().read()).value)()"
+            )
+            assert first == 0
+            assert not closed.is_set()
+            if how == "source":
+                py_stream.close()
+        finally:
+            runtime.close()
+        await asyncio.wait_for(closed.wait(), timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_closing_runs_aclose_in_the_sources_own_context(self):
+        """The generator's `finally` sees the contextvars of the task that made the source."""
+        import contextvars
+
+        var = contextvars.ContextVar("owner", default="unset")
+        seen = asyncio.get_running_loop().create_future()
+
+        async def numbers():
+            try:
+                for i in range(1000):
+                    yield i
+            finally:
+                if not seen.done():
+                    seen.set_result(var.get())
+
+        runtime = Runtime()
+        try:
+
+            async def make():
+                var.set("creator")
+                return runtime.stream_from_async_iterable(numbers())
+
+            py_stream = await asyncio.create_task(make())
+            runtime.eval("(stream) => { globalThis.py_ctx = stream; }")(py_stream)
+            assert (
+                await runtime.eval_async(
+                    "(async () => (await py_ctx.getReader().read()).value)()"
+                )
+                == 0
+            )
+
+            async def close():
+                var.set("closer")
+                py_stream.close()
+
+            await asyncio.create_task(close())
+        finally:
+            runtime.close()
+        assert await asyncio.wait_for(seen, timeout=2) == "creator"
+
+    @pytest.mark.asyncio
     async def test_js_stream_cancelled_from_python(self):
         runtime = Runtime()
         try:

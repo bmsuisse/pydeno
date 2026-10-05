@@ -68,5 +68,10 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "WireNativeError",
         m.py().get_type::<runtime::wire::WireNativeError>(),
     )?;
+    // Before finalization, stop Tokio workers from entering Python and wait for those inside.
+    let exit_hook = pyo3::wrap_pyfunction!(runtime::python::utils::_wait_for_background_attach, m)?;
+    m.py()
+        .import("atexit")?
+        .call_method1("register", (exit_hook,))?;
     Ok(())
 }

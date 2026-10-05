@@ -10,9 +10,9 @@ use crate::runtime::runner::{
 };
 use crate::runtime::stats::RuntimeStatsSnapshot;
 use crate::runtime::stream::{PyStreamRegistry, StreamChunk};
-use pyo3::prelude::Py;
+use pyo3::prelude::{Py, Python};
 use pyo3::PyAny;
-use pyo3_async_runtimes::{tokio as pyo3_tokio, TaskLocals};
+use pyo3_async_runtimes::TaskLocals;
 use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -573,14 +573,13 @@ impl RuntimeHandle {
         Ok(stream_id)
     }
 
-    /// Cancel a Python stream on a background task without blocking.
-    pub fn cancel_py_stream_async(&self, stream_id: u32) {
-        let registry = self.py_stream_registry.clone();
-        pyo3_tokio::get_runtime().spawn(async move {
-            if let Err(err) = registry.cancel(stream_id).await {
-                log::debug!("PyStream cancellation for id {} failed: {}", stream_id, err);
-            }
-        });
+    /// Cancel a Python stream on the calling thread, which holds the GIL, without blocking.
+    ///
+    /// Not on a background task: one could still be waiting for the GIL when the interpreter
+    /// finalizes, and CPython ends such a thread inside the GIL wait (before 3.14), which
+    /// aborts the process.
+    pub fn cancel_py_stream(&self, py: Python<'_>, stream_id: u32) {
+        self.py_stream_registry.cancel_now(py, stream_id);
         self.untrack_py_stream_id(stream_id);
     }
 

@@ -16,9 +16,17 @@ TYPE_CHECKING = False
 if TYPE_CHECKING:
     from typing import Any
 
-__all__ = ["as_coroutine"]
+__all__ = ["aclose_quietly", "as_coroutine"]
 
 
 async def as_coroutine(awaitable: Awaitable[Any]) -> Any:
     """Await `awaitable` from inside a coroutine, so `create_task` accepts it."""
     return await awaitable
+
+
+async def aclose_quietly(iterator: Any) -> None:
+    """Close a cancelled stream source's iterator; its errors are not the caller's."""
+    try:
+        await iterator.aclose()
+    except Exception:  # noqa: BLE001, S110
+        pass
