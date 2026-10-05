@@ -54,7 +54,28 @@ Status below is a plan, not a promise of dates.
   Proposed experimental: `SessionPool`, the pydantic-ai integration, snapshots.
 - Pin the journal and snapshot formats with an explicit compatibility promise.
 
-## 0.9: external review and soak
+## 0.9: worker loop, WebAssembly, CI coverage
+
+| Item | Issue / PR |
+|---|---|
+| Persistent worker loop | #60 |
+| Stream edge case | #58 |
+| `load_wasm` | #37 |
+| Follow-up pull requests: performance, hardening and test changes that came out of review | #85, #90, #91, #92, #93 |
+| CI additions: every cargo feature compiles on its own, a default-install smoke test (wheel in a clean venv, no extras), examples run only for release publishes | this release |
+
+## 0.10: cold start, allow-list, review preparation
+
+| Item | Issue / PR |
+|---|---|
+| Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap) | #72 |
+| Seccomp as an allow-list with kill-on-violation | #45 |
+| Custom V8 build: research | #44 |
+| A deep review run over the whole tree | |
+| Preparation for an outside security review: threat model, scope, reproducible builds, known-issue list | |
+| Free-threaded CPython (3.14t): support it, or state plainly that it is unsupported | |
+
+## Before 1.0: external review and soak
 
 - An independent review or fuzzing campaign of the sandbox (not run by the authors, and not by the same models
   that wrote the code).

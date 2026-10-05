@@ -431,7 +431,8 @@ class _Pump:
     Console output is not a tool call: it is the guest's own work, but the host's handling of it
     (a slow terminal, a log shipper) is not. So console time pauses the deadline only up to an
     allowance of one hard deadline per command: one slow write does not kill a run, and a flood
-    of them can at most double it (it used to stretch it up to `max_host_wait`). Console time
+    of them can at most double it between callbacks. A synchronous callback must return before
+    the deadline can be checked again. Console time
     while a tool call is outstanding is covered by that call's pause and not charged twice.
     """
 
@@ -562,7 +563,7 @@ class IsolatedRuntime:
             The worker's CPU use is also capped at twice the hard deadline per command, which
             callbacks cannot pause. `None` removes the wait cap. Console output is not a
             callback in this sense: handling it pauses the hard deadline for at most one hard
-            deadline in total per command (a flood of slow console writes at most doubles a run),
+            deadline in total per command (between calls; a synchronous handler must return before deadline enforcement resumes),
             and it does not count toward this wait cap. Console output while a tool call is in
             flight is covered by that call's pause.
         max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);

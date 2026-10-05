@@ -204,6 +204,24 @@ _CONFIG_KEYS = (
 )
 
 
+class _CommandLoop(asyncio.SelectorEventLoop):
+    """Between commands this loop looks closed to other threads, as the per-command loop did once
+    `asyncio.run` closed it: a late `call_soon_threadsafe` (a host call's start or completion
+    owed to an earlier command) is refused instead of queued for the next one."""
+
+    idle = True
+
+    def is_closed(self) -> bool:
+        return self.idle or super().is_closed()
+
+    def call_soon_threadsafe(
+        self, callback: Any, *args: Any, context: Any = None
+    ) -> Any:
+        if self.idle:
+            raise RuntimeError("Event loop is closed")
+        return super().call_soon_threadsafe(callback, *args, context=context)
+
+
 class _Worker:
     def __init__(self, in_fd: int, out_fd: int) -> None:
         self._reader = _wire.FrameReader(in_fd)
@@ -226,6 +244,12 @@ class _Worker:
         self._pending_lock = threading.Lock()
         self._call_ids = itertools.count(1)
         self._runtime: Runtime | None = None
+        # One event loop for every async command, driven by the main thread for the length of
+        # the command and idle in between, instead of an `asyncio.run` (a new loop, its selector
+        # and self-pipe, and their teardown) per command. Created here, before the OS sandbox,
+        # like every import; it starts no thread. `_settle` leaves it empty after each command,
+        # and between commands it refuses work from other threads (`_CommandLoop`).
+        self._loop = _CommandLoop()
         # `load_wasm` instances, by id: the bridge's function handles (the parent holds only ids).
         self._wasm: dict[int, Any] = {}
         self._wasm_ids = itertools.count(1)
@@ -367,19 +391,46 @@ class _Worker:
             raise RuntimeError("worker is not initialised")
         return self._runtime
 
+    def _run_async(self, make: Callable[[], Any]) -> Any:
+        """Run one async command on the worker's loop. `make` is called from inside the
+        coroutine: `eval_async` binds to the running loop when *called*."""
+
+        async def run() -> Any:
+            return await make()
+
+        self._loop.idle = False
+        try:
+            return self._loop.run_until_complete(run())
+        finally:
+            # From here on other threads see a closed loop: nothing more can be queued for later.
+            self._loop.idle = True
+            self._settle()
+
+    def _settle(self) -> None:
+        """Leave nothing of a command on the loop for the next one, as `asyncio.run` closing
+        its loop did: every task still pending (an async host call the guest started and never
+        awaited) is cancelled and run until it has finished, and whatever callbacks the last pass
+        queued (a finished host call's completion) run now, not at the start of the next
+        command."""
+        loop = self._loop
+        tasks = asyncio.all_tasks(loop)
+        if tasks:
+            for task in tasks:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        loop.call_soon(loop.stop)
+        loop.run_forever()
+
     def _handle(self, message: dict[str, Any]) -> Any:
         kind = message["t"]
         if kind == "eval":
             return self._rt().eval(message["code"])
         if kind == "eval_async":
-            # `eval_async` binds to the running loop when *called*, so it must be
-            # called from inside the coroutine, not handed to asyncio.run.
-            async def run() -> Any:
-                return await self._rt().eval_async(
+            return self._run_async(
+                lambda: self._rt().eval_async(
                     message["code"], timeout=message.get("timeout")
                 )
-
-            return asyncio.run(run())
+            )
         if kind == "bind_function":
             return self._rt().bind_function(
                 message["name"], self._stub(message["hid"], bool(message["async"]))
@@ -404,13 +455,11 @@ class _Worker:
         if kind == "eval_module":
             return self._rt().eval_module(message["specifier"])
         if kind == "eval_module_async":
-
-            async def run_module() -> Any:
-                return await self._rt().eval_module_async(
+            return self._run_async(
+                lambda: self._rt().eval_module_async(
                     message["specifier"], timeout=message.get("timeout")
                 )
-
-            return asyncio.run(run_module())
+            )
         if kind in ("wasm_load", "wasm_call"):
             # Instances whose `WasmModule` the parent dropped without unloading.
             for wid in message.get("drop", ()):

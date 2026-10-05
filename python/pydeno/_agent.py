@@ -2064,6 +2064,8 @@ class AgentSandbox(_SessionBase):
         **runtime_options: Any,
     ) -> None:
         self._gate = _hook(gate, gate_timeout, who="AgentSandbox", sync_only=True)
+        timeout = _limit_seconds("timeout", timeout)
+        max_pause = _limit_seconds("max_pause", max_pause)
         if runtime is not None:
             clock, random_seed = self._adopt_arguments(
                 "AgentSandbox",

@@ -28,6 +28,7 @@ _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 collect_ignore = (
     [
         "test_agent_sandbox.py",
+        "test_agent_limit_names.py",
         "test_frame_buffer_bounds.py",
         "test_isolated_limit_values.py",
         "test_limit_values_review.py",
@@ -43,6 +44,7 @@ collect_ignore = (
         "test_isolated_hardening_round2.py",
         "test_isolated_hardening_round3.py",
         "test_isolated_libraries.py",
+        "test_isolated_command_loop.py",
         "test_isolated_lifecycle.py",
         "test_isolated_limits.py",
         "test_isolated_review_findings.py",
@@ -93,6 +95,7 @@ collect_ignore = (
         "test_isolated_guest_surface.py",
         "test_isolated_wasm.py",
         "test_gate_hooks.py",
+        "test_stream_source_owner.py",
     ]
     if sys.platform == "win32"
     else []

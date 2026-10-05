@@ -816,7 +816,8 @@ DEFAULT_PRINT_LIMIT_BYTES = 1024 * 1024
 
 class _CappedDefaultPrint:
     """The default printer for one feed: `_default_print` until `DEFAULT_PRINT_LIMIT_BYTES` of
-    UTF-8 have been written, then one ``[truncated]`` line and nothing more. A guest could
+    UTF-8 have been written across stdout and stderr together, then one additional
+    ``[truncated]`` line (12 bytes) and nothing more. A guest could
     otherwise write without limit to the host's stdout (measured: ~150 MB in 2 s), which is often a
     log pipeline. An explicit ``print_callback`` gets everything and is not capped."""
 
@@ -834,7 +835,8 @@ class _CappedDefaultPrint:
             self._left -= size
             _default_print(stream, text)
             return
-        # Leave room for the newline that ends the cut line, so the total stays within the cap.
+        # Leave room for the cut line’s newline within the shared payload cap.
+        # The truncation marker is additional to that cap.
         cut = max(0, self._left - 1)
         head = text.encode("utf-8", "replace")[:cut].decode("utf-8", "ignore")
         self._done = True
