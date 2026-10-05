@@ -1166,7 +1166,9 @@ def test_the_gate_thread_count_is_configurable() -> None:
     try:
         _gate.set_gate_threads(2)
         assert _gate.gate_threads() == 2
-        for bad in (0, -1, True, 1.5):
+        _gate.set_gate_threads(256)
+        assert pydeno.gate_threads() == 256
+        for bad in (0, -1, 257, True, 1.5):
             with pytest.raises((TypeError, ValueError)):
                 _gate.set_gate_threads(bad)  # type: ignore[arg-type]
     finally:

@@ -265,3 +265,72 @@ def test_the_scan_is_linear(shape: str, mode: str) -> None:
         assert time.perf_counter() - started < 0.5
     took = _timed(shape, policy)
     assert took < _bound(mode), (took, _baseline(mode))
+
+
+# ---------------------------------------------------------------------------
+# the `constructor` rule's edges (default mode, forbid_function=True)
+# ---------------------------------------------------------------------------
+
+FUNCTION_ONLY = SourcePolicy(forbid_function=True)
+
+#: (code, reported). "Reported" includes harmless definitions the cheap proof cannot accept: the
+#: rule fails closed, so those are documented false positives, never the other way round.
+CONSTRUCTOR_EDGES = {
+    # definitions the rule accepts
+    "class": ("class A { constructor(a) { this.a = a } }", False),
+    "class-after-method": ("class A { m() {} constructor() {} }", False),
+    "class-after-field": ("class A { x = 1; constructor() {} }", False),
+    "class-after-comment-line": ("class A {\n  // init\n  constructor() {}\n}", False),
+    "object-method": ("const o = { constructor() { return 1 } }", False),
+    "string-in-parameters": ('class A { constructor(s = "(") {} }', False),
+    # harmless, but not provable cheaply: reported (false positives)
+    "static": ("class A { static constructor() {} }", True),
+    "getter": ("const o = { get constructor() { return 1 } }", True),
+    "setter": ("const o = { set constructor(v) {} }", True),
+    "computed-string-member": ("class A { ['constructor']() {} }", True),
+    "brace-on-next-line": ("class A {\n  constructor(a)\n  {\n  }\n}", True),
+    "comment-line-before-brace": ("class A { constructor(a)\n// c\n{} }", True),
+    "block-comment-before-paren": ("class A { constructor/*x*/(a) {} }", True),
+    "template-in-parameters": ("class A { constructor(s = `x`) {} }", True),
+    "regex-in-parameters": ("class A { constructor(r = /x/) {} }", True),
+    "block-comment-before-name": ("class A { /* c */ constructor() {} }", True),
+    # reaches (or may reach) the Function constructor: reported
+    "object-value": ("const o = { constructor: Function }", True),
+    "property": ("const F = (() => 0).constructor", True),
+    "after-extends": ("class A extends constructor('return 1') {}", True),
+    "after-new": ("new constructor('return 1')", True),
+    "after-with": ("with (() => 0) constructor('return 1')()", True),
+    "after-return": ("function f() { return constructor('return 1') }", True),
+    "after-in": ("'x' in constructor", True),
+    "after-of": ("for (const c of [constructor]) c('return 1')", True),
+    "comment-then-call": ("with (() => 0) { constructor/*x*/('return 1')() }", True),
+    "template-argument": ("with (() => 0) { constructor(`return 1`)() }", True),
+    "at-start": ("constructor('return 1')", True),
+    "at-end": ("x = constructor", True),
+    "after-hashbang": ("#!x\nconstructor('return 1')", True),
+    "destructuring": ("const { constructor: F } = () => 0", True),
+}
+
+
+@pytest.mark.parametrize("name", sorted(CONSTRUCTOR_EDGES))
+def test_constructor_rule_edges(name: str) -> None:
+    code, reported = CONSTRUCTOR_EDGES[name]
+    rules = {f.rule for f in check_source(code, policy=FUNCTION_ONLY).findings}
+    assert bool(rules) == reported, (name, rules)
+    if reported:
+        assert rules == {"forbidden-function-constructor"}
+
+
+def test_a_constructor_name_built_at_run_time_is_not_seen() -> None:
+    """A documented limit: no scan reads a name assembled at run time. `strict_eval=True` is
+    what stops it (see the end-to-end test in tests/test_gate_hooks.py)."""
+    code = '(() => 0)["constr" + "uctor"]("return 1")()'
+    assert check_source(code, policy=FUNCTION_ONLY).ok
+
+
+def test_many_allowed_class_constructors_scan_in_linear_time() -> None:
+    unit = "class A { constructor(a, b = 'x') { this.a = a } }\n"
+    code = unit * (_MIB // len(unit))
+    took = _timed(code, FUNCTION_ONLY)
+    assert check_source(code, policy=FUNCTION_ONLY).ok
+    assert took < _bound("default"), (took, _baseline("default"))

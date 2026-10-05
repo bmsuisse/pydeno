@@ -885,3 +885,64 @@ def test_round3_shapes_are_denied_through_isolated_runtime() -> None:
             rt.eval("globalThis.hit = undefined")
             rt.eval(code)
             assert rt.eval("globalThis.hit") is not None
+
+
+# ---------------------------------------------------------------------------
+# the `constructor` rule end to end
+# ---------------------------------------------------------------------------
+
+#: Feeds that reach the Function constructor (each sets globalThis.hit when it runs).
+REACHES_FUNCTION = {
+    "with-call": "with (() => 0) { constructor('globalThis.hit = 1')() }",
+    "with-statement": "with (() => 0) { 0; constructor('globalThis.hit = 1')() }",
+    "with-extends": (
+        "with (() => 0) { class A extends constructor('globalThis.hit = 1') {}; new A() }"
+    ),
+    "with-new": "with (() => 0) { new constructor('globalThis.hit = 1')() }",
+    "with-return": (
+        "with (() => 0) { const f = () => { return constructor('globalThis.hit = 1') }; f()() }"
+    ),
+    "with-of": "with (() => 0) { for (const c of [constructor]) c('globalThis.hit = 1')() }",
+    "with-comment": "with (() => 0) { constructor/*x*/('globalThis.hit = 1')() }",
+    "with-template": "with (() => 0) { constructor(`globalThis.hit = 1`)() }",
+    "property": "(() => 0).constructor('globalThis.hit = 1')()",
+    "object-value": "({ f: Function }).f('globalThis.hit = 1')()",
+    "destructuring": "const { constructor: F } = () => 0; F('globalThis.hit = 1')()",
+}
+#: Harmless code with `constructor` the rule accepts: it must run under the gate.
+ACCEPTED = {
+    "class": "class A { constructor(a) { this.a = a } }; new A(7).a",
+    "object-method": "const o = { constructor() { return 8 } }; Object.keys(o).length + 7",
+}
+
+
+def test_constructor_shapes_really_reach_function_without_a_gate() -> None:
+    with IsolatedRuntime() as rt:
+        for name, code in REACHES_FUNCTION.items():
+            rt.eval("globalThis.hit = undefined")
+            rt.eval(code)
+            assert rt.eval("globalThis.hit") == 1, name
+
+
+def test_constructor_shapes_are_denied_through_pydeno() -> None:
+    gate = static_gate(SourcePolicy(forbid_function=True))
+    with Pydeno(sandbox=MODE, gate=gate, min_processes=1) as pool:
+        with pool.checkout() as session:
+            for name, code in REACHES_FUNCTION.items():
+                with pytest.raises(GateDenied):
+                    session.feed_run(code)
+                assert session.feed_run("typeof hit") == "undefined", name
+            assert session.feed_run(ACCEPTED["class"]) == 7
+            assert session.feed_run(ACCEPTED["object-method"]) == 8
+
+
+def test_a_constructor_name_built_at_run_time_is_stopped_by_strict_eval() -> None:
+    from pydeno import PydenoRuntimeError
+
+    gate = static_gate(SourcePolicy(forbid_function=True))
+    code = '(() => 0)["constr" + "uctor"]("globalThis.hit = 1")()'
+    with Pydeno(sandbox=MODE, gate=gate, strict_eval=True, min_processes=1) as pool:
+        with pool.checkout() as session:
+            with pytest.raises(PydenoRuntimeError, match="EvalError"):
+                session.feed_run(code)  # the gate cannot see it; the engine refuses it
+            assert session.feed_run("typeof hit") == "undefined"
