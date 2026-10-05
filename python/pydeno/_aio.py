@@ -763,7 +763,7 @@ class AsyncIsolatedRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sup: _Supervisor | None = None
         self._lock: asyncio.Lock | None = None
-        self._send_lock = asyncio.Lock()
+        self._send_lock: asyncio.Lock | None = None
         self._proc: Any = None
         self._stderr: Any = None
         self._rproto = _FrameReader()
@@ -818,6 +818,7 @@ class AsyncIsolatedRuntime:
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._sup = _supervisor_for(loop)
         try:
             async with self._sup.start_slots:
@@ -1229,25 +1230,18 @@ class AsyncIsolatedRuntime:
     async def _drain(self) -> None:
         if not self._wproto.paused:
             return
-        remaining = self._wtransport.get_write_buffer_size()
-        while self._wproto.paused:
-            try:
-                async with _compat.timeout(self._stall):
-                    await self._wproto.drain()
-            except TimeoutError:
-                current = self._wtransport.get_write_buffer_size()
-                if current < remaining:
-                    # The peer is still reading. Measure a stall from observed progress,
-                    # rather than timing out a large reply that is steadily draining.
-                    remaining = current
-                    continue
-                raise _wire.StalledWrite(
-                    errno.EAGAIN, f"the peer stopped reading for {self._stall:g}s"
-                ) from None
+        try:
+            async with _compat.timeout(self._stall):
+                await self._wproto.drain()
+        except TimeoutError:
+            raise _wire.StalledWrite(
+                errno.EAGAIN, f"the peer stopped reading for {self._stall:g}s"
+            ) from None
 
     async def _send_frame(self, frame: bytes) -> None:
         # Wait before entering the transport buffer, so a burst of replies cannot all
         # queue ahead of drain(). Its backlog is at most one frame above the high watermark.
+        assert self._send_lock is not None
         async with self._send_lock:
             self._write(frame)
             await self._drain()
@@ -1598,6 +1592,7 @@ class AsyncIsolatedRuntime:
         try:
             if self._closed:
                 return  # nobody to answer
+            assert self._send_lock is not None
             async with self._send_lock:
                 if isinstance(reply, bytes):
                     frame = reply

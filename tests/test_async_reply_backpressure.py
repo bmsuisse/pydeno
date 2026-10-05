@@ -1,7 +1,9 @@
-"""Reply bursts stay bounded while a slow reader makes measurable pipe progress."""
+"""Reply bursts stay bounded, a reader that keeps up is not killed, and one that stops or only
+drips is killed within one stall window."""
 
 import asyncio
 import os
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -29,9 +31,12 @@ async def _pipe():
 
 
 async def test_slow_progressing_reader_has_bounded_backlog_and_no_false_stall():
+    # The reader takes 8 KiB per tick (no more than the smallest pipe gives), so each frame
+    # drains well within one stall window while the whole burst takes longer than one.
     runtime, fd = await _pipe()
+    runtime._stall = 0.5
     frame = b"x" * (128 * 1024)
-    count = 4
+    count = 32
     peak = 0
     read = 0
 
@@ -40,18 +45,20 @@ async def test_slow_progressing_reader_has_bounded_backlog_and_no_false_stall():
         while read < count * len(frame):
             peak = max(peak, runtime._wtransport.get_write_buffer_size())
             try:
-                read += len(os.read(fd, 4 * 1024))
+                read += len(os.read(fd, 8 * 1024))
             except BlockingIOError:
                 pass
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.002)
 
     consumer = asyncio.create_task(consume())
+    started = time.monotonic()
     try:
         outcomes = await asyncio.gather(
             *(AsyncIsolatedRuntime._send_frame(runtime, frame) for _ in range(count)),
             return_exceptions=True,
         )
-        await asyncio.wait_for(consumer, 5)
+        assert time.monotonic() - started > runtime._stall
+        await asyncio.wait_for(consumer, 10)
         assert peak <= len(frame) + 64 * 1024
         assert outcomes == [None] * count
         assert read == count * len(frame)
@@ -65,11 +72,42 @@ async def test_slow_progressing_reader_has_bounded_backlog_and_no_false_stall():
 async def test_reader_without_progress_still_stalls():
     runtime, fd = await _pipe()
     try:
+        # 1 MiB: more than the pipe and the 64 KiB high watermark take, on any kernel.
+        runtime._write(b"x" * (1024 * 1024))
+        assert runtime._wproto.paused
+        with pytest.raises(_wire.StalledWrite):
+            await asyncio.wait_for(runtime._drain(), 1)
+    finally:
+        runtime._wtransport.close()
+        os.close(fd)
+
+
+async def test_dripping_reader_is_killed_within_one_stall_window():
+    # A reader that takes one page per window, just under the stall limit, must not keep a
+    # large reply (and with it the host call) alive past one window.
+    runtime, fd = await _pipe()
+    stop = False
+
+    async def drip():
+        while not stop:
+            await asyncio.sleep(runtime._stall * 0.9)
+            try:
+                os.read(fd, 4 * 1024)
+            except BlockingIOError:
+                pass
+
+    dripper = asyncio.create_task(drip())
+    started = time.monotonic()
+    try:
         with pytest.raises(_wire.StalledWrite):
             await asyncio.wait_for(
-                AsyncIsolatedRuntime._send_frame(runtime, b"x" * (128 * 1024)), 1
+                AsyncIsolatedRuntime._send_frame(runtime, b"x" * (1024 * 1024)), 2
             )
+        assert time.monotonic() - started < runtime._stall * 2
     finally:
+        stop = True
+        dripper.cancel()
+        await asyncio.gather(dripper, return_exceptions=True)
         runtime._wtransport.close()
         os.close(fd)
 

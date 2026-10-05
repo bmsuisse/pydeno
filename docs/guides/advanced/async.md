@@ -172,7 +172,7 @@ reply drains, so the default `max_inflight_host_calls=64` also bounds waiting re
 Setting that limit to `None` explicitly removes the producer cap; a trusted host callback’s
 returned Python value can still consume arbitrary memory.
 
-The write stall timeout checks whether the transport buffer shrinks during each timeout
-window. Continued progress starts another window; a window without progress still kills the
-worker. This prevents a slow but active reader from being killed merely because a burst of
-replies took longer than the stall timeout to finish.
+Each reply gets its own `write_stall_timeout` window, which starts when the reply is written: a
+worker that keeps reading through a burst is not killed because the whole burst takes longer than
+the timeout, and a worker that does not drain one reply (at most that frame plus the 64 KiB high
+watermark) within the timeout is killed, however slowly it is still reading.
