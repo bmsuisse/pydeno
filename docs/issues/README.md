@@ -7,7 +7,7 @@ posted: the GitHub CLI could not reach `api.github.com`. The branch push did suc
 | Issue body | Implementation |
 | --- | --- |
 | [Fair prompt catalog](opencode-tool-catalog.md) | `describe_tool_catalog()` with an opt-in character budget and namespace fairness; preserves complete, entry-local schema descriptions. |
-| [Async lifecycle coverage](opencode-async-lifecycle.md) | Five bounded tests; no promise-semantic changes or production defect claim. |
+| [Async lifecycle coverage](opencode-async-lifecycle.md) | Six bounded tests and a verified closed-session dispatch fix; no promise-semantic changes. |
 | [Output boundaries](opencode-output-boundaries.md) | Bounded five-entry dictionary preview snapshot; result/log/HTTP and wire-boundary tests. |
 
 ## Verified locally
@@ -26,8 +26,13 @@ Instructions and namespace summaries are additional to the entry budget.
 
 Ruff, formatting and diff checks passed. Independent review caught an ambiguous schema-name
 case; separate entry scopes and a regression addressed it. Each change received independent
-review. The native Linux invocation failed before collection because Podman's control socket
-was denied; there is no passing Linux JUnit report for this branch.
+review. The first Linux invocations were denied before collection. A later direct Podman run
+reproduced a late-dispatch cleanup defect; the closed-session guard then passed all
+172 selected async tests on native Linux ARM64 CPython 3.12 (zero failures or skips),
+including six new lifecycle cases. The initial combined ARM64 run also passed the
+native wire-cap case; its one lifecycle failure is addressed by the guard. These runs
+used the retained 0771370 compiled release wheel with the current Python overlay,
+not an exact-head release artifact.
 
 ## Required before merge
 
