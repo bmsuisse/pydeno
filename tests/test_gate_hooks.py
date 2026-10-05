@@ -173,6 +173,43 @@ def test_a_refused_bootstrap_starts_no_worker(monkeypatch: pytest.MonkeyPatch) -
     assert rec.calls[0][1].mode == "bootstrap"
 
 
+def test_a_gate_with_the_wrong_signature_fails_at_construction() -> None:
+    def three(source: str, context: GateContext, extra: object) -> Verdict:
+        return ALLOW
+
+    for build in (
+        lambda: IsolatedRuntime(gate=three),
+        lambda: AsyncIsolatedRuntime(gate=three),
+        lambda: AgentSandbox({}, gate=three),
+        lambda: AsyncAgentSandbox({}, gate=three),
+        lambda: Pydeno(sandbox=MODE, gate=three),
+        lambda: AsyncPydeno(sandbox=MODE, gate=three),
+        lambda: IsolatedRuntime(gate="not callable"),
+    ):
+        with pytest.raises(TypeError):
+            build()
+
+
+def test_a_one_argument_gate_works_in_a_hook() -> None:
+    def clf(source):  # type: ignore[no-untyped-def]
+        return Verdict("DENY" not in source, "one-arg")
+
+    with IsolatedRuntime(gate=clf) as rt:
+        assert rt.eval("1 + 1") == 2
+        with pytest.raises(GateDenied, match="one-arg"):
+            rt.eval("'DENY'")
+
+
+async def test_an_async_one_argument_gate_works_in_a_hook() -> None:
+    async def clf(source):  # type: ignore[no-untyped-def]
+        return Verdict("DENY" not in source, "async one-arg")
+
+    async with AsyncAgentSandbox({}, gate=clf) as sb:
+        assert await sb.run("return 3") == 3
+        with pytest.raises(GateDenied, match="async one-arg"):
+            await sb.run("return 'DENY'")
+
+
 def test_a_sync_runtime_refuses_an_async_gate() -> None:
     async def agate(source: str, context: GateContext) -> Verdict:
         return ALLOW

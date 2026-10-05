@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import gc
 import hashlib
 import pickle
@@ -710,6 +711,10 @@ def test_policy_messages_are_the_documented_templates() -> None:
         "forbidden-webassembly": (
             "WebAssembly is not allowed here. Write the computation in JavaScript."
         ),
+        "forbidden-computed-global-access": (
+            "Looking up a global by a computed name is not allowed here. Use the name "
+            "directly."
+        ),
     }
     assert POLICY_MESSAGES == expected
 
@@ -816,3 +821,203 @@ print(len(answers))
     )
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "2"
+
+
+# ---------------------------------------------------------------------------
+# gate signatures: programming errors are TypeErrors, not outages
+# ---------------------------------------------------------------------------
+
+
+def test_a_one_argument_gate_is_called_with_the_source() -> None:
+    seen: list[str] = []
+
+    def clf(source):  # type: ignore[no-untyped-def]
+        seen.append(source)
+        return Verdict("bad" not in source, "one-arg", ("clf",))
+
+    assert gate_check(clf, "good") == Verdict(True, "one-arg", ("clf",))
+    with pytest.raises(GateDenied, match="one-arg"):
+        gate_check(all_of(static_gate(SourcePolicy()), clf), "bad")
+    assert seen == ["good", "bad"]
+    assert _hook(clf, 10.0, who="X", sync_only=True) is not None
+
+
+async def test_an_async_one_argument_gate_works() -> None:
+    async def clf(source):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(0)
+        return Verdict(source == "ok", "async one-arg")
+
+    assert (await async_gate_check(clf, "ok")).reason == "async one-arg"
+    with pytest.raises(GateDenied):
+        await async_gate_check(any_of(clf), "no")
+    with pytest.raises(TypeError, match="async"):
+        _hook(clf, 10.0, who="X", sync_only=True)  # still recognised as async
+    assert _hook(clf, 10.0, who="X", sync_only=False) is not None
+
+
+def test_optional_and_variadic_signatures_are_accepted() -> None:
+    def defaults(source, context=None, extra=1):  # type: ignore[no-untyped-def]
+        return ALLOW
+
+    def variadic(*args):  # type: ignore[no-untyped-def]
+        assert len(args) == 2
+        return ALLOW
+
+    class Method:
+        def check(self, source, context):  # type: ignore[no-untyped-def]
+            return ALLOW
+
+    for gate in (defaults, variadic, Method().check, static_gate(SourcePolicy())):
+        assert gate_check(gate, "x") == ALLOW
+        assert _hook(gate, 10.0, who="X", sync_only=True) is not None
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        lambda a, b, c: ALLOW,
+        lambda: ALLOW,
+        lambda *, source, context: ALLOW,
+        "not callable",
+    ],
+    ids=["three-args", "no-args", "keyword-only", "string"],
+)
+def test_an_incompatible_gate_is_a_type_error_everywhere(gate: object) -> None:
+    with pytest.raises(TypeError):
+        gate_check(gate, "x")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        all_of(gate)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        _hook(gate, 10.0, who="X", sync_only=False)
+
+
+async def test_an_incompatible_gate_is_a_type_error_in_async_gate_check() -> None:
+    with pytest.raises(TypeError):
+        await async_gate_check(lambda a, b, c: ALLOW, "x")  # type: ignore[arg-type]
+
+
+def test_a_type_error_raised_inside_the_gate_is_still_unavailable() -> None:
+    def buggy(source, context):  # type: ignore[no-untyped-def]
+        return len(source, context)  # a TypeError from the gate's own body
+
+    with pytest.raises(GateUnavailable, match="TypeError"):
+        gate_check(buggy, "x")
+
+
+def test_a_partial_gate_is_inspected_through() -> None:
+    gate = functools.partial(lambda verdict, source, context: verdict, ALLOW)
+    assert gate_check(gate, "x") == ALLOW
+    with pytest.raises(TypeError):
+        gate_check(functools.partial(lambda a, b, c, d: ALLOW, 1), "x")
+
+
+# ---------------------------------------------------------------------------
+# model-facing text: the clean message without a location
+# ---------------------------------------------------------------------------
+
+
+def test_findings_expose_the_bare_text_and_template() -> None:
+    policy = SourcePolicy(forbidden_globals={"process"}, forbid_eval=True)
+    result = check_source("let a = 1;\nprocess.exit(eval('1'))", policy=policy)
+    first, second = result.findings
+    assert (first.rule, first.line, first.column) == ("forbidden-global", 2, 1)
+    assert first.text == first.message
+    assert first.text == POLICY_MESSAGES["forbidden-global"].format(name="process")
+    assert first.template == POLICY_MESSAGES["forbidden-global"]
+    assert not first.text.startswith("2:")  # no location prefix
+    assert second.text == POLICY_MESSAGES["forbidden-eval"]
+    # The usability rules have no template.
+    assert check_source("fetch('x')").findings[0].template is None
+
+
+def test_static_gate_labels_are_the_rules_and_check_gives_the_findings() -> None:
+    gate = static_gate(SourcePolicy(forbid_eval=True, forbidden_globals={"process"}))
+    source = "eval('1'); process.env"
+    with pytest.raises(GateDenied) as info:
+        gate_check(gate, source)
+    assert info.value.top_label == "forbidden-eval"
+    findings = gate.check(source).findings
+    assert [f.rule for f in findings] == list(info.value.labels)
+    assert [f.text for f in findings] == [
+        POLICY_MESSAGES["forbidden-eval"],
+        POLICY_MESSAGES["forbidden-global"].format(name="process"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# computed access on a global object
+# ---------------------------------------------------------------------------
+
+COMPUTED = SourcePolicy(forbid_computed_global_access=True)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "globalThis['ev' + 'al']('1')",
+        "globalThis[k]",
+        "this[k]",
+        "self[name]()",
+        "window[`${a}b`]",
+        "global[x.y]",
+        "globalThis?.[k]",
+        "(() => {}).constructor[k]",
+        "Function[k]",
+        "globalThis[`a${''}`]",
+    ],
+    ids=[
+        "concat",
+        "variable",
+        "this",
+        "self",
+        "template-substitution",
+        "global",
+        "optional",
+        "constructor-chain",
+        "function",
+        "template-with-empty-substitution",
+    ],
+)
+def test_computed_global_access_is_flagged(code: str) -> None:
+    findings = check_source(code, policy=COMPUTED).findings
+    assert [f.rule for f in findings] == ["forbidden-computed-global-access"]
+    assert findings[0].text == POLICY_MESSAGES["forbidden-computed-global-access"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "obj[k]",
+        "arr[i + 1]",
+        "rows[0][col]",
+        "globalThis['Math']",
+        "globalThis[`Math`]",
+        "globalThis[0]",
+        "x.self[k]",
+        "globalThis.cache[k]",
+        "// globalThis[k]\n1",
+        "'globalThis[k]'",
+        "const [a, b] = pair",
+    ],
+    ids=[
+        "object",
+        "array",
+        "nested",
+        "string-key",
+        "template-key",
+        "number",
+        "property-named-self",
+        "global-property",
+        "comment",
+        "string",
+        "destructuring",
+    ],
+)
+def test_ordinary_bracket_access_is_not_flagged(code: str) -> None:
+    assert check_source(code, policy=COMPUTED).findings == []
+
+
+def test_computed_global_access_is_off_by_default() -> None:
+    assert check_source("globalThis[k]", policy=SourcePolicy()).findings == []
+    with pytest.raises(TypeError):
+        SourcePolicy(forbid_computed_global_access="yes")  # type: ignore[arg-type]
