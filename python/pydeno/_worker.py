@@ -204,6 +204,24 @@ _CONFIG_KEYS = (
 )
 
 
+class _CommandLoop(asyncio.SelectorEventLoop):
+    """Between commands this loop looks closed to other threads, as the per-command loop did once
+    `asyncio.run` closed it: a late `call_soon_threadsafe` (a host call's start or completion
+    owed to an earlier command) is refused instead of queued for the next one."""
+
+    idle = True
+
+    def is_closed(self) -> bool:
+        return self.idle or super().is_closed()
+
+    def call_soon_threadsafe(
+        self, callback: Any, *args: Any, context: Any = None
+    ) -> Any:
+        if self.idle:
+            raise RuntimeError("Event loop is closed")
+        return super().call_soon_threadsafe(callback, *args, context=context)
+
+
 class _Worker:
     def __init__(self, in_fd: int, out_fd: int) -> None:
         self._reader = _wire.FrameReader(in_fd)
@@ -229,8 +247,9 @@ class _Worker:
         # One event loop for every async command, driven by the main thread for the length of
         # the command and idle in between, instead of an `asyncio.run` (a new loop, its selector
         # and self-pipe, and their teardown) per command. Created here, before the OS sandbox,
-        # like every import; it starts no thread. `_settle` leaves it empty after each command.
-        self._loop = asyncio.new_event_loop()
+        # like every import; it starts no thread. `_settle` leaves it empty after each command,
+        # and between commands it refuses work from other threads (`_CommandLoop`).
+        self._loop = _CommandLoop()
         # `load_wasm` instances, by id: the bridge's function handles (the parent holds only ids).
         self._wasm: dict[int, Any] = {}
         self._wasm_ids = itertools.count(1)
@@ -379,22 +398,28 @@ class _Worker:
         async def run() -> Any:
             return await make()
 
+        self._loop.idle = False
         try:
             return self._loop.run_until_complete(run())
         finally:
+            # From here on other threads see a closed loop: nothing more can be queued for later.
+            self._loop.idle = True
             self._settle()
 
     def _settle(self) -> None:
         """Leave nothing of a command on the loop for the next one, as `asyncio.run` closing
         its loop did: every task still pending (an async host call the guest started and never
-        awaited) is cancelled and run until it has finished."""
+        awaited) is cancelled and run until it has finished, and whatever callbacks the last pass
+        queued (a finished host call's completion) run now, not at the start of the next
+        command."""
         loop = self._loop
         tasks = asyncio.all_tasks(loop)
-        if not tasks:
-            return
-        for task in tasks:
-            task.cancel()
-        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        if tasks:
+            for task in tasks:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+        loop.call_soon(loop.stop)
+        loop.run_forever()
 
     def _handle(self, message: dict[str, Any]) -> Any:
         kind = message["t"]
