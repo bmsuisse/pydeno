@@ -359,14 +359,15 @@ class TestContainment:
         if sys.platform not in ("linux", "darwin"):
             pytest.skip("RSS polling is implemented for Linux and macOS")
         # An explicit big buffer cap: the default one would turn this into a catchable RangeError,
-        # and this test is about the RSS ceiling behind it.
+        # and this test is about the RSS ceiling behind it. 800 MiB: over max_memory, under the
+        # kernel's ceiling on Linux (max_memory + 1 GiB), where an allocation is refused outright.
         rt = IsolatedRuntime(
             RuntimeConfig(max_buffer_bytes=8192 * MIB),
             max_memory=300 * MIB,
             request_timeout=30,
         )
         with pytest.raises(WorkerCrashed, match="max_memory"):
-            rt.eval("new Uint8Array(1500 * 1024 * 1024).fill(1).length")
+            rt.eval("new Uint8Array(800 * 1024 * 1024).fill(1).length")
         assert rt.is_closed()
 
     @pytest.mark.parametrize(
