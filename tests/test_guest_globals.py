@@ -110,6 +110,8 @@ _PYDENO_BRIDGE_GLOBALS = {
     "__pydeno_bind_object",
     "__pydeno_bind_function",
     "__pydeno_from_py_stream",
+    # `load_wasm`'s loader; installed only where V8 has WebAssembly (not under --jitless).
+    "__pydeno_wasm_load",
     "ReadableStream",
 }
 
