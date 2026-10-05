@@ -385,6 +385,62 @@ jobs:
             tests/test_isolated_*.py \
             tests/test_aio_isolated_runtime.py
 
+  # Every feature on its own must compile (default = inspector, bench). `cargo test` and clippy only
+  # cover the default set, `bench`, and no-default-features, so a feature that stops building alone
+  # would go unnoticed. cargo-hack is pinned and installed from a prebuilt binary.
+  cargo-features:
+    name: cargo feature combinations
+    timeout-minutes: 45
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-hack
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack@0.6.37
+      - name: cargo hack check --each-feature
+        run: cargo hack check --each-feature --no-dev-deps
+
+  # The default install is `pip install pydeno` with no extras (pydantic-ai and the like are opt-in).
+  # Install the built wheel into a clean venv, away from the source tree, and use it.
+  default-install:
+    name: default install smoke
+    needs: linux-wheels
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-x86_64
+          path: wheels
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install without extras and use it
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/clean"
+          "$RUNNER_TEMP/clean/bin/python" -m pip install wheels/*cp312*.whl
+          "$RUNNER_TEMP/clean/bin/python" -m pip list
+          # run from a directory without the source tree so the installed wheel is what gets imported
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/clean/bin/python" - <<'PY'
+          import pydeno
+          assert "site-packages" in pydeno.__file__, pydeno.__file__
+          for extra in ("pydantic_ai", "pydantic_ai_slim"):
+              try:
+                  __import__(extra)
+              except ImportError:
+                  continue
+              raise SystemExit(f"{extra} is installed: the venv is not clean")
+          print(pydeno.sandbox_status())
+          with pydeno.IsolatedRuntime() as rt:
+              assert rt.eval("1 + 2") == 3
+          print("default install ok")
+          PY
+
   cargo-test:
     name: cargo test
     runs-on: macos-latest
