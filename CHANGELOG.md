@@ -14,7 +14,9 @@
   `f32`/`f64`) and runs each call under the runtime's timeout. The bridge compiles and instantiates
   the module with WebAssembly intrinsics captured before any guest code, through one new fixed
   global, `__pydeno_wasm_load`, installed only where V8 has WebAssembly; the instance is held only by
-  the host. **Explicit opt-in for trusted modules:** the isolated runtimes need `jitless=False`
+  the host (the isolated worker takes its reference to it before any guest code, so a loader the
+  guest planted where V8 has no WebAssembly, for example under `--lite-mode`, is never called).
+  **Explicit opt-in for trusted modules:** the isolated runtimes need `jitless=False`
   (with the default, `load_wasm` raises `RuntimeError` in the parent and the worker is unchanged),
   and a module's linear memory is not bounded by `max_buffer_bytes` (it counts toward `max_memory`
   in the isolated runtimes; nothing bounds it in an in-process `Runtime`). Not on `Pydeno`,

@@ -744,6 +744,9 @@ class AsyncIsolatedRuntime:
         self._handlers: dict[int, tuple[Callable[..., Any], bool]] = {}
         self._token_to_hid: dict[int, int] = {}
         self._revoked_hids: dict[int, None] = {}
+        # Ids of `load_wasm` instances whose module object was dropped without `unload()`: sent
+        # along with the next wasm command, so the worker forgets them (see `_wasm.track_drop`).
+        self._wasm_dropped: list[int] = []
         self._hids = itertools.count(1)
         self._cmd_ids = itertools.count(1)
         self._serial = next(_SERIALS)
@@ -1730,7 +1733,7 @@ class AsyncIsolatedRuntime:
 
         Needs ``jitless=False``; a path is read by this process (in a thread, so the loop does not
         block), never by the worker."""
-        if _isolated._bool_flag_setting(self._options["v8_flags"], "jitless"):  # noqa: SLF001
+        if _wasm.flags_disable_wasm(self._options["v8_flags"]):
             raise RuntimeError(_wasm.JITLESS_MESSAGE)
         if isinstance(module, (bytes, bytearray, memoryview)):
             data = _wasm.read_module(module, max_bytes)
@@ -1741,7 +1744,12 @@ class AsyncIsolatedRuntime:
         if soft is None:
             soft = self._soft_timeout
         wid = await self._request(
-            {"t": "wasm_load", "bytes": _wire.Enc(data), "timeout": soft},
+            {
+                "t": "wasm_load",
+                "bytes": _wire.Enc(data),
+                "timeout": soft,
+                "drop": _wasm.drain(self._wasm_dropped),
+            },
             soft_timeout=soft,
         )
         if not _is_token(wid):
@@ -1761,6 +1769,7 @@ class AsyncIsolatedRuntime:
                 "args": _wire.Enc(values),
                 "wide": wide,
                 "timeout": soft,
+                "drop": _wasm.drain(self._wasm_dropped),
             }
             return await self._request(message, soft_timeout=soft)
 
@@ -1768,7 +1777,9 @@ class AsyncIsolatedRuntime:
             if not self._closed:
                 await self._request({"t": "wasm_unload", "wid": wid})
 
-        return _wasm.AsyncWasmModule(signatures, call, unload)
+        return _wasm.track_drop(
+            _wasm.AsyncWasmModule(signatures, call, unload), self._wasm_dropped, wid
+        )
 
     async def set_module_resolver(
         self, resolver: Callable[[str, str], str | None]

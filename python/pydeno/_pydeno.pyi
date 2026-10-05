@@ -1085,7 +1085,7 @@ class Runtime:
         /,
         *,
         max_bytes: int = ...,
-        timeout: float | None = None,
+        timeout: float | int | timedelta | None = None,
     ) -> WasmModule:
         """Load a **trusted** WebAssembly module (bytes, or a path the host reads; at most
         `max_bytes`, default and ceiling 8 MiB; no imports) and return a `WasmModule` whose

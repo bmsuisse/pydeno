@@ -16,11 +16,13 @@ Imported by the isolation worker before its sandbox goes up, so only the standar
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+import weakref
+from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 
 TYPE_CHECKING = False
 if TYPE_CHECKING:
+    from datetime import timedelta
     from typing import Any
 
 #: The most bytes `load_wasm` takes. Base64 on the isolation wire makes 8 MiB about 10.7 MiB, inside
@@ -28,8 +30,8 @@ if TYPE_CHECKING:
 MAX_WASM_BYTES = 8 * 1024 * 1024
 
 JITLESS_MESSAGE = (
-    "load_wasm needs jitless=False: this runtime runs V8 with --jitless, which has no "
-    "WebAssembly. Turning it off enables V8's JIT compiler and WebAssembly, a larger attack "
+    "load_wasm needs jitless=False: this runtime's V8 has no WebAssembly (--jitless, or a flag "
+    "such as --lite-mode that implies it). Turning it off enables V8's JIT compiler and WebAssembly, a larger attack "
     "surface (the OS sandbox and the other limits still apply, but max_buffer_bytes does not "
     "bound WebAssembly memory). Load only trusted modules."
 )
@@ -218,7 +220,12 @@ def prepare_args(
                     f"{name}() argument {position}: an {kind} takes a float or int, not "
                     f"{type(value).__name__}"
                 )
-            out.append(float(value))  # OverflowError for an int past the float range
+            try:
+                out.append(float(value))
+            except OverflowError:
+                raise ValueError(
+                    f"{name}() argument {position}: {value} does not fit an {kind}"
+                ) from None
         else:
             raise TypeError(
                 f"{name}() parameter {position} is a {kind}, which Python cannot pass"
@@ -227,18 +234,42 @@ def prepare_args(
     return out, wide
 
 
-def _result(value: Any) -> Any:
+def _typed(kind: str, value: Any) -> Any:
+    # The result conversion makes an integral double a Python int (and -0.0 a plain 0); a float
+    # result type gives a float back. The sign of a negative zero is not recoverable here.
+    if (
+        kind in ("f32", "f64")
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+    ):
+        return float(value)
+    return value
+
+
+def _result(results: tuple[str, ...], value: Any) -> Any:
     from . import undefined
 
     if value is undefined:
         return None
     if isinstance(value, list):
-        return tuple(value)
-    return value
+        return tuple(_typed(k, v) for k, v in zip(results, value))
+    return _typed(results[0], value) if len(results) == 1 else value
+
+
+def flags_disable_wasm(flags: Sequence[str]) -> bool:
+    """Whether these V8 flags leave the engine without WebAssembly (`--jitless` or `--lite-mode`,
+    which implies it; last mention winning): the isolated runtimes then refuse `load_wasm` in the
+    parent. Only an early, clearer refusal: the worker holds its own reference to the loader,
+    taken before any guest code, and refuses whenever it has none, whatever the flags say."""
+    from ._isolated import _bool_flag_setting
+
+    return bool(
+        _bool_flag_setting(flags, "jitless") or _bool_flag_setting(flags, "lite-mode")
+    )
 
 
 class _Base:
-    __slots__ = ("_signatures", "_closed")
+    __slots__ = ("_signatures", "_closed", "__weakref__")
 
     def __init__(
         self, signatures: dict[str, tuple[tuple[str, ...], tuple[str, ...]]]
@@ -288,10 +319,14 @@ class WasmModule(_Base):
         """Exported function name -> a callable taking the arguments (and ``timeout=``)."""
         return MappingProxyType({name: _bound(self, name) for name in self._signatures})
 
-    def call(self, name: str, *args: Any, timeout: float | None = None) -> Any:
+    def call(
+        self, name: str, *args: Any, timeout: float | timedelta | None = None
+    ) -> Any:
         """Call the exported function `name`. `timeout` (seconds) defaults to the runtime's."""
         values, wide = self._prepare(name, args)
-        return _result(self._call(name, values, wide, timeout))
+        return _result(
+            self._signatures[name][1], self._call(name, values, wide, timeout)
+        )
 
     def unload(self) -> None:
         """Drop the instance. Idempotent; later calls raise RuntimeError."""
@@ -331,9 +366,13 @@ class AsyncWasmModule(_Base):
         """Exported function name -> a coroutine function taking the arguments."""
         return MappingProxyType({name: _bound(self, name) for name in self._signatures})
 
-    async def call(self, name: str, *args: Any, timeout: float | None = None) -> Any:
+    async def call(
+        self, name: str, *args: Any, timeout: float | timedelta | None = None
+    ) -> Any:
         values, wide = self._prepare(name, args)
-        return _result(await self._call(name, values, wide, timeout))
+        return _result(
+            self._signatures[name][1], await self._call(name, values, wide, timeout)
+        )
 
     async def unload(self) -> None:
         if not self._closed:
@@ -352,25 +391,42 @@ class AsyncWasmModule(_Base):
 
 
 def _bound(owner: WasmModule | AsyncWasmModule, name: str) -> Callable[..., Any]:
-    def call(*args: Any, timeout: float | None = None) -> Any:
+    def call(*args: Any, timeout: float | timedelta | None = None) -> Any:
         return owner.call(name, *args, timeout=timeout)
 
     call.__name__ = call.__qualname__ = name
     return call
 
 
-def bridge_load(runtime: Any, data: bytes, timeout: Any = None) -> Any:
-    """Instantiate `data` through the bridge of an in-process `Runtime`; returns the closure's
-    function handle. Used by `Runtime.load_wasm` and by the isolation worker.
+def drain(dropped: list[int]) -> list[int]:
+    """Take the ids queued by `track_drop` (a finalizer may append concurrently, at the end)."""
+    taken = dropped[:]
+    del dropped[: len(taken)]
+    return taken
+
+
+def track_drop(module: Any, dropped: list[int], wid: int) -> Any:
+    """Queue `wid` for the worker to forget once `module` is garbage collected. A finalizer must
+    not talk to the worker itself (it can run on any thread, inside another command), so the id
+    rides along with the next wasm command. After `unload()` the id is already gone there, and
+    forgetting it again is harmless."""
+    weakref.finalize(module, dropped.append, wid)
+    return module
+
+
+def bridge_loader(runtime: Any) -> Any:
+    """The bridge's loader in an in-process `Runtime` (a function handle), or None when V8 has no
+    WebAssembly here.
 
     Where V8 has WebAssembly the bridge fixed this global (non-writable, non-configurable) before
-    any guest code ran, so a guest cannot replace it. Where it has none (`--jitless`) a guest could
-    plant a global of that name; the isolated runtimes refuse from their flags before getting here,
-    and an in-process `Runtime` is not a boundary for hostile code in the first place."""
-    if runtime.eval("typeof __pydeno_wasm_load") != "function":
-        raise RuntimeError(JITLESS_MESSAGE)
-    loader = runtime.eval("__pydeno_wasm_load")
-    return loader(data, timeout=timeout)
+    any guest code ran, so a guest cannot replace it. Where it has none (`--jitless`,
+    `--lite-mode`, ...) a guest could plant a global of that name. The isolation worker therefore
+    takes this reference once, right after its runtime is created and before any guest code, and
+    uses only that. `Runtime.load_wasm` looks it up per call: an in-process `Runtime` is not a
+    boundary for hostile code, and a process whose V8 has no WebAssembly is one the host set up."""
+    return runtime.eval(
+        "typeof __pydeno_wasm_load === 'function' ? __pydeno_wasm_load : null"
+    )
 
 
 def runtime_load_wasm(
@@ -379,7 +435,7 @@ def runtime_load_wasm(
     /,
     *,
     max_bytes: int = MAX_WASM_BYTES,
-    timeout: float | None = None,
+    timeout: float | timedelta | None = None,
 ) -> WasmModule:
     """Load a **trusted** WebAssembly module and return a `WasmModule`.
 
@@ -398,7 +454,10 @@ def runtime_load_wasm(
     """
     data = read_module(module, max_bytes)
     signatures = parse_signatures(data)
-    handle = bridge_load(self, data, timeout)
+    loader = bridge_loader(self)
+    if loader is None:
+        raise RuntimeError(JITLESS_MESSAGE)
+    handle = loader(data, timeout=timeout)
 
     def call(name: str, values: list[Any], wide: list[bool], call_timeout: Any) -> Any:
         return handle(name, values, wide, timeout=call_timeout)

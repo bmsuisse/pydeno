@@ -763,6 +763,9 @@ class IsolatedRuntime:
         self._async_inflight_lock = threading.Lock()
         # Recently revoked handler ids, oldest first (bounded): see `_on_call`.
         self._revoked_hids: dict[int, None] = {}
+        # Ids of `load_wasm` instances whose module object was dropped without `unload()`: sent
+        # along with the next wasm command, so the worker forgets them (see `_wasm.track_drop`).
+        self._wasm_dropped: list[int] = []
         _LIVE.add(self)
         self._handshake()
         self._check_termination_authority()
@@ -1613,7 +1616,7 @@ class IsolatedRuntime:
         8 MiB), no imports. A call runs under the runtime's timeout (or `timeout=`) like `eval`.
         The module's linear memory counts against `max_memory` but not `max_buffer_bytes`.
         """
-        if _bool_flag_setting(self._options["v8_flags"], "jitless"):
+        if _wasm.flags_disable_wasm(self._options["v8_flags"]):
             raise RuntimeError(_wasm.JITLESS_MESSAGE)
         data = _wasm.read_module(module, max_bytes)
         signatures = _wasm.parse_signatures(data)
@@ -1621,7 +1624,12 @@ class IsolatedRuntime:
         if soft is None:
             soft = self._soft_timeout
         wid = self._request(
-            {"t": "wasm_load", "bytes": _wire.Enc(data), "timeout": soft},
+            {
+                "t": "wasm_load",
+                "bytes": _wire.Enc(data),
+                "timeout": soft,
+                "drop": _wasm.drain(self._wasm_dropped),
+            },
             soft_timeout=soft,
         )
         if not _is_token(wid):
@@ -1641,6 +1649,7 @@ class IsolatedRuntime:
                 "args": _wire.Enc(values),
                 "wide": wide,
                 "timeout": soft,
+                "drop": _wasm.drain(self._wasm_dropped),
             }
             return self._request(message, soft_timeout=soft)
 
@@ -1648,7 +1657,9 @@ class IsolatedRuntime:
             if not self._closed:
                 self._request({"t": "wasm_unload", "wid": wid})
 
-        return _wasm.WasmModule(signatures, call, unload)
+        return _wasm.track_drop(
+            _wasm.WasmModule(signatures, call, unload), self._wasm_dropped, wid
+        )
 
     def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
         """Resolve import specifiers with a host function: `(specifier, referrer) -> str | None`."""

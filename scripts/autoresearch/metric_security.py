@@ -2192,6 +2192,34 @@ def wasm_guest_poisoned_api_reaches_host() -> bool:
 
 
 @probe
+def wasm_guest_planted_loader_gets_the_bytes() -> bool:
+    # A flag that implies jitless without the word (`--lite-mode`) leaves V8 without WebAssembly, so the
+    # bridge installs no loader and a guest can define one. The host's bytes must never reach it, even when
+    # the parent's flag check is bypassed: the worker uses only the loader it took before guest code.
+    from pydeno import _wasm
+
+    plant = (
+        "globalThis.stolen = null; globalThis.__pydeno_wasm_load = (b) => {"
+        " globalThis.stolen = b.length; return () => 666; }; 0"
+    )
+    saved = _wasm.flags_disable_wasm
+    try:
+        for bypass in (False, True):
+            _wasm.flags_disable_wasm = (lambda flags: False) if bypass else saved
+            with iso(jitless=False, v8_flags=["--lite-mode"]) as rt:
+                rt.eval(plant)
+                try:
+                    result = rt.load_wasm(_WASM_ADD).call("add", 2, 3)
+                except RuntimeError:
+                    result = None
+                if result is not None or rt.eval("stolen") is not None:
+                    return True
+    finally:
+        _wasm.flags_disable_wasm = saved
+    return False
+
+
+@probe
 def wasm_loader_global_replaceable() -> bool:
     with iso(jitless=False) as rt:
         rt.eval("__pydeno_wasm_load = () => 'guest'; 0")

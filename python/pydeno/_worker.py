@@ -229,6 +229,9 @@ class _Worker:
         # `load_wasm` instances, by id: the bridge's function handles (the parent holds only ids).
         self._wasm: dict[int, Any] = {}
         self._wasm_ids = itertools.count(1)
+        # The bridge's loader, taken once before any guest code (see `_init`), never looked up by
+        # name later: where V8 has no WebAssembly a guest could plant a global of that name.
+        self._wasm_loader: Any = None
 
     # -- transport ---------------------------------------------------------
 
@@ -408,11 +411,17 @@ class _Worker:
                 )
 
             return asyncio.run(run_module())
+        if kind in ("wasm_load", "wasm_call"):
+            # Instances whose `WasmModule` the parent dropped without unloading.
+            for wid in message.get("drop", ()):
+                self._wasm.pop(wid, None)
         if kind == "wasm_load":
             data = _wire.decode_value(message["bytes"])
             if not isinstance(data, bytes) or len(data) > _wasm.MAX_WASM_BYTES:
                 raise _wire.WireError("wasm_load takes at most MAX_WASM_BYTES bytes")
-            handle = _wasm.bridge_load(self._rt(), data, message.get("timeout"))
+            if self._wasm_loader is None:
+                raise RuntimeError(_wasm.JITLESS_MESSAGE)
+            handle = self._wasm_loader(data, timeout=message.get("timeout"))
             wid = next(self._wasm_ids)
             self._wasm[wid] = handle
             return wid
@@ -553,6 +562,9 @@ class _Worker:
                 kwargs.get("bootstrap") or ""
             )
         self._runtime = Runtime(RuntimeConfig(**kwargs))
+        if "--jitless" not in flags:
+            # Before any guest code: only the host's own bootstrap has run.
+            self._wasm_loader = _wasm.bridge_loader(self._runtime)
         self._writer.send(
             {
                 "t": "ready",

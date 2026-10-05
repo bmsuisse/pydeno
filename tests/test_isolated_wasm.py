@@ -7,12 +7,15 @@ assembles them byte by byte.
 
 from __future__ import annotations
 
+import gc
 import random
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from pydeno import JavaScriptError, RuntimeConfig, RuntimeTimeout, WorkerCrashed
+from pydeno import _wasm, _wire
 from pydeno._aio import AsyncIsolatedRuntime
 from pydeno._isolated import IsolatedRuntime
 from pydeno._wasm import AsyncWasmModule, WasmModule
@@ -142,3 +145,90 @@ async def test_async_round_trip() -> None:
             await wasm64.call("add64", 1, 2)
         await wasm.unload()
         assert await rt.eval("1 + 1") == 2
+
+
+# A guest that defines its own loader global, which can only happen where V8 has no WebAssembly
+# (with it, the bridge's global is fixed in place before any guest code).
+PLANT = """
+globalThis.stolen = null;
+globalThis.__pydeno_wasm_load = function (bytes) {
+  globalThis.stolen = bytes.length;
+  return function () { return 666; };
+};
+0
+"""
+
+
+def _no_round_trip(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("load_wasm reached the worker")
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [[], ["--lite-mode"], ["--lite_mode"], ["--no-jitless", "--jitless"]],
+    ids=["jitless", "lite-mode", "lite_mode", "last-wins"],
+)
+def test_flags_without_webassembly_are_refused_in_the_parent(flags: list[str]) -> None:
+    jitless = not flags  # the default worker, or jitless=False plus flags that imply it
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=5.0), jitless=jitless, v8_flags=flags
+    ) as rt:
+        rt.eval(PLANT)
+        rt._request = _no_round_trip  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="jitless=False"):
+            rt.load_wasm(ADD)
+        del rt._request
+        assert rt.eval("stolen") is None
+
+
+def test_the_worker_never_calls_a_guest_planted_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Even if the parent's flag check missed a flag that removes WebAssembly, the worker uses only
+    # the loader it took before any guest code, and has none here.
+    monkeypatch.setattr(_wasm, "flags_disable_wasm", lambda flags: False)
+    with IsolatedRuntime(
+        RuntimeConfig(timeout=5.0), jitless=False, v8_flags=["--lite-mode"]
+    ) as rt:
+        assert rt.eval("typeof WebAssembly") == "undefined"
+        rt.eval(PLANT)
+        with pytest.raises(RuntimeError, match="jitless=False"):
+            rt.load_wasm(ADD)
+        assert rt.eval("stolen") is None
+
+
+async def test_async_never_calls_a_guest_planted_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with await AsyncIsolatedRuntime.create(
+        RuntimeConfig(timeout=5.0), jitless=False, v8_flags=["--lite-mode"]
+    ) as rt:
+        await rt.eval(PLANT)
+        with pytest.raises(RuntimeError, match="jitless=False"):
+            await rt.load_wasm(ADD)  # refused in the parent
+        monkeypatch.setattr(_wasm, "flags_disable_wasm", lambda flags: False)
+        with pytest.raises(RuntimeError, match="jitless=False"):
+            await rt.load_wasm(ADD)  # and by the worker
+        assert await rt.eval("stolen") is None
+
+
+def test_a_dropped_module_is_forgotten_by_the_worker() -> None:
+    with _jit() as rt:
+        wasm = rt.load_wasm(ADD)
+        assert wasm.call("add", 1, 2) == 3
+        del wasm
+        gc.collect()
+        assert len(rt._wasm_dropped) == 1
+        (wid,) = rt._wasm_dropped
+        keep = rt.load_wasm(ADD)  # carries the drop
+        assert rt._wasm_dropped == [] and keep.call("add", 2, 2) == 4
+        with pytest.raises(RuntimeError, match="unloaded"):
+            rt._request(
+                {
+                    "t": "wasm_call",
+                    "wid": wid,
+                    "name": "add",
+                    "args": _wire.Enc([1, 2]),
+                    "wide": [False, False],
+                }
+            )

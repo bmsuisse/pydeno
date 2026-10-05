@@ -148,6 +148,12 @@ def test_i64_parameters_take_python_ints_of_any_size(rt: Runtime) -> None:
 def test_floats(rt: Runtime) -> None:
     wasm = rt.load_wasm(ADDF64)
     assert wasm.call("addf", 0.5, 2) == 2.5
+    # An integral f64 result is still a float (the result conversion alone would give an int).
+    result = wasm.call("addf", 1.0, 1)
+    assert result == 2.0 and isinstance(result, float)
+    # An int past the float range is a ValueError, like an out-of-range integer.
+    with pytest.raises(ValueError, match="f64"):
+        wasm.call("addf", 10**400, 1)
 
 
 def test_a_path_is_read_by_the_host(rt: Runtime, tmp_path: Path) -> None:

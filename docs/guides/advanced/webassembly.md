@@ -45,23 +45,31 @@ What it does, and refuses:
 - **Plain numbers across.** Each argument is checked against the function's signature: an `int` for
   `i32` (from `-2**31` to `2**32 - 1`, wrapping as WebAssembly does) and `i64` (from `-2**63` to
   `2**64 - 1`, exact), an `int` or `float` for `f32` / `f64`. A `bool`, a string or a wrong count is a
-  `TypeError`, an out-of-range integer a `ValueError`. Results are an `int`, a `float`, a `tuple`
-  (several results) or `None` (none), converted with the runtime's usual result limits. `v128` and
-  reference types cannot be passed.
+  `TypeError`, a number out of the type's range (an integer, or an `int` past the float range for
+  `f32` / `f64`) a `ValueError`. Results are an `int` (`i32`, `i64`), a `float` (`f32`, `f64`, also
+  when integral), a `tuple` (several results) or `None` (none), converted with the runtime's usual
+  result limits; a negative-zero float result comes back as `0.0`. `v128` and reference types
+  cannot be passed.
 - **Timeouts.** A call runs under the runtime's `timeout` (or `call(..., timeout=)`); a module that
   loops forever is terminated like a script. A trap (`unreachable`, out-of-bounds memory) raises
   `JavaScriptError`.
 - **A controlled bridge.** The module is compiled and instantiated with WebAssembly intrinsics the
   runtime captured before any guest code ran, and the instance is held only by the host: a guest
   that replaced `WebAssembly.Module` or `WebAssembly.Instance` cannot see the bytes or swap the
-  instance, and the guest has no reference to it.
+  instance, and the guest has no reference to it. The isolated worker takes its reference to the
+  loader once, before any guest code, so where V8 has no WebAssembly a loader the guest defined
+  itself is never called.
+- **Unloading.** `unload()` (or leaving the `with` block) drops the instance. A module object that
+  is garbage collected without it is forgotten too: the in-process handle is released, and the
+  isolated worker drops the instance with the next `load_wasm` or call on that runtime.
 
 ### The cost: `jitless=False`, and memory
 
 Only load modules you trust, as you would a native library.
 
 - **WebAssembly needs V8's JIT.** The isolated runtimes default to `jitless=True`, which has no
-  WebAssembly, and there `load_wasm` raises `RuntimeError` before anything reaches the worker.
+  WebAssembly, and there `load_wasm` raises `RuntimeError` before anything reaches the worker (also
+  for `v8_flags` that imply jitless, such as `--lite-mode`).
   `jitless=False` turns on V8's JIT compiler and WebAssembly for that runtime, and so for its guest
   code too: a larger attack surface (most V8 exploits are in the JIT). The OS sandbox and the other
   limits still apply. See [Isolation](isolation.md#-jitless).
