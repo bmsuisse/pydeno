@@ -2077,6 +2077,41 @@ def console_flood_does_not_stretch_the_hard_deadline() -> bool:
 
 
 @probe
+def slow_console_handler_does_not_keep_the_worker_alive() -> bool:
+    # A 1 s hard deadline and one console call whose handler takes 6 s. The synchronous runtime runs
+    # the handler on the thread that supervises the command; the worker must still die at about the
+    # deadline plus the console allowance (2 s), not when the handler returns (it used to: ~6 s).
+    code = (
+        "import json, os, time\n"
+        "from pydeno import IsolatedRuntime, RuntimeConfig\n"
+        "box = {}\n"
+        "def slow(level, args):\n"
+        "    t = time.monotonic(); end = t + 6\n"
+        "    while time.monotonic() < end:\n"
+        "        try:\n"
+        "            os.kill(box['pid'], 0)\n"
+        "        except ProcessLookupError:\n"
+        "            box.setdefault('died', time.monotonic() - t)\n"
+        "        time.sleep(0.02)\n"
+        "with IsolatedRuntime(RuntimeConfig(on_console=slow), request_timeout=1, sandbox='require') as rt:\n"
+        "    box['pid'] = rt._proc.pid\n"
+        "    try:\n"
+        "        rt.eval(\"console.log('x')\")\n"
+        "    except Exception as exc:\n"
+        "        box['exc'] = type(exc).__name__\n"
+        "print(json.dumps(box))\n"
+    )
+    try:
+        out = _subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=40
+        )
+        box = json.loads(out.stdout.strip().splitlines()[-1])
+    except (_subprocess.TimeoutExpired, ValueError, IndexError):
+        return True
+    return box.get("exc") != "RuntimeTimeout" or not 0 < box.get("died", 99) < 3.5
+
+
+@probe
 def default_printer_volume_is_capped_per_feed() -> bool:
     # Pydeno's default print_callback writes the guest's console to the host's stdout (often a log
     # pipeline). A feed may write at most about 1 MiB there; it used to be unbounded (~150 MB in 2 s).

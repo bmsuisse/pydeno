@@ -111,14 +111,21 @@ boundary; the sandbox is.
   checkout plus 11 feeds about 4.4 to 3.4 ms. The synchronous paths are unchanged.
 - **Clearer limit and diagnostics wording** (#84). Agent sessions name the argument the caller passed
   (`timeout`, `max_pause`) when they reject a value; `-0.0` is stored as `0.0`; the docs describe
-  how the Proxy, console-deadline and default-printer limits behave (console time in the synchronous
-  runtimes is only checked between console calls).
+  how the Proxy, console-deadline and default-printer limits behave.
 - **`stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker**, with or
   without a cap: a cold start that fails to start (or, with a cap, a checkout that raised
   `CheckoutTimeout`) is no longer counted in either.
 
 ### Fixed
 
+- **The synchronous isolated runtimes enforce their limits while a host handler runs** (#84). In
+  `IsolatedRuntime`, agent sessions and `Pydeno` feeds, the hard deadline (with its console
+  allowance), `max_host_wait` and the CPU cap were checked only after a synchronous `on_console`,
+  `print_callback` or tool returned: a 6 s console handler under a 1 s deadline kept the worker
+  alive for about 6 s (the async runtimes: about 2 s). The idle watchdog now applies them while a
+  handler runs and kills the worker on time (about 2 s in that case); the handler is not
+  interrupted and still runs on the calling thread, and the command raises `RuntimeTimeout` once
+  it returns.
 - **`check_source(source)` without a policy runs in linear time on hostile input.** It no longer
   retries a regex scan after one failed on the same line, and its `\u{` look-ahead is capped.
   Results are unchanged.

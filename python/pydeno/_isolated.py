@@ -431,9 +431,12 @@ class _Pump:
     Console output is not a tool call: it is the guest's own work, but the host's handling of it
     (a slow terminal, a log shipper) is not. So console time pauses the deadline only up to an
     allowance of one hard deadline per command: one slow write does not kill a run, and a flood
-    of them can at most double it between callbacks. A synchronous callback must return before
-    the deadline can be checked again. Console time
-    while a tool call is outstanding is covered by that call's pause and not charged twice.
+    of them, or one handler that never returns, can at most double it. Console time while a tool
+    call is outstanding is covered by that call's pause and not charged twice.
+
+    In the synchronous runtime a host handler runs on the pump's own thread, so while one runs
+    the idle watchdog applies these limits instead (`IsolatedRuntime._idle_check`): it kills the
+    worker on time and leaves the verdict for the pump, which raises it once the handler returns.
     """
 
     __slots__ = (
@@ -563,9 +566,11 @@ class IsolatedRuntime:
             The worker's CPU use is also capped at twice the hard deadline per command, which
             callbacks cannot pause. `None` removes the wait cap. Console output is not a
             callback in this sense: handling it pauses the hard deadline for at most one hard
-            deadline in total per command (between calls; a synchronous handler must return before deadline enforcement resumes),
-            and it does not count toward this wait cap. Console output while a tool call is in
-            flight is covered by that call's pause.
+            deadline in total per command, and it does not count toward this wait cap. Console
+            output while a tool call is in flight is covered by that call's pause. These limits
+            are enforced while a synchronous handler (`on_console`, a tool) runs, too: the
+            worker is killed on time, the handler is not interrupted (it runs on the calling
+            thread), and the command raises `RuntimeTimeout` once the handler returns.
         max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);
             further ones are answered with an error instead of being run. Console calls are
             synchronous and never refused by it (they still count toward `max_host_calls`).
@@ -741,6 +746,11 @@ class IsolatedRuntime:
         # Why the idle watchdog killed the worker, for the pump to report: the watchdog thread
         # cannot raise into the caller, so without this the caller sees only "killed by SIGKILL".
         self._kill_reason: str | None = None
+        # The pump of a command whose synchronous host handler is running right now (None
+        # otherwise), and the watchdog's verdict on it: see `_run_watched`.
+        self._handler_pump: _Pump | None = None
+        self._handler_verdict: RuntimeTimeout | None = None
+        self._handler_lock = threading.Lock()
         # Where `execute()` collects the console output of the command in flight.
         self._capture: OutputCapture | None = None
         if config.on_console is not None or capture_console:
@@ -1191,18 +1201,32 @@ class IsolatedRuntime:
         assert remote is not None
         raise remote
 
-    def _idle_check(self) -> None:
+    def _idle_check(self) -> float | None:
         """One pass of the idle watchdog. While a command holds the runtime the pump supervises
         (deadline, CPU, memory), except that the pump can be stuck inside a host handler for as
         long as the handler takes, and a hostile worker can allocate then. So memory and thread
-        count are still checked here, without taking the lock."""
+        count are still checked here, without taking the lock, and while a synchronous handler
+        runs, the whole of the pump's supervision (see `_run_watched`).
+
+        Returns how long to wait before the next pass while a command is in flight (None: the
+        idle interval), so a deadline that passes during a handler is acted on within about
+        `_POLL_SECONDS`."""
         if not self._lock.acquire(blocking=False):
             if not self._closed:
                 try:
+                    with self._handler_lock:
+                        pump = self._handler_pump
+                        if pump is not None:
+                            try:
+                                self._supervise(pump)
+                            except RuntimeTimeout as exc:
+                                # Already killed; the pump raises it when the handler returns.
+                                self._handler_verdict = exc
+                            return _POLL_SECONDS
                     self._check_memory()
                 except WorkerCrashed:
                     pass  # killed; the pump sees the pipe close and reports it
-            return
+            return _POLL_SECONDS
         try:
             if self._closed:
                 return
@@ -1336,7 +1360,7 @@ class IsolatedRuntime:
             # still counts it (above).
             pump.begin_console()
             try:
-                self._run_sync_handler(handler, decoded, cid, None)
+                self._run_watched(handler, decoded, cid, pump, None)
             finally:
                 pump.end_console()
             return
@@ -1374,7 +1398,32 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
-        self._run_sync_handler(handler, decoded, cid, pump)
+        self._run_watched(handler, decoded, cid, pump, pump)
+
+    def _run_watched(
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump,
+        reply_pump: _Pump | None,
+    ) -> None:
+        """Run a synchronous handler on this (the pump's) thread, with the idle watchdog standing
+        in for the pump meanwhile. The handler is never interrupted and never moved to another
+        thread: a host handler may rely on the caller's thread (thread-locals, a terminal, a
+        loop). Only the worker is killed when a limit passes, so a guest cannot make a slow
+        handler extend its run, and the command raises the watchdog's `RuntimeTimeout` once the
+        handler has returned. `reply_pump` is the pump to `end_call` on (None for console)."""
+        self._handler_pump = pump
+        try:
+            self._run_sync_handler(handler, decoded, cid, reply_pump)
+        finally:
+            # Under the lock: a verdict the watchdog is still reaching is seen here, not lost.
+            with self._handler_lock:
+                self._handler_pump = None
+                verdict, self._handler_verdict = self._handler_verdict, None
+        if verdict is not None:
+            raise verdict
 
     def _run_sync_handler(
         self,
@@ -1938,12 +1987,13 @@ def _idle_watch(ref: weakref.ref[IsolatedRuntime]) -> None:
         rt = ref()
         if rt is None or rt._closed:  # noqa: SLF001
             return
+        delay = None
         try:
-            rt._idle_check()  # noqa: SLF001
+            delay = rt._idle_check()  # noqa: SLF001
         except Exception:  # noqa: BLE001, S110 - a watchdog must never die of its own check
             pass
         del rt
-        time.sleep(_IDLE_CHECK_SECONDS)
+        time.sleep(delay or _IDLE_CHECK_SECONDS)
 
 
 def _kill_all_at_exit() -> None:

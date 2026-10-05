@@ -31,6 +31,7 @@ collect_ignore = (
         "test_agent_limit_names.py",
         "test_frame_buffer_bounds.py",
         "test_isolated_limit_values.py",
+        "test_sync_handler_deadline.py",
         "test_limit_values_review.py",
         "test_module_timeout_recovery.py",
         "test_timeout_error_prototype.py",

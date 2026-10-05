@@ -106,7 +106,9 @@ class (`tests/test_aio_isolated_runtime.py`, with the same hostile fake workers)
   session; a call for a handler id it was never given ends the session; a call that was already in
   flight when the host revoked its capability gets an error, not a kill;
 - the hard deadline (paused while a host function runs; console output pauses it only within one
-  deadline per command, and not at all beyond that), `max_host_wait`, the per-command CPU cap
+  deadline per command, and not at all beyond that, including while one slow handler runs; the
+  synchronous runtime enforces the same bound),
+  `max_host_wait`, the per-command CPU cap
   (twice the hard deadline), the memory ceiling, the thread cap (64), idle-CPU supervision,
   `max_host_calls`, the runtime-wide `max_inflight_host_calls`, the write-stall timeout, error-text
   sanitising, `redact_host_errors`, argument checks on module resolvers/loaders and `on_console`,
