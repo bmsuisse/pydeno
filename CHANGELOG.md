@@ -44,6 +44,16 @@
   without a cap: a cold start that fails to start (or, with a cap, a checkout that raised
   `CheckoutTimeout`) is no longer counted in either.
 
+### Fixed
+
+- **A stream source is refused by any runtime other than the one that created it** (#98). Stream
+  ids are allocated per runtime, so a source from runtime B returned by runtime A's host function
+  (or passed to A's functions, bound into A, or yielded by one of A's streams) was read through A's
+  own stream with the same id, and A's guest received A's data. Each source now carries its
+  runtime's identity and the transfer raises `RuntimeError` ("this stream source belongs to a
+  different runtime; ..."); a source whose runtime is closed raises `RuntimeError` too. The same
+  runtime is unaffected, and `IsolatedRuntime` has no stream sources.
+
 ## 0.8.0 — 2026-10-04
 
 Highlights: one Monty-shaped front door (`Pydeno` / `AsyncPydeno`) as the default path, much faster
