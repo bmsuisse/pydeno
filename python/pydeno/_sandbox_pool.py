@@ -66,6 +66,17 @@ class CheckoutTimeout(TimeoutError):
     succeed."""
 
 
+class _Handover:
+    """One slot held across the old process's exit and its replacement's startup."""
+
+    def __init__(self, proc: Any) -> None:
+        self.proc = proc
+
+    def poll(self) -> None:
+        # Even after proc exits the slot remains reserved for the replay.
+        return None
+
+
 class _WorkerCapacity:
     """Reservations plus live process handles; never retain checked-out runtimes.
 
@@ -107,14 +118,26 @@ class _WorkerCapacity:
         }
 
     def hand_over(self, proc: Any) -> object | None:
-        """Turn `proc`'s slot into a reservation for its replacement (a session loading state
-        kills its worker and starts another), so no other waiter can take the slot in between.
+        """Reserve `proc`'s slot for replacement, keeping its process counted until exit.
         None if `proc` holds no slot (already exited and pruned, or no cap)."""
         for token, held in self.workers.items():
             if held is proc:
-                self.workers[token] = None
+                self.workers[token] = _Handover(proc)
                 return token
         return None
+
+    def replacement_pending(self, token: object) -> bool:
+        held = self.workers.get(token)
+        return isinstance(held, _Handover) and held.proc.poll() is None
+
+    def release(self, token: object | None) -> None:
+        held = self.workers.get(token)
+        if isinstance(held, _Handover) and held.proc.poll() is None:
+            # A timeout, cancellation or closed pool abandoned the replacement. The old live
+            # process still consumes capacity until a later poll observes its exit.
+            self.workers[token] = held.proc
+        else:
+            self.workers.pop(token, None)
 
     def reserve(self) -> object:
         token = object()
@@ -289,11 +312,32 @@ class _Core:
                 with self.cond:
                     capacity.waiters -= 1
                     self.cond.notify_all()
+        else:
+            deadline = time.monotonic() + capacity.timeout
+            with self.cond:
+                capacity.waiters += 1
+                try:
+                    while capacity.replacement_pending(token):
+                        if self.closed:
+                            raise RuntimeError("this SandboxPool is closed")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            capacity.timeouts += 1
+                            raise CheckoutTimeout(
+                                "the previous worker did not exit within checkout_timeout"
+                            )
+                        self.cond.wait(min(_POLL_SECONDS, remaining))
+                except BaseException:
+                    capacity.release(token)
+                    raise
+                finally:
+                    capacity.waiters -= 1
+                    self.cond.notify_all()
         try:
             rt = factory() if factory is not None else self._create(session)
         except BaseException:
             with self.cond:
-                capacity.workers.pop(token, None)
+                capacity.release(token)
                 self.cond.notify_all()
             raise
         with self.cond:
@@ -708,10 +752,29 @@ class AsyncSandboxPool:
                         )
             finally:
                 capacity.waiters -= 1
+        else:
+            deadline = time.monotonic() + capacity.timeout
+            capacity.waiters += 1
+            try:
+                while capacity.replacement_pending(token):
+                    if self._closed:
+                        raise RuntimeError("this AsyncSandboxPool is closed")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        capacity.timeouts += 1
+                        raise CheckoutTimeout(
+                            "the previous worker did not exit within checkout_timeout"
+                        )
+                    await asyncio.sleep(min(_POLL_SECONDS, remaining))
+            except BaseException:
+                capacity.release(token)
+                raise
+            finally:
+                capacity.waiters -= 1
         try:
             rt = factory() if factory is not None else self._build(session)
         except BaseException:
-            capacity.workers.pop(token, None)
+            capacity.release(token)
             raise
 
         async def start_reserved() -> None:
@@ -729,7 +792,7 @@ class AsyncSandboxPool:
                 if capacity.maximum is not None and rt._proc is not None:
                     capacity.workers[token] = rt._proc
                 else:
-                    capacity.workers.pop(token, None)
+                    capacity.release(token)
 
         # Cancelling the caller must not free a slot while its executor is still spawning.
         # The startup task owns the reservation until it settles, then an abandoned successful

@@ -552,3 +552,85 @@ def test_a_failed_capped_load_says_how_to_recover(monkeypatch):
             monkeypatch.setattr(_front.AgentSandbox, "load", real)
             session.load_session(state)
             assert session.feed_run("v + 1") == 42
+
+
+@pytest.mark.full_sandbox
+def test_capped_replacement_waits_for_actual_sync_process_exit(monkeypatch):
+    """A bounded close returning with a live process cannot grant a replay another worker."""
+    with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=0.05) as pool:
+        with pool.checkout() as session:
+            session.feed_run("var v = 41")
+            state = session.dump()
+            old = session._agent
+            proc = old._core.rt._proc
+            with monkeypatch.context() as patch:
+                patch.setattr(pool._reaper, "kill", lambda rt: None)
+                patch.setattr(old, "close", lambda: None)
+                patch.setattr(proc, "wait", lambda *args, **kwargs: None)
+                with pytest.raises(pydeno.CheckoutTimeout):
+                    session.load_session(state)
+                assert proc.poll() is None
+                assert pool.stats()["workers"] == 1
+            old.close()
+            session.load_session(state)
+            assert session.feed_run("v + 1") == 42
+
+
+@pytest.mark.full_sandbox
+@pytest.mark.asyncio
+async def test_capped_replacement_waits_for_actual_async_process_exit(monkeypatch):
+    async with pydeno.AsyncPydeno(
+        min_processes=1, max_workers=1, checkout_timeout=0.05
+    ) as pool:
+        async with pool.checkout() as session:
+            await session.feed_run("var v = 41")
+            state = await session.dump()
+            old = session._agent
+            proc = old._core.rt._proc
+
+            async def bounded_close():
+                return None
+
+            with monkeypatch.context() as patch:
+                patch.setattr(old._core, "kill", lambda reason: None)
+                patch.setattr(old, "close", bounded_close)
+                with pytest.raises(pydeno.CheckoutTimeout):
+                    await session.load_session(state)
+                assert proc.poll() is None
+                assert pool.stats()["workers"] == 1
+            await old.close()
+            await session.load_session(state)
+            assert await session.feed_run("v + 1") == 42
+
+
+@pytest.mark.full_sandbox
+@pytest.mark.asyncio
+async def test_cancelled_replacement_close_does_not_leave_a_reserved_ticket(
+    monkeypatch,
+):
+    import asyncio
+
+    async with pydeno.AsyncPydeno(
+        min_processes=1, max_workers=1, checkout_timeout=0.1
+    ) as pool:
+        async with pool.checkout() as session:
+            await session.feed_run("var v = 41")
+            state = await session.dump()
+            old = session._agent
+            entered = asyncio.Event()
+
+            async def pending_close():
+                entered.set()
+                await asyncio.Future()
+
+            with monkeypatch.context() as patch:
+                patch.setattr(old._core, "kill", lambda reason: None)
+                patch.setattr(old, "close", pending_close)
+                load = asyncio.create_task(session.load_session(state))
+                await entered.wait()
+                load.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await load
+            await old.close()
+            async with pool._pool.checkout() as rt:
+                assert await rt.eval("42") == 42

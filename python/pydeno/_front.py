@@ -1739,12 +1739,18 @@ class PydenoSession:
             core = self._pool._pool._core  # noqa: SLF001
             with core.cond:
                 token = core.capacity.hand_over(rt._proc)  # noqa: SLF001
-            self._pool._reaper.kill(rt)  # noqa: SLF001
-            old.close()
             try:
-                rt._proc.wait(5)  # noqa: SLF001 - its slot is reused: let it exit first
-            except Exception:  # noqa: BLE001, S110
-                pass
+                self._pool._reaper.kill(rt)  # noqa: SLF001
+                old.close()
+                try:
+                    rt._proc.wait(5)  # noqa: SLF001 - capacity confirms exit before reuse
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            except BaseException:
+                with core.cond:
+                    core.capacity.release(token)
+                    core.cond.notify_all()
+                raise
             return token
 
         new = self._pool._load(  # noqa: SLF001

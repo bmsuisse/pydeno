@@ -614,10 +614,15 @@ class AsyncPydenoSession:
             # See `PydenoSession._replace`: only with a worker cap.
             self._load_failed = True
             rt = old._core.rt  # noqa: SLF001
-            token = self._pool._pool._capacity.hand_over(rt._proc)  # noqa: SLF001
-            if not old._core.closed:  # noqa: SLF001
-                old._core.kill("the session loaded new state")  # noqa: SLF001
-            await old.close()
+            capacity = self._pool._pool._capacity  # noqa: SLF001
+            token = capacity.hand_over(rt._proc)  # noqa: SLF001
+            try:
+                if not old._core.closed:  # noqa: SLF001
+                    old._core.kill("the session loaded new state")  # noqa: SLF001
+                await old.close()
+            except BaseException:
+                capacity.release(token)
+                raise
             return token
 
         new = await self._pool._load(  # noqa: SLF001
