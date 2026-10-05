@@ -127,6 +127,15 @@
   runtime's identity and the transfer raises `RuntimeError` ("this stream source belongs to a
   different runtime; ..."); a source whose runtime is closed raises `RuntimeError` too. The same
   runtime is unaffected, and `IsolatedRuntime` has no stream sources.
+- **`AsyncIsolatedRuntime`: a burst of async host replies no longer gets a worker killed that is
+  still reading, and the parent's memory for it is bounded** (#86, #91). Replies are encoded and
+  written one at a time under a send lock, so the transport buffer holds at most one reply above
+  its 64 KiB high watermark, and each reply gets its own `write_stall_timeout` window. A host call
+  stays in flight (and counts toward `max_inflight_host_calls`) until its reply is written.
+  3000 concurrent 200 KB replies on macOS: peak transport buffer ~595 MB -> ~0.1 MB, parent max
+  RSS ~3.1 GB -> ~0.7 GB, and the burst completes at `write_stall_timeout=1`, where the worker
+  used to be killed; 10000 x 20 KB: parent max RSS ~1.8 GB -> ~0.13-0.27 GB. A worker that does
+  not drain one reply within the stall window is still killed, however slowly it reads.
 
 ## 0.8.0 — 2026-10-04
 

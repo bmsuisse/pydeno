@@ -163,3 +163,16 @@ Two places where this class is *stricter* than `IsolatedRuntime`:
 ```python
 from pydeno import AsyncIsolatedRuntime
 ```
+
+## Host reply backpressure
+
+Concurrent host replies wait before encoding and writing to the worker. The transport buffer
+can grow by at most one frame above its high watermark. A host call stays in flight until its
+reply drains, so the default `max_inflight_host_calls=64` also bounds waiting reply producers.
+Setting that limit to `None` explicitly removes the producer cap; a trusted host callback’s
+returned Python value can still consume arbitrary memory.
+
+Each reply gets its own `write_stall_timeout` window, which starts when the reply is written: a
+worker that keeps reading through a burst is not killed because the whole burst takes longer than
+the timeout, and a worker that does not drain one reply (at most that frame plus the 64 KiB high
+watermark) within the timeout is killed, however slowly it is still reading.

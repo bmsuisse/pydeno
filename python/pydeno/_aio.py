@@ -425,7 +425,11 @@ class _Writer(asyncio.BaseProtocol):
             return
         waiter = asyncio.get_running_loop().create_future()
         self._waiters.append(waiter)
-        await waiter
+        try:
+            await waiter
+        finally:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +775,7 @@ class AsyncIsolatedRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sup: _Supervisor | None = None
         self._lock: asyncio.Lock | None = None
+        self._send_lock: asyncio.Lock | None = None
         self._proc: Any = None
         self._stderr: Any = None
         self._rproto = _FrameReader()
@@ -834,6 +839,7 @@ class AsyncIsolatedRuntime:
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._sup = _supervisor_for(loop)
         try:
             async with self._sup.start_slots:
@@ -1254,8 +1260,12 @@ class AsyncIsolatedRuntime:
             ) from None
 
     async def _send_frame(self, frame: bytes) -> None:
-        self._write(frame)
-        await self._drain()
+        # Wait before entering the transport buffer, so a burst of replies cannot all
+        # queue ahead of drain(). Its backlog is at most one frame above the high watermark.
+        assert self._send_lock is not None
+        async with self._send_lock:
+            self._write(frame)
+            await self._drain()
 
     async def _encode(self, message: dict[str, Any], big: bool) -> bytes:
         if big:
@@ -1602,9 +1612,9 @@ class AsyncIsolatedRuntime:
                 big = _big_value(value)
             except BaseException as exc:  # noqa: BLE001 - as IsolatedRuntime: an error reply
                 reply = self._error(cid, exc)
+            await self._send_reply(reply, pump, big=big)
         finally:
             self._async_inflight -= 1
-        await self._send_reply(reply, pump, big=big)
 
     async def _send_reply(
         self, reply: dict[str, Any] | bytes, pump: _Pump | None, *, big: bool = False
@@ -1612,14 +1622,19 @@ class AsyncIsolatedRuntime:
         try:
             if self._closed:
                 return  # nobody to answer
-            if isinstance(reply, bytes):
-                frame = reply
-            else:
-                try:
-                    frame = await self._encode(reply, big)
-                except _wire.WireError as exc:
-                    frame = _frame(self._error(reply["cid"], exc))
-            await self._send_frame(frame)
+            assert self._send_lock is not None
+            async with self._send_lock:
+                if self._closed:
+                    return  # the worker was killed or closed while this reply waited its turn
+                if isinstance(reply, bytes):
+                    frame = reply
+                else:
+                    try:
+                        frame = await self._encode(reply, big)
+                    except _wire.WireError as exc:
+                        frame = _frame(self._error(reply["cid"], exc))
+                self._write(frame)
+                await self._drain()
         except _wire.StalledWrite:
             # The worker stopped reading what we send: kill it; the pump reports it.
             self._kill(
