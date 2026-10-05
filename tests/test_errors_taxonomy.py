@@ -484,7 +484,7 @@ def test_the_async_runtime_reports_a_sandbox_violation_the_same_way(
             request_timeout=20,
         )
         try:
-            return await _araised(rt.eval("1"))
+            return await _araised(lambda: rt.eval("1"))
         finally:
             await rt.close()
 
@@ -492,12 +492,24 @@ def test_the_async_runtime_reports_a_sandbox_violation_the_same_way(
     assert classify_error(exc).kind == "sandbox_violation", str(exc)
 
 
-async def _araised(awaitable: Any) -> BaseException:
-    try:
-        await awaitable
-    except BaseException as exc:  # noqa: BLE001
-        return exc
-    raise AssertionError("expected an error")
+@pytest.mark.linux_only
+def test_v8_aborting_at_the_kernel_memory_ceiling_is_a_memory_limit(
+    tmp_path: Path,
+) -> None:
+    """Under `max_memory` a Linux worker also has a kernel ceiling on private memory
+    (`_sandbox.limit_data`). An allocation past it fails and V8 aborts the process; that is the
+    memory limit, not a crash to retry."""
+    body = (
+        _READY
+        + "import resource, signal\n"
+        + "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        + "sys.stderr.write('\\n#\\n# Fatal process out of memory: Zone\\n#\\n'); sys.stderr.flush()\n"
+        + "os.kill(os.getpid(), signal.SIGABRT)\ntime.sleep(30)\n"
+    )
+    exc = _raised(lambda: _fake_runtime(tmp_path, body, max_memory=256 * MIB).eval("1"))
+    info = classify_error(exc)
+    assert (info.kind, info.retryable) == ("memory_limit", False), str(exc)
+    assert "kernel memory ceiling" in str(exc)
 
 
 def test_sigsys_without_a_seccomp_layer_is_an_ordinary_crash(tmp_path: Path) -> None:

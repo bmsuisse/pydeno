@@ -326,6 +326,30 @@ class WorkerCrashed(RuntimeError):
     """The worker process died, was killed, or broke protocol. The runtime is closed."""
 
 
+# V8's own words when an allocation it cannot do without fails (it then aborts the process).
+_V8_OOM = re.compile(r"Fatal (?:process|JavaScript) out of memory")
+
+
+def _v8_out_of_memory(code: int | None, tail: str, max_memory: int | None) -> bool:
+    """A worker under the kernel's memory ceiling (`_sandbox.limit_data`, Linux, only with
+    `max_memory`) that hit it: an allocation failed and V8 aborted. The stderr text is the
+    worker's, but all it can choose is a non-retryable kind, never a more retryable one."""
+    return (
+        max_memory is not None
+        and sys.platform.startswith("linux")
+        and code is not None
+        and code < 0
+        and bool(_V8_OOM.search(tail))
+    )
+
+
+def _memory_ceiling_message(max_memory: int | None) -> str:
+    return (
+        f"worker reached its kernel memory ceiling (max_memory={max_memory} plus headroom) "
+        "and was stopped"
+    )
+
+
 # What a worker killed by its seccomp filter is reported as (after "worker process died: " or
 # the like); `classify_error` gives it the kind `sandbox_violation`.
 SANDBOX_VIOLATION = (
@@ -978,6 +1002,8 @@ class IsolatedRuntime:
             tail = self._stderr.read().decode("utf-8", "replace").strip()
         except (OSError, ValueError):
             tail = ""
+        if _v8_out_of_memory(code, tail, self._max_memory):
+            return f"{prefix}: {_memory_ceiling_message(self._max_memory)}"
         # The worker wrote this, and a compromised one can write anything: it goes into an
         # exception message, so no control or escape characters.
         last = tail.splitlines()[-1] if tail else ""
