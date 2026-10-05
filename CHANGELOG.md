@@ -102,6 +102,8 @@ boundary; the sandbox is.
 
 ### Changed
 
+- **The static source scanner is native** (#107): `check_source` and `static_gate` scan in Rust
+  with the GIL released, with findings identical to the Python scanner, which stays as the reference.
 - **Faster async commands in the isolated worker** (#60). The worker keeps one event loop for its
   whole life instead of building one per command, created before the OS sandbox goes up (no thread
   starts). Each command still ends with the loop emptied: pending tasks are cancelled and finished,

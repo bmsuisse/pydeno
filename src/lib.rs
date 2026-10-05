@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod runtime;
+mod scanner;
 
 // Re-exported so benches/ (an external crate target) can drive the runtime directly.
 pub use runtime::ops::PythonOpMode;
@@ -64,6 +65,7 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::wire_json::_wire_dumps, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(scanner::_scan_source, m)?)?;
     m.add(
         "WireNativeError",
         m.py().get_type::<runtime::wire::WireNativeError>(),

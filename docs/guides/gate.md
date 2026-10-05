@@ -32,13 +32,16 @@ with Pydeno(gate=gate, strict_eval=True) as pool:
 
 Each layer catches what the one before it missed. A later layer never relies on an earlier one.
 
-1. **Static policy** (`static_gate(SourcePolicy(...))`): a pure, deterministic scan in Python that
-   runs in linear time. Measured on a laptop (Apple silicon, CPython 3.10), the default mode takes
-   about 0.1–0.6 s per MiB, worst case included; the precise mode takes about 1–2 s per MiB. The
-   default 1 MiB cap keeps it well inside the 10 s gate timeout. It refuses forbidden names,
-   `eval`, the `Function` constructor, `import()`, `WebAssembly` and oversized programs, and by
-   default it fails closed: it reads the whole text, strings and comments included. Its messages are
-   fixed, actionable sentences, so a model can use them to fix the code.
+1. **Static policy** (`static_gate(SourcePolicy(...))`): a pure, deterministic scan that runs in
+   linear time, in native code with the GIL released. Measured on a laptop (Apple silicon,
+   CPython 3.14), the default mode takes about 3–20 ms per MiB, worst case included, and the precise
+   mode about 3–40 ms per MiB; a text that is one finding after another costs more in the precise
+   mode (about 0.2 s for 200,000 findings), since each finding is a Python object. That is 5 to 50
+   times faster than the Python implementation it replaced, with identical findings. The default
+   1 MiB cap stays. It refuses forbidden names, `eval`, the `Function` constructor, `import()`,
+   `WebAssembly` and oversized programs, and by default it fails closed: it reads the whole text,
+   strings and comments included. Its messages are fixed, actionable sentences, so a model can use
+   them to fix the code.
 2. **An optional classifier that you supply**: any callable, sync or async (a model call, a policy
    service). Combine it with the static layer in `all_of(...)`. The static layer runs first, and a
    classifier is not called for code that the static layer already refused.
@@ -221,9 +224,10 @@ except GateUnavailable:
 ```
 
 `gate_check` applies exactly the rules above, including the exact-`str` normalisation, the size cap
-and the timeout. It returns the allowing `Verdict`. `static_gate(policy)` is pure Python: no I/O, no
-imports when it is called, and deterministic. You can import it and run it anywhere, a sandboxed
-process included.
+and the timeout. It returns the allowing `Verdict`. `static_gate(policy)` is pure: no I/O, no
+imports when it is called, and deterministic. Its scan is one native function of the text and the
+policy: no callback into Python, no thread, no object kept, and the GIL released while it runs. You
+can import it and run it anywhere, a sandboxed process included.
 
 ## Static policy
 
@@ -239,7 +243,7 @@ process included.
 | `forbid_function` | the name `Function`, and `constructor` everywhere except where it is provably a method definition: preceded by `{`, `}` or `;` (whitespace and up to two whole `//` lines aside) and its balanced parameter list followed by `{` on the same line. Inside `with (fn) { ... }` a bare `constructor(...)` call, or `extends constructor(...)`, is the Function constructor, and is reported. So is a constructor that cannot be proved cheaply (a regex or template in its parameters, the brace on the next line, a block comment right before it): a false positive, the safe direction |
 | `forbid_webassembly` | `WebAssembly` |
 | `forbid_computed_global_access` | a global object used other than as `name.property` (`globalThis[k]`, `= globalThis`, `f(this)`, `...self`), `Reflect`, and `constructor[` / `Function[` (off by default) |
-| `max_source_bytes` | longer code, checked first; nothing else is scanned then. Default **1 MiB** (`None` removes it): a 16 MiB source could not be scanned within the default 10 s gate timeout |
+| `max_source_bytes` | longer code, checked first; nothing else is scanned then. Default **1 MiB** (`None` removes it; a gate never sees more than 16 MiB) |
 | `include_preflight_rules` | also `check_source`'s usability rules (`require`, `fetch`, ...), off by default under a policy |
 | `ignore_strings_and_comments` | selects the precise mode (below); off by default |
 
@@ -260,8 +264,17 @@ hidden a call that then ran. So the default scan works differently:
 
 A name in a string or a comment is therefore reported too. That over-reporting is the safe default.
 Findings still point at the original line and column. Fullwidth letters and zero-width joiners make
-*different* identifiers in JavaScript, and they are not reported as `eval`. The scan is a few compiled
-patterns in one linear pass, with bounded look-arounds.
+*different* identifiers in JavaScript, and they are not reported as `eval`. The scan is one linear
+pass with bounded look-arounds, iterative (no recursion, so deep nesting cannot exhaust the stack).
+
+**Native, with a Python specification.** The scan runs in Rust (`src/scanner/`) on a copy of the text
+(code points, so offsets and lone surrogates match Python's `str`), with character classes taken
+from the running CPython's Unicode version. The Python scanner it was ported from stays as the
+specification, `pydeno._preflight_reference`, and `tests/test_scanner_differential.py` requires
+identical findings from both: every case of the gate tests and every bypass shape from the review
+rounds, generated and mutated text up to 1 MiB, 100,000 fixed-seed inputs and a Hypothesis search.
+Two rare inputs still go to the Python scanner: a text over 16 MiB (possible only without a policy
+or with `max_source_bytes=None`) and a Python whose Unicode version the tables do not cover.
 
 **The precise mode** (`ignore_strings_and_comments=True`) is opt-in and best effort. A tokenizer skips
 strings, comments, templates and regular expressions, so it reports fewer false positives. It decodes
