@@ -43,3 +43,39 @@ python benches_py/frame_reader_bench.py --baseline BASE_COMMIT --end-to-end
 
 Native x86-64 measurements and independent review remain pending. This optimization need not
 block the 0.8 release if those gates cannot be completed in time.
+
+## 0.9 measurements (2026-10-05)
+
+Merged onto the 0.9 line (persistent worker loop, reply backpressure, send lock); the readers
+merged without conflict and only the extraction lines differ. One release wheel (macOS arm64,
+CPython 3.12) installed twice, the baseline with the 0.9 `_wire.py` and `_aio.py` restored, so
+the native extension is identical. Each number comes from a child process (fresh interpreter,
+fresh worker), the two variants alternating order each round, 9 rounds; medians of the
+per-process values. The machine was shared and loaded, so only differences that hold for both
+the minimum and the median are read as real.
+
+Reader only (a pipe for the sync reader, 256 KiB `data_received` chunks for the async one; peak
+RSS growth is the parent's high-water mark above its level before reading):
+
+| Stream | Reader | Python-heap peak | Peak RSS growth | Reader CPU |
+|---|---|---:|---:|---:|
+| 3 x 16 MiB | sync | 52.1 -> 35.3 MB | 71.2 -> 54.4 MB | 27.8 -> 22.8 ms |
+| 3 x 16 MiB | async | 52.7 -> 36.2 MB | 69.8 -> 53.0 MB | 17.6 -> 12.3 ms |
+| 4 x 8 MiB | sync | 25.8 -> 17.4 MB | 46.0 -> 37.6 MB | 18.0 -> 14.8 ms |
+| 4 x 8 MiB | async | 25.6 -> 17.5 MB | 46.6 -> 37.9 MB | 13.5 -> 10.1 ms |
+| 8 x 1 MiB | sync | 3.4 -> 2.4 MB | 5.5 -> 2.6 MB | 3.6 -> 3.2 ms |
+| 8 x 1 MiB | async | 3.4 -> 2.6 MB | within noise | 2.2 -> 1.4 ms |
+| 10,000 x 100 B | both | unchanged | unchanged | within noise |
+| mixed (small, threshold edges, 1 and 8 MiB) | both | 25.7 -> 17.3 MB | 29 -> 20 MB | 12 to 29 percent less |
+
+End to end (`eval("'x'.repeat(N)")` on a warm `IsolatedRuntime` / `AsyncIsolatedRuntime`):
+the Python-heap peak of one call falls by one payload (16 MiB: 52.1 -> 35.3 MB; 8 MiB:
+25.8 -> 17.4 MB; 1 MiB: 3.3 -> 2.2 MB), host CPU per call falls 2 to 4 percent (16 MiB sync
+28.1 -> 27.0 ms), wall time is within noise, and the process's peak RSS is unchanged (about
+121 MB for a 16 MiB reply in both): a later phase of the call, not frame extraction, sets the
+high-water mark.
+
+Latency, unchanged within noise (median of per-process medians, base -> branch): warm `eval`
+64 -> 64 us, one host call 161 -> 164 us, 50 concurrent async host calls 6.55 -> 6.49 ms,
+`metric_speed.py` warm 67.0 -> 65.8 us, checkout 7.43 -> 7.06 ms, feeds10 14.9 -> 14.0 ms.
+`feed_run` was within noise on a loaded machine (two runs: 390 -> 412 us and 894 -> 839 us).
