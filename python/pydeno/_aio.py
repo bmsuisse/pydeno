@@ -45,7 +45,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import _compat, _isolated, _sandbox, _wire
+from . import _compat, _isolated, _sandbox, _wasm, _wire
 from ._isolated import (
     DEFAULT_MAX_MEMORY,
     DEFAULT_REQUEST_TIMEOUT,
@@ -1717,6 +1717,58 @@ class AsyncIsolatedRuntime:
 
     async def add_static_module(self, name: str, source: str) -> None:
         await self._request({"t": "add_module", "name": name, "source": source})
+
+    async def load_wasm(
+        self,
+        module: Any,
+        /,
+        *,
+        max_bytes: int = _wasm.MAX_WASM_BYTES,
+        timeout: float | int | timedelta | None = None,
+    ) -> _wasm.AsyncWasmModule:
+        """`IsolatedRuntime.load_wasm` for asyncio: returns an `AsyncWasmModule`.
+
+        Needs ``jitless=False``; a path is read by this process (in a thread, so the loop does not
+        block), never by the worker."""
+        if _isolated._bool_flag_setting(self._options["v8_flags"], "jitless"):  # noqa: SLF001
+            raise RuntimeError(_wasm.JITLESS_MESSAGE)
+        if isinstance(module, (bytes, bytearray, memoryview)):
+            data = _wasm.read_module(module, max_bytes)
+        else:
+            data = await asyncio.to_thread(_wasm.read_module, module, max_bytes)
+        signatures = _wasm.parse_signatures(data)
+        soft = _limit_seconds("timeout", timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        wid = await self._request(
+            {"t": "wasm_load", "bytes": _wire.Enc(data), "timeout": soft},
+            soft_timeout=soft,
+        )
+        if not _is_token(wid):
+            self._kill()
+            raise WorkerCrashed("worker returned a malformed module id")
+
+        async def call(
+            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+        ) -> Any:
+            soft = _limit_seconds("timeout", call_timeout)
+            if soft is None:
+                soft = self._soft_timeout
+            message = {
+                "t": "wasm_call",
+                "wid": wid,
+                "name": name,
+                "args": _wire.Enc(values),
+                "wide": wide,
+                "timeout": soft,
+            }
+            return await self._request(message, soft_timeout=soft)
+
+        async def unload() -> None:
+            if not self._closed:
+                await self._request({"t": "wasm_unload", "wid": wid})
+
+        return _wasm.AsyncWasmModule(signatures, call, unload)
 
     async def set_module_resolver(
         self, resolver: Callable[[str, str], str | None]

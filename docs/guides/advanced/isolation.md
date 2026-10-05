@@ -125,7 +125,9 @@ The exact behaviour is pinned by tests, so this cannot drift from reality.
 V8's JIT compilers are where most of its exploitable bugs live, and an interpreter-only V8 is a
 much smaller target. The cost is speed on hot compute loops (about 3x on a recursion
 microbenchmark) and **no WebAssembly**. If you need either, pass `jitless=False`; the other layers
-still apply, and `max_memory` still bounds WebAssembly memory.
+still apply, and `max_memory` still bounds WebAssembly memory. To run a trusted compiled module
+next to the guest, `rt.load_wasm(...)` loads it from the host (only with `jitless=False`; see
+[WebAssembly](webassembly.md)).
 
 `v8_flags=[...]` passes extra flags to the worker. Unknown flags are an error, not ignored.
 

@@ -261,6 +261,13 @@ def _schedule_owner_cleanup(slot: _RuntimeSlot) -> None:
 setattr(Runtime, "bind", _runtime_bind)
 
 
+# Standard library only, so importing it costs next to nothing (the isolation worker needs it too).
+from ._wasm import AsyncWasmModule, WasmModule  # noqa: E402
+from ._wasm import runtime_load_wasm as _runtime_load_wasm  # noqa: E402
+
+setattr(Runtime, "load_wasm", _runtime_load_wasm)
+
+
 _default_runtime_var: contextvars.ContextVar[_RuntimeSlot | None] = (
     contextvars.ContextVar("pydeno_default_runtime", default=None)
 )
@@ -501,6 +508,8 @@ __all__ = [
     "ToolNotDiscoveredError",
     "WEB_POLYFILLS",
     "WorkerCrashed",
+    "WasmModule",
+    "AsyncWasmModule",
     "SnapshotAuthenticationError",
     "sign_snapshot",
     "verify_snapshot",

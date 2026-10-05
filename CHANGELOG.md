@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`load_wasm()`: a trusted WebAssembly module, loaded by the host** (#37). On `Runtime`,
+  `IsolatedRuntime` and `AsyncIsolatedRuntime`: `rt.load_wasm(bytes_or_path)` returns a
+  `WasmModule` (`AsyncWasmModule`) with `.exports` (name -> callable), `.signatures`,
+  `.call(name, *args, timeout=)` and `.unload()`. The host reads the bytes (the guest never gets
+  file access), refuses more than `max_bytes` (default and ceiling 8 MiB), parses the type, import,
+  function and export sections with bounded reads, refuses modules with imports, checks each
+  argument against the signature (`int` for `i32`/`i64`, exact up to 64 bits; `int`/`float` for
+  `f32`/`f64`) and runs each call under the runtime's timeout. The bridge compiles and instantiates
+  the module with WebAssembly intrinsics captured before any guest code, through one new fixed
+  global, `__pydeno_wasm_load`, installed only where V8 has WebAssembly; the instance is held only by
+  the host. **Explicit opt-in for trusted modules:** the isolated runtimes need `jitless=False`
+  (with the default, `load_wasm` raises `RuntimeError` in the parent and the worker is unchanged),
+  and a module's linear memory is not bounded by `max_buffer_bytes` (it counts toward `max_memory`
+  in the isolated runtimes; nothing bounds it in an in-process `Runtime`). Not on `Pydeno`,
+  `AgentSandbox` or `SandboxPool`, whose journaled sessions could not replay it. See
+  [`docs/guides/advanced/webassembly.md`](docs/guides/advanced/webassembly.md);
+  `benches_py/wasm_kernel_bench.py` compares one kernel as JavaScript and as WebAssembly (no faster
+  under the JIT; about 19x faster than jitless JavaScript).
+
 ## 0.8.0 — 2026-10-04
 
 Highlights: one Monty-shaped front door (`Pydeno` / `AsyncPydeno`) as the default path, much faster

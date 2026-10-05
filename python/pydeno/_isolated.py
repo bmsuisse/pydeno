@@ -41,7 +41,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import _sandbox, _wire
+from . import _sandbox, _wasm, _wire
 from ._limits import limit_int, limit_seconds
 from ._result import (
     UNSAFE_TEXT,
@@ -1596,6 +1596,59 @@ class IsolatedRuntime:
 
     def add_static_module(self, name: str, source: str) -> None:
         self._request({"t": "add_module", "name": name, "source": source})
+
+    def load_wasm(
+        self,
+        module: Any,
+        /,
+        *,
+        max_bytes: int = _wasm.MAX_WASM_BYTES,
+        timeout: float | int | timedelta | None = None,
+    ) -> _wasm.WasmModule:
+        """Load a **trusted** WebAssembly module into the worker; returns a `WasmModule`.
+
+        Needs ``jitless=False`` (the default jitless worker has no WebAssembly, and this raises
+        `RuntimeError` before anything reaches it). `module` is the binary as bytes, or a path this
+        process reads; the worker never gets file access. At most `max_bytes` (default and ceiling
+        8 MiB), no imports. A call runs under the runtime's timeout (or `timeout=`) like `eval`.
+        The module's linear memory counts against `max_memory` but not `max_buffer_bytes`.
+        """
+        if _bool_flag_setting(self._options["v8_flags"], "jitless"):
+            raise RuntimeError(_wasm.JITLESS_MESSAGE)
+        data = _wasm.read_module(module, max_bytes)
+        signatures = _wasm.parse_signatures(data)
+        soft = _limit_seconds("timeout", timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        wid = self._request(
+            {"t": "wasm_load", "bytes": _wire.Enc(data), "timeout": soft},
+            soft_timeout=soft,
+        )
+        if not _is_token(wid):
+            self._kill()
+            raise WorkerCrashed("worker returned a malformed module id")
+
+        def call(
+            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+        ) -> Any:
+            soft = _limit_seconds("timeout", call_timeout)
+            if soft is None:
+                soft = self._soft_timeout
+            message = {
+                "t": "wasm_call",
+                "wid": wid,
+                "name": name,
+                "args": _wire.Enc(values),
+                "wide": wide,
+                "timeout": soft,
+            }
+            return self._request(message, soft_timeout=soft)
+
+        def unload() -> None:
+            if not self._closed:
+                self._request({"t": "wasm_unload", "wid": wid})
+
+        return _wasm.WasmModule(signatures, call, unload)
 
     def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
         """Resolve import specifiers with a host function: `(specifier, referrer) -> str | None`."""

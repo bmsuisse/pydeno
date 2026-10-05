@@ -74,7 +74,12 @@ def test_round_trip_with_jitless_false(tmp_path: Path) -> None:
 
 def test_invalid_bytes_and_limits_leave_the_worker_usable() -> None:
     with _jit() as rt:
-        for data in (b"", b"junk", ADD[:-1], b"\x00asm\x01\x00\x00\x00\x01\xff\xff\xff\xff\x0f"):
+        for data in (
+            b"",
+            b"junk",
+            ADD[:-1],
+            b"\x00asm\x01\x00\x00\x00\x01\xff\xff\xff\xff\x0f",
+        ):
             with pytest.raises((ValueError, JavaScriptError)):
                 rt.load_wasm(data)
         with pytest.raises(ValueError, match="imports"):

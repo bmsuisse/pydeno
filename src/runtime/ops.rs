@@ -1490,6 +1490,83 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   }
   globalThis.__pydeno_from_py_stream = fromPyStream;
 
+  // `load_wasm` (python/pydeno/_wasm.py): compile and instantiate a host-supplied, trusted module
+  // and hand the host a closure over its exported functions. The instance lives only in that
+  // closure, which the host holds as a function handle; nothing guest-reachable refers to it.
+  // The WebAssembly intrinsics are captured here, before any guest code exists, so a guest that
+  // has replaced `WebAssembly.Module`, `WebAssembly.Instance` or the `exports` getter by the time
+  // the host loads a module cannot see the bytes or substitute its own instance. Installed only
+  // when this V8 has WebAssembly at all: under `--jitless` (the isolated worker's default) the
+  // global does not exist, so that guest's surface is unchanged.
+  if (typeof WebAssembly === "object" && WebAssembly !== null) {
+    const WasmModuleCtor = WebAssembly.Module;
+    const WasmInstanceCtor = WebAssembly.Instance;
+    const WasmModuleImports = WebAssembly.Module.imports;
+    const WasmModuleExports = WebAssembly.Module.exports;
+    const WasmInstanceExports = uncurry(
+      GetOwnPropertyDescriptor(WebAssembly.Instance.prototype, "exports").get
+    );
+    const ReflectApply = Reflect.apply;
+    const ObjectFreeze = Object.freeze;
+    const TypedArrayTag = uncurry(
+      GetOwnPropertyDescriptor(GetPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get
+    );
+
+    const wasmLoad = function (bytes) {
+      if (!IsView(bytes) || TypedArrayTag(bytes) !== "Uint8Array") {
+        throw new TypeErrorCtor("load_wasm expects the module's bytes");
+      }
+      const module = new WasmModuleCtor(bytes);
+      if (WasmModuleImports(module).length !== 0) {
+        throw new TypeErrorCtor("load_wasm: modules with imports are not supported");
+      }
+      const exported = WasmInstanceExports(new WasmInstanceCtor(module));
+      let functions = { __proto__: null };
+      const names = WasmModuleExports(module);
+      for (let index = 0; index < names.length; index++) {
+        const entry = names[index];
+        if (entry.kind === "function") {
+          setOwn(functions, entry.name, exported[entry.name]);
+        }
+      }
+      // `call(name, args, wide)`: `args` are numbers, except where `wide[i] === true` marks an
+      // i64 parameter (the host parsed the signatures): that one is a decimal string, because a
+      // host integer up to 2^64 would cross as a lossy double, and V8 takes an i64 only as a BigInt.
+      // `call(null)` unloads: the instance becomes unreachable and later calls fail.
+      return function (name, args, wide) {
+        if (name === null) {
+          functions = null;
+          return undefined;
+        }
+        if (functions === null) {
+          throw new TypeErrorCtor("this WebAssembly module was unloaded");
+        }
+        if (typeof name !== "string" || !HasOwn(functions, name)) {
+          throw new TypeErrorCtor("the module exports no function of that name");
+        }
+        if (!ArrayIsArray(args) || !ArrayIsArray(wide)) {
+          throw new TypeErrorCtor("load_wasm: invalid call");
+        }
+        const callArgs = [];
+        for (let index = 0; index < args.length; index++) {
+          const value = args[index];
+          if (wide[index] === true) {
+            if (typeof value !== "string") {
+              throw new TypeErrorCtor("load_wasm: invalid call");
+            }
+            setOwn(callArgs, index, BigIntCtor(value));
+          } else if (typeof value === "number") {
+            setOwn(callArgs, index, value);
+          } else {
+            throw new TypeErrorCtor("WebAssembly arguments must be numbers");
+          }
+        }
+        return ReflectApply(functions[name], undefined, callArgs);
+      };
+    };
+    globalThis.__pydeno_wasm_load = ObjectFreeze(wasmLoad);
+  }
+
   // Library code (or a guest) that assigns to one of these would silently reroute every bound
   // host function, since they look the bridge up by name at call time, and the Rust side looks up
   // `__pydeno_bind_object` and `__pydeno_from_py_stream` on the live global. Fixed in place and
@@ -1503,6 +1580,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     "__pydeno_bind_function",
     "__pydeno_from_py_stream",
   ];
+  if (HasOwn(globalThis, "__pydeno_wasm_load")) {
+    FIXED_GLOBALS[FIXED_GLOBALS.length] = "__pydeno_wasm_load";
+  }
   for (let index = 0; index < FIXED_GLOBALS.length; index++) {
     DefineProperty(globalThis, FIXED_GLOBALS[index], {
       writable: false,

@@ -2,6 +2,7 @@
 Type stubs for the pydeno Python extension module.
 """
 
+import os
 import types
 from datetime import timedelta
 from collections.abc import AsyncIterable, Awaitable, Callable, Coroutine, Mapping
@@ -12,6 +13,8 @@ from typing import (
     TypedDict,
     overload,
 )
+
+from ._wasm import WasmModule
 
 __all__ = [
     "InspectorConfig",
@@ -1074,6 +1077,20 @@ class Runtime:
             42
             ```
         """
+        ...
+
+    def load_wasm(
+        self,
+        module: bytes | bytearray | memoryview | str | os.PathLike[str],
+        /,
+        *,
+        max_bytes: int = ...,
+        timeout: float | None = None,
+    ) -> WasmModule:
+        """Load a **trusted** WebAssembly module (bytes, or a path the host reads; at most
+        `max_bytes`, default and ceiling 8 MiB; no imports) and return a `WasmModule` whose
+        exported functions take and return numbers. Its linear memory is not bounded by
+        `max_buffer_bytes`. See the WebAssembly guide."""
         ...
 
     def __enter__(self) -> Self:

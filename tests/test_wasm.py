@@ -19,9 +19,29 @@ from pydeno._wasm import MAX_WASM_BYTES, WasmModule
 ADD = bytes(
     [
         *(0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00),  # "\0asm", version 1
-        *(0x01, 0x07, 0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F),  # type 0: (i32, i32) -> i32
+        *(
+            0x01,
+            0x07,
+            0x01,
+            0x60,
+            0x02,
+            0x7F,
+            0x7F,
+            0x01,
+            0x7F,
+        ),  # type 0: (i32, i32) -> i32
         *(0x03, 0x02, 0x01, 0x00),  # function 0 has type 0
-        *(0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00),  # export "add" = function 0
+        *(
+            0x07,
+            0x07,
+            0x01,
+            0x03,
+            0x61,
+            0x64,
+            0x64,
+            0x00,
+            0x00,
+        ),  # export "add" = function 0
         *(0x0A, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6A, 0x0B),  # its body
     ]
 )
@@ -64,7 +84,9 @@ def module(
     """A module of exported functions `(name, params, results, code)`; `code` excludes the final
     `end`. Every function gets the same locals declaration."""
     types = [
-        b"\x60" + _vec([bytes([p]) for p in params]) + _vec([bytes([r]) for r in results])
+        b"\x60"
+        + _vec([bytes([p]) for p in params])
+        + _vec([bytes([r]) for r in results])
         for _, params, results, _ in functions
     ]
     out = b"\x00asm\x01\x00\x00\x00" + _section(1, _vec(types))
@@ -73,7 +95,9 @@ def module(
     out += _section(3, _vec([_leb(i) for i in range(len(functions))]))
     if memory_pages is not None:
         out += _section(5, _vec([b"\x00" + _leb(memory_pages)]))
-    exports = [_name(name) + b"\x00" + _leb(i) for i, (name, *_rest) in enumerate(functions)]
+    exports = [
+        _name(name) + b"\x00" + _leb(i) for i, (name, *_rest) in enumerate(functions)
+    ]
     out += _section(7, _vec(exports))
     bodies = []
     for *_rest, code in functions:
@@ -114,6 +138,10 @@ def test_i64_parameters_take_python_ints_of_any_size(rt: Runtime) -> None:
     wasm = rt.load_wasm(ADD64)
     assert wasm.call("add64", 1, 2) == 3  # small ints still cross as BigInt
     assert wasm.call("add64", 2**53, 1) == 2**53 + 1
+    # Exact past 2**53, where the ordinary int conversion would round to a double.
+    assert wasm.call("add64", 2**53 + 1, 0) == 2**53 + 1
+    assert wasm.call("add64", 2**63 - 1, 0) == 2**63 - 1
+    assert wasm.call("add64", 2**64 - 1, 0) == -1  # the unsigned spelling of -1
     assert wasm.call("add64", 2**63 - 1, 1) == -(2**63)
 
 
@@ -158,7 +186,15 @@ def test_size_is_capped(rt: Runtime, tmp_path: Path) -> None:
         b"\x00asm\x01\x00\x00\x00\x01\xff\xff\xff\xff\x0f",  # section longer than the module
         b"\x00asm\x01\x00\x00\x00\x01\x05\xff\xff\xff\xff\xff",  # LEB128 past 32 bits
     ],
-    ids=["empty", "text", "version", "truncated-body", "truncated-section", "long-section", "leb"],
+    ids=[
+        "empty",
+        "text",
+        "version",
+        "truncated-body",
+        "truncated-section",
+        "long-section",
+        "leb",
+    ],
 )
 def test_invalid_bytes_give_a_clean_error(rt: Runtime, data: bytes) -> None:
     with pytest.raises((ValueError, JavaScriptError)):
