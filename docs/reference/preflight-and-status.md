@@ -34,6 +34,11 @@ root or can drop root. Missing termination authority refuses startup in every sa
 
 ## `check_source()`: a readable early rejection, not a security boundary
 
+With `policy=SourcePolicy(...)` it applies the host's own rules instead (forbidden names, `eval`,
+`import()`, the `Function` constructor, `WebAssembly`, a size cap), and `static_gate(policy)` puts
+those rules in front of a sandbox: see [A gate in front of the sandbox](../guides/gate.md). What
+follows is the behaviour without a policy, which is unchanged.
+
 ```python
 from pydeno._preflight import check_source
 

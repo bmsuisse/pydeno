@@ -4,6 +4,58 @@
 
 ### Added
 
+- **Gates: a host-side check of the exact source before it runs.** A gate is a callable
+  `(source, GateContext) -> Verdict(allow, reason, labels)`, sync or async.
+  - **Where it attaches.** Pass it as `gate=` (with `gate_timeout=`, default 10 s) to:
+    - `Pydeno` / `AsyncPydeno`: every `feed_run` / `feed_start`;
+    - `AgentSandbox` / `AsyncAgentSandbox`: `start` / `run` / `execute`;
+    - `IsolatedRuntime` / `AsyncIsolatedRuntime`: `eval*`, `execute*`, `add_static_module` sources,
+      module-loader sources, and `RuntimeConfig.bootstrap` (checked before the worker starts).
+  - **It fails closed.** A denial raises `GateDenied` (kind `gate_denied`, not retryable). A gate that
+    raises, times out or answers with anything but an exact `Verdict` raises `GateUnavailable` (kind
+    `gate_unavailable`, retryable, and the run is still blocked). Both are `PydenoError` subclasses.
+    Cancellation propagates unchanged.
+  - **No gap between check and use.** The source is normalised to an exact `str` once. The gate sees
+    it, and the same string runs. Sources over 16 MiB are refused before the gate is called.
+  - **No side effects.** A denied call sends nothing to the worker and uses no budget, in-flight
+    slot or journal record. Journal replay (`load_session`, `load_snapshot`, `AgentSandbox.load`) is
+    not re-gated.
+  - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
+  - **Sync gates and async callers.** In the async classes and `async_gate_check`, sync gates run on
+    a gate thread, never on the event loop. There `gate_timeout=None` is refused. The gate threads
+    form one process-wide pool of daemon threads, 32 by default; change it with
+    `set_gate_threads(n)` or `PYDENO_GATE_THREADS`.
+  - **Module loaders and closed sessions.** A module-loader refusal is raised by the command that
+    imported, keeps its `__cause__`, and is raised even when the guest catches the failed import.
+    A closed session or runtime never calls its gate.
+  - **Pools.** `SandboxPool` / `SessionPool` pass `gate=` through.
+  - **Without fixing the source.** `check_source(source)` without a policy no longer retries a
+    regex scan after one fails on the same line, and caps its `\u{` look-ahead. Results are
+    unchanged; hostile input no longer takes quadratic time.
+  - **Signatures checked up front.** A gate may also take only the source (`async def
+    classify(source)`). A gate whose signature fits neither form raises `TypeError` when it is
+    configured or passed to `gate_check`, so a programming error is not mistaken for an outage.
+  - **Static policy.** `check_source(source, policy=SourcePolicy(...))` covers:
+    - forbidden identifiers and globals;
+    - `import()`;
+    - `eval`, and timers given strings;
+    - the `Function` constructor and `WebAssembly`;
+    - `max_source_bytes`;
+    - optionally, computed access on a global (`forbid_computed_global_access`, best effort).
+
+    By default the scan fails closed. It decodes every escape (`\u`, `\u{...}`, `\x`, legacy
+    octal, identity escapes, line continuations) and reads the whole text, strings and comments
+    included. It runs in linear time, with `max_source_bytes` defaulting to 1 MiB.
+    `ignore_strings_and_comments=True` selects a tokenizer-based precise mode instead: opt-in,
+    best effort, with its known bypasses listed in the guide. The messages are fixed templates
+    (`POLICY_MESSAGES`, a public contract). `Finding.text` is the bare message without a location.
+    `static_gate(policy)` turns a policy into a gate, and `.check(source)` returns its findings. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
+    first allow. `check_source(source)` without a policy is unchanged.
+  - **Moved class.** `PydenoError` now lives in `pydeno._errors`. It is the same class, still
+    exported as `pydeno.PydenoError`.
+
+  See [`docs/guides/gate.md`](docs/guides/gate.md).
+
 - **`load_wasm()`: a trusted WebAssembly module, loaded by the host** (#37). On `Runtime`,
   `IsolatedRuntime` and `AsyncIsolatedRuntime`: `rt.load_wasm(bytes_or_path)` returns a
   `WasmModule` (`AsyncWasmModule`) with `.exports` (name -> callable), `.signatures`,
@@ -24,9 +76,50 @@
   [`docs/guides/advanced/webassembly.md`](docs/guides/advanced/webassembly.md);
   `benches_py/wasm_kernel_bench.py` compares one kernel as JavaScript and as WebAssembly (no faster
   under the JIT; about 19x faster than jitless JavaScript).
+- **Opt-in worker caps for pools** (#81). `SandboxPool`, `AsyncSandboxPool`, `Pydeno` and
+  `AsyncPydeno` take `max_workers=None` (default: unchanged, cold starts without limit) and
+  `checkout_timeout=30.0`. With a cap, the pool counts every worker process that has not exited
+  (starting, ready, checked out, and the custom-memory and replay workers of `Pydeno` sessions); a
+  checkout at the cap waits up to `checkout_timeout` (polling every 20 ms, not FIFO) and raises the
+  new `pydeno.CheckoutTimeout` (a `TimeoutError`; `classify_error` kind `checkout_timeout`,
+  retryable). `load_session` / `load_snapshot` on a capped pool kill the session's current worker
+  after the state is authenticated and before the replay, so a load never needs a second slot; if
+  the replay then fails, the session has no worker until the next successful load (the next feed
+  raises `PydenoCrashedError` saying so; another `load_session` / `load_snapshot` recovers it). The
+  killed worker's slot is handed to the replay, so a checkout already waiting cannot take it in
+  between. `stats()` adds `max_workers`, `workers`, `waiting` and `checkout_timeouts`.
+  Based on the contribution in #93.
+
+### Changed
+
+- **Faster async commands in the isolated worker** (#60). The worker keeps one event loop for its
+  whole life instead of building one per command, created before the OS sandbox goes up (no thread
+  starts). Each command still ends with the loop emptied: pending tasks are cancelled and finished,
+  and callbacks that a finished host call left queued run before the next command starts, so nothing
+  is held over to a later command. Measured on macOS arm64 (release build, paired runs): a warm
+  `eval_async` about 237 to 150 microseconds, a warm `feed_run` about 220 to 140 microseconds,
+  checkout plus 11 feeds about 4.4 to 3.4 ms. The synchronous paths are unchanged.
+- **Clearer limit and diagnostics wording** (#84). Agent sessions name the argument the caller passed
+  (`timeout`, `max_pause`) when they reject a value; `-0.0` is stored as `0.0`; the docs describe
+  how the Proxy, console-deadline and default-printer limits behave (console time in the synchronous
+  runtimes is only checked between console calls).
+- **`stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker**, with or
+  without a cap: a cold start that fails to start (or, with a cap, a checkout that raised
+  `CheckoutTimeout`) is no longer counted in either.
 
 ### Fixed
 
+- **A host function that re-enters its own runtime, or returns a stream source, no longer aborts the
+  process** (#58). Calling `rt.eval` (or any `Runtime` method) from inside a host function made
+  PyO3 raise a panic that was re-raised when the call returned and aborted the process, and a
+  returned `PyStreamSource` hit the same check. The guest now gets a catchable `RuntimeError`
+  ("this object cannot be used from the runtime thread, where host functions run; ...") with fixed
+  text, the panic detail goes to the log, and the runtime stays usable. `PyStreamSource` no longer
+  has to stay on the thread that made it. Keep a reference to a source until the guest has read it
+  (the finalizer cancels the stream); see the "Inside a host function" section of the runtime guide.
+- **Registered function and stream ids are never reused while live** (#89 follow-up). The ids are
+  32-bit counters; after a wrap a new registration could overwrite a live entry. Allocation now skips
+  live ids, and a wrapper that fails to build rolls its registration back without a double release.
 - **A stream source is refused by any runtime other than the one that created it** (#98). Stream
   ids are allocated per runtime, so a source from runtime B returned by runtime A's host function
   (or passed to A's functions, bound into A, or yielded by one of A's streams) was read through A's

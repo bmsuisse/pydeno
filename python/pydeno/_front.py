@@ -71,6 +71,8 @@ from ._agent import (
     _unavailable,
     preinstall,
 )
+from ._errors import PydenoError
+from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import _CONTROL, IsolatedRuntime, WorkerCrashed
 from ._limits import limit_int, limit_seconds
 from ._pydeno import JavaScriptError, JsUndefined, RuntimeConfig, RuntimeTimeout
@@ -213,21 +215,6 @@ def _resolve_limits(*layers: Mapping[str, Any] | None) -> _Limits:
 # ---------------------------------------------------------------------------
 # errors
 # ---------------------------------------------------------------------------
-
-
-class PydenoError(Exception):
-    """Base class of every error a `Pydeno` session raises for a feed (Monty's `MontyError`).
-
-    `exception()` returns the pydeno exception it wraps (a `JavaScriptError`, `WorkerCrashed`,
-    `RuntimeTimeout`, ...); `classify_error` classifies that one."""
-
-    def __init__(self, message: str, inner: BaseException | None = None) -> None:
-        super().__init__(message)
-        self._pydeno_inner = inner
-
-    def exception(self) -> BaseException:
-        """The exception pydeno raised underneath (this one if there is none)."""
-        return self._pydeno_inner if self._pydeno_inner is not None else self
 
 
 class _GuestError(PydenoError):
@@ -686,6 +673,12 @@ def _check_lookup(
     return calls, tuple(calls)
 
 
+def _own(mapping: Any) -> Any:
+    """A shallow copy of a mapping argument, taken before the gate runs: whatever the gate (or
+    anything else) does to the caller's dict afterwards cannot change this feed."""
+    return dict(mapping) if isinstance(mapping, Mapping) else mapping
+
+
 def _values(external_lookup: Mapping[str, Any] | None) -> dict[str, Any]:
     if not external_lookup:
         return {}
@@ -1006,7 +999,7 @@ class _Core(_sandbox_pool._Core):  # noqa: SLF001
     it; `Math.random` must not repeat across sessions) and arrives with the session's
     dispatcher and prelude installed (`preinstall`), so a checkout does no round trip."""
 
-    def new(self, session: dict[str, Any] | None = None) -> IsolatedRuntime:
+    def _create(self, session: dict[str, Any] | None = None) -> IsolatedRuntime:
         if session is None and self.ready:
             # A filler replacing a worker just checked out. Starting a process forks this one
             # and holds the GIL for about a millisecond, right when the new session runs its
@@ -1068,13 +1061,16 @@ class _Reaper:
                 rt.close()
             return
         proc = rt._proc  # noqa: SLF001
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        # A worker already reaped (by the capacity check's poll(), say) has given up its pid,
+        # which may now name another process group: signal only one that is still ours.
+        if proc.poll() is None:
             try:
-                proc.kill()
-            except OSError:
-                pass
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
         rt._closed = True  # noqa: SLF001 - nothing may be sent to it any more
         with self._lock:
             if self._stopped:  # closed meanwhile: reap here
@@ -1181,9 +1177,17 @@ class Pydeno:
         min_processes: Workers kept started and ready (default 2: enough that back-to-back
             checkouts find one ready while the next starts in the background, at ~30-40 MB of
             memory each). A checkout that finds none ready starts one on the spot (a cold start,
-            tens of milliseconds): exhaustion is never an error and never waits for a return.
-            Workers are single-use, so there is no ``max_processes``: a session's worker dies
-            with the session.
+            tens of milliseconds). Workers are single-use: a session's worker dies with it.
+        max_workers: Optional cap on starting and live workers, including checked-out sessions
+            and custom memory or replay workers. None (default) allows unlimited cold starts.
+            The ready target is clamped to the cap if it is smaller than min_processes.
+        checkout_timeout: Finite positive seconds to wait for capacity (default 30), then raise
+            CheckoutTimeout. The worker startup handshake has its own timeout. Waiting is by
+            polling (every 20 ms), not FIFO; a checkout from a thread or task that already holds
+            every slot waits the full timeout. With a cap, `load_session` / `load_snapshot` kill
+            the session's worker before replaying on a new one (after checking the state), so a
+            load needs no second slot; a failed replay leaves the session without a worker until
+            the next successful load.
         limits: Default `PydenoLimits` for every session (each key overrides the built-in
             default; ``checkout(limits=...)`` overrides these).
         sandbox: ``"require"`` (default): refuse to start unless every OS sandbox layer the
@@ -1211,6 +1215,15 @@ class Pydeno:
             guest; `ToolThreadLimitError` for the host). Clamped to the process ceiling
             (`pydeno._agent.MAX_TOOL_THREADS`, 512), which every pool draws from: a cap is an
             upper bound, not a reservation (a warning says so when open pools' caps exceed it).
+        gate: A `Gate` (sync) that every `feed_run` / `feed_start` of every session must pass
+            first. It sees exactly the feed's code (an exact `str`), with ``context.tools`` the
+            feed's external function names; the host adds only its own fixed setup (the stubs
+            and `inputs`, as data) and the rewrite of the trailing expression to ``return``. A
+            denial raises `GateDenied` (a gate that cannot decide, `GateUnavailable`) before
+            anything reaches the worker: no budget, journal entry or state is touched, and the
+            session stays usable. `load_session` / `load_snapshot` replay without it. See
+            ``docs/guides/gate.md``.
+        gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded.
 
     The first worker starts in the constructor (a platform that cannot sandbox fails here, not
     at the first checkout) and the rest in the background, so the first checkout is fast. Use
@@ -1221,16 +1234,21 @@ class Pydeno:
         self,
         *,
         min_processes: int = DEFAULT_MIN_PROCESSES,
+        max_workers: int | None = None,
+        checkout_timeout: float = 30.0,
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
         strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         self._key = _check_pool_arguments(
             min_processes, sandbox, jitless, dump_key, strict_eval
         )
+        self._gate = _hook(gate, gate_timeout, who="PydenoSession", sync_only=True)
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
@@ -1246,7 +1264,13 @@ class Pydeno:
         )  # may warn (or raise, under -W error): before anything starts
         try:
             self._reaper = _Reaper()
-            self._pool = _Pool(_CONFIG, size=min_processes, **self._spawn)
+            self._pool = _Pool(
+                _CONFIG,
+                size=min_processes,
+                max_workers=max_workers,
+                checkout_timeout=checkout_timeout,
+                **self._spawn,
+            )
         except WorkerCrashed as exc:
             _close_pool(self._budget)
             raise _start_failure(exc, sandbox) from exc
@@ -1285,7 +1309,8 @@ class Pydeno:
 
     def stats(self) -> dict[str, Any]:
         """The pool's `SandboxPool.stats()`: ``size``, ``ready``, ``starting``, ``checkouts``,
-        ``cold_starts`` and ``last_error``."""
+        ``cold_starts``, ``last_error``, ``max_workers``, ``workers``, ``waiting`` and
+        ``checkout_timeouts``."""
         return self._pool.stats()
 
     @staticmethod
@@ -1298,15 +1323,23 @@ class Pydeno:
 
     # -- for sessions --------------------------------------------------------
 
-    def _runtime(self, limits: _Limits, seed: int | None = None) -> IsolatedRuntime:
+    def _runtime(
+        self, limits: _Limits, seed: int | None = None, token: object | None = None
+    ) -> IsolatedRuntime:
         try:
             if seed is None and limits.max_memory == self._limits.max_memory:
                 return self._pool.checkout()
             options = {**self._spawn, "max_memory": limits.max_memory}
-            return IsolatedRuntime(
-                _CONFIG,
-                random_seed=_fresh_seed() if seed is None else seed,
-                **options,
+            core = self._pool._core  # noqa: SLF001
+            return core.new(
+                factory=lambda: IsolatedRuntime(
+                    _CONFIG,
+                    # A spare is an extra process: only without a cap, as before caps existed.
+                    prewarm=core.capacity.maximum is None,
+                    random_seed=_fresh_seed() if seed is None else seed,
+                    **options,
+                ),
+                token=token,
             )
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
@@ -1329,12 +1362,24 @@ class Pydeno:
         return agent
 
     def _load(
-        self, state: bytes, limits: _Limits, associated_data: bytes = b""
+        self,
+        state: bytes,
+        limits: _Limits,
+        associated_data: bytes = b"",
+        *,
+        suspended: bool | None = None,
+        release: Callable[[], object | None] | None = None,
     ) -> AgentSandbox:
         seed = _journal_seed(
-            state, self._key, self._spawn["strict_eval"], associated_data
+            state, self._key, self._spawn["strict_eval"], associated_data, suspended
         )
-        rt = self._runtime(limits, seed)
+        token = None
+        if release is not None and self._pool._core.capacity.maximum is not None:  # noqa: SLF001
+            # With a worker cap, the session's current worker holds a slot the replay needs:
+            # hand it over now (the state is authentic and of the right kind), not after the
+            # replay, and not through the queue of waiting checkouts.
+            token = release()
+        rt = self._runtime(limits, seed, token)
         try:
             agent = AgentSandbox.load(
                 state,
@@ -1353,14 +1398,21 @@ class Pydeno:
 
 
 def _journal_seed(
-    state: bytes, key: bytes, strict_eval: bool, associated_data: bytes = b""
+    state: bytes,
+    key: bytes,
+    strict_eval: bool,
+    associated_data: bytes = b"",
+    suspended: bool | None = None,
 ) -> int:
     """The state's random seed, checked before a worker is started for it (also its
-    ``strict_eval``, which `AgentSandbox.load` checks again on the worker it gets)."""
+    ``strict_eval``, which `AgentSandbox.load` checks again on the worker it gets, and, unless
+    `suspended` is None, whether it was dumped mid-feed)."""
     try:
         journal = _open_journal(state, key, associated_data, DEFAULT_MAX_JOURNAL_BYTES)
     except Exception as exc:  # noqa: BLE001
         raise _load_failure(exc) from exc
+    if suspended is not None and _ends_paused(journal) != suspended:
+        raise _wrong_load(suspended)
     recorded = journal["config"].get("strict_eval", False)
     if recorded != strict_eval:
         raise _load_failure(
@@ -1373,6 +1425,29 @@ def _journal_seed(
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**31:
         raise PydenoError("cannot load this state: it has no valid random seed")
     return seed
+
+
+def _ends_paused(journal: dict[str, Any]) -> bool:
+    """Whether a journal was dumped mid-feed: its last record is an outcome that is a tool call
+    (the replay checks the records' order; a malformed journal fails there)."""
+    records = journal.get("records")
+    if not isinstance(records, list) or not records:
+        return False
+    last = records[-1]
+    return (
+        isinstance(last, list)
+        and len(last) > 1
+        and last[0] == "obs"
+        and last[1] == "call"
+    )
+
+
+def _wrong_load(suspended: bool) -> PydenoError:
+    return PydenoError(
+        "this state was dumped mid-feed; use load_snapshot"
+        if not suspended
+        else "this state was dumped between feeds; use load_session"
+    )
 
 
 def _load_failure(exc: BaseException) -> BaseException:
@@ -1427,6 +1502,8 @@ class PydenoSession:
         self._printer = _Printer()
         self._entered = False
         self._busy = threading.Lock()
+        # A capped load stopped the worker and its replay failed (see `_replace`).
+        self._load_failed = False
 
     def __enter__(self) -> PydenoSession:
         if self._entered:
@@ -1463,6 +1540,12 @@ class PydenoSession:
                 else "the session is closed"
             )
         if agent.is_closed():
+            if self._load_failed:
+                raise PydenoCrashedError(
+                    "the session's worker was stopped for a load that then failed (a pool with "
+                    "max_workers frees the slot before the replay); call load_session or "
+                    "load_snapshot again to recover the session, or check out a new one"
+                )
             raise PydenoCrashedError(
                 "the session's worker is gone (crashed, killed or timed out); check out a new "
                 "session"
@@ -1517,9 +1600,13 @@ class PydenoSession:
             PydenoSyntaxError: the code does not parse (the session survives).
             PydenoTimeoutError: a deadline killed the worker (the session is over).
             PydenoCrashedError: the worker is gone (the session is over).
+            GateDenied / GateUnavailable: the pool's gate refused the code, or could not decide;
+                nothing ran (the session survives).
         """
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=True)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = self._gated(code, "feed_run", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         agent._core.refused = None  # noqa: SLF001
@@ -1558,6 +1645,8 @@ class PydenoSession:
         arguments as in `feed_run`; ``print_callback`` stays in force until the feed ends."""
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=False)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = self._gated(code, "feed_start", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         agent._core.refused = None  # noqa: SLF001
@@ -1638,21 +1727,48 @@ class PydenoSession:
         self._printer.callback = (
             None  # the replay's console output was printed long ago
         )
-        new = self._pool._load(state, self._limits, associated_data)  # noqa: SLF001
+        assert old is not None
+
+        def release() -> object | None:
+            # Only with a worker cap (see `Pydeno._load`): the old worker is killed before the
+            # replay starts, and its slot goes to the replay. If the load then fails, the
+            # session keeps its journal and has no worker, as after a crash: another load
+            # recovers it.
+            self._load_failed = True
+            rt = old._core.rt  # noqa: SLF001
+            core = self._pool._pool._core  # noqa: SLF001
+            with core.cond:
+                token = core.capacity.hand_over(rt._proc)  # noqa: SLF001
+            self._pool._reaper.kill(rt)  # noqa: SLF001
+            old.close()
+            try:
+                rt._proc.wait(5)  # noqa: SLF001 - its slot is reused: let it exit first
+            except Exception:  # noqa: BLE001, S110
+                pass
+            return token
+
+        new = self._pool._load(  # noqa: SLF001
+            state,
+            self._limits,
+            associated_data,
+            suspended=suspended,
+            release=release,
+        )
         if (new.pending is not None) != suspended:
             new.close()
-            raise PydenoError(
-                "this state was dumped mid-feed; use load_snapshot"
-                if not suspended
-                else "this state was dumped between feeds; use load_session"
-            )
+            raise _wrong_load(suspended)
         new._core.console.user = self._printer  # noqa: SLF001
         self._agent = new
-        assert old is not None
+        self._load_failed = False
         old.close()
         return new
 
     # -- internals -----------------------------------------------------------
+
+    def _gated(self, code: Any, mode: str, names: tuple[str, ...]) -> Any:
+        """The exact feed code the pool's gate allowed (`code` itself without a gate)."""
+        gate = self._pool._gate  # noqa: SLF001
+        return code if gate is None else gate.check(code, mode, names)
 
     def _start(
         self,

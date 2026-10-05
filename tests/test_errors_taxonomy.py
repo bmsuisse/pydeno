@@ -165,6 +165,14 @@ def _worker_crashed(tmp: Path) -> BaseException:
     return _raised(lambda: rt.eval("1"))
 
 
+def _checkout_timeout(tmp: Path) -> BaseException:
+    from pydeno import SandboxPool
+
+    with SandboxPool(size=1, max_workers=1, checkout_timeout=0.1) as pool:
+        with pool.checkout():
+            return _raised(pool.checkout)
+
+
 def _terminated(tmp: Path) -> BaseException:
     with Runtime() as rt:
         handle = rt.termination_handle()
@@ -339,6 +347,30 @@ def _cancelled(tmp: Path) -> BaseException:
     return asyncio.run(go())
 
 
+def _gate_denied(tmp: Path) -> BaseException:
+    from pydeno import GateDenied, IsolatedRuntime, Verdict
+
+    with IsolatedRuntime(gate=lambda s, c: Verdict(False, "no", ("x",))) as rt:
+        try:
+            rt.eval("1")
+        except GateDenied as exc:
+            return exc
+    raise AssertionError("not denied")
+
+
+def _gate_unavailable(tmp: Path) -> BaseException:
+    from pydeno import GateUnavailable, gate_check
+
+    def broken(source: str, context: object) -> object:
+        raise ConnectionError("classifier down")
+
+    try:
+        gate_check(broken, "1")  # type: ignore[arg-type]
+    except GateUnavailable as exc:
+        return exc
+    raise AssertionError("not unavailable")
+
+
 def _unknown(tmp: Path) -> BaseException:
     return KeyError("something pydeno never raises")
 
@@ -350,6 +382,7 @@ CASES: dict[str, Callable[[Path], BaseException]] = {
     "memory_limit": _memory_limit,
     "thread_limit": _thread_limit,
     "worker_crashed": _worker_crashed,
+    "checkout_timeout": _checkout_timeout,
     "terminated": _terminated,
     "force_killed": _force_killed,
     "host_wait": _host_wait,
@@ -368,6 +401,8 @@ CASES: dict[str, Callable[[Path], BaseException]] = {
     "snapshot_invalid": _snapshot_invalid,
     "invalid_input": _invalid_input,
     "cancelled": _cancelled,
+    "gate_denied": _gate_denied,
+    "gate_unavailable": _gate_unavailable,
     "unknown": _unknown,
 }
 
@@ -390,8 +425,13 @@ def test_a_real_error_gets_its_documented_kind(kind: str, tmp_path: Path) -> Non
 
 
 def test_the_retry_rule_is_one_rule() -> None:
-    """Only environmental kinds are retryable; limit overruns are not, but say a larger limit helps."""
-    assert {k for k, (r, _, _) in KINDS.items() if r} == {"worker_crashed"}
+    """Only environmental kinds are retryable (a dead worker, no free worker slot, a gate that
+    could not decide); limit overruns are not, but say a larger limit helps."""
+    assert {k for k, (r, _, _) in KINDS.items() if r} == {
+        "worker_crashed",
+        "checkout_timeout",
+        "gate_unavailable",
+    }
     for kind in ("timeout", "cpu_limit", "memory_limit"):
         retryable, larger, _ = KINDS[kind]
         assert not retryable and larger

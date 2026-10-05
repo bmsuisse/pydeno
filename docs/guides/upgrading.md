@@ -108,6 +108,23 @@ behaviour you have today:
 | `feed_start` surfaces snapshots only for functions in that feed's `external_lookup`; a call to another name throws a `ReferenceError` in the guest | `Pydeno` | Drivers that expected snapshots for names they did not declare | Declare every function the feed may call |
 | Journal associated data may be up to 4096 bytes (was 1024) | agent sessions, `SessionPool` | Nobody (a relaxation: 256-character non-ASCII pool ids now persist) | Nothing |
 
+## 0.8.x to 0.9.0: gates, `load_wasm`, worker caps
+
+Mostly additions. Two things can change behaviour you have today: a stream source now belongs to one
+runtime, and a host function that re-enters its runtime gets an error instead of killing the process.
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| New: `Gate`, `Verdict`, `GateContext`, `GateDenied`, `GateUnavailable`, `gate_check`, `async_gate_check`, `SourcePolicy`, `static_gate`, `all_of`, `any_of`, `check_source(source, policy=...)`, `gate=` / `gate_timeout=` on the front door, agent sessions and isolated runtimes | new, opt-in | Adopters | See the [gate guide](gate.md); a gate is defence in depth, never the boundary |
+| `PydenoError` is defined in `pydeno._errors` (same class, still `pydeno.PydenoError`) | internal | Code that imported it from `pydeno._front` | Import it from `pydeno` |
+| New: `load_wasm()` on `Runtime`, `IsolatedRuntime`, `AsyncIsolatedRuntime`, for trusted WebAssembly (the isolated runtimes need `jitless=False`; a module's memory is not bounded by `max_buffer_bytes`) | new, opt-in | Adopters | See the [WebAssembly guide](advanced/webassembly.md) |
+| New: `max_workers=` and `checkout_timeout=` on the pools and the front door, `CheckoutTimeout` (`classify_error` kind `checkout_timeout`, retryable), more `stats()` fields | new, opt-in | Nobody unless set | See [Pools](advanced/isolation.md) |
+| `stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker | pools, front door | Dashboards that counted failed starts | Nothing |
+| A `PyStreamSource` from one runtime handed to another runtime raises `RuntimeError` (it used to be read through the other runtime's stream of the same id) | `Runtime` | Code that passed one runtime's source to another | Create the source with the runtime that will read it |
+| A host function that calls its own runtime, or returns a stream source from a sync callback, no longer aborts the process: the guest gets a catchable `RuntimeError` | `Runtime` | Nobody (a fix); code that relied on the crash | Call the runtime from outside the host function |
+| The isolated worker keeps one event loop for its life (a warm `eval_async` or `feed_run` is about 35 to 40 percent faster) | `IsolatedRuntime`, front door | Nobody | Nothing |
+| Agent sessions name the passed argument in limit errors (`timeout`, `max_pause`); `-0.0` is stored as `0.0` | agent sessions | Tests that match the old argument names | Match on the new names |
+
 ## Safe to bump?
 
 **From 0.4.x to 0.5.0** (`Runtime` users: nothing to change)

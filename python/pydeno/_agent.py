@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import (
     _CONFIG_KEYS,
     IsolatedRuntime,
@@ -1238,6 +1239,7 @@ class _SessionBase:
         random seed the session must use (the runtime's own, which replay depends on)."""
         if not isinstance(runtime, runtime_type):
             raise TypeError(f"runtime must be a pydeno.{runtime_type.__name__}")
+        _SessionBase._check_ungated(runtime)
         if runtime_options:
             raise TypeError(
                 f"{who}(runtime=...) takes an already-built runtime, whose options were fixed when "
@@ -1276,6 +1278,27 @@ class _SessionBase:
                 )
             clock = frozen / 1000
         return clock, seed
+
+    @staticmethod
+    def _check_ungated(runtime: Any) -> None:
+        if getattr(runtime, "_gate", None) is not None:
+            raise ValueError(
+                "runtime= has a gate of its own, which would also see the session's own commands; "
+                "build it without one and pass gate= to the session instead"
+            )
+
+    def _gated(self, code: Any, mode: str) -> Any:
+        """The exact source the session's gate allowed (`code` itself without a gate)."""
+        gate = self._gate
+        if gate is None:
+            return code
+        return gate.check(code, mode, tuple(self._tools) + tuple(self._catalog))
+
+    async def _agated(self, code: Any, mode: str) -> Any:
+        gate = self._gate
+        if gate is None:
+            return code
+        return await gate.acheck(code, mode, tuple(self._tools) + tuple(self._catalog))
 
     def _check_prepared(self, runtime: Any) -> None:
         """A runtime prepared ahead of time (`preinstall`) serves one session, with exactly the
@@ -2006,7 +2029,15 @@ class AgentSandbox(_SessionBase):
             becomes the session's too, and without one the session freezes the guest's clock
             before any guest code runs. ``timeout`` and ``max_pause`` replace its deadlines; its
             other options (``sandbox``, ``max_memory``, ``redact_host_errors``, ...) are what it
-            was built with, so no ``runtime_options`` may be passed with it.
+            was built with, so no ``runtime_options`` may be passed with it. It must not have a
+            ``gate`` of its own (pass ``gate=`` to the session).
+        gate: A `Gate` (sync) that the code of every `start`, `run` and `execute` must pass
+            before anything else happens: a denial raises `GateDenied` (a gate that cannot
+            decide, `GateUnavailable`), and nothing is journaled, charged or sent to the worker.
+            The gate sees exactly the code that then runs, and ``context.tools`` lists the
+            session's tools. Not consulted when `load` replays a journal (every run in it passed
+            the gate when it first ran). See ``docs/guides/gate.md``.
+        gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded.
         **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
             ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
             count the time paused at a tool call. ``config.on_console`` still gets every console
@@ -2028,8 +2059,11 @@ class AgentSandbox(_SessionBase):
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         runtime: IsolatedRuntime | None = None,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
         **runtime_options: Any,
     ) -> None:
+        self._gate = _hook(gate, gate_timeout, who="AgentSandbox", sync_only=True)
         timeout = _limit_seconds("timeout", timeout)
         max_pause = _limit_seconds("max_pause", max_pause)
         if runtime is not None:
@@ -2147,7 +2181,8 @@ class AgentSandbox(_SessionBase):
         """
         self._enter()
         try:
-            return self._start(code)
+            self._check_usable()  # a closed session does not pay for a gate
+            return self._start(self._gated(code, "start"))
         finally:
             self._lock.release()
 
@@ -2171,7 +2206,7 @@ class AgentSandbox(_SessionBase):
         """`start` the code and answer every tool call with the real tool; return the result, or
         raise what the run failed with. A tool that raises is reported to the guest, which may
         catch it. Tool calls are answered one at a time, in the order the guest made them."""
-        step = self._drive(code)
+        step = self._drive(code, mode="run")
         if isinstance(step, Failed):
             raise step.error
         return step.value
@@ -2185,10 +2220,16 @@ class AgentSandbox(_SessionBase):
         and for a failure a stable `error_type` (the guest's error ``name``, or the host's
         exception class). A run that kills the worker is a ``Failed`` result too; calling this
         on a closed session (or while paused) still raises, as `run` does."""
-        return self._drive(code).to_result(max_error_bytes=self._max_output_bytes)
+        return self._drive(code, mode="execute").to_result(
+            max_error_bytes=self._max_output_bytes
+        )
 
     def _drive(
-        self, code: str, answer: Callable[[ToolCall], Any] | None = None
+        self,
+        code: str,
+        answer: Callable[[ToolCall], Any] | None = None,
+        *,
+        mode: str | None = None,
     ) -> Done | Failed:
         """A run with every tool call answered, the command driven from the caller's thread.
 
@@ -2200,10 +2241,14 @@ class AgentSandbox(_SessionBase):
         fresh copy of the caller's context), and journaled exactly as `start`/`resume` journal
         them (an observed `ToolCall`, then its answer). A tool that outlives a limit gets the worker
         killed and the caller released at once; its late answer is discarded. A run that calls
-        no tool touches no other thread.
+        no tool touches no other thread. With a `mode` (``"run"``, ``"execute"``) the session's
+        gate is consulted first.
         """
         self._enter()
         try:
+            if mode is not None:
+                self._check_usable()  # a closed session does not pay for a gate
+                code = self._gated(code, mode)
             if not isinstance(code, str):
                 raise TypeError("code must be a string")
             self._check_usable()

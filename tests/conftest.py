@@ -95,6 +95,8 @@ collect_ignore = (
         "test_result_conversion_bounds.py",
         "test_isolated_guest_surface.py",
         "test_isolated_wasm.py",
+        "test_gate_hooks.py",
+        "test_worker_capacity.py",
         "test_stream_source_owner.py",
     ]
     if sys.platform == "win32"

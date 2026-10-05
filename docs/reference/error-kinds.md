@@ -22,7 +22,9 @@ raises. The `kind` strings are a public contract: they are only ever added to.
 ## The retry rule
 
 `retryable` is true **only when the failure was environmental**: the worker process died or failed to
-start, so the same work on a fresh runtime could plausibly succeed. A deadline, a memory overrun, a
+start, a pool capped with `max_workers` had no free worker slot within `checkout_timeout` (nothing
+ran; a later checkout may find one), or a gate could not reach a decision (it failed or timed out), so
+the same work could plausibly succeed on a later attempt. A deadline, a memory overrun, a
 CPU cap, a spent budget, a guest bug or a failed signature is a property of the work under the limits
 it was given; the same code fails the same way again, so those are `retryable=False`.
 
@@ -40,6 +42,7 @@ is why it is a separate field and not folded into `retryable`.
 | `memory_limit` | no | yes | `WorkerCrashed`: `worker used N bytes, over max_memory=M; killed`, or the worker's own memory exit | The worker went over max_memory and was stopped. |
 | `thread_limit` | no | no | `WorkerCrashed`: `worker started N threads (limit 64); killed` | The worker started more threads than a worker may. |
 | `worker_crashed` | yes | no | any other `WorkerCrashed`: died, killed by a signal, hung, would not start | The worker process died, hung or failed to start. |
+| `checkout_timeout` | yes | no | `CheckoutTimeout` (a `TimeoutError`) from a pool with `max_workers` | A pool with max_workers had no free worker slot within checkout_timeout. |
 | `terminated` | no | no | `RuntimeTerminated` | The runtime was terminated on request. |
 | `force_killed` | no | no | `RuntimeForceKilled` | A termination was never acknowledged; the runtime was abandoned. |
 | `host_wait` | no | yes | `RuntimeTimeout` from `max_host_wait` | Host callbacks kept the guest waiting longer than max_host_wait. |
@@ -58,6 +61,8 @@ is why it is a separate field and not folded into `retryable`.
 | `snapshot_invalid` | no | no | `SnapshotAuthenticationError` | A signed snapshot failed authentication. |
 | `invalid_input` | no | no | `TypeError` / `ValueError` (wire errors, bad arguments) | A value or argument was refused (wire or API misuse). |
 | `cancelled` | no | no | `asyncio.CancelledError` | The surrounding asyncio task was cancelled. |
+| `gate_denied` | no | no | `GateDenied` ([gate](../guides/gate.md)) | A gate refused the code before it ran. |
+| `gate_unavailable` | yes | no | `GateUnavailable`: the gate raised, timed out or returned something other than a `Verdict` | A gate could not decide (it failed, timed out or answered wrongly); nothing ran. |
 | `unknown` | no | no | anything else | An error pydeno does not classify. |
 
 ## How the kind is chosen, and what a guest can influence
