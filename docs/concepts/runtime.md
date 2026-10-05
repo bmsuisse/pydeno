@@ -262,6 +262,18 @@ async def handle_request():
         return result
 ```
 
+### Inside a host function
+
+A synchronous function bound with [`bind_function()`][pydeno.Runtime.bind_function] runs on the runtime's own thread, not on the thread that created the `Runtime`. What it may use there:
+
+| Object or call | From inside a host function |
+|---|---|
+| [`Runtime`][pydeno.Runtime] methods (`eval`, `bind_function`, ...) on the calling runtime | Not allowed. The guest gets a `RuntimeError` ("this object cannot be used from the runtime thread, ..."), which it can catch; the runtime stays usable. A Rust panic message is also printed to stderr. |
+| A stream source from [`stream_from_async_iterable()`][pydeno.Runtime.stream_from_async_iterable] | Allowed: create it outside the host function and return it; the guest receives a `ReadableStream`. Read it from code run with `eval_async()`, because its chunks come from the event loop the source was created on. |
+| Plain values (numbers, strings, lists, dicts, bytes, ...) | Allowed. |
+
+Before 0.9 both of the first two rows aborted the whole process.
+
 ## Best Practices
 
 - Prefer `with Runtime()` context manager to ensure memory is released.
