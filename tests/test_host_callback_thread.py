@@ -64,6 +64,32 @@ async def stream_case(async_tool):
         print("AFTER", rt.eval("1 + 1"))
 
 
+def collected_on_runtime_thread(kind):
+    import gc
+
+    class Holder:
+        pass
+
+    rt = Runtime()
+    gc.disable()  # the cycle must be collected inside the host function, not before
+    holder = Holder()
+    holder.cycle = holder
+    holder.value = rt.eval(
+        "(x) => x + 1" if kind == "fn" else "new ReadableStream({start(c) { c.enqueue(1); }})"
+    )
+    del holder
+
+    def collect():
+        gc.collect()  # runs the wrapper's finalizer here, on the runtime thread
+        return 1
+
+    rt.bind_function("collect", collect)
+    print("RESULT", rt.eval("collect()"))
+    print("AFTER", rt.eval("1 + 1"))
+    rt.close()
+    print("CLOSED")
+
+
 if case == "reenter":
     with Runtime() as rt:
         rt.bind_function("inner", lambda: rt.eval("1"))
@@ -109,6 +135,8 @@ elif case == "stream_fresh_unreferenced":
                 print("ERROR", type(exc).__name__, exc)
             print("AFTER", rt.eval("1 + 1"))
     asyncio.run(fresh())
+elif case in ("collected_fn", "collected_stream"):
+    collected_on_runtime_thread(case.removeprefix("collected_"))
 """
 
 
@@ -165,3 +193,21 @@ def test_a_stream_source_nobody_keeps_is_gone_before_the_guest_reads_it() -> Non
     assert lines[0].startswith("ERROR JavaScriptError"), lines
     assert "Unknown Python stream id" in lines[0]
     assert lines[-1] == "AFTER 2"
+
+
+@pytest.mark.parametrize("case", ["collected_fn", "collected_stream"])
+def test_a_wrapper_collected_inside_a_host_function_does_not_hang(case: str) -> None:
+    """A `JsFunction` or `JsStream` whose last reference is a cycle collected while a host
+    function runs: its finalizer then runs on the runtime thread, where waiting for the runtime
+    thread never ends (the stream finalizer hung the process; the function finalizer raised a
+    panic). It now releases the handle without waiting, and the runtime stays usable."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _CHILD, case],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, f"child died ({proc.returncode}): {proc.stderr[-800:]}"
+    assert proc.stdout.strip().splitlines() == ["RESULT 1", "AFTER 2", "CLOSED"]
+    assert "Panic" not in proc.stderr, proc.stderr[-800:]

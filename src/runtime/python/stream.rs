@@ -2,7 +2,7 @@
 
 use crate::runtime::conversion::js_value_to_python;
 use crate::runtime::handle::RuntimeHandle;
-use crate::runtime::js_value::RuntimeOwner;
+use crate::runtime::js_value::{on_runtime_thread, RuntimeOwner};
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio as pyo3_tokio;
@@ -33,7 +33,11 @@ impl StreamSharedState {
             return;
         }
         if let Some(handle) = self.handle.lock().unwrap().take() {
-            if let Err(err) = handle.stream_cancel(self.stream_id) {
+            if on_runtime_thread() {
+                // A finalizer run by a collection inside a host function: waiting for the
+                // runtime thread from itself never ends.
+                handle.stream_cancel_detached(self.stream_id);
+            } else if let Err(err) = handle.stream_cancel(self.stream_id) {
                 log::debug!(
                     "JsStream cancel failed for stream id {}: {}",
                     self.stream_id,
@@ -184,7 +188,7 @@ impl PyStreamSource {
             let handle = self.handle.lock().unwrap_or_else(PoisonError::into_inner);
             match handle.as_ref() {
                 None => return Err(PyRuntimeError::new_err("Runtime has been shut down")),
-                Some(handle) if handle.is_shutdown() => {
+                Some(handle) if handle.is_shutdown_nonblocking() => {
                     return Err(PyRuntimeError::new_err(OWNER_CLOSED))
                 }
                 Some(_) => {}

@@ -611,6 +611,50 @@ impl RuntimeHandle {
             || *self.shutdown.lock().unwrap()
     }
 
+    /// `is_shutdown` that never waits for the shutdown lock: the runtime thread may ask, and
+    /// `close` holds that lock while it waits for the runtime thread. A busy lock reads as
+    /// "not shut down yet" (a close under way finishes on its own).
+    pub(crate) fn is_shutdown_nonblocking(&self) -> bool {
+        self.termination.is_requested()
+            || self.termination.is_terminated()
+            || self.shutdown.try_lock().is_ok_and(|guard| *guard)
+    }
+
+    /// Send `command` without waiting for the shutdown lock or for a reply. For code that may run
+    /// on a runtime thread (a finalizer fired by a garbage collection inside a host function):
+    /// a reply would never come, and `close` may hold the lock. Nothing is sent when the runtime
+    /// is shut down, terminated, or being closed (closing frees the isolate anyway).
+    fn send_detached(&self, command: RuntimeCommand) {
+        if self.termination.is_requested() || self.termination.is_terminated() {
+            return;
+        }
+        let Ok(shutdown) = self.shutdown.try_lock() else {
+            return;
+        };
+        if *shutdown {
+            return;
+        }
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(command);
+        }
+    }
+
+    /// [`Self::release_function`] without waiting (see [`Self::send_detached`]).
+    pub(crate) fn release_function_detached(&self, fn_id: u32) {
+        let (responder, _) = oneshot::channel();
+        self.send_detached(RuntimeCommand::ReleaseFunction { fn_id, responder });
+    }
+
+    /// [`Self::stream_cancel`] without waiting (see [`Self::send_detached`]).
+    pub(crate) fn stream_cancel_detached(&self, stream_id: u32) {
+        let (responder, _) = mpsc::channel();
+        self.send_detached(RuntimeCommand::StreamCancel {
+            stream_id,
+            responder,
+        });
+        self.untrack_js_stream_id(stream_id);
+    }
+
     /// Clone of the `Send + Sync` `TerminationController`. Unlike the
     /// `unsendable` `Runtime` pyclass, this is safe to hand to another thread,
     /// which is what lets a Python watchdog thread call `TerminationHandle.terminate()`.
