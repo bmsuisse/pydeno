@@ -203,3 +203,18 @@ def test_a_thread_bomb_meets_a_kernel_ceiling_where_the_worker_has_its_own_names
     else:
         assert got["after"] == got["before"], got
         assert got["started"] == 400, got
+
+
+def test_a_buffer_past_the_kernel_ceiling_is_a_catchable_error() -> None:
+    """With a buffer cap raised out of the way, a single allocation past `max_memory` + 1 GiB is
+    refused by the kernel (RLIMIT_DATA) before it exists: the guest gets a `RangeError` and the
+    worker lives on, instead of the allocation succeeding and the sampled ceiling killing it."""
+    from pydeno import IsolatedRuntime, JavaScriptError, RuntimeConfig
+
+    mib = 1 << 20
+    with IsolatedRuntime(
+        RuntimeConfig(max_buffer_bytes=8192 * mib), max_memory=300 * mib, prewarm=False
+    ) as rt:
+        with pytest.raises(JavaScriptError, match="RangeError|Array buffer"):
+            rt.eval("new Uint8Array(1500 * 1024 * 1024).length")
+        assert rt.eval("1 + 1") == 2
