@@ -1121,3 +1121,85 @@ def test_computed_global_access_is_off_by_default() -> None:
     assert check_source("globalThis[k]", policy=SourcePolicy()).findings == []
     with pytest.raises(TypeError):
         SourcePolicy(forbid_computed_global_access="yes")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# the gate thread pool (sync gates called from async code)
+# ---------------------------------------------------------------------------
+
+
+def test_a_hung_sync_gate_does_not_keep_the_interpreter_alive() -> None:
+    code = r"""
+import asyncio, threading, time
+from pydeno import GateUnavailable, Verdict, async_gate_check
+
+def hangs(source, context):
+    time.sleep(3600)
+    return Verdict(True, "")
+
+async def main():
+    try:
+        await async_gate_check(hangs, "1", timeout=0.2)
+    except GateUnavailable:
+        print("unavailable")
+    threads = [t for t in threading.enumerate() if t.name.startswith("pydeno-gate")]
+    print(len(threads), all(t.daemon for t in threads))
+
+asyncio.run(main())
+"""
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["unavailable", "1", "True"]
+    assert (
+        time.monotonic() - started < 30
+    )  # exited without waiting for the gate's thread
+
+
+def test_the_gate_thread_count_is_configurable() -> None:
+    from pydeno import _gate
+
+    assert pydeno.set_gate_threads is _gate.set_gate_threads
+    before = _gate.gate_threads()
+    try:
+        _gate.set_gate_threads(2)
+        assert _gate.gate_threads() == 2
+        for bad in (0, -1, True, 1.5):
+            with pytest.raises((TypeError, ValueError)):
+                _gate.set_gate_threads(bad)  # type: ignore[arg-type]
+    finally:
+        _gate.set_gate_threads(before)
+
+
+async def test_hung_gates_starve_later_ones_into_unavailable_not_a_hang() -> None:
+    from pydeno import _gate
+
+    release = threading.Event()
+
+    def hangs(source: str, context: GateContext) -> Verdict:
+        release.wait(30)
+        return ALLOW
+
+    before = _gate.gate_threads()
+    _gate.set_gate_threads(2)
+    try:
+        held = [
+            asyncio.ensure_future(async_gate_check(hangs, "1", timeout=0.3))
+            for _ in range(2)
+        ]
+        await asyncio.sleep(0.05)
+        started = time.monotonic()
+        with pytest.raises(GateUnavailable, match="gate_timeout"):
+            await async_gate_check(allow, "1", timeout=0.3)  # queued behind them
+        assert time.monotonic() - started < 3
+        for task in held:
+            with pytest.raises(GateUnavailable):
+                await task
+        release.set()
+        await asyncio.sleep(0.1)
+        assert await async_gate_check(allow, "1", timeout=5) == ALLOW  # recovered
+    finally:
+        release.set()
+        _gate.set_gate_threads(before)

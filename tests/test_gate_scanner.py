@@ -10,6 +10,7 @@ through `Pydeno` and `IsolatedRuntime` are in `tests/test_gate_hooks.py`.
 
 from __future__ import annotations
 
+import functools
 import time
 
 import pytest
@@ -55,6 +56,20 @@ BYPASSES = {
     "computed-destructuring": 'const {["ev" + "al"]: e} = globalThis; e("1")',
     "constructor-destructuring": 'const {constructor: F} = function(){}; F("return 1")()',
     "constructor-after-comment": 'f.\n// note\nconstructor("return 1")()',
+    # A backslash before a line break inside a comment is comment text: the comment still ends
+    # at the break (a decoder that joined the lines read `xeval`).
+    "comment-backslash-lf": '//x\\\neval("1")',
+    "comment-backslash-crlf": '//x\\\r\neval("1")',
+    "comment-backslash-u2028": '//x\\ eval("1")',
+    "hashbang-backslash": '#!x\\\neval("1")',
+    "html-comment-backslash": 'let q = 1 <!--x\\\neval("1")',
+    # Inside `with (fn)`, a bare `constructor` is fn.constructor: the Function constructor.
+    "with-constructor": 'with (()=>0) { constructor("return 6*7")() }',
+    "with-constructor-statement": 'with (()=>0) { 0; constructor("return 6*7")() }',
+    "with-extends-constructor": (
+        'with (()=>0) { class A extends constructor("return 1") {}; new A() }'
+    ),
+    "with-constructor-paren-in-string": 'with (()=>0) { constructor("x//){")() }',
 }
 
 #: The shapes the precise mode does not catch (documented in docs/guides/gate.md).
@@ -77,6 +92,11 @@ PRECISE_MISSES = {
     "reflect",
     "computed-destructuring",
     "constructor-destructuring",
+    # `constructor` inside `with`: precise mode reports only `.constructor(` and `["constructor"](`
+    "with-constructor",
+    "with-constructor-statement",
+    "with-extends-constructor",
+    "with-constructor-paren-in-string",
 }
 
 
@@ -124,6 +144,47 @@ def test_a_hidden_forbidden_tool_is_denied_by_default() -> None:
         ], code
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        '//x\\\nsecretTool("lc")',
+        '//x\\\r\nsecretTool("crlf")',
+        '//x\\ secretTool("u2028")',
+        '#!x\\\nsecretTool("hb")',
+        'let q = 1 <!--x\\\nsecretTool("html")',
+    ],
+    ids=["lf", "crlf", "u2028", "hashbang", "html"],
+)
+def test_a_backslash_ending_a_comment_line_hides_no_name(code: str) -> None:
+    policy = SourcePolicy(forbidden_globals={"secretTool"})
+    assert [f.rule for f in check_source(code, policy=policy).findings] == [
+        "forbidden-global"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("code", "reported"),
+    [
+        ("class A { constructor(x) { this.x = x } }", False),
+        ("class A {\n  constructor(a, b = [1, 2]) {\n  }\n}", False),
+        ("class A { m() {}\n  // set up the state\n  constructor() {} }", False),
+        ("const o = { constructor(a) { return a } }", False),
+        # not provably a definition: reported (fail closed)
+        ("class A {\n  constructor(x)\n  {}\n}", True),
+        ('class A { constructor(s = ")") {} }', False),  # strings are matched
+        ("class A { constructor(r = /[)]/) {} }", True),  # a regex: not provable
+        ("class A { /* c */ constructor() {} }", True),
+        ("constructor(1)", True),
+        ("x.constructor(1)", True),
+    ],
+)
+def test_only_a_provable_constructor_definition_is_allowed(
+    code: str, reported: bool
+) -> None:
+    findings = check_source(code, policy=SourcePolicy(forbid_function=True)).findings
+    assert bool(findings) == reported, code
+
+
 def test_findings_point_at_the_original_text() -> None:
     result = check_source('let a = 1;\n  globalThis["\\145val"]("1")', policy=POLICY)
     found = {(f.rule, f.line, f.column) for f in result.findings}
@@ -139,9 +200,26 @@ _ORDINARY = (
     "return c.length>0?`n=${c.length}`:/a+b/.test(b)?'s':\"d\"}"
     "const o={k:1,'q':[1,2,3],m(){return this.k/2}};// comment\n"
 )
-# Seconds, for a slow CI runner (a laptop needs 0.1-2.5 s); the quadratic behaviour these inputs
-# used to trigger takes minutes to hours.
-_LIMIT = 8.0
+_MIB = 1024 * 1024
+
+
+@functools.lru_cache(maxsize=None)
+def _baseline(mode: str) -> float:
+    """Seconds to scan 1 MiB of ordinary code in this process, now: the bounds below are
+    multiples of it (with a floor), so a loaded CI runner slows both sides alike. The inputs below
+    used to take minutes to hours (quadratic); linear ones take a small multiple of this."""
+    code = (_ORDINARY * (_MIB // len(_ORDINARY) + 1))[:_MIB]
+    policy = {"no-policy": None, "default": POLICY, "precise": PRECISE}[mode]
+    return min(_timed(code, policy) for _ in range(2))
+
+
+def _bound(mode: str) -> float:
+    # The default scan is a few compiled patterns: tight. The tokenizer modes are pure Python.
+    return (
+        max(2.0, 25 * _baseline(mode))
+        if mode == "default"
+        else max(4.0, 8 * _baseline(mode))
+    )
 
 
 def _timed(code: str, policy: SourcePolicy | None) -> float:
@@ -153,22 +231,29 @@ def _timed(code: str, policy: SourcePolicy | None) -> float:
     return time.perf_counter() - started
 
 
-@pytest.mark.parametrize(
-    "policy",
-    [None, POLICY, PRECISE],
-    ids=["no-policy", "default", "precise"],
-)
+MODES = {"no-policy": None, "default": POLICY, "precise": PRECISE}
+
+
+@pytest.mark.parametrize("mode", sorted(MODES))
 @pytest.mark.parametrize(
     "shape",
     [
         pytest.param("/[" * (8 * 1024), id="unclosed-regex-classes-16k"),
         pytest.param("\\u{" * (700 * 1024), id="unclosed-brace-escapes-2m"),
-        pytest.param("\\u{" + "0" * (2 * 1024 * 1024), id="one-long-brace-escape"),
-        pytest.param("/" * (1024 * 1024), id="slashes-1m"),
-        pytest.param(_ORDINARY * (1024 * 1024 // len(_ORDINARY)), id="ordinary-1m"),
+        pytest.param("\\u{" + "0" * (2 * _MIB), id="one-long-brace-escape"),
+        pytest.param("/" * _MIB, id="slashes-1m"),
+        pytest.param(
+            "//constructor(\n" * (_MIB // 15), id="comment-constructor-lines-1m"
+        ),
+        pytest.param("constructor(" * (_MIB // 12), id="constructor-calls-1m"),
+        pytest.param("constructor(" + "(" * _MIB, id="constructor-deep-parens"),
+        pytest.param("//x\\\n" * (_MIB // 5), id="comment-continuations-1m"),
+        pytest.param("eval;" * (_MIB // 5), id="forbidden-words-1m"),
+        pytest.param(_ORDINARY * (_MIB // len(_ORDINARY)), id="ordinary-1m"),
     ],
 )
-def test_the_scan_is_linear(shape: str, policy: SourcePolicy | None) -> None:
+def test_the_scan_is_linear(shape: str, mode: str) -> None:
+    policy = MODES[mode]
     if policy is not None:
         # Over the default cap the scan is refused at once (below); up to it, it must be fast.
         cap = policy.max_source_bytes
@@ -178,4 +263,5 @@ def test_the_scan_is_linear(shape: str, policy: SourcePolicy | None) -> None:
         started = time.perf_counter()
         assert check_source(over, policy=policy).findings[0].rule == "source-too-large"
         assert time.perf_counter() - started < 0.5
-    assert _timed(shape, policy) < _LIMIT
+    took = _timed(shape, policy)
+    assert took < _bound(mode), (took, _baseline(mode))

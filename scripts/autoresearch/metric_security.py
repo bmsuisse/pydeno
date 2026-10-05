@@ -2340,6 +2340,16 @@ def static_gate_misread_shapes_run_forbidden_code() -> bool:
         'const {["ev" + "al"]: e} = globalThis; globalThis.hit = e("1")',
         'const {constructor: F} = function(){}; globalThis.hit = F("return 1")()',
         "globalThis.hit = \\u{0000000065}val('1')",
+        # a backslash at the end of a comment line is comment text, not a line continuation
+        '//x\\\nglobalThis.hit = eval("1")',
+        '//x\\\r\nglobalThis.hit = eval("1")',
+        '//x\\ globalThis.hit = eval("1")',
+        '#!x\\\nglobalThis.hit = eval("1")',
+        'var q = 1 <!--x\\\nglobalThis.hit = eval("1")',
+        # inside `with (fn)` a bare `constructor` is the Function constructor
+        'with (()=>0) { globalThis.hit = constructor("return 1")() }',
+        "with (()=>0) { class A extends constructor('globalThis.hit = 1') {}; new A() }",
+        'with (()=>0) { globalThis.hit = constructor("1//){")() }',
     )
     probe_code = "typeof hit"
     for code in shapes:

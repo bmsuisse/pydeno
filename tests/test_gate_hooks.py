@@ -835,3 +835,53 @@ def test_sandbox_pool_passes_the_gate_to_its_runtimes() -> None:
             with pytest.raises(GateDenied):
                 rt.eval("'DENY'")
     assert [c.entry_point for _, c in rec.calls] == ["IsolatedRuntime.eval"] * 2
+
+
+# ---------------------------------------------------------------------------
+# review round 3: comment line continuations and `with` + constructor, end to end
+# ---------------------------------------------------------------------------
+
+ROUND3_FEEDS = {
+    "comment-backslash-lf": '//x\\\nsecretTool("lc")',
+    "comment-backslash-crlf": '//x\\\r\nsecretTool("crlf")',
+    "comment-backslash-u2028": '//x\\ secretTool("u2028")',
+    "html-comment-backslash": 'let q = 1 <!--x\\\nsecretTool("html")',
+}
+
+
+@pytest.mark.parametrize("strict_eval", [False, True], ids=["plain", "strict-eval"])
+def test_comment_continuations_are_denied_through_pydeno(strict_eval: bool) -> None:
+    called: list[object] = []
+
+    def secret_tool(*args: object) -> str:
+        called.append(args)
+        return "SECRET"
+
+    with Pydeno(
+        sandbox=MODE, gate=static_gate(STRICT), strict_eval=strict_eval, min_processes=1
+    ) as pool:
+        with pool.checkout() as session:
+            for code in ROUND3_FEEDS.values():
+                with pytest.raises(GateDenied):
+                    session.feed_run(code, external_lookup={"secretTool": secret_tool})
+    assert called == []
+
+
+def test_round3_shapes_are_denied_through_isolated_runtime() -> None:
+    shapes = {
+        "hashbang-backslash": '#!x\\\nglobalThis.hit = eval("1")',
+        "comment-backslash": '//x\\\nglobalThis.hit = eval("1")',
+        "with-constructor": 'with (()=>0) { globalThis.hit = constructor("return 6*7")() }',
+        "with-extends": (
+            "with (()=>0) { class A extends constructor('globalThis.hit = 1') {}; new A() }"
+        ),
+    }
+    with IsolatedRuntime(gate=static_gate(STRICT)) as rt:
+        for code in shapes.values():
+            with pytest.raises(GateDenied):
+                rt.eval(code)
+    with IsolatedRuntime() as rt:  # they do run without the gate
+        for code in shapes.values():
+            rt.eval("globalThis.hit = undefined")
+            rt.eval(code)
+            assert rt.eval("globalThis.hit") is not None
