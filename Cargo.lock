@@ -1437,6 +1437,7 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-build-config 0.25.1",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_bytes",
  "serde_json",
