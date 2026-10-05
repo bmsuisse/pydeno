@@ -108,8 +108,8 @@ gate runs is left exactly as it was.
 
 **The gate threads are shared by the whole process.**
 
-- There are 32 by default; set the number with `pydeno.set_gate_threads(n)` or the
-  `PYDENO_GATE_THREADS` environment variable.
+- There are 32 by default; set the number (1 to 256) with `pydeno.set_gate_threads(n)` or the
+  `PYDENO_GATE_THREADS` environment variable, and read it with `pydeno.gate_threads()`.
 - They are daemon threads: a gate that never returns does not keep the interpreter from exiting.
 - A gate that never returns holds its thread for good. A few slow or hostile gates can therefore
   hold them all, and every later sync gate in any async runtime or session then waits and ends as
@@ -275,6 +275,13 @@ strings, comments, templates and regular expressions, so it reports fewer false 
 - names reached without being written: `Reflect.get(globalThis, k)`, `const {[k]: e} = globalThis`,
   and `const {constructor: F} = function(){}`;
 - a bare `constructor` inside `with (fn) { ... }`, which is the Function constructor there.
+
+Neither mode sees a name assembled at run time, such as `f["constr" + "uctor"]` on an ordinary
+object or `globalThis["ev" + "al"]` without `forbid_computed_global_access`. `strict_eval=True` is
+what stops those: the engine then refuses to compile the string (`EvalError`).
+`tests/test_gate_scanner.py` lists the `constructor` rule's accepted and reported shapes, including
+its false positives: `static` / `get` / `set` / computed members named `constructor`, a brace on the
+next line, and comments or templates around it.
 
 Use the precise mode only where false positives in strings and comments are a real problem, and
 never as the only layer. Without a policy, `check_source(code)` behaves as it always has.

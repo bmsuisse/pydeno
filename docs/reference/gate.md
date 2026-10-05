@@ -25,7 +25,7 @@ is importable from `pydeno`.
 | `static_gate(policy)` | A sync gate that denies on any `check_source(source, policy=policy)` error. |
 | `all_of(*gates)` | Allows when every gate allows. Stops at the first denial, which leads with its own reason and labels, followed by the labels of earlier gates that allowed. Unavailable if any gate is. |
 | `any_of(*gates)` | Allows at the first gate that allows. Otherwise it denies with every reason and label merged, or is unavailable if a gate could not decide. |
-| `set_gate_threads(n)` | How many threads run sync gates for async callers, process-wide (default 32, or `PYDENO_GATE_THREADS`). They are daemon threads; gates that never return can hold them all, and later checks then end as `GateUnavailable`. |
+| `set_gate_threads(n)`, `gate_threads()` | Set or read how many threads run sync gates for async callers, process-wide: 1 to 256 (default 32, or `PYDENO_GATE_THREADS`). They are daemon threads; gates that never return can hold them all, and later checks then end as `GateUnavailable`. |
 | `check_source(code, *, policy=None, ...)` | A `PreflightResult`. With a `policy`, the result holds the policy's findings, each an error. |
 
 `all_of` and `any_of` are async when any gate in them is async.

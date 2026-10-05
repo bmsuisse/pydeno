@@ -371,12 +371,16 @@ def _callable_gate(gate: Any) -> Any:
     return _SourceOnly(gate)
 
 
+#: The most threads `set_gate_threads` (or ``PYDENO_GATE_THREADS``) may ask for.
+MAX_GATE_THREADS = 256
+
+
 def _default_gate_threads() -> int:
     try:
         value = int(os.environ.get("PYDENO_GATE_THREADS", ""))
     except ValueError:
         return 32
-    return value if value > 0 else 32
+    return value if 0 < value <= MAX_GATE_THREADS else 32
 
 
 class _GatePool:
@@ -444,14 +448,14 @@ _GATE_POOL = _GatePool()
 
 
 def set_gate_threads(count: int) -> None:
-    """Set how many threads the process may use to run sync gates for async callers (default 32,
-    or the ``PYDENO_GATE_THREADS`` environment variable). The pool is shared by every async
+    """Set how many threads the process may use to run sync gates for async callers: 1 to 256
+    (default 32, or the ``PYDENO_GATE_THREADS`` environment variable). The pool is shared by every async
     runtime, session and `async_gate_check` in the process. Lowering it lets busy threads finish
     first; a thread held by a gate that never returns is never reclaimed."""
     if isinstance(count, bool) or not isinstance(count, int):
         raise TypeError("set_gate_threads takes an int")
-    if count < 1:
-        raise ValueError("set_gate_threads needs at least 1 thread")
+    if not 1 <= count <= MAX_GATE_THREADS:
+        raise ValueError(f"set_gate_threads takes 1 to {MAX_GATE_THREADS} threads")
     with _GATE_POOL.lock:
         _GATE_POOL.size = count
 

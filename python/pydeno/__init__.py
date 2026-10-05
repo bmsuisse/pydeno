@@ -85,6 +85,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         any_of,
         async_gate_check,
         gate_check,
+        gate_threads,
         set_gate_threads,
         static_gate,
     )
@@ -183,6 +184,7 @@ _LAZY = {
     "any_of": "_gate",
     "async_gate_check": "_gate",
     "gate_check": "_gate",
+    "gate_threads": "_gate",
     "set_gate_threads": "_gate",
     "static_gate": "_gate",
     "Layer": "_status",
@@ -517,6 +519,7 @@ __all__ = [
     "any_of",
     "async_gate_check",
     "gate_check",
+    "gate_threads",
     "set_gate_threads",
     "static_gate",
     "sandbox_status",
