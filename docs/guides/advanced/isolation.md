@@ -105,8 +105,8 @@ Everything else is refused, in one of three ways:
 
 | Call | Answer | Why |
 |---|---|---|
-| Never legitimate in a worker: `ptrace`, `process_vm_*`, `execve`, `fork`, `mount` and the rest of the mount API, `pivot_root`, `chroot`, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `memfd_create`, `keyctl`, kernel modules, `kexec`, `reboot`, `swapon`, `settimeofday`, `sethostname`, ... | the worker is **killed** (`SECCOMP_RET_KILL_PROCESS`) | A process that makes one of these is an exploit probing the kernel, not a runtime on an edge case. Killing it leaves nothing to iterate on. |
-| Any other call not on the list (`socket`, `connect`, `sysinfo`, `setuid`, `inotify_*`, `pkey_alloc`, ...) | `EPERM` | Libraries probe some of these and fall back (V8 asks for memory protection keys on x86_64, name lookups open sockets); a kill would turn a probe into an outage. |
+| Never legitimate in a worker: `ptrace`, `process_vm_*`, `execve`, `mount` and the rest of the mount API, `pivot_root`, `chroot`, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `memfd_create`, `keyctl`, kernel modules, `kexec`, `reboot`, `swapon`, `settimeofday`, `sethostname`, ... | the worker is **killed** (`SECCOMP_RET_KILL_PROCESS`) | A process that makes one of these is an exploit probing the kernel, not a runtime on an edge case. Killing it leaves nothing to iterate on. |
+| Any other call not on the list (`socket`, `connect`, `fork`, `vfork`, non-thread `clone`, `sysinfo`, `setuid`, `inotify_*`, `pkey_alloc`, ...) | `EPERM` | Libraries probe some of these and fall back (V8 asks for memory protection keys on x86_64, name lookups open sockets, CPython's `subprocess` calls `vfork`, which on x86_64 is its own syscall); a kill would turn a probe into an outage. |
 | A syscall newer than the reviewed kernel tables | `ENOSYS` | What runtimes treat as "not on this kernel", which is the truth for a call the filter has never heard of. |
 
 A killed worker is reported as `WorkerCrashed("worker process died: sandbox violation: ...")`,

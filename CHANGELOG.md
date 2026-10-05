@@ -109,10 +109,11 @@ boundary; the sandbox is.
   `fcntl` and `ioctl` are allow-lists of commands too (`ioctl`: `TCGETS`, `TIOCGWINSZ`, `FIONREAD`,
   `FIONBIO`, `FIOCLEX`, `FIONCLEX`). Every other syscall is refused with `EPERM` (the unreviewed
   range keeps `ENOSYS`), except about 60 that no runtime ever makes (`ptrace`, `process_vm_*`,
-  `execve`, `fork`, the mount API, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`,
+  `execve`, the mount API, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`,
   `io_uring_*`, `memfd_create`, the keyring, kernel modules, `kexec`, `reboot`, the clock and the
   host name, ...): those end the worker on the spot (`SECCOMP_RET_KILL_PROCESS`), so a probing
-  exploit gets no answer to iterate on.
+  exploit gets no answer to iterate on. `fork`/`vfork` stay `EPERM`: CPython's `subprocess` calls
+  `vfork`, which on x86_64 is its own syscall (found on a native x86_64 runner).
 - **New error kind `sandbox_violation`** (not retryable). A worker killed by its filter raises
   `WorkerCrashed("worker process died: sandbox violation: ...")` from `IsolatedRuntime` and
   `AsyncIsolatedRuntime`.
