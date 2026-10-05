@@ -28,5 +28,5 @@ async def aclose_quietly(iterator: Any) -> None:
     """Close a cancelled stream source's iterator; its errors are not the caller's."""
     try:
         await iterator.aclose()
-    except Exception:  # noqa: BLE001, S110
+    except BaseException:  # noqa: BLE001, S110 - detached cleanup must not stop its source loop
         pass
