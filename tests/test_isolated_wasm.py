@@ -111,12 +111,24 @@ def test_an_endless_loop_hits_the_timeout() -> None:
 
 
 def test_linear_memory_counts_against_max_memory() -> None:
-    # `max_buffer_bytes` does not see WebAssembly memory; the worker's RSS limit does.
+    """`max_buffer_bytes` does not see WebAssembly memory; the worker's RSS limit does.
+
+    The RSS limit is sampled: while a command runs, and once more as its result arrives. A fill
+    that finishes quickly is normally caught by that last reading, but under load the reading can
+    lag the allocation (the kernel may also hold some of the pages compressed for a while), and
+    the call returns. What the design promises is that a worker over `max_memory` is killed by the
+    next command at the latest, so that is what is pinned: the memory keeps growing for a few
+    calls, and if none of them was killed the next command must be.
+    """
     with _jit(max_memory=256 * MIB) as rt:
         wasm = rt.load_wasm(FILL)
         assert wasm.call("fill", 16) is None  # 1 MiB is fine
         with pytest.raises(WorkerCrashed):
-            wasm.call("fill", 8192)  # 512 MiB is not
+            for step in (1, 2, 3):
+                wasm.call(
+                    "fill", 8192 * step
+                )  # 512 MiB, then 1 GiB, then 1.5 GiB touched
+            rt.eval("1 + 1")  # the next command at the latest
         assert rt.is_closed()
 
 
@@ -222,13 +234,110 @@ def test_a_dropped_module_is_forgotten_by_the_worker() -> None:
         (wid,) = rt._wasm_dropped
         keep = rt.load_wasm(ADD)  # carries the drop
         assert rt._wasm_dropped == [] and keep.call("add", 2, 2) == 4
-        with pytest.raises(RuntimeError, match="unloaded"):
-            rt._request(
-                {
-                    "t": "wasm_call",
-                    "wid": wid,
-                    "name": "add",
-                    "args": _wire.Enc([1, 2]),
-                    "wide": [False, False],
-                }
-            )
+        _assert_forgotten(rt, wid)
+
+
+def _assert_forgotten(rt: IsolatedRuntime, wid: int) -> None:
+    with pytest.raises(RuntimeError, match="unloaded"):
+        rt._request(
+            {
+                "t": "wasm_call",
+                "wid": wid,
+                "name": "add",
+                "args": _wire.Enc([1, 2]),
+                "wide": [False, False],
+            }
+        )
+
+
+class _Interleaved(list[int]):
+    """A drop queue on which, once, a finalizer appends and another thread drains right after the
+    first read: the worst interleaving of two concurrent drains, made deterministic."""
+
+    def __init__(self, items: list[int]) -> None:
+        super().__init__(items)
+        self.other: list[int] | None = None
+
+    def _interleave(self) -> None:
+        if self.other is None:
+            self.other = []
+            self.append(99)
+            self.other.extend(_wasm.drain(self))
+
+    def __getitem__(self, key: Any) -> Any:
+        value = super().__getitem__(key)
+        self._interleave()
+        return value
+
+    def pop(self, index: Any = -1) -> int:
+        value = super().pop(index)
+        self._interleave()
+        return value
+
+
+def test_concurrent_drains_take_each_id_once() -> None:
+    dropped = _Interleaved([1, 2, 3])
+    mine = _wasm.drain(dropped)
+    assert dropped.other is not None
+    assert sorted(mine + dropped.other + list(dropped)) == [1, 2, 3, 99]
+
+
+def test_draining_requeues_the_ids_when_the_request_fails() -> None:
+    dropped = [1, 2]
+    with pytest.raises(OSError), _wasm.draining(dropped) as drop:
+        assert drop == [1, 2] and dropped == []
+        dropped.append(3)  # a finalizer meanwhile
+        raise OSError("not sent")
+    assert sorted(dropped) == [1, 2, 3]
+    with _wasm.draining(dropped) as drop:
+        pass
+    assert sorted(drop) == [1, 2, 3] and dropped == []
+
+
+def test_a_failed_request_keeps_the_dropped_ids_for_the_next_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _jit() as rt:
+        gone = rt.load_wasm(ADD)
+        keep = rt.load_wasm(ADD)
+        del gone
+        gc.collect()
+        (wid,) = rt._wasm_dropped
+
+        def fail(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("failed before sending")
+
+        monkeypatch.setattr(rt, "_request", fail)
+        with pytest.raises(RuntimeError, match="before sending"):
+            keep.call("add", 1, 1)
+        with pytest.raises(RuntimeError, match="before sending"):
+            rt.load_wasm(ADD)
+        assert rt._wasm_dropped == [wid]  # not lost with the failed requests
+        monkeypatch.undo()
+        assert keep.call("add", 2, 2) == 4  # carries the drop
+        assert rt._wasm_dropped == []
+        _assert_forgotten(rt, wid)
+
+
+async def test_async_a_failed_request_keeps_the_dropped_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with await AsyncIsolatedRuntime.create(
+        RuntimeConfig(timeout=5.0), jitless=False
+    ) as rt:
+        gone = await rt.load_wasm(ADD)
+        keep = await rt.load_wasm(ADD)
+        del gone
+        gc.collect()
+        (wid,) = rt._wasm_dropped
+
+        async def fail(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("failed before sending")
+
+        monkeypatch.setattr(rt, "_request", fail)
+        with pytest.raises(RuntimeError, match="before sending"):
+            await keep.call("add", 1, 1)
+        assert rt._wasm_dropped == [wid]
+        monkeypatch.undo()
+        assert await keep.call("add", 2, 2) == 4
+        assert rt._wasm_dropped == []

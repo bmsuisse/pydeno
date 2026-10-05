@@ -24,6 +24,7 @@ CLOSED = "the runtime that created this stream source has been closed"
 _CHILD = r"""
 import asyncio
 import sys
+import time
 
 from pydeno import IsolatedRuntime, Runtime
 
@@ -153,6 +154,35 @@ async def after_close():
         print("AFTER", a.eval("1 + 1"))
 
 
+async def close_while_returning():
+    # `close()` holds the handle's shutdown lock while it waits for the runtime thread; the
+    # runtime thread, converting this host function's result, checks whether the source's
+    # runtime is shut down. That check must not wait for the same lock.
+    rt = Runtime()
+
+    async def it():
+        yield 1
+
+    src = rt.stream_from_async_iterable(it())
+
+    def slow():
+        time.sleep(0.5)  # releases the GIL; close() starts meanwhile
+        return src
+
+    rt.bind_function("slow", slow)
+    task = asyncio.ensure_future(
+        rt.eval_async("(async () => { slow(); return 1; })()")
+    )
+    await asyncio.sleep(0.1)
+    rt.close()
+    print("CLOSED")
+    try:
+        await asyncio.wait_for(task, 5)
+    except BaseException:
+        pass
+    print("DONE")
+
+
 def isolated():
     with IsolatedRuntime() as rt:
         rt.bind_function("add", lambda x, y: x + y)
@@ -171,17 +201,19 @@ elif case == "nested_chunk":
     asyncio.run(nested_chunk())
 elif case == "after_close":
     asyncio.run(after_close())
+elif case == "close_while_returning":
+    asyncio.run(close_while_returning())
 elif case == "isolated":
     isolated()
 """
 
 
-def _child(case: str) -> list[str]:
+def _child(case: str, timeout: float = 60) -> list[str]:
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD, case],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=timeout,
         check=False,
     )
     assert proc.returncode == 0, f"child died ({proc.returncode}): {proc.stderr[-800:]}"
@@ -244,3 +276,15 @@ def test_a_source_from_a_closed_runtime_is_refused() -> None:
 
 def test_isolated_runtime_is_unaffected() -> None:
     assert _child("isolated") == ["ISO 5"]
+
+
+def test_close_while_a_host_function_returns_a_source_does_not_hang() -> None:
+    """`Runtime.close()` racing a host function that returns a stream source.
+
+    The runtime thread checks the source's runtime while converting the return value, and
+    `close()` holds the shutdown lock while it waits for that thread: a blocking check deadlocked
+    the host (the child is then killed by the timeout). The task's own outcome is not pinned,
+    only that `close()` and the task both finish. (A `JsFunction` cannot take this path: it is
+    refused on the runtime thread before its state is checked.)
+    """
+    assert _child("close_while_returning", timeout=30) == ["CLOSED", "DONE"]

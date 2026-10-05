@@ -1687,15 +1687,16 @@ class IsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
-        wid = self._request(
-            {
-                "t": "wasm_load",
-                "bytes": _wire.Enc(data),
-                "timeout": soft,
-                "drop": _wasm.drain(self._wasm_dropped),
-            },
-            soft_timeout=soft,
-        )
+        with _wasm.draining(self._wasm_dropped) as drop:
+            wid = self._request(
+                {
+                    "t": "wasm_load",
+                    "bytes": _wire.Enc(data),
+                    "timeout": soft,
+                    "drop": drop,
+                },
+                soft_timeout=soft,
+            )
         if not _is_token(wid):
             self._kill()
             raise WorkerCrashed("worker returned a malformed module id")
@@ -1706,16 +1707,17 @@ class IsolatedRuntime:
             soft = _limit_seconds("timeout", call_timeout)
             if soft is None:
                 soft = self._soft_timeout
-            message = {
-                "t": "wasm_call",
-                "wid": wid,
-                "name": name,
-                "args": _wire.Enc(values),
-                "wide": wide,
-                "timeout": soft,
-                "drop": _wasm.drain(self._wasm_dropped),
-            }
-            return self._request(message, soft_timeout=soft)
+            with _wasm.draining(self._wasm_dropped) as drop:
+                message = {
+                    "t": "wasm_call",
+                    "wid": wid,
+                    "name": name,
+                    "args": _wire.Enc(values),
+                    "wide": wide,
+                    "timeout": soft,
+                    "drop": drop,
+                }
+                return self._request(message, soft_timeout=soft)
 
         def unload() -> None:
             if not self._closed:

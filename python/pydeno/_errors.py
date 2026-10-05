@@ -151,7 +151,7 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
     "closed": (
         False,
         False,
-        "The runtime, function, stream or session is already closed.",
+        "The runtime, function, stream, module or session is already closed.",
     ),
     "journal_invalid": (
         False,
@@ -235,7 +235,14 @@ _PROTOCOL = re.compile(
 )
 _CLOSED = re.compile(
     r"(?:runtime is closed|Runtime has been closed|Function has been closed"
-    r"|Stream has been closed|the session is closed|the session was closed)"
+    r"|Stream has been closed|the session is closed|the session was closed"
+    r"|the runtime that created this stream source has been closed or terminated"
+    r"|this WebAssembly module was unloaded)"
+)
+# A stream source handed to a runtime other than the one that created it.
+_OTHER_RUNTIME = re.compile(
+    r"this stream source belongs to a different runtime; a stream source can only be passed "
+    r"to the runtime that created it"
 )
 # The worker reports why it would not start (its text, but only ever a refusal: no retry helps).
 _SANDBOX_REFUSED = re.compile(
@@ -352,7 +359,13 @@ _ROWS: list[Row] = [
             and bool(_INFLIGHT.fullmatch(t) or _ABANDONED.fullmatch(t))
         ),
     ),
-    ("invalid_input", lambda e, t, a: isinstance(e, (TypeError, ValueError))),
+    (
+        "invalid_input",
+        lambda e, t, a: (
+            isinstance(e, (TypeError, ValueError))
+            or (isinstance(e, RuntimeError) and bool(_OTHER_RUNTIME.fullmatch(t)))
+        ),
+    ),
 ]
 
 

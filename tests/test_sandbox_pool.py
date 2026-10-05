@@ -48,6 +48,7 @@ def _ready_procs(pool: SandboxPool) -> list[subprocess.Popen[bytes]]:
 
 
 class TestCheckout:
+    @pytest.mark.full_sandbox
     def test_a_checkout_is_a_started_isolated_runtime(self) -> None:
         with SandboxPool(_cfg(), size=2) as pool:
             assert pool.wait_ready(30)

@@ -62,6 +62,13 @@ pub fn record_stack_anchor() {
     STACK_ANCHOR.with(|cell| cell.set(Some(addr)));
 }
 
+/// Whether the current thread is a runtime thread (the anchor is recorded only there). Code that
+/// can run anywhere, such as a finalizer fired by a garbage collection inside a host function,
+/// must not wait for a runtime thread from one.
+pub(crate) fn on_runtime_thread() -> bool {
+    STACK_ANCHOR.with(|cell| cell.get().is_some())
+}
+
 /// Stack bytes used since this thread's anchor (stack grows down), or `None`.
 fn stack_used_since_anchor() -> Option<usize> {
     STACK_ANCHOR.with(|cell| {
