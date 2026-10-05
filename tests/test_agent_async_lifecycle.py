@@ -111,5 +111,31 @@ async def test_cancelling_queued_tool_burst_runs_finalizer_and_reaps_worker():
             while proc.poll() is None or session._core.rt._tasks:
                 await asyncio.sleep(0.01)
 
-        await asyncio.wait_for(cleaned(), 3)
+        try:
+            await asyncio.wait_for(cleaned(), 3)
+        except TimeoutError:
+            details = [
+                (task.done(), [frame.f_code.co_name for frame in task.get_stack()])
+                for task in session._core.rt._tasks
+            ]
+            pytest.fail(
+                f"worker returncode={proc.poll()}, shims={details}, "
+                f"abandoned={len(session._core.abandoned)}"
+            )
         assert session.is_closed()
+
+
+async def test_late_tool_dispatch_after_close_is_refused_without_a_pending_future():
+    from pydeno import WorkerCrashed
+
+    async def tool():
+        return 42
+
+    session = await AsyncAgentSandbox.create({"tool": tool}, timeout=5)
+    await session.close()
+    spent = session._core.calls_made
+    # A shim already scheduled by the runtime can enter after release_calls() has run.
+    with pytest.raises(WorkerCrashed):
+        await asyncio.wait_for(session._core.on_tool_call("tool", []), 0.2)
+    assert not session._core.abandoned
+    assert session._core.calls_made == spent

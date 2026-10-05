@@ -128,6 +128,10 @@ class _Core:
 
     async def on_tool_call(self, name: str, args: list[Any]) -> Any:
         """A bound tool, as the guest sees it (see `_agent._Core.on_tool_call`)."""
+        # A runtime shim can have been scheduled before kill()/release_calls(), but enter
+        # only afterwards. Refuse it before allocating another future nobody can answer.
+        if self.closed:
+            raise WorkerCrashed("the session was closed before the tool call began")
         if self.max_tool_calls is not None and self.calls_made >= self.max_tool_calls:
             raise ToolBudgetError(
                 f"tool call budget exhausted ({self.max_tool_calls} calls); refused {name!r}"
