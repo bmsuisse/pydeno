@@ -71,14 +71,15 @@ def test_a_sandboxed_process_passes_its_self_test_without_making_the_killing_cal
     # `attest()` must not fire execve under the filter (that would kill the worker it checks).
     out = _run(
         """
+        import json
         from pydeno import _sandbox
         _sandbox.harden_process()
-        print(_sandbox.apply(), "|", ",".join(_sandbox.attest()))
+        print(json.dumps([_sandbox.apply(), _sandbox.attest()]))
         """
     )
-    applied, _, breaches = out.partition(" | ")
+    applied, breaches = json.loads(out)
     assert set(applied.split("+")) >= {"landlock", "seccomp"}, out
-    assert breaches == "", out
+    assert breaches == [], out
 
 
 @pytest.mark.full_sandbox

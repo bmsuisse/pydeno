@@ -48,7 +48,7 @@ _handle = _worker._Worker._handle
 
 def handle(self, message):
     code = message.get("code") or ""
-    if message.get("t") == "eval" and code.startswith("__fire__:"):
+    if message.get("t") in ("eval", "eval_async") and code.startswith("__fire__:"):
         nr = int(code.split(":", 1)[1])
         ctypes.set_errno(0)
         args = [ctypes.c_long(0), ctypes.c_long(ctypes.addressof(sink))] + [ctypes.c_long(0)] * 4
