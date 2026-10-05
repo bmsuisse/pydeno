@@ -1,8 +1,9 @@
 """The sandbox checks itself instead of trusting the kernel's "0".
 
-* seccomp: the throwaway child that tests the filter also makes one never-legitimate call and must
-  die of SIGSYS. A filter that installs but does not kill is reported by `attest()`, so
-  `sandbox="require"` refuses it.
+* seccomp: for `sandbox_status()` the throwaway child that tests the filter also makes one
+  never-legitimate call and must die of SIGSYS; a worker start asks the kernel whether the kill
+  action is supported instead (every kill is audited). A kill that is missing or not enforced is
+  reported by `attest()`, so `sandbox="require"` refuses it.
 * Landlock: after `landlock_restrict_self`, a directory that could be opened a moment earlier must
   now be refused with EACCES. A kernel (or a stack in front of it) that accepts the ruleset and does
   not enforce it is therefore not counted as "landlock", and `sandbox="require"` stays honest.
@@ -23,7 +24,7 @@ import pytest
 pytestmark = [pytest.mark.linux_only]
 
 
-def _run(code: str) -> str:
+def _run(code: str, lines: int = 1) -> str:
     done = subprocess.run(
         [sys.executable, "-I", "-c", textwrap.dedent(code)],
         capture_output=True,
@@ -33,7 +34,7 @@ def _run(code: str) -> str:
         start_new_session=True,
     )
     assert done.returncode == 0, done.stderr
-    return done.stdout.strip().splitlines()[-1]
+    return "\n".join(done.stdout.strip().splitlines()[-lines:])
 
 
 @pytest.mark.full_sandbox
@@ -41,10 +42,13 @@ def test_the_kill_action_is_verified_in_a_throwaway_child() -> None:
     out = _run(
         """
         from pydeno import _sandbox
-        print(_sandbox._seccomp_is_safe_here(), _sandbox.SECCOMP_KILL_VERIFIED)
-        """
+        print(_sandbox._seccomp_is_safe_here(verify_kill=True), _sandbox.SECCOMP_KILL)
+        print(_sandbox._seccomp_is_safe_here(), _sandbox.SECCOMP_KILL)
+        """,
+        lines=2,
     )
-    assert out == "True True"
+    # exercised for sandbox_status(); only asked of the kernel at a worker start (no audit record)
+    assert out == "True verified\nTrue available"
 
 
 @pytest.mark.full_sandbox
@@ -57,7 +61,7 @@ def test_a_filter_that_does_not_kill_is_a_breach() -> None:
         _sandbox.harden_process()
         applied = _sandbox.apply()
         assert "seccomp" in applied, applied
-        _sandbox.SECCOMP_KILL_VERIFIED = False
+        _sandbox.SECCOMP_KILL = "not-killed"
         print(",".join(_sandbox.attest()))
         """
     )
@@ -175,7 +179,7 @@ def test_a_thread_bomb_meets_a_kernel_ceiling_where_the_worker_has_its_own_names
         before = resource.getrlimit(resource.RLIMIT_NPROC)
         _sandbox.harden_process()
         _sandbox.apply()
-        threading.stack_size(64 * 1024)
+        threading.stack_size(512 * 1024)
         stop = threading.Event()
         started = 0
         try:

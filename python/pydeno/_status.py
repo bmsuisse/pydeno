@@ -240,12 +240,14 @@ def _confinement_probe() -> dict[str, Any]:
     if sys.platform.startswith("linux"):
         # Asked before `apply()`: the seccomp filter then refuses this very prctl.
         out["nnp_before"] = _libc_prctl_get(39)  # PR_GET_NO_NEW_PRIVS
-    applied = _sandbox.apply()
+    # `verify_kill`: exercise the seccomp kill action in the throwaway child (a worker only asks
+    # the kernel whether it is supported, to keep one audited kill per start out of the logs).
+    applied = _sandbox.apply(verify_kill=True)
     out["applied"] = applied
     out["extras"] = list(_sandbox.EXTRAS)
     out["landlock_abi"] = _sandbox.LANDLOCK_ABI
     out["landlock_note"] = _sandbox.LANDLOCK_NOTE
-    out["seccomp_kill_verified"] = _sandbox.SECCOMP_KILL_VERIFIED
+    out["seccomp_kill"] = _sandbox.SECCOMP_KILL
     out["kernel_caps"] = list(_sandbox.KERNEL_CAPS)
     out["missing"] = sorted(_sandbox.missing_layers(applied))
     if applied != "none" and not out["missing"]:
@@ -468,7 +470,7 @@ def _sandbox_status() -> SandboxStatus:
                 else ""
             ),
         )
-        killed = probe.get("seccomp_kill_verified") is True
+        killed = probe.get("seccomp_kill") == "verified"
         seccomp = probe_layer(
             "seccomp",
             "the allow-list filter survived a throwaway child and installed; a never-legitimate "

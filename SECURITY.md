@@ -163,7 +163,11 @@ open, and what security costs in speed) is in [`docs/security-report.md`](docs/s
   write a file, network, subprocess, environment, `Deno`/Node/browser globals, the runtime's own
   plumbing), through both `eval` and `eval_async`, plus a check that nothing reached the host.
 - `tests/test_redteam_syscalls.py`: assume-breach tests that fire every dangerous syscall from a
-  sandboxed process and require `EPERM`. `scripts/redteam_syscalls.py` sweeps all ~350 syscalls.
+  sandboxed process and require `EPERM`, or the death of the process for the never-legitimate ones
+  (the seccomp filter is an allow-list that kills on those). `tests/test_sandbox_violation.py` does
+  the same from a real worker and checks the parent reports `sandbox_violation`.
+  `scripts/redteam_syscalls.py` sweeps all ~350 syscalls; `scripts/trace_worker_syscalls.py` shows
+  what a real worker calls.
 - `tests/test_sandbox_syscall_tables.py`: every number in the seccomp filter checked against the
   kernel's own tables.
 - `scripts/linux_matrix.sh` and the `linux-matrix` CI job: the same suites in many distro images, on

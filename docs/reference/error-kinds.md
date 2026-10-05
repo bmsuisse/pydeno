@@ -39,7 +39,7 @@ is why it is a separate field and not folded into `retryable`.
 | `js_error` | no | no | `JavaScriptError` (including a host tool's error the guest did not catch, unless it names a `Tool*Error`) | The guest code threw or failed to compile. |
 | `timeout` | no | yes | `RuntimeTimeout`; `TimeoutError` / `asyncio.TimeoutError` | A deadline passed before the work finished. |
 | `cpu_limit` | no | yes | `RuntimeTimeout` carrying the supervisor's CPU-cap message | The worker used more CPU in one command than its cap allows. |
-| `memory_limit` | no | yes | `WorkerCrashed`: `worker used N bytes, over max_memory=M; killed`, or the worker's own memory exit | The worker went over max_memory and was stopped. |
+| `memory_limit` | no | yes | `WorkerCrashed`: `worker used N bytes, over max_memory=M; killed`, the worker's own memory exit, or (Linux) `worker reached its kernel memory ceiling (max_memory=M plus headroom) and was stopped` | The worker went over max_memory and was stopped. |
 | `thread_limit` | no | no | `WorkerCrashed`: `worker started N threads (limit 64); killed` | The worker started more threads than a worker may. |
 | `worker_crashed` | yes | no | any other `WorkerCrashed`: died, killed by a signal, hung, would not start | The worker process died, hung or failed to start. |
 | `checkout_timeout` | yes | no | `CheckoutTimeout` (a `TimeoutError`) from a pool with `max_workers` | A pool with max_workers had no free worker slot within checkout_timeout. |
@@ -54,6 +54,7 @@ is why it is a separate field and not folded into `retryable`.
 | `tool_failed` | no | no | `ToolError`; a `JavaScriptError` that names `ToolError` | A host tool raised an error. |
 | `protocol_violation` | no | no | `WorkerCrashed`: `worker broke protocol`, `malformed frame`, a reused or malformed capability token | The worker sent something the host refuses; it was discarded. |
 | `sandbox_unavailable` | no | no | `WorkerCrashed`: `worker failed to start: an OS sandbox is required but ...`, or a failed startup self-test | The worker refused to start without a complete OS sandbox. |
+| `sandbox_violation` | no | no | `WorkerCrashed`: `worker process died: sandbox violation: the worker made a system call its OS sandbox never allows and was killed (SIGSYS)` (Linux; the seccomp filter killed it for a never-legitimate call, see the [isolation guide](../guides/advanced/isolation.md#the-seccomp-filter-is-an-allow-list)) | The worker made a system call its OS sandbox never allows and was killed. |
 | `limits_unmeasurable` | no | no | `WorkerCrashed`: `max_memory ... cannot be enforced on this system` under `sandbox='require'` | sandbox='require' but the worker's resource usage cannot be read here. |
 | `closed` | no | no | `RuntimeError`: `runtime is closed`, `Runtime/Function/Stream has been closed`, `the session is closed` / `was closed`, `the runtime that created this stream source has been closed or terminated`, `this WebAssembly module was unloaded` (exact phrases only) | The runtime, function, stream, module or session is already closed. |
 | `journal_invalid` | no | no | `JournalError` | An agent journal is malformed, too large or not authentic. |

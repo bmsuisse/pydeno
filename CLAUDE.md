@@ -251,7 +251,11 @@ When adding features, add tests at both layers.
 - `tests/test_isolated_*.py` (behaviour, lifecycle, limits, determinism, fuzz),
   `tests/test_redteam_syscalls.py` (assume-breach: fires dangerous syscalls from a sandboxed process,
   Linux, container only), `tests/test_sandbox_syscall_tables.py` (every seccomp number checked against
-  `tests/data/syscalls.json`, which comes from the kernel's own tables).
+  `tests/data/syscalls.json`, which comes from the kernel's own tables), `tests/test_sandbox_violation.py`
+  (a never-legitimate syscall from a real worker kills it and is reported as `sandbox_violation`).
+- The seccomp filter is an **allow-list** (`_ALLOWED` in `_sandbox.py`; `_KILL` names the calls that kill).
+  A new syscall a worker needs shows up as `EPERM`; find it with `scripts/trace_worker_syscalls.py`
+  (strace, in a container, natively on both x86_64 and aarch64; emulation shows the host's syscalls).
 - Platform-specific tests are **deselected, never skipped** (`tests/conftest.py`; markers `linux_only`,
   `darwin_only`, `full_sandbox`, `redteam`, `as_root`), because CI enforces a zero-skip budget.
   Deliberate expected failures are `xfail`, budgeted separately (`MAX_XFAILED`).
