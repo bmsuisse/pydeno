@@ -93,6 +93,12 @@ jobs:
           "$PY" -m pytest tests/ -v -p no:randomly --strict-markers --strict-config \
             --maxfail=40 -rf --tb=short --junitxml=junit.xml
 
+      - name: Diagnose a worker that does not start (macOS)
+        if: failure() && startsWith(matrix.os, 'macos')
+        shell: bash
+        continue-on-error: true
+        run: .venv/bin/python scripts/diagnose_worker_start.py
+
       - name: Summarise
         if: always()
         shell: bash
