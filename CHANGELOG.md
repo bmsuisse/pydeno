@@ -21,11 +21,21 @@
     slot or journal record. Journal replay (`load_session`, `load_snapshot`, `AgentSandbox.load`) is
     not re-gated.
   - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
-  - **Static policy.** `check_source(source, policy=SourcePolicy(...))` covers forbidden identifiers
-    and globals, `import()`, `eval` (and timers given strings), the `Function` constructor,
-    `WebAssembly` and `max_source_bytes`. It decodes `\u` escapes the way the engine does, and its
-    messages are fixed templates (`POLICY_MESSAGES`, a public contract). `static_gate(policy)` turns
-    a policy into a gate. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
+  - **Signatures checked up front.** A gate may also take only the source (`async def
+    classify(source)`). A gate whose signature fits neither form raises `TypeError` when it is
+    configured or passed to `gate_check`, so a programming error is not mistaken for an outage.
+  - **Static policy.** `check_source(source, policy=SourcePolicy(...))` covers:
+    - forbidden identifiers and globals;
+    - `import()`;
+    - `eval`, and timers given strings;
+    - the `Function` constructor and `WebAssembly`;
+    - `max_source_bytes`;
+    - optionally, computed access on a global (`forbid_computed_global_access`, best effort).
+
+    It decodes `\u` escapes the way the engine does, and its messages are fixed templates
+    (`POLICY_MESSAGES`, a public contract). `Finding.text` is the bare message without a
+    location. `static_gate(policy)` turns a policy into a gate, and `.check(source)` returns its
+    findings. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
     first allow. `check_source(source)` without a policy is unchanged.
   - **Moved class.** `PydenoError` now lives in `pydeno._errors`. It is the same class, still
     exported as `pydeno.PydenoError`.

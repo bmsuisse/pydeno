@@ -7,13 +7,14 @@ is importable from `pydeno`.
 
 | Name | What it is |
 |---|---|
-| `Gate` | `Callable[[str, GateContext], Verdict \| Awaitable[Verdict]]` |
+| `Gate` | `Callable[[str, GateContext], Verdict \| Awaitable[Verdict]]`, or a one-argument `Callable[[str], ...]`; an incompatible signature is a `TypeError` when configured |
 | `Verdict(allow: bool, reason: str, labels: tuple[str, ...] = ())` | A gate's answer (frozen). A denial's first label is its top label. |
 | `GateContext` | Frozen: `language`, `mode`, `entry_point`, `tools`, `source_length` (UTF-8 bytes), `source_sha256` (hex), `specifier`. `GateContext.for_source(source, *, mode="check", entry_point="gate_check", tools=(), specifier=None)` builds one. |
 | `GateDenied(reason, labels=())` | `PydenoError`: the gate refused. `.reason`, `.labels`, `.top_label`. Kind `gate_denied`, not retryable. |
 | `GateUnavailable(reason)` | `PydenoError`: the gate could not decide. `.reason`. Kind `gate_unavailable`, retryable; the run is still blocked. |
 | `SourcePolicy(...)` | The static policy (frozen); see the fields in the [guide](../guides/gate.md#static-policy). |
-| `StaticGate` | What `static_gate(policy)` returns; `.policy`. |
+| `StaticGate` | What `static_gate(policy)` returns: `.policy`, and `.check(source)`, which returns a `PreflightResult` with the findings. |
+| `Finding` | `rule`, `line`, `column`, `severity`, `message`; `.text` is the bare message without a location (the model-facing next step), `.template` is `POLICY_MESSAGES[rule]` (None for rules without a policy template). |
 
 ## Functions
 
@@ -63,5 +64,6 @@ same table is `pydeno.POLICY_MESSAGES`.
 | `forbidden-string-timer` | {name} with a string argument compiles that string, which is not allowed here. Pass a function instead. |
 | `forbidden-function-constructor` | The Function constructor is not allowed here. Write the code directly instead of building it from strings. |
 | `forbidden-webassembly` | WebAssembly is not allowed here. Write the computation in JavaScript. |
+| `forbidden-computed-global-access` | Looking up a global by a computed name is not allowed here. Use the name directly. |
 
 `{size}` is a number, or "more than N" when the text is too large to be worth measuring exactly.

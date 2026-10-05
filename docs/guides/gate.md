@@ -59,7 +59,14 @@ of what was refused and why. What contains code that gets past it is the isolate
 ## The contract
 
 A gate is `gate(source: str, context: GateContext) -> Verdict`, or a coroutine function that returns
-one.
+one. A gate that takes exactly one positional argument, such as `async def classify(source)`, is called
+with the source alone.
+
+The signature is checked when the gate is configured (`gate=`, `all_of` / `any_of`) or passed to
+`gate_check`. It is checked by binding the signature, never by calling the gate. A gate that can take
+neither `(source, context)` nor `(source)` raises `TypeError` there, as a programming error, not as an
+outage. A `TypeError` raised inside the gate's own body still makes the gate unavailable. A callable
+whose signature cannot be read, such as some builtins, is trusted to take `(source, context)`.
 
 - **`Verdict(allow, reason, labels=())`**: `allow` must be a real `bool`. `labels` is a tuple of
   strings, and on a denial the first one is the *top label* (`GateDenied.top_label`).
@@ -177,6 +184,7 @@ process included.
 | `forbid_eval` | `eval`, called or just named (`(0, eval)`); `setTimeout` / `setInterval` with a string |
 | `forbid_function` | the `Function` constructor, by name or as `.constructor(...)` |
 | `forbid_webassembly` | `WebAssembly` |
+| `forbid_computed_global_access` | bracket access with a computed key on a global object or the Function constructor: `globalThis['ev' + 'al']`, `this[k]`, `self[name]`, `f.constructor[k]` (off by default) |
 | `max_source_bytes` | longer code (checked first; nothing else is scanned then) |
 | `include_preflight_rules` | also `check_source`'s usability rules (`require`, `fetch`, ...), off by default under a policy |
 
@@ -196,6 +204,25 @@ exist. Fullwidth letters and zero-width joiners make *different* identifiers in 
 scanner treats them that way too. Without a policy, `check_source(code)` behaves exactly as it always
 has.
 
-A denial from `static_gate` lists up to 20 findings as `line:column [rule] message`, one per line.
-The labels are the rules, in order. The message templates are a public contract (see the
-[gate reference](../reference/gate.md#policy-messages)).
+`forbid_computed_global_access` closes the most common way around a name list:
+`globalThis['ev' + 'al']` is not a name the scanner can read. A literal key such as
+`globalThis['Math']` is allowed, because the other rules read it, and so is `obj[k]` on any other
+object. The check is best effort and a heuristic, not a boundary:
+
+- it does not follow aliases (`const g = globalThis; g[k]`) or parentheses (`(globalThis)[k]`);
+- it reports `this[k]` inside methods too, where `this` is not the global object.
+
+`strict_eval=True` is what stops a computed `eval`.
+
+A denial from `static_gate` lists up to 20 findings as `line:column [rule] message`, one per line,
+for people and logs. Its labels are the rules, in order of first appearance, so `top_label` is the
+rule of the first finding.
+
+**The model-facing text.** Show the author the bare message without the location:
+
+- `POLICY_MESSAGES[rule]` is the clean template for a rule;
+- for the text filled in with its name, `static_gate(policy).check(source)` (or
+  `check_source(source, policy=policy)`) returns each `Finding` with `rule`, `line`, `column`, `text`
+  (the filled-in message, no location) and `template` (`POLICY_MESSAGES[rule]`).
+
+The templates are a public contract (see the [gate reference](../reference/gate.md#policy-messages)).

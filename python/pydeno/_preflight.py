@@ -61,6 +61,18 @@ class Finding:
     column: int  # 1-based
     severity: str = "error"  # "error" | "warning" | "info"
 
+    @property
+    def text(self) -> str:
+        """The bare message, without a location: what to show the author (or a model) as the
+        next step. For a `SourcePolicy` finding it is ``template`` filled in with host-chosen
+        values only."""
+        return self.message
+
+    @property
+    def template(self) -> str | None:
+        """``POLICY_MESSAGES[rule]`` for a `SourcePolicy` finding, else None."""
+        return POLICY_MESSAGES.get(self.rule)
+
 
 @dataclass(frozen=True)
 class PreflightResult:
@@ -104,6 +116,9 @@ POLICY_MESSAGES: dict[str, str] = {
     "forbidden-webassembly": (
         "WebAssembly is not allowed here. Write the computation in JavaScript."
     ),
+    "forbidden-computed-global-access": (
+        "Looking up a global by a computed name is not allowed here. Use the name directly."
+    ),
 }
 
 
@@ -140,6 +155,11 @@ class SourcePolicy:
             ``setTimeout`` / ``setInterval`` called with a string.
         forbid_function: Refuse the ``Function`` constructor, by name or as ``.constructor(...)``.
         forbid_webassembly: Refuse ``WebAssembly``.
+        forbid_computed_global_access: Refuse bracket access with a key that is not a plain
+            literal on a global object or the Function constructor: ``globalThis['ev' + 'al']``,
+            ``this[k]``, ``self[name]``, ``f.constructor[k]``. Best effort (it does not follow
+            aliases such as ``const g = globalThis; g[k]``), and ``this[k]`` inside a method is
+            reported too.
         max_source_bytes: Refuse code longer than this many UTF-8 bytes (checked first; nothing
             else is scanned then).
         include_preflight_rules: Also apply `check_source`'s usability rules (``require``,
@@ -156,6 +176,7 @@ class SourcePolicy:
     forbid_webassembly: bool = False
     max_source_bytes: int | None = None
     include_preflight_rules: bool = False
+    forbid_computed_global_access: bool = False
 
     def __post_init__(self) -> None:
         for name in ("forbidden_identifiers", "forbidden_globals"):
@@ -166,6 +187,7 @@ class SourcePolicy:
             "forbid_function",
             "forbid_webassembly",
             "include_preflight_rules",
+            "forbid_computed_global_access",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"SourcePolicy.{name} must be a bool")
@@ -700,6 +722,42 @@ def check_source(
     )
 
 
+_GLOBAL_BASES = _GLOBALS | {"this"}
+_CONSTRUCTOR_BASES = frozenset({"constructor", "Function"})
+
+
+def _computed_global(
+    toks: list[_Tok], k: int, at: Callable[[int], _Tok | None]
+) -> bool:
+    """`toks[k]` is a `[`: is it a computed key on a global object or the Function constructor?
+
+    The base is the token before the `[` (or before a `?.` in front of it): a global's name
+    (not itself a property, as in `x.self[k]`), or `constructor` / `Function`. The key is fine
+    when it is one plain literal (a string, a template without substitutions, a number)."""
+    base_at = k - 1
+    before = at(base_at)
+    if before is not None and before[0] == _P and before[1] == "?.":
+        base_at -= 1
+    base = at(base_at)
+    if base is None or base[0] != _ID:
+        return False
+    if base[1] in _GLOBAL_BASES:
+        prior = at(base_at - 1)
+        if prior is not None and prior[0] == _P and prior[1] in _ACCESS:
+            return False  # `x.self[k]`: a property that happens to be called `self`
+    elif base[1] not in _CONSTRUCTOR_BASES:
+        return False
+    key, close = at(k + 1), at(k + 2)
+    literal = (
+        key is not None
+        and key[0] in (_STR, _TPL, _NUM)
+        and close is not None
+        and close[0] == _P
+        and close[1] == "]"
+    )
+    return not literal
+
+
 _TIMERS = frozenset({"setTimeout", "setInterval"})
 _TEXT = (_STR, _TPL)
 
@@ -719,6 +777,10 @@ def _apply_policy(
         prev, nxt = at(k - 1), at(k + 1)
         p2 = at(k - 2)
         after_dot = prev is not None and prev[0] == _P and prev[1] in _ACCESS
+        if kind == _P and text == "[":
+            if policy.forbid_computed_global_access and _computed_global(toks, k, at):
+                report("forbidden-computed-global-access", off)
+            continue
         if kind in _TEXT:
             # A computed key, `x["name"]`, read as the engine reads the literal.
             if not (
