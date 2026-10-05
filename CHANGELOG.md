@@ -131,6 +131,16 @@ boundary; the sandbox is.
 
 ### Fixed
 
+- Final integration review: gate pools reset their synchronization before child threads run;
+  module-loader gates restore control-flow exceptions after completing the worker reply.
+  Failed or cancelled Wasm unloads remain retryable.
+- Persistent command-loop cleanup serializes the idle transition with submissions and drains
+  cancellation descendants and old delayed callbacks before the next command.
+- Capped session replay keeps the old worker counted until its process exits. A replacement
+  waits or raises `CheckoutTimeout`; cancellation retains accounting for a still-live process.
+- Release containment tests receive the complete scanner corpus assets. The scanner's absolute
+  speed budget runs on optimized builds; correctness and linearity remain tested in debug too.
+
 - **The synchronous isolated runtimes enforce their limits while a host handler runs** (#84). In
   `IsolatedRuntime`, agent sessions and `Pydeno` feeds, the hard deadline (with its console
   allowance), `max_host_wait` and the CPU cap were checked only after a synchronous `on_console`,
