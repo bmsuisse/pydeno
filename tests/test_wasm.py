@@ -7,6 +7,7 @@ The isolated runtimes are covered in `test_isolated_wasm.py`.
 
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
@@ -302,3 +303,25 @@ def test_the_loader_global_is_fixed_and_hidden(rt: Runtime) -> None:
     assert rt.eval("Object.keys(globalThis).includes('__pydeno_wasm_load')") is False
     assert rt.eval("Object.isFrozen(__pydeno_wasm_load)") is True
     assert rt.load_wasm(ADD).call("add", 1, 2) == 3
+
+
+@pytest.mark.parametrize(
+    "value", [10**100, -(10**100), 2**128 - 2**104 + 1, 1e100, -1e100]
+)
+def test_f32_arguments_outside_the_finite_range_raise(
+    rt: Runtime, value: int | float
+) -> None:
+    wasm = rt.load_wasm(module([("identity", [F32], [F32], b"\x20\x00")]))
+    with pytest.raises(ValueError, match="f32"):
+        wasm.call("identity", value)
+
+
+def test_f32_boundaries_and_explicit_nonfinite_arguments(rt: Runtime) -> None:
+    wasm = rt.load_wasm(module([("identity", [F32], [F32], b"\x20\x00")]))
+    maximum = 2**128 - 2**104
+    for value in (maximum, -maximum, float(maximum), -float(maximum), 0.5, 1e-50):
+        result = wasm.call("identity", value)
+        assert result == (0.0 if value == 1e-50 else value)
+    for value in (math.inf, -math.inf):
+        assert wasm.call("identity", value) == value
+    assert math.isnan(wasm.call("identity", math.nan))

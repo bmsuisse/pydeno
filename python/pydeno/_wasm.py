@@ -15,6 +15,7 @@ Imported by the isolation worker before its sandbox goes up, so only the standar
 
 from __future__ import annotations
 
+import math
 import os
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -43,6 +44,7 @@ _VALUE_TYPES = {0x7F: "i32", 0x7E: "i64", 0x7D: "f32", 0x7C: "f64"}
 _MAX_PARAMS = 1000
 _MAX_RESULTS = 1000
 _INT_RANGES = {"i32": (-(2**31), 2**32), "i64": (-(2**63), 2**64)}
+_F32_MAX = 2**128 - 2**104  # Largest finite IEEE-754 binary32 value, exact as an int.
 
 
 def read_module(module: Any, max_bytes: int) -> bytes:
@@ -222,7 +224,16 @@ def prepare_args(
                     f"{type(value).__name__}"
                 )
             try:
-                out.append(float(value))
+                number = float(value)
+                # float() checks binary64 range. Check binary32 separately before V8 narrows
+                # it, using the original int so rounding cannot hide max-finite + 1.
+                if (
+                    kind == "f32"
+                    and math.isfinite(number)
+                    and not -_F32_MAX <= value <= _F32_MAX
+                ):
+                    raise OverflowError
+                out.append(number)
             except OverflowError:
                 raise ValueError(
                     f"{name}() argument {position}: {value} does not fit an {kind}"
