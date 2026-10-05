@@ -10,6 +10,7 @@ use std::future::Future;
 use tokio::sync::oneshot;
 
 use super::error::runtime_error_with_context;
+use super::utils::attach_unless_exiting;
 
 fn python_future_flag(
     future: &Bound<'_, PyAny>,
@@ -185,7 +186,9 @@ where
             return;
         };
 
-        Python::attach(|py| {
+        // `call_soon_threadsafe` releases and retakes the GIL on this Tokio worker; the
+        // interpreter may be exiting by then (nobody awaits the result at that point).
+        attach_unless_exiting(|py| {
             if let Err(err) =
                 schedule_js_future_result(py, &locals, &py_future, result, handle, error_context)
             {

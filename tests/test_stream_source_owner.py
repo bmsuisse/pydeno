@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -142,6 +143,26 @@ async def nested_chunk():
         print("AFTER", a.eval("1 + 1"))
 
 
+async def nested_chunk_many():
+    # Eight sources left suspended at a refused chunk: closing the runtime cancels each one,
+    # and the interpreter finalizes right after.
+    with Runtime() as a, Runtime() as b:
+        src_b = b.stream_from_async_iterable(gen("b"))
+
+        async def outer():
+            yield src_b
+
+        refused = 0
+        for _ in range(8):
+            src_a = a.stream_from_async_iterable(outer())
+            a.bind_function("give", lambda src_a=src_a: src_a)
+            try:
+                await a.eval_async(READ_GIVEN, timeout=10)
+            except Exception as exc:
+                refused += "different runtime" in str(exc)
+        print("REFUSED", refused)
+
+
 async def after_close():
     with Runtime() as a:
         b = Runtime()
@@ -199,6 +220,8 @@ elif case == "async_setter":
     asyncio.run(async_setter())
 elif case == "nested_chunk":
     asyncio.run(nested_chunk())
+elif case == "nested_chunk_many":
+    asyncio.run(nested_chunk_many())
 elif case == "after_close":
     asyncio.run(after_close())
 elif case == "close_while_returning":
@@ -264,6 +287,39 @@ def test_a_source_from_another_runtime_yielded_as_a_chunk_is_refused() -> None:
     assert len(lines) == 2, lines
     _refused(lines[0], "NESTED")
     assert lines[1] == "AFTER 2"
+
+
+def test_closing_a_runtime_with_suspended_sources_does_not_crash_the_exit() -> None:
+    """`Runtime.close()` cancels the sources it still tracks, then the interpreter exits.
+
+    The cancellation used to run on a Tokio worker, and so does the delivery of an
+    `eval_async` result; either could still be waiting for the GIL when the interpreter
+    finalized. CPython before 3.14 ends such a thread inside the wait, and the process aborted
+    after its output was complete (2-9% of runs on Linux 3.10; this test caught it in 4 of 5
+    runs). The race is timing-dependent, so the scenario runs 40 times; each run must exit
+    cleanly.
+    """
+    cases = ["nested_chunk", "nested_chunk_many"] * 20
+
+    def run(case: str) -> tuple[str, int, str, str]:
+        proc = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", _CHILD, case],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        return case, proc.returncode, proc.stdout, proc.stderr
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(run, cases))
+    failures = [r for r in results if r[1] != 0]
+    assert not failures, (
+        f"{len(failures)} of {len(results)} children died: {failures[0]}"
+    )
+    for case, _, stdout, _ in results:
+        expected = "AFTER 2" if case == "nested_chunk" else "REFUSED 8"
+        assert stdout.strip().splitlines()[-1] == expected, (case, stdout)
 
 
 def test_a_source_from_a_closed_runtime_is_refused() -> None:

@@ -366,6 +366,16 @@ impl PyStreamRegistry {
         Ok(())
     }
 
+    /// Cancel a stream from a thread that holds the GIL, without leaving work for a background
+    /// thread: the iterator's `aclose()` is handed to its own event loop, and nothing of ours
+    /// touches Python afterwards. A Tokio worker that waits for the GIL while the interpreter
+    /// finalizes is ended inside CPython (before 3.14), which aborts the process.
+    pub fn cancel_now(&self, py: Python<'_>, stream_id: u32) {
+        if let Some(entry) = self.remove_entry(stream_id) {
+            entry.cancel_now(py);
+        }
+    }
+
     pub fn release(&self, stream_id: u32) {
         let _ = self.remove_entry(stream_id);
     }
@@ -451,6 +461,51 @@ impl PyStreamEntry {
                 "Python stream errored: {err}"
             ))),
         }
+    }
+
+    /// [`Self::cancel`] for a caller that holds the GIL: `aclose()` is scheduled on the
+    /// iterator's event loop (`call_soon_threadsafe(asyncio.ensure_future, ...)`) instead of
+    /// being awaited here. A closed loop means nobody can run it; the awaitable is closed then.
+    fn cancel_now(&self, py: Python<'_>) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Held only briefly by `ensure_iterator`, which may itself be waiting for the GIL we
+        // hold: never wait for it. A busy lock leaves the iterator to the loop's async
+        // generator hooks.
+        let iterator = match self.iterator.try_lock() {
+            Ok(guard) => guard.as_ref().map(|it| it.clone_ref(py)),
+            Err(_) => None,
+        };
+        let Some(iterator) = iterator else {
+            return;
+        };
+        if let Err(err) = self.schedule_aclose(py, iterator.bind(py)) {
+            log::debug!("PyStream aclose() could not be scheduled: {err}");
+        }
+    }
+
+    /// Plain `&str` names, no `intern!`: this runs inside a stream source's finalizer, which
+    /// can fire while the first `intern!` of the same name is being initialized on this thread
+    /// (pyo3 drops deferred references when it reattaches inside that initialization), and a
+    /// reentrant initialization waits for itself forever.
+    fn schedule_aclose(&self, py: Python<'_>, iterator: &Bound<'_, PyAny>) -> PyResult<()> {
+        let Ok(aclose) = iterator.getattr("aclose") else {
+            return Ok(());
+        };
+        let awaitable = aclose.call0()?;
+        let ensure_future = py.import("asyncio")?.getattr("ensure_future")?;
+        let scheduled = self
+            .task_locals
+            .event_loop(py)
+            .call_method1("call_soon_threadsafe", (ensure_future, &awaitable));
+        if scheduled.is_err() {
+            // Not scheduled: close it so it is not reported as never awaited.
+            if let Ok(close) = awaitable.getattr("close") {
+                let _ = close.call0();
+            }
+        }
+        scheduled.map(drop)
     }
 
     async fn cancel(&self) -> RuntimeResult<()> {

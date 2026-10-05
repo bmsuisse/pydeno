@@ -1812,6 +1812,35 @@ class TestStreaming:
             runtime.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["runtime", "source"])
+    async def test_closing_runs_the_python_streams_aclose_on_its_loop(self, how):
+        """Closing the runtime (or the source) closes a suspended generator on its own loop."""
+        runtime = Runtime()
+        closed = asyncio.Event()
+
+        async def numbers():
+            try:
+                for i in range(1000):
+                    yield i
+            finally:
+                closed.set()
+
+        try:
+            py_stream = runtime.stream_from_async_iterable(numbers())
+            setter = runtime.eval("(stream) => { globalThis.py_numbers = stream; }")
+            setter(py_stream)
+            first = await runtime.eval_async(
+                "(async () => (await py_numbers.getReader().read()).value)()"
+            )
+            assert first == 0
+            assert not closed.is_set()
+            if how == "source":
+                py_stream.close()
+        finally:
+            runtime.close()
+        await asyncio.wait_for(closed.wait(), timeout=2)
+
+    @pytest.mark.asyncio
     async def test_js_stream_cancelled_from_python(self):
         runtime = Runtime()
         try:

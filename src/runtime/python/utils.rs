@@ -1,7 +1,55 @@
-//! Helpers shared by multiple bindings (timeout normalization, finalizers).
+//! Helpers shared by multiple bindings (timeout normalization, finalizers, exit guard).
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Set by the `atexit` hook: background threads stop entering Python from then on.
+static INTERPRETER_EXITING: AtomicBool = AtomicBool::new(false);
+/// Background threads currently inside (or about to enter) [`attach_unless_exiting`].
+static BACKGROUND_ATTACHED: AtomicUsize = AtomicUsize::new(0);
+/// How long the `atexit` hook waits for background threads to leave Python.
+const EXIT_DRAIN_LIMIT: Duration = Duration::from_secs(2);
+
+struct BackgroundAttachGuard;
+
+impl Drop for BackgroundAttachGuard {
+    fn drop(&mut self) {
+        BACKGROUND_ATTACHED.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// `Python::attach` for a thread Python does not know about (a Tokio worker), or `None` once
+/// the interpreter has started to exit.
+///
+/// CPython before 3.14 ends a thread that takes the GIL after finalization began, inside the
+/// GIL wait (`pthread_exit`), and that aborts the process. A call such as
+/// `loop.call_soon_threadsafe` releases and retakes the GIL, so such a thread could be caught
+/// while the main thread finalizes. The `atexit` hook ([`_wait_for_background_attach`]) runs
+/// before finalization: it stops new entries and waits for the ones under way.
+pub(crate) fn attach_unless_exiting<F, R>(f: F) -> Option<R>
+where
+    F: for<'py> FnOnce(Python<'py>) -> R,
+{
+    BACKGROUND_ATTACHED.fetch_add(1, Ordering::SeqCst);
+    let _guard = BackgroundAttachGuard;
+    if INTERPRETER_EXITING.load(Ordering::SeqCst) {
+        return None;
+    }
+    Some(Python::attach(f))
+}
+
+/// Registered with `atexit` at import: see [`attach_unless_exiting`].
+#[pyfunction]
+pub(crate) fn _wait_for_background_attach(py: Python<'_>) {
+    INTERPRETER_EXITING.store(true, Ordering::SeqCst);
+    py.detach(|| {
+        let deadline = Instant::now() + EXIT_DRAIN_LIMIT;
+        while BACKGROUND_ATTACHED.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+}
 
 pub(crate) fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
     if !seconds.is_finite() {
