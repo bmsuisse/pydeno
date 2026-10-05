@@ -1202,7 +1202,10 @@ def harden_process() -> dict[str, object]:
     read the host's, and no privileges."""
     os.environ["TZ"] = "UTC"
     os.environ["LANG"] = "C.UTF-8"
-    time.tzset()
+    # Some CPython builds have no `time.tzset` (the x86_64 macOS builds made by cross-compiling: the
+    # configure check for a working tzset cannot run); the C library reads TZ on first use anyway.
+    if hasattr(time, "tzset"):
+        time.tzset()
     # No core dumps (they would hold guest data); files capped at 1 MiB (the worker's stderr is
     # a file); a small descriptor table (the worker needs a few dozen, a hostile one should not
     # be able to hold thousands); nothing pinned in memory; no POSIX message queues.
