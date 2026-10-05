@@ -786,41 +786,153 @@ async def _settle() -> None:
     gc.collect()
 
 
-class TestScaling:
-    async def test_the_loop_never_stalls(self) -> None:
-        """A 1 ms heartbeat must never be more than 100 ms late while 16 runtimes are created,
-        driven (with a host call per evaluation) and closed."""
+class _Heartbeat:
+    """A 1 ms heartbeat on the running loop: how late each beat woke up."""
+
+    def __init__(self) -> None:
+        self.lags: list[float] = []
+        self._stop = False
+        self._task: asyncio.Future[None] | None = None
+
+    async def __aenter__(self) -> _Heartbeat:
+        self._task = asyncio.ensure_future(self._run())
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._stop = True
+        assert self._task is not None
+        await self._task
+
+    async def _run(self) -> None:
         loop = asyncio.get_running_loop()
-        lags: list[float] = []
-        stop = False
+        while not self._stop:
+            due = loop.time() + 0.001
+            await asyncio.sleep(0.001)
+            self.lags.append(loop.time() - due)
 
-        async def heartbeat() -> None:
-            while not stop:
-                due = loop.time() + 0.001
-                await asyncio.sleep(0.001)
-                lags.append(loop.time() - due)
+    def p99(self) -> float:
+        ordered = sorted(self.lags)
+        return ordered[int(len(ordered) * 0.99)] if ordered else 0.0
 
-        beat = asyncio.ensure_future(heartbeat())
-        runtimes = await asyncio.gather(*(_rt(timeout=30.0) for _ in range(16)))
-        await asyncio.gather(
-            *(rt.bind_function("echo", lambda v: v) for rt in runtimes)
+    def worst(self) -> float:
+        return max(self.lags, default=0.0)
+
+
+_BURN = (
+    "import time\nt = time.process_time()\nwhile time.process_time() - t < 0.06: pass"
+)
+
+
+async def _cpu_burst(n: int) -> None:
+    """No pydeno: `n` plain child processes, each burning about as much CPU as a worker start-up,
+    started from a thread pool (as worker start-ups are) and polled from the loop."""
+    loop = asyncio.get_running_loop()
+
+    def spawn() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(  # noqa: S603 - fixed argv
+            [sys.executable, "-S", "-c", _BURN], stdin=subprocess.DEVNULL
         )
 
-        async def drive(rt: AsyncIsolatedRuntime) -> None:
-            for i in range(30):
-                assert await rt.eval(f"echo({i}) + 1") == i + 1
+    procs = await asyncio.gather(*(loop.run_in_executor(None, spawn) for _ in range(n)))
+    while any(p.poll() is None for p in procs):
+        await asyncio.sleep(0.005)
 
-        await asyncio.gather(*(drive(rt) for rt in runtimes))
-        await asyncio.gather(*(rt.close() for rt in runtimes))
-        stop = True
-        await beat
-        # A blocked loop shows as a long stall (or many late beats); a CPU-starved CI runner shows as
-        # a rare spike (a debug build on a small machine measured 0.56 s once), so: the 99th
-        # percentile is under 100 ms and nothing is later than a second.
-        ordered = sorted(lags)
-        p99 = ordered[int(len(ordered) * 0.99)]
-        assert p99 < 0.1, f"99th percentile loop stall {p99 * 1000:.1f} ms"
-        assert ordered[-1] < 1.0, f"worst loop stall {ordered[-1] * 1000:.1f} ms"
+
+class TestScaling:
+    async def test_the_loop_never_stalls(self) -> None:
+        """A 1 ms heartbeat stays on time while 16 runtimes are created, driven (with a host call
+        per evaluation) and closed: 99th percentile under 100 ms, nothing later than a second.
+
+        Those bounds are absolute on a machine that has CPU to spare. On one that does not (a
+        small CI runner, a debug build, a loaded host), any burst of process start-ups delays the
+        loop, pydeno or not: measured on Linux containers with a 2-CPU quota, 16 plain processes
+        burning 60 ms of CPU each cost the loop as much as 16 worker start-ups do (#83). So the
+        same heartbeat first measures such a burst, without pydeno, and a bound only grows past
+        its absolute value when that control itself was at least half as late."""
+        async with _Heartbeat() as control:
+            await _cpu_burst(16)
+
+        async with _Heartbeat() as beat:
+            runtimes = await asyncio.gather(*(_rt(timeout=30.0) for _ in range(16)))
+            await asyncio.gather(
+                *(rt.bind_function("echo", lambda v: v) for rt in runtimes)
+            )
+
+            async def drive(rt: AsyncIsolatedRuntime) -> None:
+                for i in range(30):
+                    assert await rt.eval(f"echo({i}) + 1") == i + 1
+
+            await asyncio.gather(*(drive(rt) for rt in runtimes))
+            await asyncio.gather(*(rt.close() for rt in runtimes))
+
+        measured = (
+            f"pydeno: p99 {beat.p99() * 1000:.1f} ms, worst {beat.worst() * 1000:.1f} ms; "
+            f"control burst: p99 {control.p99() * 1000:.1f} ms, "
+            f"worst {control.worst() * 1000:.1f} ms"
+        )
+        assert beat.p99() < max(0.1, 2 * control.p99()), measured
+        assert beat.worst() < max(1.0, 2 * control.worst()), measured
+
+    async def test_nothing_blocking_runs_on_the_loop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deterministic half of the test above (#83): during bursts of creations, host
+        calls, closes, timeouts, crashes and pool checkouts, the blocking operations (process
+        spawn, blocking waits, resource reads, stderr reads, sleeps) all run off the loop thread.
+        A regression that moved one onto the loop would stall it on every machine, however fast."""
+        from pydeno import AsyncSandboxPool
+
+        loop_thread = threading.get_ident()
+        on_loop: list[str] = []
+        off_loop: list[str] = []
+
+        def guard(owner: Any, name: str) -> None:
+            original = getattr(owner, name)
+
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                where = on_loop if threading.get_ident() == loop_thread else off_loop
+                where.append(name)
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(owner, name, wrapper)
+
+        guard(subprocess.Popen, "__init__")
+        guard(subprocess.Popen, "wait")
+        guard(subprocess.Popen, "communicate")
+        guard(_sandbox, "usage")
+        guard(_aio, "_stderr_tail")
+        guard(time, "sleep")
+
+        async def lifecycle(i: int) -> None:
+            rt = await _rt(timeout=0.3 if i % 4 == 1 else 30.0)
+            try:
+                await rt.bind_function("echo", lambda v: v)
+                assert await rt.eval("echo(1) + 1") == 2
+                if i % 4 == 1:  # timed out: the worker is killed
+                    with pytest.raises(RuntimeTimeout):
+                        await rt.eval("while (true) {}")
+                elif i % 4 == 2:  # crashed under it
+                    os.kill(rt._proc.pid, 9)  # noqa: SLF001 - our own worker
+                    with pytest.raises(WorkerCrashed):
+                        await rt.eval("1")
+            finally:
+                await rt.close()
+
+        await asyncio.gather(*(lifecycle(i) for i in range(12)))
+        async with AsyncSandboxPool(RuntimeConfig(timeout=5.0), size=2) as pool:
+
+            async def checkout() -> None:
+                async with pool.checkout() as rt:
+                    assert await rt.eval("2 * 21") == 42
+
+            await asyncio.gather(*(checkout() for _ in range(6)))  # mostly cold starts
+        await _settle()
+
+        assert not on_loop, f"blocking calls on the event loop thread: {on_loop}"
+        # Not vacuous: the guarded operations did happen, on other threads.
+        assert off_loop.count("__init__") >= 12, off_loop
+        assert "usage" in off_loop, off_loop
 
     async def test_fifty_runtimes_add_almost_no_threads(self) -> None:
         async with await _rt() as warm:  # the shared pools exist from here on

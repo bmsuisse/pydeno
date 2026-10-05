@@ -136,10 +136,31 @@ Two places where this class is *stricter* than `IsolatedRuntime`:
   ~3-4 ms at 32 busy sessions, ~10-20 ms at 64 (an idle asyncio process next to 64 unrelated
   CPU-bound processes shows 10-16 ms on the same machine). The thread-based path measured 116-335 ms
   for the same scenarios. See `benches_py/async_core_bench.py`.
-- **`fork` holds the GIL.** Starting a worker forks the parent, and CPython holds the GIL across
-  `fork()`; each spawn can delay the loop by a few milliseconds. Start-ups are limited per loop
-  (`cpu_count // 2` in flight) so a burst of creations stays near that, and the prewarmed spare
-  (shared with `IsolatedRuntime`) takes one spawn off the critical path.
+- **Spawning can hold the GIL briefly.** Workers are started on a thread, but CPython holds the
+  GIL across `fork()`, and on Python 3.10 and 3.11.0 to 3.11.5 also while a `vfork()`ed child
+  execs. Each spawn can delay the loop by a few milliseconds. On Linux, with the parent and two
+  CPU hogs pinned to one CPU, 40 spawns measured 5 to 15 ms worst heartbeat lag on 3.10, the same
+  as with plain `fork()`. Start-ups are limited per loop (`os.cpu_count() // 2` in flight, which
+  counts the machine's CPUs, not a container's CPU quota). The prewarmed spare (shared with
+  `IsolatedRuntime`) takes one spawn off the critical path.
+- **Bursts on a small or busy machine are as slow as the CPU allows.** A worker start-up costs
+  about 55 ms of CPU, and a shutdown costs CPU too. Starting or stopping 16 to 64 at once on 2
+  CPUs keeps the loop thread waiting for a CPU, as any burst of process start-ups would. This was
+  measured with `benches_py/loop_stall_bench.py` (#83) in Linux aarch64 containers with
+  `--cpus 2` and `--cpus 4` on a busy 4-vCPU VM, Python 3.10 and 3.14. The bursts were creating,
+  closing, timing out and crashing runtimes, `AsyncSandboxPool` cold checkouts and `AsyncPydeno`
+  sessions. Over 262 bursts, the heartbeat's p99 was 2 to 190 ms and the worst beat 3 ms to
+  1.1 s. With nothing running, the same loop measured p99 2 to 15 ms and worst 7 to 33 ms. The
+  same runs' no-pydeno control was 16 to 64 plain processes burning 0.1 s of CPU each. It measured
+  p99 6 ms to 1.6 s and worst 33 ms to 5.3 s. In beats later than 20 ms, the loop thread spent a
+  median 65% of the lost time runnable but without a CPU (its run-queue wait) and 8% on average
+  running Python. The rest was GIL waits or time the hypervisor took. Stack samples taken during
+  those beats were 80 to 90% in the selector's `select()`, and no pydeno function recurred.
+  0.8.0 and 0.9.0 measured the same. Nothing blocking runs on the
+  loop: `tests/test_aio_isolated_runtime.py` checks that spawns, blocking waits, resource reads,
+  stderr reads and sleeps all happen on other threads. If a latency budget matters, keep a pool
+  warm (`AsyncSandboxPool` / `AsyncPydeno`) so that bursts are checkouts and not start-ups, and
+  give the process the CPUs that its bursts need.
 - **Encoding a multi-MiB value holds the GIL.** Frames over 64 KiB are encoded/decoded on a thread,
   but the native codec holds the GIL while it builds Python objects (decoding) or serialises them
   (encoding, ~8 ms per MiB of string), so a 16 MiB `eval` source still costs the loop that long.
