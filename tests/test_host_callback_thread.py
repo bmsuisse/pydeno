@@ -78,10 +78,37 @@ elif case == "reenter_caught_by_guest":
         rt.bind_function("inner", lambda: rt.eval("1"))
         print("RESULT", rt.eval("try { inner(); 'no error' } catch (e) { e.name }"))
         print("AFTER", rt.eval("1 + 1"))
+elif case in ("guest_text_eval", "guest_text_jsfn_call", "guest_text_jsfn_return"):
+    with Runtime() as rt:
+        fn = rt.eval("(x) => x + 1")
+        tool = {
+            "guest_text_eval": lambda: rt.eval("1"),
+            "guest_text_jsfn_call": lambda: fn(1),
+            "guest_text_jsfn_return": lambda: fn,
+        }[case]
+        rt.bind_function("inner", tool)
+        text = rt.eval(
+            "try { String(inner()) } catch (e) { e.name + ': ' + e.message + '\\n' + e.stack }"
+        )
+        print("RESULT", repr(text))
+        print("AFTER", rt.eval("1 + 1"))
 elif case == "stream_sync_tool":
     asyncio.run(stream_case(False))
 elif case == "stream_async_tool":
     asyncio.run(stream_case(True))
+elif case == "stream_fresh_unreferenced":
+    async def fresh():
+        with Runtime() as rt:
+            async def give():
+                # Nothing keeps this source alive once it is returned.
+                return rt.stream_from_async_iterable(gen())
+            rt.bind_function("give", give)
+            try:
+                print("RESULT", await rt.eval_async(READ_ALL, timeout=10))
+            except Exception as exc:
+                print("ERROR", type(exc).__name__, exc)
+            print("AFTER", rt.eval("1 + 1"))
+    asyncio.run(fresh())
 """
 
 
@@ -110,7 +137,31 @@ def test_the_guest_can_catch_the_reentry_error() -> None:
     assert lines == ["RESULT RuntimeError", "AFTER 2"]
 
 
+@pytest.mark.parametrize(
+    "case", ["guest_text_eval", "guest_text_jsfn_call", "guest_text_jsfn_return"]
+)
+def test_the_guest_error_text_names_no_rust_internals(case: str) -> None:
+    """The panic text (Rust type paths, the failed assertion) goes to the log, not the guest."""
+    lines = _child(case)
+    assert lines[-1] == "AFTER 2"
+    text = lines[0]
+    assert "RuntimeError: this object cannot be used from the runtime thread" in text
+    for internal in ("_pydeno::", "left == right", "unsendable", "ThreadId"):
+        assert internal not in text, text
+
+
 @pytest.mark.parametrize("case", ["stream_sync_tool", "stream_async_tool"])
 def test_a_host_function_can_return_a_stream_source(case: str) -> None:
     lines = _child(case)
     assert lines == ["RESULT [0, 1, 2]", "AFTER 2"]
+
+
+def test_a_stream_source_nobody_keeps_is_gone_before_the_guest_reads_it() -> None:
+    """Pins current behaviour: the source's finalizer cancels the stream once the host drops its
+    last reference, so a source created inside the tool and returned without being kept is gone
+    by the time the guest reads it. The documented rule is to keep a reference until the guest is
+    done. This must stay an error, never an abort."""
+    lines = _child("stream_fresh_unreferenced")
+    assert lines[0].startswith("ERROR JavaScriptError"), lines
+    assert "Unknown Python stream id" in lines[0]
+    assert lines[-1] == "AFTER 2"

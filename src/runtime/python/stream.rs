@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio as pyo3_tokio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::error::{context, runtime_error_to_py};
 use super::utils::attach_finalizer;
@@ -164,7 +164,12 @@ impl PyStreamSource {
         if self.closed.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("Stream has been closed"));
         }
-        if self.handle.lock().unwrap().is_none() {
+        if self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+        {
             return Err(PyRuntimeError::new_err("Runtime has been shut down"));
         }
         Ok(self.stream_id)
@@ -178,7 +183,13 @@ impl PyStreamSource {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Some(handle) = self.handle.lock().unwrap().take() {
+        // Take the handle out first so the lock is not held while cancelling.
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
             handle.cancel_py_stream_async(self.stream_id);
         }
     }
