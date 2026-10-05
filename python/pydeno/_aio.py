@@ -686,7 +686,8 @@ class AsyncIsolatedRuntime:
             gate, gate_timeout, who="AsyncIsolatedRuntime", sync_only=False
         )
         self._bound_names: list[str] = []
-        self._gate_refusal: BaseException | None = None
+        self._current_cmd: int | None = None
+        self._gate_refusals: dict[int, BaseException] = {}
         clock_ms = _clock_ms(clock)
         if random_seed is not None and (
             isinstance(random_seed, bool)
@@ -1405,7 +1406,14 @@ class AsyncIsolatedRuntime:
                     raise WorkerCrashed(
                         await self._describe_death("worker is gone")
                     ) from None
-                return await self._pump(cmd_id, pump)
+                self._current_cmd = cmd_id
+                try:
+                    result = await self._pump(cmd_id, pump)
+                except Exception:
+                    self._raise_refusal(cmd_id)
+                    raise
+                self._raise_refusal(cmd_id)
+                return result
             except asyncio.CancelledError:
                 # The worker is mid-command and nothing can interrupt V8 from here; a worker left
                 # to finish would hand its answer to the next command. Kill it.
@@ -1414,6 +1422,8 @@ class AsyncIsolatedRuntime:
                 )
                 raise
             finally:
+                self._current_cmd = None
+                self._gate_refusals.pop(cmd_id, None)
                 self._end()
         finally:
             self._lock.release()
@@ -1638,16 +1648,18 @@ class AsyncIsolatedRuntime:
         """The exact source the gate allowed (`code` itself without a gate)."""
         if self._gate is None:
             return code
-        self._gate_refusal = None
+        self._check_usable()  # a closed runtime does not pay for a gate
         return await self._gate.acheck(code, mode, tuple(self._bound_names), specifier)
 
-    def _loader_refusal(self, exc: BaseException) -> None:
-        refusal, self._gate_refusal = self._gate_refusal, None
-        if refusal is not None:
-            raise refusal from exc
+    def _record_refusal(self, command: int | None, exc: BaseException) -> None:
+        """As `IsolatedRuntime._record_refusal`: only the command that imported raises it."""
+        if command is not None and command == self._current_cmd:
+            self._gate_refusals.setdefault(command, exc)
 
-    def _record_refusal(self, exc: BaseException) -> None:
-        self._gate_refusal = exc
+    def _raise_refusal(self, command: int) -> None:
+        refusal = self._gate_refusals.pop(command, None)
+        if refusal is not None:
+            raise refusal
 
     async def eval(
         self, code: str, *, timeout: float | int | timedelta | None = None
@@ -1658,13 +1670,9 @@ class AsyncIsolatedRuntime:
         if soft is None:
             soft = self._soft_timeout
         code = await self._gated(code, "eval")
-        try:
-            return await self._request(
-                {"t": "eval_async", "code": code, "timeout": soft}, soft_timeout=soft
-            )
-        except Exception as exc:
-            self._loader_refusal(exc)
-            raise
+        return await self._request(
+            {"t": "eval_async", "code": code, "timeout": soft}, soft_timeout=soft
+        )
 
     eval_async = eval
 
@@ -1675,15 +1683,10 @@ class AsyncIsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
-        self._gate_refusal = None
-        try:
-            return await self._request(
-                {"t": "eval_module_async", "specifier": specifier, "timeout": soft},
-                soft_timeout=soft,
-            )
-        except Exception as exc:
-            self._loader_refusal(exc)
-            raise
+        return await self._request(
+            {"t": "eval_module_async", "specifier": specifier, "timeout": soft},
+            soft_timeout=soft,
+        )
 
     eval_module_async = eval_module
 
@@ -1851,6 +1854,7 @@ class AsyncIsolatedRuntime:
                 self._gate,
                 loader,
                 lambda: tuple(self._bound_names),
+                lambda: self._current_cmd,
                 self._record_refusal,
             )
         hid = next(self._hids)

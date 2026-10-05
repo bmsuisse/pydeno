@@ -29,10 +29,12 @@ Rules and severities:
 
 **A `SourcePolicy`** (``check_source(code, policy=...)``) replaces those rules with the host's own:
 forbidden identifiers and globals, flags against `import()`, `eval`, the `Function` constructor
-and `WebAssembly`, and a size cap. In that mode the scanner also reads identifiers and string keys
-the way the engine does (``\\u0065val`` is ``eval``, and so is ``globalThis["\\x65val"]``) and
-treats every Unicode space as a space. It is still a heuristic (it cannot see a name built at run
-time), so it errs towards reporting: a local variable or an object key with a forbidden name is a
+and `WebAssembly`, and a size cap (1 MiB by default). By default that scan fails closed: it
+decodes every escape wherever it appears and reads the whole text, comments and strings included,
+so it does not depend on telling a regex from a division (`_scan_text`); the opt-in precise mode
+(``ignore_strings_and_comments=True``) uses the tokenizer below and has known bypasses. Both run in
+linear time. It is still a heuristic (it cannot see a name built at run time), so it errs towards
+reporting: a local variable, an object key or a word in a comment with a forbidden name is a
 finding. Every policy finding's message is a fixed template from `POLICY_MESSAGES`, filled only
 with host-chosen names and numbers, never with text from the code: that wording is a public
 contract.
@@ -40,6 +42,7 @@ contract.
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -123,6 +126,8 @@ POLICY_MESSAGES: dict[str, str] = {
 
 
 _EXACT_SIZE_UP_TO = 16 * 1024 * 1024
+#: `SourcePolicy.max_source_bytes`' default.
+DEFAULT_POLICY_MAX_SOURCE_BYTES = 1024 * 1024
 
 
 def _names(field_name: str, value: object) -> frozenset[str]:
@@ -145,25 +150,40 @@ def _names(field_name: str, value: object) -> frozenset[str]:
 class SourcePolicy:
     """What `check_source(code, policy=...)` and `static_gate(policy)` refuse.
 
+    **Two modes.** By default the scan fails closed: it decodes every escape (``\\u``,
+    ``\\u{...}``, ``\\x``, legacy octal, identity escapes, line continuations) wherever it
+    appears and reads the *whole* text, comments, strings, templates and regular expressions
+    included, so a name is found however the code hides it from a tokenizer; it reports names
+    in strings and comments too. ``ignore_strings_and_comments=True`` selects the precise mode:
+    a tokenizer that skips strings and comments, with fewer false positives but known bypasses
+    (see ``docs/guides/gate.md``). Neither is a parser; both are heuristics.
+
     Args:
-        forbidden_identifiers: Names refused wherever they appear as an identifier, a property
-            (``x.name``) or a string key (``x["name"]``).
-        forbidden_globals: Names refused as a bare identifier or as a property of a global object
-            (``globalThis.name``, ``self["name"]``); ``x.name`` on another object is allowed.
-        forbid_dynamic_import: Refuse ``import(...)``.
+        forbidden_identifiers: Names refused wherever they appear (as an identifier, a property
+            ``x.name`` or a string key ``x["name"]``; by default in any text).
+        forbidden_globals: Names refused as globals. By default any occurrence (an alias such as
+            ``g.name`` may be the global); in precise mode only bare or on a global object
+            (``globalThis.name``, ``self["name"]``).
+        forbid_dynamic_import: Refuse ``import(...)`` (``import`` followed by anything but what
+            a static ``import`` or ``import.meta`` starts with).
         forbid_eval: Refuse ``eval`` (called or merely named, as in ``(0, eval)``) and
-            ``setTimeout`` / ``setInterval`` called with a string.
-        forbid_function: Refuse the ``Function`` constructor, by name or as ``.constructor(...)``.
+            ``setTimeout`` / ``setInterval`` called with a string literal.
+        forbid_function: Refuse the ``Function`` constructor: the name ``Function``, and
+            ``constructor`` anywhere but a class's own ``constructor(...)`` method definition
+            (precise mode: ``.constructor(...)`` and ``["constructor"](...)`` only).
         forbid_webassembly: Refuse ``WebAssembly``.
-        forbid_computed_global_access: Refuse bracket access with a key that is not a plain
-            literal on a global object or the Function constructor: ``globalThis['ev' + 'al']``,
-            ``this[k]``, ``self[name]``, ``f.constructor[k]``. Best effort (it does not follow
-            aliases such as ``const g = globalThis; g[k]``), and ``this[k]`` inside a method is
-            reported too.
+        forbid_computed_global_access: Refuse reaching a global by a computed name. By default:
+            ``globalThis``, ``self``, ``window``, ``global`` or ``this`` used other than as
+            ``name.property`` (``globalThis[k]``, ``= globalThis``, ``f(this)``, ``...self``),
+            ``Reflect``, and ``constructor[`` / ``Function[``. Precise mode: only bracket access
+            with a non-literal key. Best effort either way (an alias made elsewhere is not
+            followed), and ``this`` in methods is reported too. Off by default.
         max_source_bytes: Refuse code longer than this many UTF-8 bytes (checked first; nothing
-            else is scanned then).
+            else is scanned then). Default 1 MiB, so a scan stays well inside a gate's default
+            timeout; ``None`` removes the cap.
         include_preflight_rules: Also apply `check_source`'s usability rules (``require``,
             ``fetch``, static ``import``, ...), which are off under a policy by default.
+        ignore_strings_and_comments: The precise, tokenizer-based mode (opt-in, best effort).
 
     Heuristic, never the boundary: pair it with ``strict_eval=True`` and the isolated worker.
     """
@@ -174,9 +194,10 @@ class SourcePolicy:
     forbid_eval: bool = False
     forbid_function: bool = False
     forbid_webassembly: bool = False
-    max_source_bytes: int | None = None
+    max_source_bytes: int | None = DEFAULT_POLICY_MAX_SOURCE_BYTES
     include_preflight_rules: bool = False
     forbid_computed_global_access: bool = False
+    ignore_strings_and_comments: bool = False
 
     def __post_init__(self) -> None:
         for name in ("forbidden_identifiers", "forbidden_globals"):
@@ -188,6 +209,7 @@ class SourcePolicy:
             "forbid_webassembly",
             "include_preflight_rules",
             "forbid_computed_global_access",
+            "ignore_strings_and_comments",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"SourcePolicy.{name} must be a bool")
@@ -221,6 +243,7 @@ def _is_id_char(ch: str) -> bool:
 
 
 _HEX = frozenset("0123456789abcdefABCDEF")
+_MAX_BRACE_DIGITS = 8
 _SIMPLE_ESCAPES = {
     "n": "\n",
     "r": "\r",
@@ -237,7 +260,8 @@ def _unicode_escape(src: str, j: int) -> tuple[str | None, int]:
     """A backslash-u escape (four hex digits, or hex digits in braces) starting at `j`:
     (the character, the index after it), or (None, j) when there is none."""
     if src.startswith("\\u{", j):
-        end = src.find("}", j + 3)
+        # Bounded: an unclosed `\u{` must not make every escape scan to the end of the text.
+        end = src.find("}", j + 3, j + 3 + _MAX_BRACE_DIGITS + 1)
         digits = src[j + 3 : end] if end > 0 else ""
         if digits and len(digits) <= 8 and all(c in _HEX for c in digits):
             value = int(digits, 16)
@@ -295,6 +319,7 @@ def _tokenize(src: str, policy: bool = False) -> list[_Tok]:
     # Policy only: whether each open `(` heads a control statement (`if (...)`), and the offsets
     # of the `}` / `)` tokens after which a `/` is division / starts a regex despite the default.
     parens: list[bool] = []
+    no_regex_before = 0
     closes_expression: set[int] = set()
     closes_control: set[int] = set()
 
@@ -411,7 +436,7 @@ def _tokenize(src: str, policy: bool = False) -> list[_Tok]:
                 closes_control.add(i)
             toks.append((_P, ch, i))
             i += 1
-        elif ch == "/" and regex_allowed():
+        elif ch == "/" and i >= no_regex_before and regex_allowed():
             j, in_class = i + 1, False
             while j < n and src[j] not in "\n\r":
                 c = src[j]
@@ -432,6 +457,9 @@ def _tokenize(src: str, policy: bool = False) -> list[_Tok]:
                 toks.append((_RE, "", i))
                 i = j
             else:  # not a regex after all (ran into a newline): a division sign
+                # No `/` before that line end can start one either: not retrying keeps a line of
+                # `/[/[/[...` linear instead of quadratic.
+                no_regex_before = j
                 toks.append((_P, "/", i))
                 i += 1
         elif _is_id_char(ch) and not ch.isdigit() and not policy:
@@ -566,11 +594,10 @@ def check_source(
                 return PreflightResult(
                     ok=False, findings=[Finding("source-too-large", message, 1, 1)]
                 )
-    toks = _tokenize(code, policy=policy is not None)
-    line_starts = [0]
-    for idx, ch in enumerate(code):
-        if ch == "\n":
-            line_starts.append(idx + 1)
+    precise = policy is not None and policy.ignore_strings_and_comments
+    usability = policy is None or policy.include_preflight_rules
+    toks = _tokenize(code, policy=policy is not None) if usability or precise else []
+    line_starts = [0] + [m.end() for m in _NEWLINE.finditer(code)]
 
     findings: list[Finding] = []
     seen: set[tuple[str, int]] = set()
@@ -587,7 +614,6 @@ def check_source(
     def at(k: int) -> _Tok | None:
         return toks[k] if 0 <= k < len(toks) else None
 
-    usability = policy is None or policy.include_preflight_rules
     for k, (kind, text, off) in enumerate(toks if usability else ()):
         prev, nxt = at(k - 1), at(k + 1)
         after_dot = prev is not None and prev[0] == _P and prev[1] in _ACCESS
@@ -713,8 +739,11 @@ def check_source(
                     "info",
                 )
 
-    if policy is not None:
+    if precise:
+        assert policy is not None
         _apply_policy(policy, toks, at, add)
+    elif policy is not None:
+        _scan_text(policy, code, add)
 
     findings.sort(key=lambda f: (f.line, f.column))
     return PreflightResult(
@@ -829,3 +858,153 @@ def _apply_policy(
             and called
         ):
             report("forbidden-dynamic-import", off)
+
+
+# --------------------------------------------------------------------------- the default scan
+# Fails closed: every escape is decoded wherever it appears, and the whole decoded text is read,
+# comments, strings, templates and regular expressions included. Nothing here depends on telling
+# a regex from a division or a comment from code, which is where tokenizer-based scans go wrong.
+# Linear time: one pass of compiled patterns without nested quantifiers, plus bounded look-arounds.
+
+_NEWLINE = re.compile(r"\n")
+_ESCAPE = re.compile(
+    r"\\(?:u\{0*([0-9A-Fa-f]{1,6})\}"  # \u{...}, any number of leading zeros
+    r"|u([0-9A-Fa-f]{4})"
+    r"|x([0-9A-Fa-f]{2})"
+    r"|([0-3][0-7]{0,2}|[4-7][0-7]?)"  # legacy octal
+    r"|(\r\n|[\n\r\u2028\u2029])"  # a line continuation: nothing
+    r"|(.))",  # an identity escape: the character itself (`\e` is `e`)
+    re.S,
+)
+_WORDS = re.compile(r"[\w$]+")
+_CALL = re.compile(r"\s*\(")
+_BRACKET = re.compile(r"\s*\[")
+_STRING_ARGUMENT = re.compile(r"\s*\(\s*['\"`]")
+_NEXT = re.compile(r"\s*(.?)", re.S)
+_DOTTED = re.compile(r"\s*\??\.\s*[\w$]")
+_STATIC_IMPORT_STARTS = re.compile(r"[\w${*\"'.]")
+_GLOBAL_VALUES = frozenset({"globalThis", "self", "window", "global", "this"})
+_TIMER_NAMES = frozenset({"setTimeout", "setInterval"})
+#: How far back the method-definition test for `constructor` looks before it gives up (and
+#: reports it): keeps a text made of nothing but `// constructor(` lines linear.
+_LOOKBACK = 4096
+
+
+def _decoded(code: str) -> tuple[str, list[int], list[int]]:
+    """`code` with every escape decoded, plus anchors mapping decoded offsets back."""
+    pieces: list[str] = []
+    norm_at: list[int] = [0]
+    orig_at: list[int] = [0]
+    last = 0
+    size = 0
+    for m in _ESCAPE.finditer(code):
+        start, end = m.span()
+        pieces.append(code[last:start])
+        size += start - last
+        norm_at.append(size)
+        orig_at.append(start)
+        brace, four, two, octal, newline, other = m.groups()
+        if brace is not None or four is not None:
+            value = int(brace if brace is not None else four, 16)
+            text = chr(value) if value <= 0x10FFFF else "u"
+        elif two is not None:
+            text = chr(int(two, 16))
+        elif octal is not None:
+            text = chr(int(octal, 8))
+        elif newline is not None:
+            text = ""
+        else:
+            text = _SIMPLE_ESCAPES.get(other, other)
+        pieces.append(text)
+        size += len(text)
+        norm_at.append(size)
+        orig_at.append(end)
+        last = end
+    pieces.append(code[last:])
+    return "".join(pieces), norm_at, orig_at
+
+
+def _method_definition(text: str, start: int, end: int) -> bool:
+    """Is the `constructor` at `start` a class's own `constructor(...)` definition? Only when it
+    is followed by `(` and preceded (skipping whitespace and whole `//` comment lines) by `{`,
+    `}` or `;`. A bare `constructor(...)` call is the global object's constructor (`Object`), not
+    `Function`, so allowing it there is safe; anything else is reported."""
+    if not _CALL.match(text, end):
+        return False
+    i = start - 1
+    floor = max(-1, start - _LOOKBACK)
+    while i > floor:
+        ch = text[i]
+        if ch.isspace():
+            i -= 1
+            continue
+        line_start = max(
+            text.rfind("\n", floor + 1, i + 1), text.rfind("\r", floor + 1, i + 1)
+        )
+        if line_start < 0 and floor >= 0:
+            return False  # the line runs past the look-back limit
+        if text[line_start + 1 : i + 1].lstrip().startswith("//"):
+            i = line_start
+            continue
+        return ch in "{};"
+    return floor < 0  # the start of the text: a bare call
+
+
+def _scan_text(
+    policy: SourcePolicy, code: str, add: Callable[[str, str, int], None]
+) -> None:
+    text, norm_at, orig_at = _decoded(code)
+
+    def report(rule: str, at: int, **values: object) -> None:
+        k = bisect_right(norm_at, at) - 1
+        add(rule, POLICY_MESSAGES[rule].format(**values), orig_at[k] + at - norm_at[k])
+
+    identifiers = policy.forbidden_identifiers
+    globals_ = policy.forbidden_globals
+    computed = policy.forbid_computed_global_access
+    interest = set(identifiers) | set(globals_)
+    if policy.forbid_eval:
+        interest |= {"eval"} | _TIMER_NAMES
+    if policy.forbid_function:
+        interest |= {"Function", "constructor"}
+    if policy.forbid_webassembly:
+        interest.add("WebAssembly")
+    if policy.forbid_dynamic_import:
+        interest.add("import")
+    if computed:
+        interest |= _GLOBAL_VALUES | {"Reflect", "constructor", "Function"}
+
+    for m in _WORDS.finditer(text):
+        word = m.group()
+        if word not in interest:
+            continue
+        start, end = m.span()
+        after_dot = (
+            start > 0 and text[start - 1] == "." and text[start - 3 : start] != "..."
+        )
+        if word in identifiers:
+            report("forbidden-identifier", start, name=word)
+        if word in globals_:
+            report("forbidden-global", start, name=word)
+        if policy.forbid_eval:
+            if word == "eval":
+                report("forbidden-eval", start)
+            elif word in _TIMER_NAMES and _STRING_ARGUMENT.match(text, end):
+                report("forbidden-string-timer", start, name=word)
+        if policy.forbid_function and (
+            word == "Function"
+            or (word == "constructor" and not _method_definition(text, start, end))
+        ):
+            report("forbidden-function-constructor", start)
+        if policy.forbid_webassembly and word == "WebAssembly":
+            report("forbidden-webassembly", start)
+        if policy.forbid_dynamic_import and word == "import" and not after_dot:
+            following = _NEXT.match(text, end).group(1)  # type: ignore[union-attr]
+            if following and not _STATIC_IMPORT_STARTS.match(following):
+                report("forbidden-dynamic-import", start)
+        if computed and (
+            (word in _GLOBAL_VALUES and not after_dot and not _DOTTED.match(text, end))
+            or word == "Reflect"
+            or (word in ("constructor", "Function") and _BRACKET.match(text, end))
+        ):
+            report("forbidden-computed-global-access", start)

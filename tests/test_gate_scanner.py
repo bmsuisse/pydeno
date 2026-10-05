@@ -59,6 +59,7 @@ BYPASSES = {
 
 #: The shapes the precise mode does not catch (documented in docs/guides/gate.md).
 PRECISE_MISSES = {
+    # a regex, template or comment read differently from the engine
     "await-regex",
     "yield-regex",
     "of-regex",
@@ -69,13 +70,13 @@ PRECISE_MISSES = {
     "class-expression",
     "await-object",
     "spread-object",
-    "arrow-then-regex",
+    # an escape the tokenizer does not decode
     "octal-escape",
-    "identity-escape",
-    "line-continuation",
     "padded-brace-escape",
+    # a name reached without writing it
+    "reflect",
+    "computed-destructuring",
     "constructor-destructuring",
-    "constructor-after-comment",
 }
 
 
@@ -138,7 +139,9 @@ _ORDINARY = (
     "return c.length>0?`n=${c.length}`:/a+b/.test(b)?'s':\"d\"}"
     "const o={k:1,'q':[1,2,3],m(){return this.k/2}};// comment\n"
 )
-_LIMIT = 4.0  # seconds; quadratic behaviour takes minutes on these inputs
+# Seconds, for a slow CI runner (a laptop needs 0.1-2.5 s); the quadratic behaviour these inputs
+# used to trigger takes minutes to hours.
+_LIMIT = 8.0
 
 
 def _timed(code: str, policy: SourcePolicy | None) -> float:
@@ -167,5 +170,12 @@ def _timed(code: str, policy: SourcePolicy | None) -> float:
 )
 def test_the_scan_is_linear(shape: str, policy: SourcePolicy | None) -> None:
     if policy is not None:
-        policy = SourcePolicy(**{**policy.__dict__, "max_source_bytes": None})
+        # Over the default cap the scan is refused at once (below); up to it, it must be fast.
+        cap = policy.max_source_bytes
+        assert cap is not None
+        over = shape * (2 * cap // len(shape) + 1)
+        shape = shape[:cap]
+        started = time.perf_counter()
+        assert check_source(over, policy=policy).findings[0].rule == "source-too-large"
+        assert time.perf_counter() - started < 0.5
     assert _timed(shape, policy) < _LIMIT

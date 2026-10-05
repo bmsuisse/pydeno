@@ -32,10 +32,11 @@ with Pydeno(gate=gate, strict_eval=True) as pool:
 
 Each layer catches what the one before it missed. A later layer never relies on an earlier one.
 
-1. **Static policy** (`static_gate(SourcePolicy(...))`): a pure, deterministic scan in Python. It
-   costs microseconds and refuses forbidden names, `eval`, the `Function` constructor, `import()`,
-   `WebAssembly` and oversized programs. Its messages are fixed, actionable sentences, so a model can
-   use them to fix the code.
+1. **Static policy** (`static_gate(SourcePolicy(...))`): a pure, deterministic scan in Python that
+   runs in linear time (well under a second for the default 1 MiB cap). It refuses forbidden names,
+   `eval`, the `Function` constructor, `import()`, `WebAssembly` and oversized programs, and by
+   default it fails closed: it reads the whole text, strings and comments included. Its messages are
+   fixed, actionable sentences, so a model can use them to fix the code.
 2. **An optional classifier that you supply**: any callable, sync or async (a model call, a policy
    service). Combine it with the static layer in `all_of(...)`. The static layer runs first, and a
    classifier is not called for code that the static layer already refused.
@@ -94,9 +95,19 @@ detail are not shown to a model.
 any other `BaseException` propagate unchanged, and nothing runs. An async session cancelled while its
 gate runs is left exactly as it was.
 
-**Timeouts.** `gate_timeout` defaults to 10 s. An async gate is cancelled at the deadline. A sync
-gate cannot be interrupted, so it runs to the end, but a verdict that arrives after the deadline is
-discarded, also from a gate that swallowed its cancellation. Keep sync gates fast.
+**Timeouts.** `gate_timeout` defaults to 10 s.
+
+- **Async gates** are cancelled at the deadline.
+- **Sync gates** cannot be interrupted, so they run to the end, but a verdict that arrives after
+  the deadline is discarded, also from a gate that swallowed its cancellation.
+- **Sync gates in the async classes** (and in `async_gate_check`) run on a gate thread, never on the
+  event loop, so a slow one stalls nothing else. At the deadline its result is abandoned and the
+  thread finishes on its own. There are 32 gate threads; when gates that never return hold them all,
+  further checks wait and time out as `GateUnavailable`.
+
+In the async classes and `async_gate_check` the deadline is required: `gate_timeout=None` is a
+`ValueError` there. The sync classes accept `None`, meaning a verdict is never discarded for being
+late. Keep sync gates fast.
 
 **No gap between check and use.**
 
@@ -115,11 +126,16 @@ discarded, also from a gate that swallowed its cancellation. Keep sync gates fas
 recorded: no tool budget, external-call budget, in-flight slot, journal record or guest state is
 used. The session stays usable.
 
-**Thread safety and re-entrancy.** A sync gate runs on the thread that called the entry point. If an
-external function runs on a tool thread and calls another session's `feed_run`, the gate runs on that
-tool thread. One gate object may therefore run on several threads at once, so make it thread-safe.
-`static_gate` is. A gate that calls back into the session it is gating finds that session busy, and
-the gate becomes unavailable. A gate may use other sessions.
+**A closed session does not call the gate.** A run on a closed session, or an eval on a closed
+runtime, raises its usual error before the gate is consulted, so a classifier is never paid for code
+that could not run.
+
+**Thread safety and re-entrancy.** In the sync classes, a sync gate runs on the thread that called
+the entry point. If an external function runs on a tool thread and calls another session's
+`feed_run`, the gate runs on that tool thread. In the async classes it runs on a gate thread. One
+gate object may therefore run on several threads at once, so make it thread-safe. `static_gate` is.
+A gate that calls back into the session it is gating finds that session busy, and the gate becomes
+unavailable. A gate may use other sessions.
 
 ## Where gates attach
 
@@ -133,9 +149,29 @@ Sync classes take sync gates only, and an async gate is refused at construction.
 either kind. `AgentSandbox(runtime=...)` refuses a runtime that has its own gate: put the gate on the
 session.
 
-`load_wasm` takes a binary from the host, not source text, and is not gated. The in-process `Runtime`
-has no `gate=`, because it is not a boundary for hostile code anyway. Call `gate_check(gate, code)`
-yourself before `Runtime.eval` if you want the same check.
+**Pools pass it through.** `SandboxPool(gate=...)` and `AsyncSandboxPool(gate=...)` give every
+runtime they hand out the gate. `SessionPool(..., gate=...)` gives it to every session it builds.
+Sessions it restores from their journals replay without it, like any load.
+
+**Module loaders.**
+
+- A loader's refusal belongs to the command that started the import: only that command raises it,
+  even with other commands queued on the same async runtime.
+- It keeps its `__cause__`.
+- A guest can catch the failed import (`import(...).catch(...)`), but the host still raises the
+  refusal when the command ends.
+- In that case the rest of the command did run: only the refused module did not. That is the one
+  place where `GateDenied` does not mean "nothing ran".
+
+**Not gated.**
+
+- `load_wasm` takes a binary from the host, not source text.
+- The in-process `Runtime` has no `gate=`, because it is not a boundary for hostile code anyway.
+- The command line (`pydeno ...`), the `llm` plugin and the pydantic-ai integration (`JSCodeMode`)
+  take no `gate=` either.
+
+In these cases call `gate_check(gate, code)` yourself first, or build the runtime they use with a
+gate where they accept one.
 
 ## Replay is not re-gated
 
@@ -149,6 +185,11 @@ replaying a journal, and they do not consult the gate:
 
 The gate applies again to every new feed or run after the load. If you tighten a policy and need old
 state re-checked, check the journal's code yourself before loading it, or start a fresh session.
+
+**Use one `dump_key` per gate configuration.** Replay trusts whatever the key signed. A dump from a
+pool with a lenient gate, or none, loads into a pool with a strict gate if both share a `dump_key`, and
+it replays code the strict gate would refuse. Give each gate configuration its own key, or put the
+configuration in `associated_data`.
 
 ## Standalone use
 
@@ -178,41 +219,57 @@ process included.
 
 | Field | Refuses |
 |---|---|
-| `forbidden_identifiers` | the names as identifiers, properties (`x.name`) or string keys (`x["name"]`) |
-| `forbidden_globals` | the names bare, or on a global object (`globalThis.name`, `self["name"]`) |
-| `forbid_dynamic_import` | `import(...)` |
-| `forbid_eval` | `eval`, called or just named (`(0, eval)`); `setTimeout` / `setInterval` with a string |
-| `forbid_function` | the `Function` constructor, by name or as `.constructor(...)` |
+| `forbidden_identifiers` | the names, wherever they appear |
+| `forbidden_globals` | the names, wherever they appear (an alias such as `g.name` may be the global); precise mode: bare or on a global object only |
+| `forbid_dynamic_import` | `import` followed by anything a static `import` or `import.meta` cannot start with, such as `(`, a comment or the end |
+| `forbid_eval` | `eval`, called or just named (`(0, eval)`); `setTimeout` / `setInterval` with a string literal |
+| `forbid_function` | the name `Function`, and `constructor` anywhere but a class's own `constructor(...)` method definition |
 | `forbid_webassembly` | `WebAssembly` |
-| `forbid_computed_global_access` | bracket access with a computed key on a global object or the Function constructor: `globalThis['ev' + 'al']`, `this[k]`, `self[name]`, `f.constructor[k]` (off by default) |
-| `max_source_bytes` | longer code (checked first; nothing else is scanned then) |
+| `forbid_computed_global_access` | a global object used other than as `name.property` (`globalThis[k]`, `= globalThis`, `f(this)`, `...self`), `Reflect`, and `constructor[` / `Function[` (off by default) |
+| `max_source_bytes` | longer code, checked first; nothing else is scanned then. Default **1 MiB** (`None` removes it): a 16 MiB source could not be scanned within the default 10 s gate timeout |
 | `include_preflight_rules` | also `check_source`'s usability rules (`require`, `fetch`, ...), off by default under a policy |
+| `ignore_strings_and_comments` | selects the precise mode (below); off by default |
 
-The scanner is aware of comments, strings, templates and regular expressions. Under a policy it
-reads the code as the engine does:
+**The default mode fails closed.** The policy's checks must not depend on telling a regular
+expression from a division sign, or a comment from code. A scanner that guesses wrong reads code as
+text: `await /`/`, an HTML-like `<!--` comment, a hashbang line, or `function(){} / ...` have each
+hidden a call that then ran. So the default scan works differently:
 
-- `eval` and `\u{65}val` are `eval`, and so are `globalThis["\x65val"]` and
-  ``globalThis[`eval`]``;
-- U+2028 and U+2029 end a line comment;
-- every Unicode space separates tokens.
+- it decodes every escape wherever it appears: `\u0065`, `\u{0065}` with any number of leading
+  zeros, `\x65`, legacy octal `\145`, identity escapes such as `\e`, and line continuations;
+- it reads the whole decoded text: code, comments, strings, templates, regular expressions, HTML-like
+  comments and hashbang lines;
+- it reports every forbidden name it finds there.
 
-It also tells a regular expression from a division sign the way the engine does in the cases that
-matter: after an object literal, a postfix `++`, a keyword used as a property, or a control statement's
-condition. A scanner that got this wrong would read code as a regex or a string. It is not a parser,
-though, and code written to confuse it may still succeed, which is one more reason the later layers
-exist. Fullwidth letters and zero-width joiners make *different* identifiers in JavaScript, and the
-scanner treats them that way too. Without a policy, `check_source(code)` behaves exactly as it always
-has.
+A name in a string or a comment is therefore reported too. That over-reporting is the safe default.
+Findings still point at the original line and column. Fullwidth letters and zero-width joiners make
+*different* identifiers in JavaScript, and they are not reported as `eval`. The scan is a few compiled
+patterns in one linear pass, with bounded look-arounds.
+
+**The precise mode** (`ignore_strings_and_comments=True`) is opt-in and best effort. A tokenizer skips
+strings, comments, templates and regular expressions, so it reports fewer false positives. It decodes
+`\u` and `\x` escapes in identifiers and string keys, and treats every Unicode space as a space.
+**Known bypasses**, pinned by `tests/test_gate_scanner.py`, which the default mode catches:
+
+- a regular expression or object literal the tokenizer mistakes for division, or the reverse:
+  after `await`, `yield` or `of`, after a function or class expression, after `await {}` or `...{}`;
+- HTML-like comments (`<!--`) and hashbang lines;
+- legacy octal escapes (`"\145val"`) and `\u{...}` with more than eight digits;
+- names reached without being written: `Reflect.get(globalThis, k)`, `const {[k]: e} = globalThis`,
+  and `const {constructor: F} = function(){}`.
+
+Use the precise mode only where false positives in strings and comments are a real problem, and
+never as the only layer. Without a policy, `check_source(code)` behaves as it always has.
 
 `forbid_computed_global_access` closes the most common way around a name list:
-`globalThis['ev' + 'al']` is not a name the scanner can read. A literal key such as
-`globalThis['Math']` is allowed, because the other rules read it, and so is `obj[k]` on any other
-object. The check is best effort and a heuristic, not a boundary:
+`globalThis['ev' + 'al']` is not a name any scan can read. It is best effort and a heuristic, not a
+boundary:
 
-- it does not follow aliases (`const g = globalThis; g[k]`) or parentheses (`(globalThis)[k]`);
-- it reports `this[k]` inside methods too, where `this` is not the global object.
+- it does not follow an alias made in a way it cannot see;
+- it reports `this` in methods too (`f(this)`, `this[k]`), where `this` is not the global object.
 
-`strict_eval=True` is what stops a computed `eval`.
+`obj[k]` on any other object and `globalThis.name` are allowed. `strict_eval=True` is what stops a
+computed `eval`.
 
 A denial from `static_gate` lists up to 20 findings as `line:column [rule] message`, one per line,
 for people and logs. Its labels are the rules, in order of first appearance, so `top_label` is the

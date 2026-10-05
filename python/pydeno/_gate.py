@@ -24,9 +24,13 @@ This module is pure Python with no I/O, and it imports everything it needs at im
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
 import functools
 import hashlib
 import inspect
+import os
+import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -287,14 +291,23 @@ def _decide(
 async def _adecide(
     gate: Any, source: str, context: GateContext, timeout: float | None
 ) -> Verdict:
-    """Call a gate from a coroutine: an async gate is awaited and cancelled at the deadline (a
-    sync one is called inline and cannot be). A verdict after the deadline is discarded, also
-    from a gate that swallowed its cancellation."""
+    """Call a gate from a coroutine: an async gate is awaited and cancelled at the deadline; a
+    sync one runs on a gate thread (`_gate_threads`) and is abandoned at the deadline. A verdict
+    after the deadline is discarded, also from a gate that swallowed its cancellation."""
     loop = asyncio.get_running_loop()
     deadline = None if timeout is None else loop.time() + timeout
     try:
         async with _compat.timeout(timeout):
-            result = gate(source, context)
+            if _is_async_gate(gate):
+                result = gate(source, context)
+            else:
+                # Never on the event loop: a slow sync gate (a model call, a lock) would stall
+                # every task. Its thread cannot be interrupted; past the deadline its verdict is
+                # abandoned. It sees the caller's contextvars.
+                call = contextvars.copy_context().run
+                result = await loop.run_in_executor(
+                    _gate_threads(), call, gate, source, context
+                )
             if inspect.isawaitable(result):
                 result = await result
     except (GateDenied, GateUnavailable):
@@ -355,6 +368,40 @@ def _callable_gate(gate: Any) -> Any:
     return _SourceOnly(gate)
 
 
+#: Threads that run sync gates for async callers. Bounded: gates that never return can hold
+#: them all, and then further checks wait in the queue until their `gate_timeout`
+#: (`GateUnavailable`) instead of starving the event loop's default executor.
+GATE_THREADS = 32
+_gate_pool: tuple[int, concurrent.futures.ThreadPoolExecutor] | None = None
+_gate_pool_lock = threading.Lock()
+
+
+def _gate_threads() -> concurrent.futures.ThreadPoolExecutor:
+    global _gate_pool
+    with _gate_pool_lock:
+        if (
+            _gate_pool is None or _gate_pool[0] != os.getpid()
+        ):  # not inherited across fork()
+            _gate_pool = (
+                os.getpid(),
+                concurrent.futures.ThreadPoolExecutor(
+                    max_workers=GATE_THREADS, thread_name_prefix="pydeno-gate"
+                ),
+            )
+        return _gate_pool[1]
+
+
+def _async_timeout(timeout: Any, name: str) -> float:
+    """A gate deadline for async code: required (a sync gate on a thread, or an async gate that
+    never returns, must not hold its caller forever)."""
+    value = limit_seconds(name, timeout)
+    if value is None:
+        raise ValueError(
+            f"{name}=None is not allowed for async gates: give a deadline in seconds"
+        )
+    return value
+
+
 def _is_async_gate(gate: Any) -> bool:
     """True for a coroutine function (or a partial of one, or an object whose ``__call__`` is
     one, such as `all_of` over an async gate)."""
@@ -412,8 +459,10 @@ async def async_gate_check(
     *,
     timeout: float | None = DEFAULT_GATE_TIMEOUT,
 ) -> Verdict:
-    """`gate_check` for a coroutine: awaits an async gate, cancelling it at `timeout`."""
-    timeout = limit_seconds("timeout", timeout)
+    """`gate_check` for a coroutine: awaits an async gate, cancelling it at `timeout`, and runs
+    a sync gate on a gate thread, abandoning it at `timeout` (its thread cannot be interrupted).
+    `timeout` is required here (``None`` is a `ValueError`)."""
+    timeout = _async_timeout(timeout, "timeout")
     gate = _callable_gate(gate)
     exact, made = _prepare(
         source, mode="check", entry_point="gate_check", tools=(), specifier=None
@@ -476,19 +525,21 @@ def _gated_loader(
     hook: _Hook,
     loader: Callable[[str], Any],
     tools: Callable[[], Sequence[str]],
-    record: Callable[[BaseException], None],
+    current: Callable[[], int | None],
+    record: Callable[[int | None, BaseException], None],
 ) -> Callable[[str], Any]:
     """`loader` (a module loader: specifier -> source) with every source it returns gated
-    before the worker compiles it (mode ``"module_loader"``). A refusal is passed to `record`,
-    so the command that triggered the import can raise it, and raised into the worker, where
-    the import fails with an error named after it (its message, written by the host, is kept).
+    before the worker compiles it (mode ``"module_loader"``). A refusal is passed to `record`
+    with the command that was running when the import began (`current()`), so that command,
+    and only that one, raises it; it is also raised into the worker, where the import fails
+    with an error named after it (its message, written by the host, is kept). The refusal keeps
+    its ``__cause__`` (the gate's own exception, for an unavailable gate).
     With an async loader or an async gate the wrapper is async (a sync loader then runs in an
     executor, never on the event loop)."""
 
-    def refused(exc: BaseException) -> BaseException:
-        record(exc)
+    def refused(command: int | None, exc: BaseException) -> None:
+        record(command, exc)
         exc._pydeno_public = True  # type: ignore[attr-defined]
-        return exc
 
     def specifier_of(specifier: Any) -> str | None:
         return specifier if isinstance(specifier, str) else None
@@ -503,6 +554,7 @@ def _gated_loader(
     if loader_is_async or _is_async_gate(hook.gate):
 
         async def gated_async(specifier: str) -> str:
+            command = current()
             if loader_is_async:
                 source = await loader(specifier)
             else:  # a sync loader may block: not on the event loop
@@ -515,24 +567,30 @@ def _gated_loader(
                     source, "module_loader", tools(), specifier_of(specifier)
                 )
             except (GateDenied, GateUnavailable) as exc:
-                raise refused(exc) from None
+                refused(command, exc)
+                raise
 
         return gated_async
 
     def gated(specifier: str) -> str:
+        command = current()
         source = loader(specifier)
         need_text(source)
         try:
             return hook.check(source, "module_loader", tools(), specifier_of(specifier))
         except (GateDenied, GateUnavailable) as exc:
-            raise refused(exc) from None
+            refused(command, exc)
+            raise
 
     return gated
 
 
 def _hook(gate: Any, gate_timeout: Any, *, who: str, sync_only: bool) -> _Hook | None:
     """Validate ``gate=`` / ``gate_timeout=`` for an entry point; None without a gate."""
-    timeout = limit_seconds("gate_timeout", gate_timeout)
+    if gate is not None and not sync_only:
+        timeout: float | None = _async_timeout(gate_timeout, "gate_timeout")
+    else:
+        timeout = limit_seconds("gate_timeout", gate_timeout)
     if gate is None:
         return None
     gate = _callable_gate(gate)

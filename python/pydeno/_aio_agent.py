@@ -485,6 +485,7 @@ class AsyncAgentSandbox(_SessionBase):
         See `AgentSandbox.start`."""
         self._enter()
         try:
+            self._check_usable()  # a closed session does not pay for a gate
             code = await self._agated(code, "start")
         except BaseException:  # nothing was sent: the session is as it was
             self._busy = False
@@ -532,6 +533,7 @@ class AsyncAgentSandbox(_SessionBase):
     async def _drive(self, code: str, mode: str) -> Done | Failed:
         self._enter()
         try:
+            self._check_usable()  # a closed session does not pay for a gate
             code = await self._agated(code, mode)
         except BaseException:  # nothing was sent: the session is as it was
             self._busy = False

@@ -21,6 +21,15 @@
     slot or journal record. Journal replay (`load_session`, `load_snapshot`, `AgentSandbox.load`) is
     not re-gated.
   - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
+  - **Sync gates and async callers.** In the async classes and `async_gate_check`, sync gates run on
+    a gate thread, never on the event loop. There `gate_timeout=None` is refused.
+  - **Module loaders and closed sessions.** A module-loader refusal is raised by the command that
+    imported, keeps its `__cause__`, and is raised even when the guest catches the failed import.
+    A closed session or runtime never calls its gate.
+  - **Pools.** `SandboxPool` / `SessionPool` pass `gate=` through.
+  - **Without fixing the source.** `check_source(source)` without a policy no longer retries a
+    regex scan after one fails on the same line, and caps its `\u{` look-ahead. Results are
+    unchanged; hostile input no longer takes quadratic time.
   - **Signatures checked up front.** A gate may also take only the source (`async def
     classify(source)`). A gate whose signature fits neither form raises `TypeError` when it is
     configured or passed to `gate_check`, so a programming error is not mistaken for an outage.
@@ -32,10 +41,13 @@
     - `max_source_bytes`;
     - optionally, computed access on a global (`forbid_computed_global_access`, best effort).
 
-    It decodes `\u` escapes the way the engine does, and its messages are fixed templates
-    (`POLICY_MESSAGES`, a public contract). `Finding.text` is the bare message without a
-    location. `static_gate(policy)` turns a policy into a gate, and `.check(source)` returns its
-    findings. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
+    By default the scan fails closed. It decodes every escape (`\u`, `\u{...}`, `\x`, legacy
+    octal, identity escapes, line continuations) and reads the whole text, strings and comments
+    included. It runs in linear time, with `max_source_bytes` defaulting to 1 MiB.
+    `ignore_strings_and_comments=True` selects a tokenizer-based precise mode instead: opt-in,
+    best effort, with its known bypasses listed in the guide. The messages are fixed templates
+    (`POLICY_MESSAGES`, a public contract). `Finding.text` is the bare message without a location.
+    `static_gate(policy)` turns a policy into a gate, and `.check(source)` returns its findings. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
     first allow. `check_source(source)` without a policy is unchanged.
   - **Moved class.** `PydenoError` now lives in `pydeno._errors`. It is the same class, still
     exported as `pydeno.PydenoError`.

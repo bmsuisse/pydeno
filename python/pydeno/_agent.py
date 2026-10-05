@@ -2179,6 +2179,7 @@ class AgentSandbox(_SessionBase):
         """
         self._enter()
         try:
+            self._check_usable()  # a closed session does not pay for a gate
             return self._start(self._gated(code, "start"))
         finally:
             self._lock.release()
@@ -2244,6 +2245,7 @@ class AgentSandbox(_SessionBase):
         self._enter()
         try:
             if mode is not None:
+                self._check_usable()  # a closed session does not pay for a gate
                 code = self._gated(code, mode)
             if not isinstance(code, str):
                 raise TypeError("code must be a string")

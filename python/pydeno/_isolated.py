@@ -681,7 +681,9 @@ class IsolatedRuntime:
         # Names bound for the guest so far (the gate's `context.tools`), and a gate refusal raised
         # inside a module loader during the command in flight (that command raises it).
         self._bound_names: list[str] = []
-        self._gate_refusal: BaseException | None = None
+        # The command in flight, and refusals module loaders met during it (see `_request`).
+        self._current_cmd: int | None = None
+        self._gate_refusals: dict[int, BaseException] = {}
         if self._gate is not None and self._config["bootstrap"]:
             # Before any worker exists: a refused bootstrap starts nothing.
             self._config["bootstrap"] = self._gate.check(
@@ -1103,9 +1105,18 @@ class IsolatedRuntime:
                 raise WorkerCrashed(self._describe_death("worker is gone")) from None
             self._capture = capture
             self._end_cpu = None
+            self._current_cmd = cmd_id
             try:
-                return self._pump(cmd_id, pump)
+                try:
+                    result = self._pump(cmd_id, pump)
+                except Exception:
+                    self._raise_refusal(cmd_id)
+                    raise
+                self._raise_refusal(cmd_id)
+                return result
             finally:
+                self._current_cmd = None
+                self._gate_refusals.pop(cmd_id, None)
                 self._capture = None
                 # Where "idle" starts: what the worker burns from here on, with no command
                 # running, is the idle watchdog's business. The reading is the one the pump took
@@ -1420,28 +1431,28 @@ class IsolatedRuntime:
         """The exact source the gate allowed (`code` itself without a gate)."""
         if self._gate is None:
             return code
-        self._gate_refusal = None
+        if self._closed:  # a closed runtime does not pay for a gate (a classifier call)
+            raise WorkerCrashed("runtime is closed")
         return self._gate.check(code, mode, tuple(self._bound_names), specifier)
 
-    def _loader_refusal(self, exc: BaseException) -> None:
-        """Re-raise a gate refusal a module loader met during this command, if any."""
-        refusal, self._gate_refusal = self._gate_refusal, None
-        if refusal is not None:
-            raise refusal from exc
+    def _record_refusal(self, command: int | None, exc: BaseException) -> None:
+        """A module loader's gate refused a source during `command`: that command raises it."""
+        if command is not None and command == self._current_cmd:
+            self._gate_refusals.setdefault(command, exc)
 
-    def _record_refusal(self, exc: BaseException) -> None:
-        self._gate_refusal = exc
+    def _raise_refusal(self, command: int) -> None:
+        refusal = self._gate_refusals.pop(command, None)
+        if refusal is not None:
+            # Raised even if the guest caught the failed import: the host must know. Its own
+            # `__cause__` (the gate's exception, for an unavailable gate) is kept.
+            raise refusal
 
     def eval(self, code: str) -> Any:
         """Evaluate JavaScript synchronously in the worker."""
         code = self._gated(code, "eval")
-        try:
-            return self._request(
-                {"t": "eval", "code": code}, soft_timeout=self._soft_timeout
-            )
-        except Exception as exc:
-            self._loader_refusal(exc)
-            raise
+        return self._request(
+            {"t": "eval", "code": code}, soft_timeout=self._soft_timeout
+        )
 
     async def eval_async(
         self, code: str, *, timeout: float | int | timedelta | None = None
@@ -1458,9 +1469,6 @@ class IsolatedRuntime:
         except asyncio.CancelledError:
             # The thread cannot be interrupted, and the worker is mid-command.
             self._kill()
-            raise
-        except Exception as exc:
-            self._loader_refusal(exc)
             raise
 
     def execute(
@@ -1737,6 +1745,7 @@ class IsolatedRuntime:
                 self._gate,
                 loader,
                 lambda: tuple(self._bound_names),
+                lambda: self._current_cmd,
                 self._record_refusal,
             )
         hid = next(self._hids)
@@ -1752,15 +1761,10 @@ class IsolatedRuntime:
 
     def eval_module(self, specifier: str) -> Any:
         """Evaluate a module synchronously and return its namespace as a dict."""
-        self._gate_refusal = None
-        try:
-            return self._request(
-                {"t": "eval_module", "specifier": specifier},
-                soft_timeout=self._soft_timeout,
-            )
-        except Exception as exc:
-            self._loader_refusal(exc)
-            raise
+        return self._request(
+            {"t": "eval_module", "specifier": specifier},
+            soft_timeout=self._soft_timeout,
+        )
 
     async def eval_module_async(
         self, specifier: str, *, timeout: float | int | timedelta | None = None
@@ -1771,14 +1775,10 @@ class IsolatedRuntime:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
         message = {"t": "eval_module_async", "specifier": specifier, "timeout": soft}
-        self._gate_refusal = None
         try:
             return await self._in_own_thread(message, soft, loop)
         except asyncio.CancelledError:
             self._kill()  # the thread cannot be interrupted, and the worker is mid-command
-            raise
-        except Exception as exc:
-            self._loader_refusal(exc)
             raise
 
 
