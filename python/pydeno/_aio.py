@@ -46,6 +46,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from . import _compat, _isolated, _sandbox, _wasm, _wire
+from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._isolated import (
     DEFAULT_MAX_MEMORY,
     DEFAULT_REQUEST_TIMEOUT,
@@ -639,6 +640,9 @@ class AsyncIsolatedRuntime:
         handler_executor: Where synchronous host functions run (default: a shared pool of
             `DEFAULT_HANDLER_THREADS` threads). Pass your own to size it, or to keep one tenant's
             slow tools from occupying threads another tenant needs.
+        gate / gate_timeout: As for `IsolatedRuntime`, except that the gate may also be async
+            (awaited, and cancelled at ``gate_timeout``). ``config.bootstrap`` is gated when the
+            runtime starts, before the worker is spawned.
 
     Use it as `async with AsyncIsolatedRuntime(config) as rt:` or
     `rt = await AsyncIsolatedRuntime.create(config)`. Constructing the object starts nothing; the
@@ -674,8 +678,15 @@ class AsyncIsolatedRuntime:
         python: str | None = None,
         prewarm: bool = True,
         handler_executor: Executor | None = None,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         # Validation is `IsolatedRuntime.__init__`'s, line for line; nothing here blocks.
+        self._gate = _hook(
+            gate, gate_timeout, who="AsyncIsolatedRuntime", sync_only=False
+        )
+        self._bound_names: list[str] = []
+        self._gate_refusal: BaseException | None = None
         clock_ms = _clock_ms(clock)
         if random_seed is not None and (
             isinstance(random_seed, bool)
@@ -810,6 +821,15 @@ class AsyncIsolatedRuntime:
         if self._starting or self._closed:
             raise RuntimeError("this AsyncIsolatedRuntime has already been started")
         self._starting = True
+        if self._gate is not None and self._config["bootstrap"]:
+            # Before any worker exists: a refused bootstrap starts nothing.
+            try:
+                self._config["bootstrap"] = await self._gate.acheck(
+                    self._config["bootstrap"], "bootstrap"
+                )
+            except BaseException:
+                self._closed = True
+                raise
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._lock = asyncio.Lock()
@@ -1614,6 +1634,21 @@ class AsyncIsolatedRuntime:
 
     # -- public API --------------------------------------------------------
 
+    async def _gated(self, code: Any, mode: str, specifier: str | None = None) -> Any:
+        """The exact source the gate allowed (`code` itself without a gate)."""
+        if self._gate is None:
+            return code
+        self._gate_refusal = None
+        return await self._gate.acheck(code, mode, tuple(self._bound_names), specifier)
+
+    def _loader_refusal(self, exc: BaseException) -> None:
+        refusal, self._gate_refusal = self._gate_refusal, None
+        if refusal is not None:
+            raise refusal from exc
+
+    def _record_refusal(self, exc: BaseException) -> None:
+        self._gate_refusal = exc
+
     async def eval(
         self, code: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
@@ -1622,9 +1657,14 @@ class AsyncIsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
-        return await self._request(
-            {"t": "eval_async", "code": code, "timeout": soft}, soft_timeout=soft
-        )
+        code = await self._gated(code, "eval")
+        try:
+            return await self._request(
+                {"t": "eval_async", "code": code, "timeout": soft}, soft_timeout=soft
+            )
+        except Exception as exc:
+            self._loader_refusal(exc)
+            raise
 
     eval_async = eval
 
@@ -1635,10 +1675,15 @@ class AsyncIsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
-        return await self._request(
-            {"t": "eval_module_async", "specifier": specifier, "timeout": soft},
-            soft_timeout=soft,
-        )
+        self._gate_refusal = None
+        try:
+            return await self._request(
+                {"t": "eval_module_async", "specifier": specifier, "timeout": soft},
+                soft_timeout=soft,
+            )
+        except Exception as exc:
+            self._loader_refusal(exc)
+            raise
 
     eval_module_async = eval_module
 
@@ -1665,6 +1710,7 @@ class AsyncIsolatedRuntime:
             self._kill()
             raise WorkerCrashed("worker returned a malformed capability token")
         self._register_token(token, hid)
+        self._bound_names.append(name)
         return token
 
     async def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
@@ -1704,6 +1750,7 @@ class AsyncIsolatedRuntime:
             raise WorkerCrashed("worker returned malformed capability tokens")
         for key, token in tokens.items():
             self._register_token(token, hids[key])
+        self._bound_names.append(name)
         return tokens
 
     async def revoke_op(self, op_id: int) -> bool:
@@ -1719,6 +1766,9 @@ class AsyncIsolatedRuntime:
         return bool(await self._request({"t": "revoke", "token": op_id}))
 
     async def add_static_module(self, name: str, source: str) -> None:
+        source = await self._gated(
+            source, "add_static_module", name if isinstance(name, str) else None
+        )
         await self._request({"t": "add_module", "name": name, "source": source})
 
     async def load_wasm(
@@ -1794,7 +1844,15 @@ class AsyncIsolatedRuntime:
             raise
 
     async def set_module_loader(self, loader: Callable[[str], Any]) -> None:
-        """Supply module source with a host function: `(specifier) -> str`, sync or async."""
+        """Supply module source with a host function: `(specifier) -> str`, sync or async.
+        With a ``gate``, every source it returns must pass the gate first."""
+        if self._gate is not None:
+            loader = _gated_loader(
+                self._gate,
+                loader,
+                lambda: tuple(self._bound_names),
+                self._record_refusal,
+            )
         hid = next(self._hids)
         self._handlers[hid] = (
             _checked_specifiers(loader, 1),

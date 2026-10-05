@@ -2248,6 +2248,70 @@ def wasm_hostile_bytes_end_the_session() -> bool:
         return rt.is_closed() or rt.eval("1 + 1") != 2
 
 
+@probe
+def gate_bypass_runs_refused_code() -> bool:
+    # A gate in front of the worker must fail closed: what it refuses, cannot judge or never saw
+    # must not run, and what it saw must be exactly what runs. Each attempt sets `ran` if it ran.
+    from pydeno import (
+        GateDenied,
+        GateUnavailable,
+        SourcePolicy,
+        Verdict,
+        all_of,
+        static_gate,
+    )
+
+    evil = "globalThis.ran = 1; eval('1')"
+
+    class Disguised(
+        str
+    ):  # what a gate would see through str() / ==, versus the real text
+        def __str__(self) -> str:
+            return "1"
+
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = str.__hash__
+
+    class AlwaysAllow(Verdict):
+        @property  # type: ignore[override]
+        def allow(self) -> bool:  # type: ignore[override]
+            return True
+
+    static = static_gate(SourcePolicy(forbid_eval=True))
+    attempts = [
+        (static, Disguised(evil)),
+        (static, "globalThis.ran = 1; \\u0065val('1')"),
+        (static, "// note globalThis.ran = 1; eval('1')"),
+        (static, "globalThis.ran = 1; globalThis['\\x65val']('1')"),
+        (static, "globalThis.ran = 1; '" + "x" * (17 * 1024 * 1024) + "'"),
+        (
+            lambda s, c: (_ for _ in ()).throw(RuntimeError("down")),
+            "globalThis.ran = 1",
+        ),
+        (lambda s, c: True, "globalThis.ran = 1"),
+        (lambda s, c: "allow", "globalThis.ran = 1"),
+        (lambda s, c: AlwaysAllow.__new__(AlwaysAllow), "globalThis.ran = 1"),
+        (all_of(lambda s, c: Verdict(True, ""), static), evil),
+    ]
+    probe_code = "typeof ran"
+
+    def letting_the_probe_through(gate):  # type: ignore[no-untyped-def]
+        return lambda s, c: Verdict(True, "") if s == probe_code else gate(s, c)
+
+    for gate, code in attempts:
+        with iso(gate=letting_the_probe_through(gate)) as rt:
+            try:
+                rt.eval(code)
+                return True  # ran
+            except (GateDenied, GateUnavailable):
+                pass
+            if rt.eval(probe_code) != "undefined":
+                return True
+    return False
+
+
 def main() -> None:
     violations = []
     for name, fn in PROBES.items():

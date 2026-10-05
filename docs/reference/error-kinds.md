@@ -22,7 +22,8 @@ raises. The `kind` strings are a public contract: they are only ever added to.
 ## The retry rule
 
 `retryable` is true **only when the failure was environmental**: the worker process died or failed to
-start, so the same work on a fresh runtime could plausibly succeed. A deadline, a memory overrun, a
+start, or a gate could not reach a decision (it failed or timed out), so the same work could plausibly
+succeed on a later attempt. A deadline, a memory overrun, a
 CPU cap, a spent budget, a guest bug or a failed signature is a property of the work under the limits
 it was given; the same code fails the same way again, so those are `retryable=False`.
 
@@ -58,6 +59,8 @@ is why it is a separate field and not folded into `retryable`.
 | `snapshot_invalid` | no | no | `SnapshotAuthenticationError` | A signed snapshot failed authentication. |
 | `invalid_input` | no | no | `TypeError` / `ValueError` (wire errors, bad arguments) | A value or argument was refused (wire or API misuse). |
 | `cancelled` | no | no | `asyncio.CancelledError` | The surrounding asyncio task was cancelled. |
+| `gate_denied` | no | no | `GateDenied` ([gate](../guides/gate.md)) | A gate refused the code before it ran. |
+| `gate_unavailable` | yes | no | `GateUnavailable`: the gate raised, timed out or returned something other than a `Verdict` | A gate could not decide (it failed, timed out or answered wrongly); nothing ran. |
 | `unknown` | no | no | anything else | An error pydeno does not classify. |
 
 ## How the kind is chosen, and what a guest can influence

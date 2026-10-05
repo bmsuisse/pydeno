@@ -4,6 +4,34 @@
 
 ### Added
 
+- **Gates: a host-side check of the exact source before it runs.** A gate is a callable
+  `(source, GateContext) -> Verdict(allow, reason, labels)`, sync or async.
+  - **Where it attaches.** Pass it as `gate=` (with `gate_timeout=`, default 10 s) to:
+    - `Pydeno` / `AsyncPydeno`: every `feed_run` / `feed_start`;
+    - `AgentSandbox` / `AsyncAgentSandbox`: `start` / `run` / `execute`;
+    - `IsolatedRuntime` / `AsyncIsolatedRuntime`: `eval*`, `execute*`, `add_static_module` sources,
+      module-loader sources, and `RuntimeConfig.bootstrap` (checked before the worker starts).
+  - **It fails closed.** A denial raises `GateDenied` (kind `gate_denied`, not retryable). A gate that
+    raises, times out or answers with anything but an exact `Verdict` raises `GateUnavailable` (kind
+    `gate_unavailable`, retryable, and the run is still blocked). Both are `PydenoError` subclasses.
+    Cancellation propagates unchanged.
+  - **No gap between check and use.** The source is normalised to an exact `str` once. The gate sees
+    it, and the same string runs. Sources over 16 MiB are refused before the gate is called.
+  - **No side effects.** A denied call sends nothing to the worker and uses no budget, in-flight
+    slot or journal record. Journal replay (`load_session`, `load_snapshot`, `AgentSandbox.load`) is
+    not re-gated.
+  - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
+  - **Static policy.** `check_source(source, policy=SourcePolicy(...))` covers forbidden identifiers
+    and globals, `import()`, `eval` (and timers given strings), the `Function` constructor,
+    `WebAssembly` and `max_source_bytes`. It decodes `\u` escapes the way the engine does, and its
+    messages are fixed templates (`POLICY_MESSAGES`, a public contract). `static_gate(policy)` turns
+    a policy into a gate. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
+    first allow. `check_source(source)` without a policy is unchanged.
+  - **Moved class.** `PydenoError` now lives in `pydeno._errors`. It is the same class, still
+    exported as `pydeno.PydenoError`.
+
+  See [`docs/guides/gate.md`](docs/guides/gate.md).
+
 - **`load_wasm()`: a trusted WebAssembly module, loaded by the host** (#37). On `Runtime`,
   `IsolatedRuntime` and `AsyncIsolatedRuntime`: `rt.load_wasm(bytes_or_path)` returns a
   `WasmModule` (`AsyncWasmModule`) with `.exports` (name -> callable), `.signatures`,
