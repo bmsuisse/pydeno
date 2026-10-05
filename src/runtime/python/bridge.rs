@@ -10,7 +10,7 @@ use std::future::Future;
 use tokio::sync::oneshot;
 
 use super::error::runtime_error_with_context;
-use super::utils::attach_unless_exiting;
+use super::utils::{attach_unless_exiting, interpreter_exiting};
 
 fn python_future_flag(
     future: &Bound<'_, PyAny>,
@@ -168,6 +168,7 @@ where
     python_future.call_method1(pyo3::intern!(py, "add_done_callback"), (cancel_callback,))?;
 
     let py_future: Py<PyAny> = python_future.clone().unbind();
+    let started_after_exit_hook = interpreter_exiting();
 
     pyo3_tokio::get_runtime().spawn(async move {
         let scoped_future = pyo3_tokio::scope(locals.clone(), future);
@@ -187,8 +188,10 @@ where
         };
 
         // `call_soon_threadsafe` releases and retakes the GIL on this Tokio worker; the
-        // interpreter may be exiting by then (nobody awaits the result at that point).
-        attach_unless_exiting(|py| {
+        // interpreter may be exiting by then (nobody awaits the result at that point). A call
+        // made after the exit hook ran (from a later `atexit` handler) is awaited, so it is
+        // always delivered: dropping its result would hang that handler.
+        let deliver = |py: Python<'_>| {
             if let Err(err) =
                 schedule_js_future_result(py, &locals, &py_future, result, handle, error_context)
             {
@@ -199,7 +202,12 @@ where
                     );
                 }
             }
-        });
+        };
+        if started_after_exit_hook {
+            Python::attach(deliver);
+        } else {
+            attach_unless_exiting(deliver);
+        }
     });
 
     as_coroutine(py, python_future)

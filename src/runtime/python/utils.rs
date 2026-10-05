@@ -39,6 +39,12 @@ where
     Some(Python::attach(f))
 }
 
+/// Whether the `atexit` hook has run. Work started after it (by a later `atexit` handler, which
+/// keeps the interpreter alive while it waits) is not gated: refusing it would hang that handler.
+pub(crate) fn interpreter_exiting() -> bool {
+    INTERPRETER_EXITING.load(Ordering::SeqCst)
+}
+
 /// Registered with `atexit` at import: see [`attach_unless_exiting`].
 #[pyfunction]
 pub(crate) fn _wait_for_background_attach(py: Python<'_>) {

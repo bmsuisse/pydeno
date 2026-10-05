@@ -161,7 +161,7 @@ boundary; the sandbox is.
   the returned source on that thread checked the same lock, so the host deadlocked (for example
   when an `eval_async` task was cancelled inside `with Runtime()`). The check no longer waits for
   the lock.
-- A process no longer intermittently aborts at interpreter exit after using `Runtime`: `close()` cancels stream sources on the calling thread, and background threads stop entering Python once the interpreter exits.
+- A process no longer intermittently aborts at interpreter exit after using `Runtime`: `close()` cancels stream sources on the calling thread, and background threads stop entering Python once the interpreter exits. `eval_async` started later than that (in an `atexit` handler registered before `import pydeno`, or after `atexit._run_exitfuncs()`) still completes. The stream's `aclose()` runs in the contextvars the source was created in, and its exceptions are not reported as "Task exception was never retrieved".
 - **A `JsFunction` or `JsStream` garbage-collected inside a host function no longer hangs the
   process or panics.** Its finalizer then runs on the runtime thread and waited for that same
   thread; the stream finalizer hung forever. On the runtime thread the handle is now released

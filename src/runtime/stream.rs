@@ -7,6 +7,7 @@ use deno_core::v8;
 use indexmap::IndexMap;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3_async_runtimes::TaskLocals;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -490,15 +491,23 @@ impl PyStreamEntry {
     /// (pyo3 drops deferred references when it reattaches inside that initialization), and a
     /// reentrant initialization waits for itself forever.
     fn schedule_aclose(&self, py: Python<'_>, iterator: &Bound<'_, PyAny>) -> PyResult<()> {
-        let Ok(aclose) = iterator.getattr("aclose") else {
+        if !iterator.hasattr("aclose")? {
             return Ok(());
-        };
-        let awaitable = aclose.call0()?;
+        }
+        let awaitable = py
+            .import("pydeno._awaitable")?
+            .getattr("aclose_quietly")?
+            .call1((iterator,))?;
         let ensure_future = py.import("asyncio")?.getattr("ensure_future")?;
-        let scheduled = self
-            .task_locals
-            .event_loop(py)
-            .call_method1("call_soon_threadsafe", (ensure_future, &awaitable));
+        // The source's saved contextvars, as pyo3-async-runtimes passes them for its own
+        // callbacks: `aclose()` (the generator's `finally`) runs in the context it was made in.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("context", self.task_locals.context(py))?;
+        let scheduled = self.task_locals.event_loop(py).call_method(
+            "call_soon_threadsafe",
+            (ensure_future, &awaitable),
+            Some(&kwargs),
+        );
         if scheduled.is_err() {
             // Not scheduled: close it so it is not reported as never awaited.
             if let Ok(close) = awaitable.getattr("close") {
