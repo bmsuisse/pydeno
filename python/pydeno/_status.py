@@ -246,6 +246,7 @@ def _confinement_probe() -> dict[str, Any]:
     out["landlock_abi"] = _sandbox.LANDLOCK_ABI
     out["landlock_note"] = _sandbox.LANDLOCK_NOTE
     out["seccomp_kill_verified"] = _sandbox.SECCOMP_KILL_VERIFIED
+    out["kernel_caps"] = list(_sandbox.KERNEL_CAPS)
     out["missing"] = sorted(_sandbox.missing_layers(applied))
     if applied != "none" and not out["missing"]:
         try:
@@ -482,8 +483,15 @@ def _sandbox_status() -> SandboxStatus:
         if not ran_probe:
             empty_root = Layer(False, note or "the probe did not run")
         elif "emptyroot" in extras:
+            caps = probe.get("kernel_caps") or []
             empty_root = Layer(
-                True, "private mount/net/IPC/UTS namespaces and an empty root"
+                True,
+                "private mount/net/IPC/UTS namespaces and an empty root"
+                + (
+                    f"; threads capped by the kernel at {_sandbox.TASK_LIMIT}"
+                    if "tasklimit" in caps
+                    else "; no per-worker kernel thread cap (needs Linux 5.14+)"
+                ),
             )
         else:
             hint = _userns_hint()

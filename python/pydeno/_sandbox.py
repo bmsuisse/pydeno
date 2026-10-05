@@ -1129,6 +1129,9 @@ def layer_notes() -> str:
 #: that the core answer ("landlock+seccomp", "seatbelt") means the same on every machine. Today:
 #: "emptyroot", which only works where unprivileged user namespaces are allowed.
 EXTRAS: list[str] = []
+#: Kernel-enforced resource caps `apply()` set beyond the rlimits every worker gets: "tasklimit"
+#: (RLIMIT_NPROC per worker, see `_limit_tasks`). Diagnostics; never part of `apply()`'s answer.
+KERNEL_CAPS: list[str] = []
 
 _CLONE_NEWNS = 0x00020000
 _CLONE_NEWUTS = 0x04000000
@@ -1260,6 +1263,34 @@ def _apply_empty_root() -> bool:
         libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
+#: Most tasks (threads) the worker may have, enforced by the kernel where it can be per worker.
+#: Twice the supervisor's sampled cap (`_isolated._MAX_WORKER_THREADS`, 64), so that one still
+#: fires first with its own message; this one is the ceiling a thread bomb cannot outrun.
+TASK_LIMIT = 128
+
+
+def _kernel_at_least(major: int, minor: int) -> bool:
+    try:
+        parts = os.uname().release.split(".")
+        return (int(parts[0]), int(parts[1].split("-")[0])) >= (major, minor)
+    except (ValueError, IndexError):
+        return False
+
+
+def _limit_tasks() -> bool:
+    """Linux, inside the worker's own user namespace: RLIMIT_NPROC at `TASK_LIMIT`.
+
+    RLIMIT_NPROC counts the tasks of a *user*, which on a plain host means every process the
+    host user runs, so it cannot cap one worker there. Since Linux 5.14 the count is kept per
+    user namespace (ucounts), and the empty-root layer gives the worker a namespace of its own:
+    in it, the count is exactly the worker's threads. Only then is it set. The hard limit can be
+    raised only with CAP_SYS_RESOURCE in the initial namespace, which the worker never has."""
+    if not _kernel_at_least(5, 14):
+        return False
+    resource.setrlimit(resource.RLIMIT_NPROC, (TASK_LIMIT, TASK_LIMIT))
+    return True
+
+
 _READ_IMPLIES_EXEC = 0x0400000
 
 
@@ -1295,6 +1326,7 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
     filesystem to stay visible."""
     layers: list[str] = []
     EXTRAS.clear()
+    KERNEL_CAPS.clear()
 
     def attempt(name: str, fn: Callable[[], bool], into: list[str]) -> None:
         # One layer failing must never stop the next from being tried: each gets its own try.
@@ -1317,6 +1349,8 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
         # below take away.
         if empty_root and single_threaded:
             attempt("emptyroot", _apply_empty_root, EXTRAS)
+            if "emptyroot" in EXTRAS:
+                attempt("tasklimit", _limit_tasks, KERNEL_CAPS)
         if single_threaded:
             attempt("landlock", _apply_landlock, layers)
         if not allow_exec:

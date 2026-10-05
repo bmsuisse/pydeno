@@ -158,3 +158,44 @@ def test_no_max_memory_means_no_data_cap() -> None:
 
     with IsolatedRuntime(max_memory=None, prewarm=False) as rt:
         assert _limit_of(rt._proc.pid, "Max data size") == "unlimited"  # noqa: SLF001
+
+
+@pytest.mark.full_sandbox
+def test_a_thread_bomb_meets_a_kernel_ceiling_where_the_worker_has_its_own_namespace() -> (
+    None
+):
+    """RLIMIT_NPROC counts per user, so it caps one worker only inside the worker's own user
+    namespace (the empty-root layer) on Linux 5.14+, where the kernel counts per namespace.
+    There the 129th task is refused; elsewhere the limit is left alone and the supervisor's
+    sampled cap is what stops a bomb."""
+    out = _run(
+        """
+        import json, resource, threading
+        from pydeno import _sandbox
+        before = resource.getrlimit(resource.RLIMIT_NPROC)
+        _sandbox.harden_process()
+        _sandbox.apply()
+        threading.stack_size(64 * 1024)
+        stop = threading.Event()
+        started = 0
+        try:
+            for _ in range(400):
+                threading.Thread(target=stop.wait, daemon=True).start()
+                started += 1
+        except RuntimeError:
+            pass
+        stop.set()
+        print(json.dumps({"caps": _sandbox.KERNEL_CAPS, "extras": _sandbox.EXTRAS,
+                          "started": started, "before": before,
+                          "after": resource.getrlimit(resource.RLIMIT_NPROC)}))
+        """
+    )
+    got = json.loads(out)
+    if "tasklimit" in got["caps"]:
+        assert "emptyroot" in got["extras"], got
+        assert got["after"] == [128, 128], got
+        # the main thread counts too, and the kernel refuses at the limit
+        assert 100 < got["started"] < 128, got
+    else:
+        assert got["after"] == got["before"], got
+        assert got["started"] == 400, got

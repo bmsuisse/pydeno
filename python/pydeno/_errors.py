@@ -223,7 +223,9 @@ _DEATH_PREFIX = r"(?:worker exited during startup|worker is gone|worker process 
 
 _MEMORY = re.compile(
     rf"(?:worker used \d+ bytes, over max_memory=\d+; killed"
-    rf"|{_DEATH_PREFIX}: worker went over max_memory=\d+ and exited)"
+    rf"|{_DEATH_PREFIX}: worker went over max_memory=\d+ and exited"
+    rf"|{_DEATH_PREFIX}(?: \([^)]*\))?: worker reached its kernel memory ceiling "
+    r"\(max_memory=\d+ plus headroom\) and was stopped)"
 )
 _THREADS = re.compile(r"worker started \d+ threads \(limit \d+\); killed")
 _HOST_CALLS = re.compile(r"guest made more than max_host_calls=\d+ host calls")

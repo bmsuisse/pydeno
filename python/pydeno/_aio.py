@@ -1154,6 +1154,8 @@ class AsyncIsolatedRuntime:
             prefix += f" (exit code {code})"
         loop = asyncio.get_running_loop()
         tail = await loop.run_in_executor(_pool("io"), _stderr_tail, self._stderr)
+        if _isolated._v8_out_of_memory(code, tail, self._max_memory):
+            return f"{prefix}: {_isolated._memory_ceiling_message(self._max_memory)}"
         last = tail.splitlines()[-1] if tail else ""
         if not last or _NATIVE_FRAME.search(last):
             return prefix
