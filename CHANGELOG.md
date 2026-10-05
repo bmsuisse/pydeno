@@ -22,7 +22,9 @@
     not re-gated.
   - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
   - **Sync gates and async callers.** In the async classes and `async_gate_check`, sync gates run on
-    a gate thread, never on the event loop. There `gate_timeout=None` is refused.
+    a gate thread, never on the event loop. There `gate_timeout=None` is refused. The gate threads
+    form one process-wide pool of daemon threads, 32 by default; change it with
+    `set_gate_threads(n)` or `PYDENO_GATE_THREADS`.
   - **Module loaders and closed sessions.** A module-loader refusal is raised by the command that
     imported, keeps its `__cause__`, and is raised even when the guest catches the failed import.
     A closed session or runtime never calls its gate.

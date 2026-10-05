@@ -33,7 +33,9 @@ with Pydeno(gate=gate, strict_eval=True) as pool:
 Each layer catches what the one before it missed. A later layer never relies on an earlier one.
 
 1. **Static policy** (`static_gate(SourcePolicy(...))`): a pure, deterministic scan in Python that
-   runs in linear time (well under a second for the default 1 MiB cap). It refuses forbidden names,
+   runs in linear time. Measured on a laptop (Apple silicon, CPython 3.10), the default mode takes
+   about 0.1–0.6 s per MiB, worst case included; the precise mode takes about 1–2 s per MiB. The
+   default 1 MiB cap keeps it well inside the 10 s gate timeout. It refuses forbidden names,
    `eval`, the `Function` constructor, `import()`, `WebAssembly` and oversized programs, and by
    default it fails closed: it reads the whole text, strings and comments included. Its messages are
    fixed, actionable sentences, so a model can use them to fix the code.
@@ -101,9 +103,20 @@ gate runs is left exactly as it was.
 - **Sync gates** cannot be interrupted, so they run to the end, but a verdict that arrives after
   the deadline is discarded, also from a gate that swallowed its cancellation.
 - **Sync gates in the async classes** (and in `async_gate_check`) run on a gate thread, never on the
-  event loop, so a slow one stalls nothing else. At the deadline its result is abandoned and the
-  thread finishes on its own. There are 32 gate threads; when gates that never return hold them all,
-  further checks wait and time out as `GateUnavailable`.
+  event loop, so a slow one does not block the loop. At the deadline its result is abandoned and the
+  thread finishes on its own.
+
+**The gate threads are shared by the whole process.**
+
+- There are 32 by default; set the number with `pydeno.set_gate_threads(n)` or the
+  `PYDENO_GATE_THREADS` environment variable.
+- They are daemon threads: a gate that never returns does not keep the interpreter from exiting.
+- A gate that never returns holds its thread for good. A few slow or hostile gates can therefore
+  hold them all, and every later sync gate in any async runtime or session then waits and ends as
+  `GateUnavailable` at its deadline. The work is refused, not run.
+- Keep sync gates bounded: give a classifier its own timeout.
+- Bound the size of the source before it reaches any gate: a policy's `max_source_bytes` does that
+  for the static layer.
 
 In the async classes and `async_gate_check` the deadline is required: `gate_timeout=None` is a
 `ValueError` there. The sync classes accept `None`, meaning a verdict is never discarded for being
@@ -223,7 +236,7 @@ process included.
 | `forbidden_globals` | the names, wherever they appear (an alias such as `g.name` may be the global); precise mode: bare or on a global object only |
 | `forbid_dynamic_import` | `import` followed by anything a static `import` or `import.meta` cannot start with, such as `(`, a comment or the end |
 | `forbid_eval` | `eval`, called or just named (`(0, eval)`); `setTimeout` / `setInterval` with a string literal |
-| `forbid_function` | the name `Function`, and `constructor` anywhere but a class's own `constructor(...)` method definition |
+| `forbid_function` | the name `Function`, and `constructor` everywhere except where it is provably a method definition: preceded by `{`, `}` or `;` (whitespace and up to two whole `//` lines aside) and its balanced parameter list followed by `{` on the same line. Inside `with (fn) { ... }` a bare `constructor(...)` call, or `extends constructor(...)`, is the Function constructor, and is reported. So is a constructor that cannot be proved cheaply (a regex or template in its parameters, the brace on the next line, a block comment right before it): a false positive, the safe direction |
 | `forbid_webassembly` | `WebAssembly` |
 | `forbid_computed_global_access` | a global object used other than as `name.property` (`globalThis[k]`, `= globalThis`, `f(this)`, `...self`), `Reflect`, and `constructor[` / `Function[` (off by default) |
 | `max_source_bytes` | longer code, checked first; nothing else is scanned then. Default **1 MiB** (`None` removes it): a 16 MiB source could not be scanned within the default 10 s gate timeout |
@@ -236,10 +249,14 @@ text: `await /`/`, an HTML-like `<!--` comment, a hashbang line, or `function(){
 hidden a call that then ran. So the default scan works differently:
 
 - it decodes every escape wherever it appears: `\u0065`, `\u{0065}` with any number of leading
-  zeros, `\x65`, legacy octal `\145`, identity escapes such as `\e`, and line continuations;
+  zeros, `\x65`, legacy octal `\145` and identity escapes such as `\e`;
+- a backslash before a line break is a continuation inside a string (`"ev\` + newline + `al"` is
+  `"eval"`) but plain text in a `//`, `<!--` or hashbang comment, which still ends at the break. The
+  scan reads the text both ways and reports what either reading finds;
 - it reads the whole decoded text: code, comments, strings, templates, regular expressions, HTML-like
   comments and hashbang lines;
-- it reports every forbidden name it finds there.
+- it reports every forbidden name it finds there, up to 1,000 findings per reading, after which the
+  code is refused anyway.
 
 A name in a string or a comment is therefore reported too. That over-reporting is the safe default.
 Findings still point at the original line and column. Fullwidth letters and zero-width joiners make
@@ -256,7 +273,8 @@ strings, comments, templates and regular expressions, so it reports fewer false 
 - HTML-like comments (`<!--`) and hashbang lines;
 - legacy octal escapes (`"\145val"`) and `\u{...}` with more than eight digits;
 - names reached without being written: `Reflect.get(globalThis, k)`, `const {[k]: e} = globalThis`,
-  and `const {constructor: F} = function(){}`.
+  and `const {constructor: F} = function(){}`;
+- a bare `constructor` inside `with (fn) { ... }`, which is the Function constructor there.
 
 Use the precise mode only where false positives in strings and comments are a real problem, and
 never as the only layer. Without a policy, `check_source(code)` behaves as it always has.

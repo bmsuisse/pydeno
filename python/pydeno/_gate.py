@@ -30,6 +30,7 @@ import functools
 import hashlib
 import inspect
 import os
+import queue
 import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -54,6 +55,8 @@ __all__ = [
     "any_of",
     "async_gate_check",
     "gate_check",
+    "gate_threads",
+    "set_gate_threads",
     "static_gate",
 ]
 
@@ -292,7 +295,7 @@ async def _adecide(
     gate: Any, source: str, context: GateContext, timeout: float | None
 ) -> Verdict:
     """Call a gate from a coroutine: an async gate is awaited and cancelled at the deadline; a
-    sync one runs on a gate thread (`_gate_threads`) and is abandoned at the deadline. A verdict
+    sync one runs on a gate thread (`_GatePool`) and is abandoned at the deadline. A verdict
     after the deadline is discarded, also from a gate that swallowed its cancellation."""
     loop = asyncio.get_running_loop()
     deadline = None if timeout is None else loop.time() + timeout
@@ -305,8 +308,8 @@ async def _adecide(
                 # every task. Its thread cannot be interrupted; past the deadline its verdict is
                 # abandoned. It sees the caller's contextvars.
                 call = contextvars.copy_context().run
-                result = await loop.run_in_executor(
-                    _gate_threads(), call, gate, source, context
+                result = await asyncio.wrap_future(
+                    _GATE_POOL.submit(call, gate, source, context)
                 )
             if inspect.isawaitable(result):
                 result = await result
@@ -368,27 +371,94 @@ def _callable_gate(gate: Any) -> Any:
     return _SourceOnly(gate)
 
 
-#: Threads that run sync gates for async callers. Bounded: gates that never return can hold
-#: them all, and then further checks wait in the queue until their `gate_timeout`
-#: (`GateUnavailable`) instead of starving the event loop's default executor.
-GATE_THREADS = 32
-_gate_pool: tuple[int, concurrent.futures.ThreadPoolExecutor] | None = None
-_gate_pool_lock = threading.Lock()
+def _default_gate_threads() -> int:
+    try:
+        value = int(os.environ.get("PYDENO_GATE_THREADS", ""))
+    except ValueError:
+        return 32
+    return value if value > 0 else 32
 
 
-def _gate_threads() -> concurrent.futures.ThreadPoolExecutor:
-    global _gate_pool
-    with _gate_pool_lock:
-        if (
-            _gate_pool is None or _gate_pool[0] != os.getpid()
-        ):  # not inherited across fork()
-            _gate_pool = (
-                os.getpid(),
-                concurrent.futures.ThreadPoolExecutor(
-                    max_workers=GATE_THREADS, thread_name_prefix="pydeno-gate"
-                ),
-            )
-        return _gate_pool[1]
+class _GatePool:
+    """The threads that run sync gates for async callers: one pool for the whole process.
+
+    Daemon threads, started on demand up to `size`: a gate that never returns cannot keep the
+    interpreter from exiting (nothing joins them at exit). A job whose caller gave up (its
+    `gate_timeout` passed, or it was cancelled) before a thread took it is skipped. Gates that
+    never return hold their threads for good; once all are held, later checks wait in the queue
+    and end as `GateUnavailable` at their deadline, so a few slow or hostile gates can starve
+    every other async gate in the process. Bound the source size before the gate."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.size = _default_gate_threads()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.pid = os.getpid()
+        self.jobs: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self.threads = 0
+        self.idle = 0
+
+    def submit(
+        self, fn: Callable[..., Any], *args: Any
+    ) -> concurrent.futures.Future[Any]:
+        future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        with self.lock:
+            if (
+                self.pid != os.getpid()
+            ):  # a fork() child: the parent's threads are not here
+                self._reset()
+            self.jobs.put((future, fn, args))
+            if self.idle == 0 and self.threads < self.size:
+                self.threads += 1
+                threading.Thread(
+                    target=self._work,
+                    name=f"pydeno-gate-{self.threads}",
+                    daemon=True,
+                ).start()
+        return future
+
+    def _work(self) -> None:
+        jobs = self.jobs
+        while True:
+            with self.lock:
+                if self.threads > self.size or jobs is not self.jobs:
+                    self.threads -= jobs is self.jobs
+                    return
+                self.idle += 1
+            future, fn, args = jobs.get()
+            with self.lock:
+                self.idle -= 1
+            if not future.set_running_or_notify_cancel():
+                continue  # its caller already gave up
+            try:
+                result = fn(*args)
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller as is
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+
+_GATE_POOL = _GatePool()
+
+
+def set_gate_threads(count: int) -> None:
+    """Set how many threads the process may use to run sync gates for async callers (default 32,
+    or the ``PYDENO_GATE_THREADS`` environment variable). The pool is shared by every async
+    runtime, session and `async_gate_check` in the process. Lowering it lets busy threads finish
+    first; a thread held by a gate that never returns is never reclaimed."""
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("set_gate_threads takes an int")
+    if count < 1:
+        raise ValueError("set_gate_threads needs at least 1 thread")
+    with _GATE_POOL.lock:
+        _GATE_POOL.size = count
+
+
+def gate_threads() -> int:
+    """The current limit set by `set_gate_threads`."""
+    return _GATE_POOL.size
 
 
 def _async_timeout(timeout: Any, name: str) -> float:

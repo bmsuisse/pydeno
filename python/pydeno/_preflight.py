@@ -169,8 +169,9 @@ class SourcePolicy:
         forbid_eval: Refuse ``eval`` (called or merely named, as in ``(0, eval)``) and
             ``setTimeout`` / ``setInterval`` called with a string literal.
         forbid_function: Refuse the ``Function`` constructor: the name ``Function``, and
-            ``constructor`` anywhere but a class's own ``constructor(...)`` method definition
-            (precise mode: ``.constructor(...)`` and ``["constructor"](...)`` only).
+            ``constructor`` anywhere but a provable ``constructor(...) {`` method definition
+            (see `_method_definition`; inside ``with`` a bare ``constructor`` is Function).
+            Precise mode: ``.constructor(...)`` and ``["constructor"](...)`` only.
         forbid_webassembly: Refuse ``WebAssembly``.
         forbid_computed_global_access: Refuse reaching a global by a computed name. By default:
             ``globalThis``, ``self``, ``window``, ``global`` or ``this`` used other than as
@@ -877,7 +878,6 @@ _ESCAPE = re.compile(
     re.S,
 )
 _WORDS = re.compile(r"[\w$]+")
-_CALL = re.compile(r"\s*\(")
 _BRACKET = re.compile(r"\s*\[")
 _STRING_ARGUMENT = re.compile(r"\s*\(\s*['\"`]")
 _NEXT = re.compile(r"\s*(.?)", re.S)
@@ -885,18 +885,28 @@ _DOTTED = re.compile(r"\s*\??\.\s*[\w$]")
 _STATIC_IMPORT_STARTS = re.compile(r"[\w${*\"'.]")
 _GLOBAL_VALUES = frozenset({"globalThis", "self", "window", "global", "this"})
 _TIMER_NAMES = frozenset({"setTimeout", "setInterval"})
-#: How far back the method-definition test for `constructor` looks before it gives up (and
-#: reports it): keeps a text made of nothing but `// constructor(` lines linear.
-_LOOKBACK = 4096
+#: The constructor test's bounds: how far back it looks (whitespace and at most two whole `//`
+#: comment lines) and how long a parameter list it matches. Past either it reports: constant
+#: cost per occurrence, so a text of nothing but `constructor(` stays linear.
+_BACK = 64
+#: Most findings one policy scan lists (per reading of the text): the code is refused anyway,
+#: and collecting 200 000 of them would cost more than the scan.
+MAX_POLICY_FINDINGS = 1000
+_PARAMS = 1024
+_LINE_TERMINATORS = "\n\r  "
 
 
-def _decoded(code: str) -> tuple[str, list[int], list[int]]:
-    """`code` with every escape decoded, plus anchors mapping decoded offsets back."""
+def _decoded(code: str, continuation: str) -> tuple[str, list[int], list[int], bool]:
+    """`code` with every escape decoded, anchors mapping decoded offsets back, and whether any
+    backslash-line-terminator pair was seen. Such a pair is a line continuation inside a string
+    (nothing) but plain text inside a `//`, `<!--` or hashbang comment, which still ends at the
+    break: the caller scans both readings, `continuation` = "" and "\\n"."""
     pieces: list[str] = []
     norm_at: list[int] = [0]
     orig_at: list[int] = [0]
     last = 0
     size = 0
+    continued = False
     for m in _ESCAPE.finditer(code):
         start, end = m.span()
         pieces.append(code[last:start])
@@ -912,7 +922,8 @@ def _decoded(code: str) -> tuple[str, list[int], list[int]]:
         elif octal is not None:
             text = chr(int(octal, 8))
         elif newline is not None:
-            text = ""
+            text = continuation
+            continued = True
         else:
             text = _SIMPLE_ESCAPES.get(other, other)
         pieces.append(text)
@@ -921,43 +932,114 @@ def _decoded(code: str) -> tuple[str, list[int], list[int]]:
         orig_at.append(end)
         last = end
     pieces.append(code[last:])
-    return "".join(pieces), norm_at, orig_at
+    return "".join(pieces), norm_at, orig_at, continued
 
 
-def _method_definition(text: str, start: int, end: int) -> bool:
-    """Is the `constructor` at `start` a class's own `constructor(...)` definition? Only when it
-    is followed by `(` and preceded (skipping whitespace and whole `//` comment lines) by `{`,
-    `}` or `;`. A bare `constructor(...)` call is the global object's constructor (`Object`), not
-    `Function`, so allowing it there is safe; anything else is reported."""
-    if not _CALL.match(text, end):
-        return False
+def _before(code: str, start: int) -> str:
+    """The character before `start`, skipping whitespace and up to two whole `//` comment lines,
+    within bounded windows ("" at the start of the text, "?" when a window runs out)."""
     i = start - 1
-    floor = max(-1, start - _LOOKBACK)
-    while i > floor:
-        ch = text[i]
-        if ch.isspace():
+    for _hop in range(3):
+        floor = max(-1, i - _BACK)
+        while i > floor and code[i].isspace():
             i -= 1
-            continue
-        line_start = max(
-            text.rfind("\n", floor + 1, i + 1), text.rfind("\r", floor + 1, i + 1)
-        )
-        if line_start < 0 and floor >= 0:
-            return False  # the line runs past the look-back limit
-        if text[line_start + 1 : i + 1].lstrip().startswith("//"):
-            i = line_start
-            continue
-        return ch in "{};"
-    return floor < 0  # the start of the text: a bare call
+        if i < 0:
+            return ""
+        if i == floor:
+            return "?"
+        window = max(0, i - _BACK)
+        line_start = max(code.rfind(t, window, i + 1) for t in _LINE_TERMINATORS)
+        if line_start < 0 or not code[line_start + 1 : i + 1].lstrip().startswith("//"):
+            return code[i]
+        i = line_start  # a whole comment line: look before it
+    return "?"
+
+
+def _parameters_end(code: str, i: int) -> int | None:
+    """From the `(` at `i`: the index after its matching `)`, or None when that cannot be shown
+    cheaply (a regex, comment or template inside, an unclosed string, too long)."""
+    depth = 0
+    limit = min(len(code), i + _PARAMS)
+    j = i
+    while j < limit:
+        c = code[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return j + 1 if c == ")" else None
+            if depth < 0:
+                return None
+        elif c in "'\"":
+            j += 1
+            while j < limit and code[j] != c:
+                if code[j] in _LINE_TERMINATORS:
+                    return None
+                j += 2 if code[j] == "\\" else 1
+            if j >= limit:
+                return None
+        elif c in "/`":
+            return None
+        j += 1
+    return None
+
+
+def _method_definition(code: str, start: int, end: int) -> bool:
+    """Is the `constructor` at `code[start:end]` (the original text) provably a method
+    definition, `constructor(...) {`? Only when it is preceded by `{`, `}` or `;` (whitespace and
+    whole `//` lines aside) and its balanced parameter list is followed, on the same line, by
+    `{`: a call has no body there, a definition must. Inside `with (fn) { ... }` a bare
+    `constructor(...)` call is the Function constructor, and so is `extends constructor(...)`;
+    neither passes. Constant cost per occurrence; when in doubt it is not a definition, and the
+    caller reports it."""
+    if _before(code, start) not in ("{", "}", ";"):
+        return False
+    j = end
+    limit = min(len(code), end + _BACK)
+    while j < limit and code[j].isspace():
+        j += 1
+    if j >= limit or code[j] != "(":
+        return False
+    close = _parameters_end(code, j)
+    if close is None:
+        return False
+    limit = min(len(code), close + _BACK)
+    while close < limit and code[close] in " \t\v\f ﻿":
+        close += 1
+    return close < len(code) and code[close] == "{"
 
 
 def _scan_text(
     policy: SourcePolicy, code: str, add: Callable[[str, str, int], None]
 ) -> None:
-    text, norm_at, orig_at = _decoded(code)
+    text, norm_at, orig_at, continued = _decoded(code, "")
+    _scan_view(policy, code, text, norm_at, orig_at, add)
+    if continued:
+        # A backslash at the end of a comment line is text, and the comment ends at the break:
+        # read that way too, or `//x\` + newline + `name` would read as the one word `xname`.
+        text, norm_at, orig_at, _ = _decoded(code, "\n")
+        _scan_view(policy, code, text, norm_at, orig_at, add)
+
+
+def _scan_view(
+    policy: SourcePolicy,
+    code: str,
+    text: str,
+    norm_at: list[int],
+    orig_at: list[int],
+    add: Callable[[str, str, int], None],
+) -> None:
+    def original(at: int) -> int:
+        k = bisect_right(norm_at, at) - 1
+        return orig_at[k] + at - norm_at[k]
+
+    reported = 0
 
     def report(rule: str, at: int, **values: object) -> None:
-        k = bisect_right(norm_at, at) - 1
-        add(rule, POLICY_MESSAGES[rule].format(**values), orig_at[k] + at - norm_at[k])
+        nonlocal reported
+        reported += 1
+        add(rule, POLICY_MESSAGES[rule].format(**values), original(at))
 
     identifiers = policy.forbidden_identifiers
     globals_ = policy.forbidden_globals
@@ -978,6 +1060,8 @@ def _scan_text(
         word = m.group()
         if word not in interest:
             continue
+        if reported >= MAX_POLICY_FINDINGS:
+            return  # denied many times over; listing more only costs time
         start, end = m.span()
         after_dot = (
             start > 0 and text[start - 1] == "." and text[start - 3 : start] != "..."
@@ -993,7 +1077,10 @@ def _scan_text(
                 report("forbidden-string-timer", start, name=word)
         if policy.forbid_function and (
             word == "Function"
-            or (word == "constructor" and not _method_definition(text, start, end))
+            or (
+                word == "constructor"
+                and not _method_definition(code, original(start), original(end))
+            )
         ):
             report("forbidden-function-constructor", start)
         if policy.forbid_webassembly and word == "WebAssembly":
