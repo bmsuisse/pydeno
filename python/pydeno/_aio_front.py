@@ -19,7 +19,7 @@ import contextvars
 import functools
 import inspect
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from ._agent import (
@@ -60,6 +60,7 @@ from ._front import (
     _fresh_seed,
     _is_js_syntax,
     _journal_seed,
+    _wrong_load,
     _Limits,
     _load_failure,
     _not_available,
@@ -205,10 +206,11 @@ class AsyncPydeno:
             if seed is None and limits.max_memory == self._limits.max_memory:
                 return await self._pool.checkout()
             options = {**self._spawn, "max_memory": limits.max_memory}
-            return await self._pool._new(
+            return await self._pool._new(  # noqa: SLF001
                 factory=lambda: AsyncIsolatedRuntime(
                     _CONFIG,
-                    prewarm=False,
+                    # A spare is an extra process: only without a cap, as before caps existed.
+                    prewarm=self._pool._capacity.maximum is None,  # noqa: SLF001
                     random_seed=_fresh_seed() if seed is None else seed,
                     **options,
                 )
@@ -234,11 +236,19 @@ class AsyncPydeno:
         return agent
 
     async def _load(
-        self, state: bytes, limits: _Limits, associated_data: bytes = b""
+        self,
+        state: bytes,
+        limits: _Limits,
+        associated_data: bytes = b"",
+        *,
+        suspended: bool | None = None,
+        release: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncAgentSandbox:
         seed = _journal_seed(
-            state, self._key, self._spawn["strict_eval"], associated_data
+            state, self._key, self._spawn["strict_eval"], associated_data, suspended
         )
+        if release is not None and self._pool._capacity.maximum is not None:  # noqa: SLF001
+            await release()  # see `Pydeno._load`
         rt = await self._runtime(limits, seed)
         try:
             return await AsyncAgentSandbox.load(
@@ -577,18 +587,27 @@ class AsyncPydenoSession:
         if old is None:
             self._live()
         self._printer.callback = None
-        new = await self._pool._load(state, self._limits, associated_data)  # noqa: SLF001
+        assert old is not None
+
+        async def release() -> None:
+            # See `PydenoSession._replace`: only with a worker cap.
+            if not old._core.closed:  # noqa: SLF001
+                old._core.kill("the session loaded new state")  # noqa: SLF001
+            await old.close()
+
+        new = await self._pool._load(  # noqa: SLF001
+            state,
+            self._limits,
+            associated_data,
+            suspended=suspended,
+            release=release,
+        )
         if (new.pending is not None) != suspended:
             await new.close()
-            raise PydenoError(
-                "this state was dumped mid-feed; use load_snapshot"
-                if not suspended
-                else "this state was dumped between feeds; use load_session"
-            )
+            raise _wrong_load(suspended)
         new._core.console.user = self._printer  # noqa: SLF001
         new._core.rt._handler_executor = self._console  # noqa: SLF001
         self._agent = new
-        assert old is not None
         await old.close()
         return new
 

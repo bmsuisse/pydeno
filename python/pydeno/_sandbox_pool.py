@@ -13,9 +13,10 @@ The rules that keep a pool as safe as a fresh runtime:
 * **Same construction.** Each pooled runtime is an ordinary `IsolatedRuntime` /
   `AsyncIsolatedRuntime`, built with the pool's options: the same handshake, `sandbox="require"`
   check, self-test, limits and caps, only earlier.
-* **By default, exhaustion is a cold start, never an error.** If every pooled runtime is taken, `checkout()`
-  starts one on the spot, exactly as `IsolatedRuntime(...)` would. Replacements are started in the
-  background as soon as a runtime is handed out.
+* **By default, exhaustion is a cold start, never an error.** If every pooled runtime is taken,
+  `checkout()` starts one on the spot, exactly as `IsolatedRuntime(...)` would. Replacements are
+  started in the background as soon as a runtime is handed out. An opt-in ``max_workers`` cap makes
+  a checkout wait instead, and raise `CheckoutTimeout` after ``checkout_timeout``.
 
 Options split in two. Whatever the worker receives at start-up (the `RuntimeConfig`, `sandbox`,
 `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing, ...)
@@ -38,7 +39,7 @@ from typing import Any
 from . import _compat
 from ._aio import AsyncIsolatedRuntime
 from ._isolated import SESSION_OPTIONS, IsolatedRuntime, _session_options
-from ._limits import limit_int, limit_seconds
+from ._limits import MAX_SECONDS, limit_int, limit_seconds
 from ._pydeno import RuntimeConfig
 
 __all__ = ["AsyncSandboxPool", "SandboxPool", "CheckoutTimeout", "SESSION_OPTIONS"]
@@ -55,10 +56,14 @@ _MAX_BACKOFF = 30.0
 _JOIN_SECONDS = 35.0
 
 _ASYNC_SESSION_OPTIONS = (*SESSION_OPTIONS, "handler_executor")
+# How often a checkout waiting for a worker slot (``max_workers``) checks again.
+_POLL_SECONDS = 0.02
 
 
 class CheckoutTimeout(TimeoutError):
-    """No worker capacity became available within ``checkout_timeout``."""
+    """No worker capacity became available within ``checkout_timeout`` (only with
+    ``max_workers`` set). Nothing was started; retrying later, or with a larger cap, may
+    succeed."""
 
 
 class _WorkerCapacity:
@@ -67,6 +72,10 @@ class _WorkerCapacity:
     Poll the process, not runtime.is_closed(): the front-door reaper marks a runtime closed
     before the kernel has finished its process. Runtime GC still runs its normal finalizer.
     Access is serialized by the sync core's condition, or by the async pool's event loop.
+
+    Waiting is by polling (every `_POLL_SECONDS`), not a FIFO queue: when a slot frees, any
+    waiter may take it. A checkout made while the same thread or task holds every slot waits
+    the full ``checkout_timeout`` and then raises `CheckoutTimeout`.
     """
 
     def __init__(self, maximum: int | None, timeout: float) -> None:
@@ -74,16 +83,28 @@ class _WorkerCapacity:
         self.timeout = timeout
         self.workers: dict[object, Any] = {}
         self.waiters = 0
+        self.timeouts = 0
 
-    def available(self) -> bool:
-        if self.maximum is None:
-            return True
+    def live(self) -> int:
+        """Reserved slots plus worker processes that have not exited (0 without a cap: no
+        process is tracked then)."""
         self.workers = {
             token: proc
             for token, proc in self.workers.items()
             if proc is None or proc.poll() is None
         }
-        return len(self.workers) < self.maximum
+        return len(self.workers)
+
+    def available(self) -> bool:
+        return self.maximum is None or self.live() < self.maximum
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "max_workers": self.maximum,
+            "workers": None if self.maximum is None else self.live(),
+            "waiting": self.waiters,
+            "checkout_timeouts": self.timeouts,
+        }
 
     def reserve(self) -> object:
         token = object()
@@ -94,9 +115,23 @@ class _WorkerCapacity:
 
 def _capacity(max_workers: int | None, checkout_timeout: float) -> _WorkerCapacity:
     maximum = limit_int("max_workers", max_workers, minimum=1)
-    timeout = limit_seconds("checkout_timeout", checkout_timeout)
-    if timeout is None:
-        raise TypeError("checkout_timeout must be finite seconds, not None")
+    # `limit_seconds` accepts None ("no limit"); a capacity wait always has one.
+    if checkout_timeout is None:
+        raise TypeError(
+            "checkout_timeout must be a number of seconds or a timedelta, not None"
+        )
+    try:
+        timeout = limit_seconds("checkout_timeout", checkout_timeout)
+    except TypeError:
+        raise TypeError(
+            "checkout_timeout must be a number of seconds or a timedelta"
+        ) from None
+    except ValueError:
+        raise ValueError(
+            "checkout_timeout must be a finite number of seconds > 0 and at most "
+            f"{MAX_SECONDS:.0f}"
+        ) from None
+    assert timeout is not None
     return _WorkerCapacity(maximum, timeout)
 
 
@@ -196,7 +231,10 @@ class _Core:
         *,
         factory: Any = None,
         token: object | None = None,
+        count: bool = False,
     ) -> IsolatedRuntime:
+        """Start a runtime in a reserved slot (`token`), or reserve one first, waiting for
+        capacity. `count`: a `SandboxPool.checkout` that found none ready (stats)."""
         capacity = self.capacity
         if token is None:
             deadline = time.monotonic() + capacity.timeout
@@ -222,14 +260,18 @@ class _Core:
                             ):
                                 if session is not None:
                                     retired._apply_session(_session_options(**session))
+                                if count:
+                                    self.checkouts += 1
                                 return retired
                         elif time.monotonic() >= deadline:
+                            capacity.timeouts += 1
                             raise CheckoutTimeout(
-                                "worker checkout exceeded checkout_timeout"
+                                f"no worker slot became free within checkout_timeout="
+                                f"{capacity.timeout:g}s (max_workers={capacity.maximum})"
                             )
                         else:
                             self.cond.wait(
-                                min(0.02, max(0, deadline - time.monotonic()))
+                                min(_POLL_SECONDS, max(0, deadline - time.monotonic()))
                             )
                     if retired is not None:
                         retired.close()
@@ -247,6 +289,9 @@ class _Core:
         with self.cond:
             if capacity.maximum is not None:
                 capacity.workers[token] = rt._proc
+            if count:
+                self.checkouts += 1
+                self.cold_starts += 1
         return rt
 
     def start_fillers(self) -> None:
@@ -272,7 +317,7 @@ class _Core:
                         None
                         if self.capacity.maximum is None
                         or len(self.ready) + self.starting >= self.size
-                        else 0.02
+                        else _POLL_SECONDS
                     )
 
                 if self.closed:
@@ -314,9 +359,8 @@ class _Core:
                     rt = candidate
                     break
                 dead.append(candidate)
-            self.checkouts += 1
-            if rt is None:
-                self.cold_starts += 1
+            if rt is not None:  # a cold start is counted once it has started (`new`)
+                self.checkouts += 1
             self.cond.notify_all()  # a filler starts the replacement
         for candidate in dead:
             candidate.close()
@@ -369,6 +413,7 @@ class _Core:
                 "checkouts": self.checkouts,
                 "cold_starts": self.cold_starts,
                 "last_error": self.last_error,
+                **self.capacity.stats(),
             }
 
 
@@ -391,7 +436,9 @@ class SandboxPool:
             to this cap when it is smaller than size.
         checkout_timeout: Finite positive seconds to wait for capacity (default 30). A checkout
             that cannot obtain capacity raises CheckoutTimeout. This bounds capacity waiting,
-            not the worker's subsequent startup handshake.
+            not the worker's subsequent startup handshake. Waiting is by polling (every 20 ms),
+            not FIFO; a checkout while the same thread already holds every slot waits the full
+            timeout.
         **options: Any other `IsolatedRuntime` keyword argument. The ones in `SESSION_OPTIONS`
             are defaults that `checkout()` can override; the rest are fixed for the pool.
 
@@ -450,7 +497,7 @@ class SandboxPool:
         options = _session_options(**session) if session_options else None
         rt = core.take()
         if rt is None:
-            return core.new(session)
+            return core.new(session, count=True)
         if options is not None:
             rt._apply_session(options)  # noqa: SLF001
         return rt
@@ -469,7 +516,11 @@ class SandboxPool:
 
     def stats(self) -> dict[str, Any]:
         """`size`, `ready`, `starting`, `checkouts`, `cold_starts` (checkouts that found the pool
-        empty) and `last_error` (the last background start that failed, or None)."""
+        empty and started a worker), `last_error` (the last background start that failed, or
+        None), `max_workers` (the cap, or None), `workers` (slots in use: starting, ready and
+        checked-out workers whose process has not exited; None without a cap), `waiting`
+        (checkouts waiting for a slot) and `checkout_timeouts` (checkouts that raised
+        `CheckoutTimeout`; neither a checkout nor a cold start)."""
         return self._core.stats()
 
     def close(self) -> None:
@@ -607,7 +658,9 @@ class AsyncSandboxPool:
         *,
         factory: Any = None,
         token: object | None = None,
+        count: bool = False,
     ) -> AsyncIsolatedRuntime:
+        """As `_Core.new`."""
         capacity = self._capacity
         if token is None:
             deadline = time.monotonic() + capacity.timeout
@@ -629,15 +682,19 @@ class AsyncSandboxPool:
                         ):
                             if session is not None:
                                 candidate._apply_session(_parent_side(session))
+                            if count:
+                                self._checkouts += 1
                             return candidate
                         await candidate.close()
                     elif time.monotonic() >= deadline:
+                        capacity.timeouts += 1
                         raise CheckoutTimeout(
-                            "worker checkout exceeded checkout_timeout"
+                            f"no worker slot became free within checkout_timeout="
+                            f"{capacity.timeout:g}s (max_workers={capacity.maximum})"
                         )
                     else:
                         await asyncio.sleep(
-                            min(0.02, max(0, deadline - time.monotonic()))
+                            min(_POLL_SECONDS, max(0, deadline - time.monotonic()))
                         )
             finally:
                 capacity.waiters -= 1
@@ -683,6 +740,9 @@ class AsyncSandboxPool:
             _START_CLEANUPS.add(cleanup)
             cleanup.add_done_callback(_START_CLEANUPS.discard)
             raise
+        if count:
+            self._checkouts += 1
+            self._cold_starts += 1
         return rt
 
     async def start(self) -> AsyncSandboxPool:
@@ -728,7 +788,7 @@ class AsyncSandboxPool:
                         await cond.wait()
                     else:
                         try:
-                            await asyncio.wait_for(cond.wait(), 0.02)
+                            await asyncio.wait_for(cond.wait(), _POLL_SECONDS)
                         except asyncio.TimeoutError:
                             pass
                 if self._closed:
@@ -787,14 +847,13 @@ class AsyncSandboxPool:
                 rt = candidate
                 break
             dead.append(candidate)
-        self._checkouts += 1
-        if rt is None:
-            self._cold_starts += 1
+        if rt is not None:  # a cold start is counted once it has started (`_new`)
+            self._checkouts += 1
         self._wake_fillers()
         for candidate in dead:
             await candidate.close()
         if rt is None:
-            return await self._new(session)
+            return await self._new(session, count=True)
         if options is not None:
             rt._apply_session(options)  # noqa: SLF001
         return rt
@@ -843,6 +902,7 @@ class AsyncSandboxPool:
             "checkouts": self._checkouts,
             "cold_starts": self._cold_starts,
             "last_error": self._last_error,
+            **self._capacity.stats(),
         }
 
     async def close(self) -> None:

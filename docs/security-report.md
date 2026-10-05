@@ -126,7 +126,7 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Non-finite limit values (NaN, infinity) were accepted and silently disabled the limit | **Fixed** (0.8). Validated at construction; probe `non_finite_limits_are_refused`. |
 | Console calls paused the hard deadline like tool calls, so a console flood stretched a run up to `max_host_wait` | **Fixed** (0.8). Console time pauses the deadline only within one deadline per command (a flood at most doubles a run); probe `console_flood_does_not_stretch_the_hard_deadline`. |
 | `Pydeno`'s default printer wrote guest console output to the host's stdout without limit (~150 MB in 2 s) | **Fixed** (0.8). 1 MiB per feed, then `[truncated]`; probe `default_printer_volume_is_capped_per_feed`. |
-| A `SandboxPool` / `Pydeno` that runs out of ready workers starts new ones without limit (cold starts) | **Open, by design** ("exhaustion is never an error"). An opt-in per-pool worker cap is proposed separately. |
+| A `SandboxPool` / `Pydeno` that runs out of ready workers starts new ones without limit (cold starts) | **Mitigated, opt-in** (0.9). The default is unchanged (cold starts without limit). `max_workers=N` caps a pool's live worker processes, checked-out ones included; at the cap a checkout waits up to `checkout_timeout` and raises `CheckoutTimeout`. The cap is per pool, not per host. |
 
 ### Guest surface
 

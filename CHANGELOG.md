@@ -24,6 +24,17 @@
   [`docs/guides/advanced/webassembly.md`](docs/guides/advanced/webassembly.md);
   `benches_py/wasm_kernel_bench.py` compares one kernel as JavaScript and as WebAssembly (no faster
   under the JIT; about 19x faster than jitless JavaScript).
+- **Opt-in worker caps for pools** (#81). `SandboxPool`, `AsyncSandboxPool`, `Pydeno` and
+  `AsyncPydeno` take `max_workers=None` (default: unchanged, cold starts without limit) and
+  `checkout_timeout=30.0`. With a cap, the pool counts every worker process that has not exited
+  (starting, ready, checked out, and the custom-memory and replay workers of `Pydeno` sessions); a
+  checkout at the cap waits up to `checkout_timeout` (polling every 20 ms, not FIFO) and raises the
+  new `pydeno.CheckoutTimeout` (a `TimeoutError`; `classify_error` kind `checkout_timeout`,
+  retryable). `load_session` / `load_snapshot` on a capped pool kill the session's current worker
+  after the state is authenticated and before the replay, so a load never needs a second slot; if
+  the replay then fails, the session has no worker until the next successful load. `stats()` adds
+  `max_workers`, `workers`, `waiting` and `checkout_timeouts`; a checkout that timed out is no
+  longer counted in `checkouts` / `cold_starts`. Based on the contribution in #93.
 
 ## 0.8.0 — 2026-10-04
 

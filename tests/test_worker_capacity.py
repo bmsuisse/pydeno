@@ -14,6 +14,9 @@ import pydeno
 def test_sync_cap_waits_then_times_out():
     with pydeno.SandboxPool(size=1, max_workers=2, checkout_timeout=0.1) as pool:
         first = pool.checkout()
+        # The filler takes the second slot: let it finish, or a loaded machine makes the
+        # second checkout wait longer than 0.1 s for it.
+        assert pool.wait_ready(30)
         second = pool.checkout()
         try:
             start = time.monotonic()
@@ -49,11 +52,13 @@ async def test_async_cap_and_release():
         size=1, max_workers=2, checkout_timeout=0.1
     ) as pool:
         first = await pool.checkout()
+        assert await pool.wait_ready(30)  # see test_sync_cap_waits_then_times_out
         second = await pool.checkout()
         try:
             with pytest.raises(pydeno.CheckoutTimeout):
                 await pool.checkout()
             await first.close()
+            assert await pool.wait_ready(30)  # the freed slot's replacement
             async with pool.checkout() as replacement:
                 assert await replacement.eval("6*7") == 42
         finally:
@@ -322,3 +327,162 @@ else:
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
     )
     assert done.returncode == 0, done.stderr
+
+
+# ---------------------------------------------------------------------------
+# stats, counting, messages
+# ---------------------------------------------------------------------------
+
+
+def test_stats_report_the_cap_and_a_timeout_is_not_a_checkout():
+    with pydeno.SandboxPool(size=1, max_workers=1, checkout_timeout=0.1) as pool:
+        stats = pool.stats()
+        assert stats["max_workers"] == 1
+        assert stats["workers"] == 1
+        assert stats["waiting"] == 0
+        assert stats["checkout_timeouts"] == 0
+        held = pool.checkout()
+        try:
+            with pytest.raises(pydeno.CheckoutTimeout) as info:
+                pool.checkout()
+            assert "max_workers=1" in str(info.value)
+            stats = pool.stats()
+            assert stats["checkouts"] == 1
+            assert stats["cold_starts"] == 0
+            assert stats["checkout_timeouts"] == 1
+            assert stats["workers"] == 1
+        finally:
+            held.close()
+
+
+def test_stats_without_a_cap():
+    with pydeno.SandboxPool(size=1) as pool:
+        stats = pool.stats()
+        assert stats["max_workers"] is None
+        assert stats["workers"] is None
+        assert stats["checkout_timeouts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_async_stats_and_a_timeout_is_not_a_checkout():
+    async with pydeno.AsyncSandboxPool(
+        size=1, max_workers=1, checkout_timeout=0.1
+    ) as pool:
+        held = await pool.checkout()
+        try:
+            with pytest.raises(pydeno.CheckoutTimeout):
+                await pool.checkout()
+            stats = pool.stats()
+            assert (stats["checkouts"], stats["cold_starts"]) == (1, 0)
+            assert stats["checkout_timeouts"] == 1
+            assert stats["max_workers"] == 1
+        finally:
+            await held.close()
+
+
+def test_checkout_timeout_none_says_none_is_refused():
+    with pytest.raises(TypeError, match="not None"):
+        pydeno.SandboxPool(checkout_timeout=None)
+    with pytest.raises(ValueError) as info:
+        pydeno.SandboxPool(checkout_timeout=0)
+    assert "or None" not in str(info.value)
+
+
+def test_checkout_timeout_is_classified_as_retryable():
+    info = pydeno.classify_error(pydeno.CheckoutTimeout("x"))
+    assert info.kind == "checkout_timeout"
+    assert info.retryable and not info.retry_with_larger_limits
+
+
+# ---------------------------------------------------------------------------
+# loading state into a session of a capped pool needs no second slot
+# ---------------------------------------------------------------------------
+
+
+def _double(n):
+    return n * 2
+
+
+async def _adouble(n):
+    return n * 2
+
+
+_TWO_CALLS = "const a = await double(3)\nconst b = await double(a)\na + b"
+
+
+@pytest.mark.parametrize("cap", [1, 2])
+def test_load_session_at_the_cap(cap):
+    with pydeno.Pydeno(min_processes=1, max_workers=cap, checkout_timeout=1) as pool:
+        sessions = [pool.checkout() for _ in range(cap)]
+        for session in sessions:
+            session.__enter__()
+        try:
+            sessions[0].feed_run("var v = 41")
+            state = sessions[0].dump()
+            for session in sessions:
+                session.load_session(state)
+                assert session.feed_run("v + 1") == 42
+        finally:
+            for session in sessions:
+                session.close()
+
+
+def test_load_snapshot_at_the_cap():
+    with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
+        with pool.checkout() as session:
+            snap = session.feed_start(_TWO_CALLS, external_lookup={"double": _double})
+            assert isinstance(snap, pydeno.PydenoSnapshot)
+            snap = snap.resume({"return_value": 6})
+            state = snap.dump()
+            restored = session.load_snapshot(state, external_lookup={"double": _double})
+            assert restored.args == (6,)
+            assert restored.resume(value=100).output == 106
+
+
+def test_load_of_the_wrong_kind_at_the_cap_keeps_the_session():
+    """The state's kind is checked before the session's worker is given up."""
+    with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
+        with pool.checkout() as session:
+            session.feed_run("var v = 1")
+            idle = session.dump()
+            with pytest.raises(pydeno.PydenoError, match="load_session"):
+                session.load_snapshot(idle)
+            assert session.feed_run("v") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap", [1, 2])
+async def test_async_load_session_at_the_cap(cap):
+    async with pydeno.AsyncPydeno(
+        min_processes=1, max_workers=cap, checkout_timeout=1
+    ) as pool:
+        sessions = [pool.checkout() for _ in range(cap)]
+        for session in sessions:
+            await session.__aenter__()
+        try:
+            await sessions[0].feed_run("var v = 41")
+            state = await sessions[0].dump()
+            for session in sessions:
+                await session.load_session(state)
+                assert await session.feed_run("v + 1") == 42
+        finally:
+            for session in sessions:
+                await session.close()
+
+
+@pytest.mark.asyncio
+async def test_async_load_snapshot_at_the_cap():
+    async with pydeno.AsyncPydeno(
+        min_processes=1, max_workers=1, checkout_timeout=1
+    ) as pool:
+        async with pool.checkout() as session:
+            snap = await session.feed_start(
+                _TWO_CALLS, external_lookup={"double": _adouble}
+            )
+            snap = await snap.resume({"return_value": 6})
+            state = await snap.dump()
+            restored = await session.load_snapshot(
+                state, external_lookup={"double": _adouble}
+            )
+            assert restored.args == (6,)
+            assert (await restored.resume(value=100)).output == 106

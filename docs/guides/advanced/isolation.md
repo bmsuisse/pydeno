@@ -429,10 +429,18 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   options: the same handshake, `sandbox="require"` check, self-test and limits, only earlier. The
   constructor starts the first one itself, so invalid options, or a platform that cannot satisfy
   `sandbox="require"`, fail there and not in the background.
-- **Exhaustion is a cold start, never an error.** If every pooled runtime is taken, `checkout()`
-  starts one on the spot. Replacements start in the background as soon as a runtime is handed out
-  (`max_concurrent_starts`, default 2, at a time); a replacement that fails to start is retried with
-  a backoff and shown in `stats()["last_error"]`.
+- **By default, exhaustion is a cold start, never an error.** If every pooled runtime is taken,
+  `checkout()` starts one on the spot. Replacements start in the background as soon as a runtime is
+  handed out (`max_concurrent_starts`, default 2, at a time); a replacement that fails to start is
+  retried with a backoff and shown in `stats()["last_error"]`.
+- **An opt-in cap bounds the processes.** `max_workers=N` counts every worker process of the pool
+  that has not exited: starting, ready and checked out (until it is closed, crashes, is killed by a
+  limit or is garbage-collected). At the cap, a checkout waits up to `checkout_timeout` seconds
+  (default 30, always finite) for a process to exit, then raises `CheckoutTimeout`
+  (`classify_error` kind `checkout_timeout`, retryable). Waiting is by polling every 20 ms, not a
+  queue: when a slot frees, any waiter may take it. A checkout made while the same thread or task
+  already holds every slot cannot succeed and waits the full `checkout_timeout`. `size` is clamped
+  to the cap. The cap is per pool, not per host.
 - **Options split in two.** What the worker receives when it starts (the `RuntimeConfig`, `sandbox`,
   `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
@@ -441,7 +449,9 @@ The rules, which are what keep a pool as safe as a fresh runtime:
 
 Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
 a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports
-`ready`, `starting`, `checkouts` and `cold_starts`; `wait_ready()` blocks until the pool is full.
+`ready`, `starting`, `checkouts` and `cold_starts`, and for the cap `max_workers`, `workers` (slots
+in use), `waiting` and `checkout_timeouts` (a checkout that timed out counts as neither a checkout nor
+a cold start); `wait_ready()` blocks until the pool is full.
 
 A forked child never receives the parent's pooled workers: its copy of the pool forgets them and
 refills on its first checkout.
