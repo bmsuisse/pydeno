@@ -20,7 +20,7 @@ import time
 import traceback
 from collections.abc import Callable
 
-from pydeno import IsolatedRuntime, Runtime, RuntimeConfig
+from pydeno import IsolatedRuntime, JavaScriptError, Runtime, RuntimeConfig
 
 TIMEOUT = 3.0
 Probe = Callable[[], bool]
@@ -2152,6 +2152,100 @@ def stalled_dns_lookups_cannot_pile_up() -> bool:
             getattr(pool, "executor", pool).shutdown(wait=True)
         hf.DNS_THREADS, hf.DNS_MAX_PENDING, hf._dns_pool = saved
     return len(ran) > 4
+
+
+# --- load_wasm (#37) -------------------------------------------------------------------------------------------
+# A trusted module loaded by the host. The surface it adds: one bridge global where V8 has WebAssembly
+# (`jitless=False`), and bytes and calls crossing into the worker.
+_WASM_ADD = bytes.fromhex(
+    "0061736d0100000001070160027f7f017f030201000707010361646400000a09010700200020016a0b"
+)
+
+
+@probe
+def wasm_load_refused_on_jitless_worker() -> bool:
+    # The default worker has no WebAssembly; the helper must refuse there and add nothing to its surface.
+    with iso() as rt:
+        try:
+            rt.load_wasm(_WASM_ADD)
+        except RuntimeError as exc:
+            refused = "jitless=False" in str(exc)
+        else:
+            refused = False
+        return not refused or rt.eval("typeof __pydeno_wasm_load") != "undefined"
+
+
+@probe
+def wasm_guest_poisoned_api_reaches_host() -> bool:
+    # A guest that replaced the WebAssembly API before the host loads a module must neither see the bytes
+    # nor substitute its own instance.
+    with iso(jitless=False) as rt:
+        rt.eval(
+            "globalThis.seen = 0;"
+            "WebAssembly.Module = function () { seen++; throw new Error('guest'); };"
+            "WebAssembly.Instance = function () { seen++; throw new Error('guest'); };"
+            "Object.defineProperty(WebAssembly.Instance.prototype, 'exports',"
+            " { get() { seen++; return { add: () => 666 }; } });"
+            "Object.defineProperty(Object.prototype, 'add', { get() { seen++; return () => 667; } }); 0"
+        )
+        return rt.load_wasm(_WASM_ADD).call("add", 2, 3) != 5 or rt.eval("seen") != 0
+
+
+@probe
+def wasm_guest_planted_loader_gets_the_bytes() -> bool:
+    # A flag that implies jitless without the word (`--lite-mode`) leaves V8 without WebAssembly, so the
+    # bridge installs no loader and a guest can define one. The host's bytes must never reach it, even when
+    # the parent's flag check is bypassed: the worker uses only the loader it took before guest code.
+    from pydeno import _wasm
+
+    plant = (
+        "globalThis.stolen = null; globalThis.__pydeno_wasm_load = (b) => {"
+        " globalThis.stolen = b.length; return () => 666; }; 0"
+    )
+    saved = _wasm.flags_disable_wasm
+    try:
+        for bypass in (False, True):
+            _wasm.flags_disable_wasm = (lambda flags: False) if bypass else saved
+            with iso(jitless=False, v8_flags=["--lite-mode"]) as rt:
+                rt.eval(plant)
+                try:
+                    result = rt.load_wasm(_WASM_ADD).call("add", 2, 3)
+                except RuntimeError:
+                    result = None
+                if result is not None or rt.eval("stolen") is not None:
+                    return True
+    finally:
+        _wasm.flags_disable_wasm = saved
+    return False
+
+
+@probe
+def wasm_loader_global_replaceable() -> bool:
+    with iso(jitless=False) as rt:
+        rt.eval("__pydeno_wasm_load = () => 'guest'; 0")
+        if rt.eval("delete globalThis.__pydeno_wasm_load") is not False:
+            return True
+        if rt.eval("Object.keys(globalThis).includes('__pydeno_wasm_load')"):
+            return True
+        return rt.load_wasm(_WASM_ADD).call("add", 1, 2) != 3
+
+
+@probe
+def wasm_hostile_bytes_end_the_session() -> bool:
+    # Malformed modules must be a clean error, never a lost worker.
+    with iso(jitless=False) as rt:
+        for data in (
+            b"\x00asm\x01\x00\x00\x00\x01\xff\xff\xff\xff\x0f",
+            b"\x00asm\x01\x00\x00\x00\x01\x05\xff\xff\xff\xff\xff",
+            _WASM_ADD[:-1],
+            _WASM_ADD[:-2] + b"\xff\x0b",
+            b"\x00asm\x01\x00\x00\x00" + b"\x0a" + b"\xff" * 64,
+        ):
+            try:
+                rt.load_wasm(data)
+            except (ValueError, JavaScriptError):
+                pass
+        return rt.is_closed() or rt.eval("1 + 1") != 2
 
 
 def main() -> None:

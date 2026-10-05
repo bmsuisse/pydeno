@@ -50,6 +50,7 @@ import weakref  # noqa: F401
 from collections.abc import Callable
 
 from . import _awaitable  # noqa: F401
+from . import _wasm
 from . import _wire
 from ._pydeno import (
     JavaScriptError,
@@ -225,6 +226,12 @@ class _Worker:
         self._pending_lock = threading.Lock()
         self._call_ids = itertools.count(1)
         self._runtime: Runtime | None = None
+        # `load_wasm` instances, by id: the bridge's function handles (the parent holds only ids).
+        self._wasm: dict[int, Any] = {}
+        self._wasm_ids = itertools.count(1)
+        # The bridge's loader, taken once before any guest code (see `_init`), never looked up by
+        # name later: where V8 has no WebAssembly a guest could plant a global of that name.
+        self._wasm_loader: Any = None
 
     # -- transport ---------------------------------------------------------
 
@@ -404,6 +411,35 @@ class _Worker:
                 )
 
             return asyncio.run(run_module())
+        if kind in ("wasm_load", "wasm_call"):
+            # Instances whose `WasmModule` the parent dropped without unloading.
+            for wid in message.get("drop", ()):
+                self._wasm.pop(wid, None)
+        if kind == "wasm_load":
+            data = _wire.decode_value(message["bytes"])
+            if not isinstance(data, bytes) or len(data) > _wasm.MAX_WASM_BYTES:
+                raise _wire.WireError("wasm_load takes at most MAX_WASM_BYTES bytes")
+            if self._wasm_loader is None:
+                raise RuntimeError(_wasm.JITLESS_MESSAGE)
+            handle = self._wasm_loader(data, timeout=message.get("timeout"))
+            wid = next(self._wasm_ids)
+            self._wasm[wid] = handle
+            return wid
+        if kind == "wasm_call":
+            handle = self._wasm.get(message["wid"])
+            if handle is None:
+                raise RuntimeError("this WebAssembly module was unloaded")
+            return handle(
+                message["name"],
+                _wire.decode_value(message["args"]),
+                message["wide"],
+                timeout=message.get("timeout"),
+            )
+        if kind == "wasm_unload":
+            handle = self._wasm.pop(message["wid"], None)
+            if handle is not None:
+                handle(None, [], [])
+            return None
         raise _wire.WireError(f"unknown command {kind!r}")
 
     def _run_command(self, message: dict[str, Any]) -> None:
@@ -526,6 +562,9 @@ class _Worker:
                 kwargs.get("bootstrap") or ""
             )
         self._runtime = Runtime(RuntimeConfig(**kwargs))
+        if "--jitless" not in flags:
+            # Before any guest code: only the host's own bootstrap has run.
+            self._wasm_loader = _wasm.bridge_loader(self._runtime)
         self._writer.send(
             {
                 "t": "ready",
