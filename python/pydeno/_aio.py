@@ -1624,6 +1624,8 @@ class AsyncIsolatedRuntime:
                 return  # nobody to answer
             assert self._send_lock is not None
             async with self._send_lock:
+                if self._closed:
+                    return  # the worker was killed or closed while this reply waited its turn
                 if isinstance(reply, bytes):
                     frame = reply
                 else:
