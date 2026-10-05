@@ -83,28 +83,72 @@ inherits it. It cannot be lifted from inside the process.
   root is an **empty tmpfs** (what bubblewrap does), with empty network and IPC namespaces too.
   Then Landlock (no filesystem access, no TCP, no abstract unix sockets or signals outside itself
   on kernels that support those scopes) plus a seccomp-bpf filter. Read `rt.sandbox_extras` to see
-  whether the empty root took effect (`["emptyroot"]`) and pass `empty_root=False` to skip it. The
-  seccomp filter denies, with `EPERM`:
-    - new processes and other-process access: `execve`, `fork`, non-thread `clone`, `ptrace`,
-      `process_vm_*`, `pidfd_*`, `kcmp`;
-    - the network: `socket`, `connect`, `bind`, `listen`, `accept` (asyncio's `socketpair` stays);
-    - mounts and namespaces: `mount`, `pivot_root`, `setns`, `unshare`, the new mount API;
-    - the kernel: `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `keyctl`, modules,
-      `kexec`, `personality`, `quotactl`;
-    - IPC with the host user's other processes: SysV queues, semaphores and shared memory, POSIX
-      message queues, `inotify`, `fanotify`;
-    - file *metadata*, which Landlock does not govern: `chmod`, `chown`, `utime`, extended
-      attributes;
-    - identity and time: `setuid` and friends, `capset`, `settimeofday`, `clock_settime`,
-      `sethostname`, `sync`;
-    - acting on another process by pid: `kill`, `tgkill`, `sched_set*`, `prlimit64`, `setpriority`
-      and `migrate_pages` are allowed on the worker itself and denied on anything else.
+  whether the empty root took effect (`["emptyroot"]`) and pass `empty_root=False` to skip it.
 - **Elsewhere, or where the kernel lacks the feature**: nothing is applied. `sandbox="auto"`
   (the default) carries on and `rt.sandbox` says `"none"`; `sandbox="require"` refuses to start.
 
-The seccomp filter is test-fired in a throwaway child first and skipped (not applied, not
-fatal) if it would kill the process, which is what happens under architecture emulation such as an
-x86_64 image on Apple silicon.
+#### The seccomp filter is an allow-list
+
+The worker may make 92 syscalls on x86_64 and 79 on aarch64 with any arguments (each architecture
+has its own numbers; the x86_64 table also carries the older spellings such as `open` and
+`epoll_wait`), and about 20 more with checked arguments. The list was derived by tracing real
+workers through the isolation suites with `strace`, natively on x86_64 and on aarch64, on Debian,
+Ubuntu, Fedora and AlmaLinux images (`scripts/trace_worker_syscalls.py`). A worker in normal use
+makes about 40 distinct ones. What the list holds is the worker's own business: descriptors it
+already has, its own memory and threads, clocks, its own signal state, and path lookups that
+Landlock decides on (seccomp cannot read a path). Some calls are allowed only with certain
+arguments: `clone` only for a thread; `kill`, `tgkill`, `sched_set*`, `prlimit64` and
+`setpriority` only on the worker itself; `fcntl`, `ioctl` and `prctl` only with listed commands;
+`socketpair` only as a unix stream pair; and `mmap`/`mprotect` never with `PROT_EXEC` when jitless.
+
+Everything else is refused, in one of three ways:
+
+| Call | Answer | Why |
+|---|---|---|
+| Never legitimate in a worker: `ptrace`, `process_vm_*`, `execve`, `fork`, `mount` and the rest of the mount API, `pivot_root`, `chroot`, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_*`, `memfd_create`, `keyctl`, kernel modules, `kexec`, `reboot`, `swapon`, `settimeofday`, `sethostname`, ... | the worker is **killed** (`SECCOMP_RET_KILL_PROCESS`) | A process that makes one of these is an exploit probing the kernel, not a runtime on an edge case. Killing it leaves nothing to iterate on. |
+| Any other call not on the list (`socket`, `connect`, `sysinfo`, `setuid`, `inotify_*`, `pkey_alloc`, ...) | `EPERM` | Libraries probe some of these and fall back (V8 asks for memory protection keys on x86_64, name lookups open sockets); a kill would turn a probe into an outage. |
+| A syscall newer than the reviewed kernel tables | `ENOSYS` | What runtimes treat as "not on this kernel", which is the truth for a call the filter has never heard of. |
+
+A killed worker is reported as `WorkerCrashed("worker process died: sandbox violation: ...")`,
+`classify_error(exc).kind == "sandbox_violation"`, not retryable. Treat it like any crash of an
+untrusted run, and more so: count it against the tenant (see
+[When the worker crashes](#when-the-worker-crashes)).
+
+The filter is test-fired in a throwaway child first and skipped (not applied, not fatal) if it would
+kill the process, which is what happens under architecture emulation such as an x86_64 image on
+Apple silicon. The worker also asks the kernel whether the kill action is supported, and
+`pydeno.sandbox_status()` goes further: its throwaway child makes one never-legitimate call and must
+be killed for it. (A worker start does not exercise the kill, because the kernel audits every
+seccomp kill and a record per start would bury the real ones; a filter in front of pydeno's, such
+as a container runtime's, cannot weaken it, since the kernel applies the most severe action of all
+filters.) A kill action that is missing or not enforced fails the self-test, and
+`sandbox="require"` refuses to start.
+
+#### Landlock is checked, not trusted
+
+The kernel's Landlock ABI version is recorded, and after the ruleset is in force the worker opens a
+directory it could open a moment earlier: that open must now be refused. A kernel (or a security
+module stack, or a container runtime) that accepts the ruleset and does not enforce it is therefore
+not counted as `"landlock"`, so `sandbox="require"` refuses to start and `sandbox="auto"` warns.
+`pydeno.sandbox_status()` shows the ABI and the canary's result.
+
+#### Kernel-enforced limits
+
+Besides the limits the parent and the worker measure (memory every 20 ms, CPU and threads), the
+kernel enforces these itself, and code in the worker cannot lift them:
+
+| Limit | Value | Notes |
+|---|---|---|
+| `RLIMIT_DATA` (private writable memory) | `max_memory` + 1 GiB | Only with `max_memory`. A ceiling under the sampled limit for bursts faster than the sampling. A normal workload meets `max_memory` long before it; an allocation past it fails in the worker (a `RangeError` for a buffer; a V8 abort, reported as `memory_limit`, for the heap). |
+| `RLIMIT_NPROC` (tasks) | 128 | Only inside the worker's own user namespace (the empty root) on Linux 5.14+, where the kernel counts tasks per namespace. Elsewhere it would count every process the host user runs, so it is not set, and the parent's sampled cap of 64 threads is what stops a thread bomb. |
+| `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, `RLIMIT_CORE`, `RLIMIT_MEMLOCK`, `RLIMIT_MSGQUEUE`, `RLIMIT_RTPRIO`, `RLIMIT_NICE` | 1 MiB, 256, 0, 0, 0, 0, 0 | As before. |
+
+Not used, on purpose: `RLIMIT_AS` (V8 reserves tens of GiB of address space it never touches, so
+an address-space limit either stops V8 or bounds nothing), `RLIMIT_CPU` (it counts the worker's
+whole life; the per-command CPU cap stays in the parent), and cgroups v2 (an unprivileged process
+can only use a cgroup subtree delegated to it, for example by systemd's `Delegate=`; pydeno does not
+assume one). To bound a whole service, give it a cgroup yourself (`systemd-run --user -p
+MemoryMax=... -p TasksMax=...`, or the container's own limits).
 
 **What is still visible:**
 
@@ -207,6 +251,7 @@ still *count* loop iterations, so this narrows the timing channel rather than cl
 |---|---|
 | JS exception, soft `timeout=`, heap limit | the same exceptions as `Runtime` |
 | V8 abort, OOM, fatal signal | `WorkerCrashed`; the runtime is closed |
+| A never-legitimate syscall (Linux, an escape probing the kernel) | worker killed by its seccomp filter: `WorkerCrashed`, kind `sandbox_violation` |
 | Uninterruptible native loop | `SIGKILL` at the hard deadline: `RuntimeTimeout` |
 | Over `max_memory` | worker exits with a dedicated code: `WorkerCrashed` (names `max_memory`) |
 | Over `max_host_calls` | worker killed: `WorkerCrashed` |
@@ -279,9 +324,14 @@ Monty.
 - Behaviour, containment, leaks, limits, determinism:
   `tests/test_isolated_runtime.py`, `test_isolated_lifecycle.py`, `test_isolated_determinism.py`.
 - **Assume-breach, from the inside:** `tests/test_redteam_syscalls.py` plays a compromised worker
-  and fires every dangerous syscall from a sandboxed process, requiring `EPERM`;
-  `scripts/redteam_syscalls.py` sweeps all ~350 syscalls and is how most of the filter was found.
-  Run it only inside a container (`--network none --cap-drop all`).
+  and fires every dangerous syscall from a sandboxed process, requiring `EPERM` or, for the
+  never-legitimate ones, death by `SIGSYS`; `tests/test_sandbox_violation.py` does the same from a
+  real worker and checks that the parent reports `sandbox_violation`;
+  `scripts/redteam_syscalls.py` sweeps all ~350 syscalls. Run them only inside a container
+  (`--network none --cap-drop all`).
+- **What a worker really calls:** `scripts/trace_worker_syscalls.py` runs workers under `strace`
+  and lists every syscall made after the sandbox is up, with the kernel's answers. Run it natively
+  on each architecture: under emulation the translator issues the host's syscalls, not the guest's.
 - **Every number in the filter** is checked against the kernel's own tables
   (`tests/test_sandbox_syscall_tables.py`), so the x86_64 half is verified without x86_64 hardware.
 - **Many Linuxes:** `scripts/linux_matrix.sh WHEELS IMAGE [PROFILE]` (podman or docker) runs the
@@ -348,8 +398,10 @@ file, writing one, spawning a process, connecting out, signalling its parent, an
 parent's argv/environment and the machine's hardware ID. If a complete sandbox lets one through, the
 worker refuses to start and `IsolatedRuntime` raises `WorkerCrashed("... sandbox self-test failed ...")`.
 
-This is why a gap in a deny-list (which is only as good as its last review) becomes a failed start
-rather than a finding. It costs a handful of syscalls. A *degraded* sandbox (a kernel without Landlock,
+This is why a gap in a list (which is only as good as its last review) becomes a failed start
+rather than a finding. On Linux the self-test does not make the never-legitimate `execve` itself
+(that would kill the worker it is checking); it relies on the kill check above, and a kill action
+that is missing or was not enforced is reported as `exec-not-killed`. It costs a handful of syscalls. A *degraded* sandbox (a kernel without Landlock,
 say) is expected to leak and is not tested this way; `sandbox="require"` refuses to start there, and
 `sandbox="auto"` emits a `RuntimeWarning` saying which layers are missing.
 

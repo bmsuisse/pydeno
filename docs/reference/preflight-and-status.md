@@ -32,6 +32,18 @@ found nothing the sandbox should have stopped, the resource probes work, termina
 available, and (Linux) the process is not
 root or can drop root. Missing termination authority refuses startup in every sandbox mode. `empty_root` is a bonus layer: its absence is a warning, not a failure.
 
+On Linux the details say what was checked, not only what was asked for:
+
+- `landlock`: the kernel's Landlock ABI version, and whether the canary (a directory readable a
+  moment before the ruleset) was refused afterwards. A kernel that accepts the ruleset and does not
+  enforce it shows `applied=False` with the reason, and `complete` is false.
+- `seccomp`: that the allow-list filter installed in a throwaway child, and whether a
+  never-legitimate call in that child was killed (a worker start only asks the kernel whether the
+  kill action is supported, since every kill is audited). One that was not killed is also a
+  `self_test` failure (`exec-not-killed`).
+- `empty_root`: whether the kernel caps the worker's threads (`RLIMIT_NPROC` inside the worker's own
+  user namespace, Linux 5.14+).
+
 ## `check_source()`: a readable early rejection, not a security boundary
 
 With `policy=SourcePolicy(...)` it applies the host's own rules instead (forbidden names, `eval`,

@@ -7,9 +7,9 @@ cannot make that argument about V8, so the worker applies one itself:
 
 - **macOS**: a deny-by-default Seatbelt profile (no files, no network, no fork/exec,
   no mach services beyond logging).
-- **Linux**: Landlock (no filesystem access, no TCP) plus a seccomp-bpf filter
-  (no exec, no new processes, no non-AF_UNIX sockets, no connect/bind, no ptrace,
-  mount, bpf, io_uring, ...), with `no_new_privs`.
+- **Linux**: Landlock (no filesystem access, no TCP) plus a seccomp-bpf filter that is an
+  allow-list (everything else is refused; calls no runtime ever makes, such as exec, ptrace,
+  mount, bpf and io_uring, kill the process), with `no_new_privs`.
 
 Both are one-way: once applied they cannot be lifted from inside the process. They
 must be applied *before* the isolate exists so that every thread V8 and tokio spawn
@@ -953,15 +953,30 @@ def _apply_seccomp(*, allow_exec: bool = True) -> bool:
 
 #: True once this process runs under the filter (`attest()` must then not fire a killing call).
 _FILTER_IN_FORCE = False
-#: Whether the throwaway child of `_seccomp_is_safe_here` was killed by the filter for a
-#: never-legitimate call, i.e. the kill action is really in force on this kernel. `attest()`
-#: reports a breach if the filter is applied and this is False.
-SECCOMP_KILL_VERIFIED = False
+#: What is known about the kill action on this kernel, set by `_seccomp_is_safe_here`:
+#: "verified" (a throwaway child under the filter made a never-legitimate call and was killed),
+#: "not-killed" (it made the call and came back), "available" (the kernel reports the action as
+#: supported; not exercised), "unavailable", or "" (not checked). `attest()` reports a breach for
+#: "not-killed" and "unavailable" once the filter is in force.
+SECCOMP_KILL = ""
 _SIGSYS = 31  # on x86_64 and aarch64 alike
+_SECCOMP_GET_ACTION_AVAIL = 2
 
 
-def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
-    """Fire the filter in a throwaway child first, and check that it kills.
+def _kill_action_available(arch_nr: int) -> bool:
+    """Does the kernel support SECCOMP_RET_KILL_PROCESS? A query; changes nothing."""
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    action = ctypes.c_uint32(_SECCOMP_RET_KILL_PROCESS)
+    return (
+        libc.syscall(arch_nr, _SECCOMP_GET_ACTION_AVAIL, 0, ctypes.byref(action)) == 0
+    )
+
+
+def _seccomp_is_safe_here(
+    *, allow_exec: bool = True, verify_kill: bool = False
+) -> bool:
+    """Fire the filter in a throwaway child first.
 
     The filter hard-codes syscall numbers per architecture and kills the process if
     the architecture does not match. `platform.machine()` can lie under emulation
@@ -969,14 +984,17 @@ def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
     instead of trusting it, find out whether this exact filter survives here, and skip
     the layer rather than kill the worker if it does not.
 
-    The same child then makes one never-legitimate call (`execve` of a path that cannot exist)
-    and must die of SIGSYS before the kernel looks at the path. That is the canary for the kill
-    action: a kernel, or a container runtime's own filter in front of ours, that turned it into
-    something weaker would otherwise go unnoticed, because the worker itself can never make that
-    call to find out. The result lands in `SECCOMP_KILL_VERIFIED`; the child costs no extra fork.
+    With `verify_kill=True` (what `sandbox_status()` asks for) the same child then makes one
+    never-legitimate call (`execve` of a path that cannot exist) and must die of SIGSYS before
+    the kernel looks at the path: the kill action, exercised. A worker start does not do that,
+    because the kernel audits every seccomp kill (`type=SECCOMP` in the audit log, or the kernel
+    log), and a record per worker start would bury the real ones a host's monitoring looks for;
+    it asks the kernel whether the action is supported instead. Either way the answer lands in
+    `SECCOMP_KILL`. (A filter in front of ours, such as a container runtime's, cannot weaken
+    the kill: the kernel applies the most severe action of all filters.)
     """
-    global SECCOMP_KILL_VERIFIED  # noqa: PLW0603
-    SECCOMP_KILL_VERIFIED = False
+    global SECCOMP_KILL  # noqa: PLW0603
+    SECCOMP_KILL = ""
     idx = _arch_index()
     read_end, write_end = os.pipe()
     pid = os.fork()
@@ -984,13 +1002,16 @@ def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
         code = 4
         try:
             os.close(read_end)
-            # It is about to be killed on purpose: no core file, and not dumpable.
+            # It may be killed on purpose: no core file, and not dumpable.
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             _libc().prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
             if _apply_seccomp(allow_exec=allow_exec) and os.getpid() > 0:
                 os.write(write_end, b"1")
-                code = 5  # the canary call below came back: the kill action is not in force
-                if idx is not None:
+                code = 0
+                if verify_kill and idx is not None:
+                    code = (
+                        5  # the canary call below came back: the kill is not in force
+                    )
                     libc = _libc()
                     libc.syscall.restype = ctypes.c_long
                     libc.syscall(
@@ -1009,12 +1030,22 @@ def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
     finally:
         os.close(read_end)
     _, status = os.waitpid(pid, 0)
+    exited = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
     killed = os.WIFSIGNALED(status) and os.WTERMSIG(status) == _SIGSYS
-    survived_canary = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 5
-    SECCOMP_KILL_VERIFIED = installed and killed
-    # Safe to install either way once it installed; a filter that does not kill is reported by
-    # `attest()`, which is what makes `sandbox="require"` refuse it.
-    return installed and (killed or survived_canary)
+    if not installed:
+        return False
+    if verify_kill:
+        SECCOMP_KILL = "verified" if killed else "not-killed"
+        # Safe to install either way once it installed; a filter that does not kill is reported
+        # by `attest()`, which is what makes `sandbox="require"` refuse it.
+        return killed or exited == 5
+    arch = "aarch64" if _machine() in ("aarch64", "arm64") else _machine()
+    try:
+        available = _kill_action_available(_SYS_SECCOMP[arch])
+    except (KeyError, OSError, AttributeError):
+        available = False
+    SECCOMP_KILL = "available" if available else "unavailable"
+    return exited == 0
 
 
 _LANDLOCK_CREATE, _LANDLOCK_ADD, _LANDLOCK_RESTRICT = 444, 445, 446
@@ -1318,7 +1349,9 @@ def _thread_count_here() -> int:
         return threading.active_count()
 
 
-def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
+def apply(
+    *, empty_root: bool = True, allow_exec: bool = True, verify_kill: bool = False
+) -> str:
     """Confine the current process. Returns the layers applied, e.g. "landlock+seccomp",
     "seatbelt", or "none". Bonus layers land in `EXTRAS`.
 
@@ -1359,7 +1392,7 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
         attempt(
             "seccomp",
             lambda: (
-                _seccomp_is_safe_here(allow_exec=allow_exec)
+                _seccomp_is_safe_here(allow_exec=allow_exec, verify_kill=verify_kill)
                 and _apply_seccomp(allow_exec=allow_exec)
             ),
             layers,
@@ -1499,9 +1532,9 @@ def attest() -> list[str]:
     check("signal-parent", lambda: os.kill(ppid, 0))
     if sys.platform.startswith("linux") and _FILTER_IN_FORCE:
         # Under the filter `execve` is never-legitimate: making it here would kill this process.
-        # The throwaway child of `_seccomp_is_safe_here` made it instead, under the very same
-        # filter, and had to die of SIGSYS.
-        if not SECCOMP_KILL_VERIFIED:
+        # `_seccomp_is_safe_here` checked the kill action before the filter went up (exercised in
+        # a throwaway child for `sandbox_status()`, asked of the kernel for a worker).
+        if SECCOMP_KILL in ("not-killed", "unavailable"):
             breaches.append("exec-not-killed")
     elif sys.platform.startswith("linux"):
         # `execve` of a path that cannot exist: a filter refuses at syscall entry, and if exec is

@@ -88,6 +88,7 @@ nav:
       - "Research: engine hardening": contributing/research-engine-hardening.md
       - Autoresearch loops: contributing/autoresearch.md
       - Strix pentest review: contributing/strix.md
+      - "Design note: sandboxed tool process": contributing/sandboxed-tool-process.md
 
 plugins:
   - search
