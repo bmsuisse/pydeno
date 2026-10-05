@@ -36,7 +36,7 @@ from pydeno import (
     _sandbox,
     undefined,
 )
-from pydeno import _aio
+from pydeno import _aio, _compat
 from pydeno._aio import AsyncIsolatedRuntime
 from pydeno._isolated import _HARDENING_V8_FLAGS, _MAX_WORKER_THREADS
 
@@ -542,7 +542,7 @@ class TestCancellationAndClose:
     async def test_asyncio_timeout_around_eval_is_a_cancellation(self) -> None:
         rt = await _rt(timeout=30.0)
         with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.3):
+            async with _compat.timeout(0.3):
                 await rt.eval("while (true) {}")
         assert rt.is_closed()
         await rt.close()
@@ -551,18 +551,27 @@ class TestCancellationAndClose:
         self,
     ) -> None:
         async with await _rt() as rt:
-            first = asyncio.ensure_future(
-                rt.eval(
-                    "new Promise(r => r(1)); let s = 0; for (let i = 0; i < 3e7; i++) s++; s"
-                )
-            )
-            await asyncio.sleep(0)
-            queued = asyncio.ensure_future(rt.eval("2"))
-            await asyncio.sleep(0.05)
-            queued.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await queued
-            assert await first == 30_000_000
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def hold() -> int:
+                entered.set()
+                await release.wait()
+                return 1
+
+            await rt.bind_function("hold", hold)
+            first = asyncio.ensure_future(rt.eval("hold()"))
+            try:
+                # Keep the first command active without racing a machine-dependent CPU loop
+                # against the runtime timeout. The second task must be waiting for the slot.
+                await asyncio.wait_for(entered.wait(), 5)
+                queued = asyncio.ensure_future(rt.eval("2"))
+                await asyncio.sleep(0)
+                queued.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await queued
+            finally:
+                release.set()
+            assert await first == 1
             assert not rt.is_closed()
             assert await rt.eval("3") == 3
 
@@ -805,7 +814,13 @@ class TestScaling:
         await asyncio.gather(*(rt.close() for rt in runtimes))
         stop = True
         await beat
-        assert max(lags) < 0.1, f"worst loop stall {max(lags) * 1000:.1f} ms"
+        # A blocked loop shows as a long stall (or many late beats); a CPU-starved CI runner shows as
+        # a rare spike (a debug build on a small machine measured 0.56 s once), so: the 99th
+        # percentile is under 100 ms and nothing is later than a second.
+        ordered = sorted(lags)
+        p99 = ordered[int(len(ordered) * 0.99)]
+        assert p99 < 0.1, f"99th percentile loop stall {p99 * 1000:.1f} ms"
+        assert ordered[-1] < 1.0, f"worst loop stall {ordered[-1] * 1000:.1f} ms"
 
     async def test_fifty_runtimes_add_almost_no_threads(self) -> None:
         async with await _rt() as warm:  # the shared pools exist from here on

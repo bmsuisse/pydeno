@@ -34,8 +34,8 @@ Reproduce with `python benches_py/alternatives_bench.py pydeno|pydeno-pool|monty
 | | New sandbox + first call | Warm call (`1 + 1`) | Fresh sandbox + 10 small commands |
 |---|---:|---:|---:|
 | pydeno | 59 (212) | 0.10 (0.15) | 58 (63) |
-| pydeno, unreleased: cold start | 53 (56) | 0.09 (0.13) | 54 (56) |
-| pydeno, unreleased: `SandboxPool` checkout | 0.43 (1.74) | 0.09 (0.14) | 6.9 (8.3) |
+| pydeno 0.8.0: cold start | 53 (56) | 0.09 (0.13) | 54 (56) |
+| pydeno 0.8.0: `SandboxPool` checkout | 0.43 (1.74) | 0.09 (0.14) | 6.9 (8.3) |
 | denobox | 12.7 (15.3) | 0.03 (0.07) | 13.6 (14.2) |
 | Monty | 0.04 (23.9) | 0.01 (0.02) | 0.18 (0.81) |
 

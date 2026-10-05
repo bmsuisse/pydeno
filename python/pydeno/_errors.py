@@ -210,7 +210,8 @@ _CLOSED = re.compile(
 )
 # The worker reports why it would not start (its text, but only ever a refusal: no retry helps).
 _SANDBOX_REFUSED = re.compile(
-    r"worker failed to start: (?:an OS sandbox is required but|sandbox self-test failed)"
+    r"worker failed to start: (?:an OS sandbox is required but|sandbox self-test failed|"
+    r"supervisor termination authority is unavailable)"
 )
 _CPU = re.compile(
     rf"worker used more than {_NUM}s of CPU in one command and was killed"
@@ -326,6 +327,11 @@ def classify_error(exc: BaseException, *, via_agent: bool = False) -> ErrorInfo:
     worker's `max_host_wait`, so that timeout is reported as `max_pause` instead of `host_wait`.
     """
     try:
+        # The `Pydeno` front door's errors wrap the one pydeno raised; that one decides.
+        # (A session is an AgentSandbox, hence `via_agent`.)
+        inner = getattr(exc, "_pydeno_inner", None)
+        if isinstance(inner, BaseException) and inner is not exc:
+            return classify_error(inner, via_agent=True)
         text = str(exc)
         for kind, test in _ROWS:
             if not test(exc, text, via_agent):

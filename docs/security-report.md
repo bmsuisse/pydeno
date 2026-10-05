@@ -123,6 +123,10 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Escape sequences and native stack frames in crash messages | **Fixed.** |
 | A guest could kill the worker's only reply-reading thread by calling an async host function without awaiting it | **Fixed.** Found while building the agent-sessions layer. |
 | Decoder amplification: a 6 MB frame can become ~200 MB of Python objects | **Open.** Lower node budget planned. |
+| Non-finite limit values (NaN, infinity) were accepted and silently disabled the limit | **Fixed** (0.8). Validated at construction; probe `non_finite_limits_are_refused`. |
+| Console calls paused the hard deadline like tool calls, so a console flood stretched a run up to `max_host_wait` | **Fixed** (0.8). Console time pauses the deadline only within one deadline per command (a flood at most doubles a run); probe `console_flood_does_not_stretch_the_hard_deadline`. |
+| `Pydeno`'s default printer wrote guest console output to the host's stdout without limit (~150 MB in 2 s) | **Fixed** (0.8). 1 MiB per feed, then `[truncated]`; probe `default_printer_volume_is_capped_per_feed`. |
+| A `SandboxPool` / `Pydeno` that runs out of ready workers starts new ones without limit (cold starts) | **Open, by design** ("exhaustion is never an error"). An opt-in per-pool worker cap is proposed separately. |
 
 ### Guest surface
 
@@ -139,6 +143,17 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Bridge frames and `ext:` paths visible in stack traces | **Partly fixed** (strict mode); path filtering open. |
 | A huge source ignores `timeout=` while V8 parses it (plain `Runtime`; bounded by the frame cap in `IsolatedRuntime`) | **Open.** |
 | Prototype pollution persists across evals in one runtime | **By design.** One runtime per trust unit. |
+| A resizable `ArrayBuffer` (or growable `SharedArrayBuffer`, or the copy `transfer()` makes of one) was not counted by `max_buffer_bytes`: V8 takes those backing stores from its page allocator, not the embedder's, so 2 GiB could be committed under a 255 MiB cap and filling it was a `max_memory` kill instead of the promised `RangeError` | **Fixed.** The bridge charges their committed bytes to the same budget (constructor, `resize`/`grow`, `transfer*`), with weak handles and a GC-and-sweep when the cap is hit. `WebAssembly.Memory.grow` remains a sink the cap cannot see (not present under `--jitless`). |
+| A host `SnapshotBuilder` bootstrap that keeps a reference to the native `ArrayBuffer` constructor or `ArrayBuffer.prototype.resize` (or `SharedArrayBuffer.prototype.grow`, `transfer`) and exposes it to guest code lets the guest create or grow resizable buffers past the charge: snapshot code runs before the bridge wraps those built-ins | **By design (host code is trusted).** Do not hand a snapshot-captured native buffer constructor or method to the guest; `IsolatedRuntime` refuses snapshots. |
+| A refused buffer allocation left its refusal flagged after V8's final retry, so a later genuine heap overflow was taken for a refusal and V8 aborted the process (`FatalProcessOutOfMemory`, a few percent of runs) | **Fixed.** The attempt V8 makes right after the near-heap-limit callback consumed a refusal no longer flags again. |
+| `enable_console=True`: one `console.log` of a megabyte killed the worker (SIGABRT). Its stdout was the stderr capture file under `RLIMIT_FSIZE`, and deno_core's `op_print` unwraps the flush of the failed write | **Fixed.** The worker never lets the engine echo console output; `on_console` is unaffected. |
+| `execute()` returned console output with raw terminal escape sequences, while error text was already cleaned | **Fixed.** Same rule for both. |
+| Found by the autoresearch red team (`scripts/autoresearch/metric_security.py`, 28 probes, all passing): the probe battery pins each of the above and the deadline-bypass and refused-bind classes from the fourth review round | **Pinned.** |
+| Typed arrays (other than `Uint8Array`) and boxed strings, also behind a Proxy, as results, stream chunks or host-call arguments, were expanded into one key per element before the size budget was charged: hundreds of MB, several times past `timeout=`, and (a Proxy around one, as an argument to plain `Runtime`) a V8 out-of-memory abort of the process | **Fixed** (0.8, issue #75 slice A). Checked up front, looking through Proxies natively, plus a fixed cap of 1,048,576 elements whatever `max_serialization_bytes` is. |
+| A Proxy's traps ran while a result, stream chunk or host-call argument was converted: an `ownKeys` trap could grow a resizable buffer after its size was checked, a Proxy hid an Array from the metered path, and `ownKeys() { return [] }` made the engine list the whole target for free at every reference | **Fixed** (review of #80). A Proxy is unwrapped natively to its innermost target, which is converted; no trap runs. Revoked Proxies and chains past 64 are refused. |
+| `v8_flags` that deno_core's own start-up overrides (eight flags, among them `--no-harmony-temporal`, `--no-js-float16array` and `--no-js-explicit-resource-management`) were reported as applied while doing nothing | **Fixed.** Refused with a `ValueError` before a worker starts. The features themselves can be switched off only together, with the blunt opt-in `v8_flags=["--no-js-shipping"]` (see the isolation guide). |
+| Numbers outside int64 were clamped (`2**63` came back as `2**63 - 1`) | **Fixed.** They stay floats. |
+| Sparse-array natives (`sort`, `reverse`, `join`, `indexOf`, `lastIndexOf`, `copyWithin`, `toSorted`, `flat` on length `2**32-1`) ignore V8 termination | **Open, known.** Unbounded in plain `Runtime`; `IsolatedRuntime`'s hard deadline kills the worker (probe `slice_a_native_builtin_outlives_the_hard_deadline`). |
 
 ### Round 3: review of the new code
 
@@ -162,6 +177,45 @@ not supported, so its findings are summarised in one line below.
 | macOS: path existence is observable (`stat` answers EPERM for a path that exists and ENOENT for one that does not); XNU build string and CPU/memory counts are readable | **Open, known.** Seatbelt cannot hide existence; Linux with only Landlock has the same oracle. |
 | Linux: the thread cap is sampled, not kernel-enforced | **Open.** A pids cgroup or `RLIMIT_NPROC` in the new user namespace is planned. |
 | Hosts that mount `/proc` with `hidepid` make the worker's usage unreadable | **Open.** `require` refuses to start there (fail closed); `auto` warns. |
+
+### Round 4: host boundary and state (0.8 red team, slice C)
+
+What the host believes about the guest, and what the guest can make the host do: tools and external
+functions, error redaction, journals and replay, `SessionPool`, the `Pydeno` front door, and the text
+pydeno writes for the host. Every row has a probe in `scripts/autoresearch/metric_security.py`
+(section "slice C", each run in a fresh interpreter under a time cap) and a regression test in
+`tests/test_redteam_boundary.py`.
+
+| Finding | Status |
+|---|---|
+| `SessionPool`: a restored session did not always keep the tool budget it had already spent (after an oversized journal, overlapping calls on one session, a failed release, or pools sharing a store) | **Fixed.** Budget-only journal for oversized ones, written under the lease; stored-counter checks on `get` and `release`; unstored sessions are not evicted. `close()` stores unsaved sessions and wakes waiters. Overlapping leases in two pools sharing a store can still exceed the budget: sessions must be routed to one pool (documented). |
+| Agent sessions (driving path, before 0.8.0): a tool raising a `BaseException` left a journal that `load()` refused | **Fixed.** Such a tool ends the run like a crash (worker killed, run recorded as lost with what it spent). |
+| Agent sessions: concurrent tool calls past `max_inflight_host_calls` were refused depending on timing, which the journal did not record, so such a journal could fail to replay | **Fixed.** The session's wrappers queue calls past the cap and issue them in order. |
+| Front door (before 0.8.0): the syntax check after a failed feed depended on guest-replaceable built-ins and ran outside the journal | **Fixed.** The check uses intrinsics the prelude captured before guest code. |
+| `SessionPool`: `drop()` overlapping a `get` or a `release` could leave the dropped state in place; a `session()` block could end a newer lease of a session dropped meanwhile | **Fixed.** A barrier holds the session's place during `drop`; `session()` releases only its own lease. |
+| `SessionPool` accepted some ids that `release` then refused (long non-ASCII ids; ids that are not valid UTF-8) | **Fixed.** Associated data may be 4096 bytes; ids must be valid UTF-8. |
+| `Pydeno` dumps could not be bound to a tenant or a counter: any state a pool dumped loaded into any of its sessions, including an older dump of the same session (its external-call budget restored) | **Fixed (opt-in).** `dump` / `load_session` / `load_snapshot` take `associated_data=`; documented. |
+| Tool names equal to the session's or the guest's globals (`__pydeno_agent_settle`, `globalThis`, `JSON`, `console`, ...) were accepted and silently broke the session or the tool | **Fixed.** Refused for bare-global tools; reserved prefixes always. |
+| A front-door answer the session refuses (`resume(error="...")`) used up the snapshot, leaving the session paused forever | **Fixed.** Checked before the snapshot is used. |
+| Front door (before 0.8.0): `feed_start` surfaced snapshots for names outside the feed's `external_lookup` | **Fixed.** Refused in the guest with a `ReferenceError`, as `feed_run` does. |
+| Captured console output (`ExecutionResult.stdout`/`stderr`), error messages and the default printer passed bidi overrides and invisible characters (zero-width, Unicode tags) through, and captured output also escape sequences; the 0.7 CLI printed results and errors raw | **Fixed.** One shared filter (C0/C1 except tab and newline, bidi controls, separators, zero-width and tag characters, soft hyphen, BOM); the sandboxed CLI (#49) filters its output too, and a probe now guards it. Values and a custom `print_callback` stay raw (documented). |
+| The 0.7 CLI ran code in-process with no deadline | **Fixed by #49** (the CLI runs `IsolatedRuntime(sandbox="require")` with a deadline). |
+| Rollback of a stored journal by someone who can write both the journal and its counter | **Open, known** (documented since 0.7). |
+| A journal can still fail to replay for reasons outside the journal (a run that only fits `timeout` on a quiet machine) | **Documented.** `drop` then starts over with a fresh budget; carry the spent budget over yourself if that matters. |
+
+Tried and held: forged, truncated, bit-flipped and spliced journals, journals under another tenant's
+associated data or key, moved or rolled-back pool journals; resuming another session's call, a forged
+`ToolCall`, a used call, or a pre-dump call after `load`; catalog tools before discovery (refused and
+not charged), including through `constructor`/`__proto__`; tool arguments (40 MB strings, 100k-deep and
+cyclic nesting, Symbols, functions, Proxies with throwing traps, getters, `__proto__` keys, huge
+`BigInt`s, out-of-range dates, lone surrogates, `Map`/`Set` with unhashable members); tool results that
+cannot cross; errors from tools (redacted by default, also for `BaseException`); guest error names that
+claim host failures; the guest's view of time and entropy (`Date`, `Temporal`, `Intl`, no
+`performance`/`crypto`; seeded `Math.random` replays); calls from escaped run wrappers (charged and
+journaled); re-entering, closing or dumping a session from its own tool; contextvars across calls;
+`http_fetch` URL and address parsing (dot segments, encoded separators, IPv4-mapped/NAT64/6to4/Teredo
+and other embedded forms, trailing-dot and confusable hosts); weird callables as tools (partials,
+bound methods, classes, async generators, builtins).
 
 ### Rejected after measuring
 

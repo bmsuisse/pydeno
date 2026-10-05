@@ -8,20 +8,23 @@ name: Platforms
 # `experimental` cells (free-threaded 3.14t, Windows) report but do not fail the
 # workflow until they are known-green; flip the flag when they are.
 on:
+  # 41 jobs on scarce runners: run on `main` and on demand, not on every pull request (a
+  # busy queue starved the run that gates a release). Workflow edits still validate on PRs.
+  # Run it for any other branch with
+  # `gh workflow run platforms.yml --ref <branch>`.
   push:
-    branches: [main, "ci/platform-matrix"]
+    branches: [main]
   pull_request:
-    paths:
-      - ".github/workflows/platforms.yml"
-      - "src/**"
-      - "python/**"
-      - "tests/**"
-      - "Cargo.*"
-      - "pyproject.toml"
+    branches: [main]  # sub-PRs into an integration branch do not run CI; the PR to main does
+    paths: [".github/workflows/platforms.yml"]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  # Debug info is never read in CI; leaving it out makes builds faster and the Rust cache smaller.
+  RUSTFLAGS: "-C debuginfo=0"
 
 concurrency:
   group: platforms-${{ github.ref }}
@@ -44,17 +47,14 @@ jobs:
           - macos-14
           - macos-15
           - macos-15-intel
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-        include:
-          # Windows has no IsolatedRuntime (POSIX-only: Seatbelt / Landlock+seccomp); the
-          # in-process Runtime is what is checked there.
-          - { os: windows-2022, python: "3.12", experimental: true }
-          - { os: windows-2025, python: "3.12", experimental: true }
-          - { os: windows-2025, python: "3.14", experimental: true }
-          - { os: windows-11-arm, python: "3.13", experimental: true }
-          # Free-threaded CPython.
-          - { os: ubuntu-24.04, python: "3.14t", experimental: true }
-          - { os: macos-15, python: "3.14t", experimental: true }
+        # Pull requests and pushes test the oldest, a middle and the newest CPython (the macOS runners queue
+        # slowest); a manual run (`gh workflow run platforms.yml --ref <branch>`) tests all five.
+        python: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '["3.10","3.11","3.12","3.13","3.14"]' || '["3.10","3.12","3.14"]') }}
+        # Windows has no IsolatedRuntime (POSIX-only: Seatbelt / Landlock+seccomp); the in-process
+        # Runtime is what is checked there. Free-threaded CPython (3.14t) is not supported yet (the
+        # extension does not declare it can run without the GIL), so those two cells run only on a
+        # manual run, for information.
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '[{"os":"windows-2022","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.14","experimental":true},{"os":"windows-11-arm","python":"3.13","experimental":true},{"os":"ubuntu-24.04","python":"3.14t","experimental":true},{"os":"macos-15","python":"3.14t","experimental":true}]' || '[{"os":"windows-2022","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.12","experimental":true},{"os":"windows-2025","python":"3.14","experimental":true},{"os":"windows-11-arm","python":"3.13","experimental":true}]') }}
     steps:
       - uses: actions/checkout@v5
 
@@ -74,13 +74,30 @@ jobs:
           uv pip install --python .venv maturin "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0"
           uv run --no-sync --python .venv maturin develop --uv --release
 
+      # Same collect-then-run-then-check shape as test.yml: a collection error or a mass-skip must fail
+      # the cell, and `check_test_report.py` needs the collect log to count what was never run.
+      # The 180-second collection watchdog matches test.yml and bounds stuck imports on slow runners.
+      - name: Collect tests
+        shell: bash
+        run: |
+          PY=.venv/bin/python
+          [ -x "$PY" ] || PY=.venv/Scripts/python.exe
+          "$PY" scripts/collect_guard.py 180 tests/ --co -q -p no:randomly \
+            --strict-markers --strict-config | tee collect.log
+
       - name: Run the suite
         shell: bash
         run: |
           PY=.venv/bin/python
           [ -x "$PY" ] || PY=.venv/Scripts/python.exe
           "$PY" -m pytest tests/ -v -p no:randomly --strict-markers --strict-config \
-            --junitxml=junit.xml
+            --maxfail=40 -rf --tb=short --junitxml=junit.xml
+
+      - name: Diagnose a worker that does not start (macOS)
+        if: failure() && startsWith(matrix.os, 'macos')
+        shell: bash
+        continue-on-error: true
+        run: .venv/bin/python scripts/diagnose_worker_start.py
 
       - name: Summarise
         if: always()
@@ -89,4 +106,5 @@ jobs:
           PY=.venv/bin/python
           [ -x "$PY" ] || PY=.venv/Scripts/python.exe
           "$PY" scripts/check_test_report.py --label "${{ matrix.os }} py${{ matrix.python }}" \
-            --junit junit.xml --min-tests 500 --max-skipped 0 --max-xfailed 10
+            --junit junit.xml --collect-log collect.log --min-tests 500 \
+            --max-skipped 0 --max-xfailed 10

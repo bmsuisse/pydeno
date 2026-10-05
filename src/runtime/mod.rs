@@ -77,6 +77,96 @@ mod tests {
         }
     }
 
+    /// (function handles, active JS streams) the runtime thread currently holds.
+    fn handle_counts(handle: &RuntimeHandle) -> (u64, u64) {
+        let stats = handle.get_stats().unwrap();
+        (stats.function_handles, stats.active_js_streams)
+    }
+
+    #[test]
+    fn failed_conversion_rolls_back_function_and_stream_handles() {
+        let handle = spawn(RuntimeConfig::default());
+        for code in [
+            // A function, then a value that cannot be converted.
+            "({f: () => 1, m: new Map()})",
+            "[() => 1, {g() {}}, Symbol('x')]",
+            "new Set([() => 1, new WeakMap()])",
+            // A stream, then a value that cannot be converted.
+            "({s: new ReadableStream(), e: new Error('x')})",
+            "[new ReadableStream(), () => 1, new ReadableStream(), new Map()]",
+            // A getter that throws after a function was registered.
+            "({f() {}, get boom() { throw new Error('getter'); }})",
+            // A cycle found after a function was registered.
+            "(() => { const o = {f() {}}; o.self = o; return o; })()",
+        ] {
+            for _ in 0..50 {
+                assert!(handle.eval_sync(code).is_err(), "{code} should fail");
+            }
+            assert_eq!(handle_counts(&handle), (0, 0), "{code} left handles behind");
+        }
+    }
+
+    #[test]
+    fn failed_conversion_over_byte_limit_rolls_back_handles() {
+        let handle = spawn(RuntimeConfig {
+            max_serialization_bytes: 1024,
+            ..RuntimeConfig::default()
+        });
+        for _ in 0..20 {
+            let err = handle
+                .eval_sync("[() => 1, new ReadableStream(), 'x'.repeat(4096)]")
+                .unwrap_err();
+            assert!(err.to_string().contains("size"), "{err}");
+        }
+        assert_eq!(handle_counts(&handle), (0, 0));
+    }
+
+    #[test]
+    fn deadline_during_a_successful_conversion_releases_its_handles() {
+        // The conversion itself can succeed after the deadline passed; the caller then gets the
+        // timeout, never the value, so the handles in that value must go too.
+        let handle = spawn(RuntimeConfig {
+            bootstrap_script: Some(
+                "globalThis.big = Array.from({length: 300000}, (_, i) => () => i);\
+                 globalThis.streams = Array.from({length: 2000}, () => new ReadableStream());"
+                    .to_string(),
+            ),
+            execution_timeout: Some(std::time::Duration::from_millis(1)),
+            ..RuntimeConfig::default()
+        });
+        // The watchdog thread can be scheduled late on a busy machine, so the conversion sometimes
+        // finishes before it fires: that result is delivered, and its handles are released the way
+        // a Python caller's wrappers would. Over many tries the deadline must fire at least once.
+        let mut timed_out = 0;
+        for code in ["big", "[streams, big]"] {
+            for _ in 0..30 {
+                match handle.eval_sync(code) {
+                    Err(err) => {
+                        assert!(err.to_string().contains("timed out"), "{err}");
+                        timed_out += 1;
+                    }
+                    Ok(value) => handle.release_unowned_handles(&value),
+                }
+                assert_eq!(handle_counts(&handle), (0, 0), "{code} left handles behind");
+            }
+        }
+        assert!(
+            timed_out > 0,
+            "the deadline never fired during a conversion"
+        );
+    }
+
+    #[test]
+    fn successful_conversion_keeps_its_handles() {
+        let handle = spawn(RuntimeConfig::default());
+        assert!(handle.eval_sync("({m: new Map()})").is_err());
+        let value = handle
+            .eval_sync("({f: () => 1, s: new ReadableStream(), g: [() => 2]})")
+            .unwrap();
+        assert!(matches!(value, JSValue::Object(_)));
+        assert_eq!(handle_counts(&handle), (2, 1));
+    }
+
     #[test]
     fn test_runtime_with_heap_limits() {
         let handle = spawn(RuntimeConfig {

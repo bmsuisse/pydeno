@@ -120,9 +120,15 @@ class TestOutputCapture:
         c("log", [object()])
         assert c.stdout == '"<object>"\n'
 
-    @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10", None])
+    @pytest.mark.parametrize("bad", [0, -1])
     def test_the_cap_must_be_a_positive_int(self, bad: Any) -> None:
         with pytest.raises(ValueError, match="max_output_bytes"):
+            OutputCapture(bad)
+
+    @pytest.mark.parametrize("bad", [1.5, True, "10", None])
+    def test_the_cap_must_be_an_int(self, bad: Any) -> None:
+        # A wrong type is a TypeError, a bad value a ValueError (consistent across every limit).
+        with pytest.raises(TypeError, match="max_output_bytes"):
             OutputCapture(bad)
 
     def test_format_console_arg_handles_negative_zero_and_big_ints(self) -> None:

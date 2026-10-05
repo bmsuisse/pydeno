@@ -99,8 +99,19 @@ fails throws an Error whose `name` is the failure's type.
 - **No call is left behind.** A run does not end while one of its tool calls is unanswered, even a
   call the code forgot to `await`, or one still running when a `Promise.all` rejected. (A worker
   that finished its command and then received a late answer would break; the session prevents it.)
+- **Concurrent calls wait their turn.** At most `max_inflight_host_calls - 1` tool calls (63 by
+  default) are in flight at once; further calls (a `Promise.all` over a long list) wait, in the order
+  they were made, and go out as earlier ones settle (they used to be refused, depending on timing).
+  Tools must therefore not wait for each other: if more than that many calls are in flight and
+  each waits for a call still queued behind them, the run waits until `max_pause` or `timeout`.
 - **Tools are called positionally** (`query_rows("SELECT ...")`), since JavaScript has no keyword
   arguments. A tool with a *required* keyword-only parameter is refused when the session is made.
+- **Tool names.** Names follow `ToolBridge`'s rules (plain identifiers, not `constructor`,
+  `__proto__`, ...). Names starting with `__pydeno` or `__host_op` belong to pydeno and are refused,
+  and so, for tools installed as bare globals, are the names of the guest's own globals (`JSON`,
+  `Promise`, `console`, `globalThis`, `eval`, ...): the tool would replace the global, silently
+  breaking the session or being unreachable. Under a namespace (`namespace="tools"`) any such name
+  is fine (`tools.JSON(...)`); the namespace itself must not be one of them.
 
 ## Telling the model about the tools
 
@@ -305,9 +316,9 @@ during replay), and compares every outcome with the recorded hash.
   and no worker is ever started for it. A signed V8 snapshot is not a journal (different header),
   even under the same key. It contains the code and tool results in clear: store it like you would
   store the conversation. Redacted error messages (the default) are not written to it.
-- **Bound to an identity.** `dump(key, associated_data=b"tenant-42")` folds the bytes into the
-  signature without storing them, and `load(..., associated_data=b"tenant-42")` must be given the same
-  bytes, so one tenant's journal cannot be loaded as another's even when they share a key. The journal
+- **Bound to an identity.** `dump(key, associated_data=b"tenant-42")` folds the bytes (up to 4096)
+  into the signature without storing them, and `load(..., associated_data=b"tenant-42")` must be given
+  the same bytes, so one tenant's journal cannot be loaded as another's even when they share a key. The journal
   also records the pydeno release and the `redact_host_errors` setting and is refused, before any worker
   starts, if either differs. **A journal alone cannot prevent rollback:** loading an older dump of the
   same session restores the tool budget it had spent since. If that matters, keep a counter in your own
@@ -347,8 +358,37 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
 - **Tool arguments are untrusted.** `ToolCall.args` and the arguments your tools receive are data
   the guest (and so, the model and whatever text it read) chose. Validate them in the tool, and
   show them to an approver as data, not as instructions.
+- **Network access is a tool.** The guest has no `fetch`; give it one with
+  [`http_fetch`](http-fetch.md), an allow-listed GET tool that refuses private, loopback and
+  metadata addresses (also through redirects and DNS rebinding) and caps size and time:
+  `AgentSandbox({"fetch_url": http_fetch(["api.example.com/v1/"])})`.
 - **Errors are redacted** by default: the guest learns a failing tool's exception class, not its
   message. Use `redact_host_errors=False` only for tools whose errors carry nothing sensitive.
+  Messages pydeno writes itself for the guest (catalog guidance, `http_fetch` refusals, "takes one
+  object argument") are shown; they hold nothing of yours.
+- **A tool that raises something that is not an `Exception`** (`SystemExit`, `KeyboardInterrupt`,
+  `asyncio.CancelledError`, your own `BaseException` subclass) has not answered. In `run()` /
+  `execute()` the run is then stopped like a crash: the worker is killed, the run fails with
+  `WorkerCrashed("a tool raised SystemExit, which is not an answer; ...")`, and `dump()` records it
+  as lost with the calls it made, so the journal still loads. (`AsyncAgentSandbox.run()` lets the
+  exception propagate to you instead: a cancellation kills the worker, as for any cancelled run;
+  anything else, `KeyboardInterrupt` included, reaches whoever awaits `run()` and leaves the
+  session paused at that call, so close it or answer the call yourself.)
+- **Text from the guest is cleaned where pydeno shows it to you.** `stdout`/`stderr` of a result,
+  error messages and the front door's default printer replace C0/C1 control characters (escape
+  sequences, carriage returns; tab and newline stay), bidirectional controls, line and paragraph
+  separators, and invisible format characters (zero-width spaces and joiners, variation selectors,
+  soft hyphen, BOM, Unicode tag characters, ...) with `?`, the same set the CLI uses (emoji
+  sequences show as separate emoji with `?` between them), so guest output cannot drive or disguise what a terminal or log
+  shows. Values are not changed: a result, a tool argument, or the text a `print_callback` of your
+  own receives is exactly what the guest produced. Treat all of it as untrusted when you put it in
+  a prompt, a page or a query.
+- **A journal that does not replay** (`ReplayDivergence`, or `JournalError` from an authentic
+  journal) means the session's state is lost, not that its spending is. It can still happen for
+  reasons outside the journal (a run that only finishes within `timeout` on a quiet machine, say).
+  If you start such a session over, carry its spent tool budget over too rather than handing out a
+  fresh one ([`SessionPool`](advanced/async-agent-sessions.md#size-cap) does this for
+  journals that outgrow their cap).
 - **The budget** (`max_tool_calls`) counts every call over the session's life, across `start`,
   `resume` and `run`, and survives `load()` (also of a journal dumped after a crash). A call over
   budget throws a `ToolBudgetError` in the guest and never reaches you.

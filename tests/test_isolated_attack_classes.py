@@ -74,7 +74,9 @@ def baseline() -> dict[str, int]:
     }
 
 
-def _assert_back_to_baseline(before: dict[str, int], what: str) -> None:
+def _assert_back_to_baseline(
+    before: dict[str, int], what: str, thread_slack: int = 1
+) -> None:
     _settle()
     after = {
         "children": len(_child_pids()),
@@ -84,7 +86,7 @@ def _assert_back_to_baseline(before: dict[str, int], what: str) -> None:
     assert after["children"] <= before["children"], (what, before, after)
     # A few descriptors of slack: the interpreter and pytest may open one or two lazily.
     assert after["fds"] <= before["fds"] + 3, (what, before, after)
-    assert after["threads"] <= before["threads"] + 1, (what, before, after)
+    assert after["threads"] <= before["threads"] + thread_slack, (what, before, after)
 
 
 class TestNothingLeaksAcrossLifecycles:
@@ -263,7 +265,9 @@ class TestRaces:
         for t in threads:
             t.join(180)
         assert errors == []
-        _assert_back_to_baseline(baseline, "10 parallel runtimes")
+        # The shared worker pools grow to a high-water mark when ten start at once and keep those
+        # threads; a leak adds a thread per runtime (ten), so a few threads of slack still catch it.
+        _assert_back_to_baseline(baseline, "10 parallel runtimes", thread_slack=4)
 
     def test_a_host_function_that_closes_the_runtime_ends_cleanly(self) -> None:
         rt = IsolatedRuntime(request_timeout=20)

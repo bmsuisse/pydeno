@@ -20,20 +20,66 @@ import zipfile
 
 import pytest
 
-from pydeno import WEB_POLYFILLS, IsolatedRuntime, Runtime, RuntimeConfig
+from pydeno import (
+    WEB_POLYFILLS,
+    IsolatedRuntime,
+    JavaScriptError,
+    Runtime,
+    RuntimeConfig,
+)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "vendor"
 LIBS = ROOT / "libs"
 
 PINS = {
+    "d3-force-3.0.0-delaunay-6.0.4.bundle.js": "67e190242161066fea190c201ea2f97ea4d3d97fb1ba9f2f577f33d5dc5b97f7",
     "dagre.bundle.js": "ca109f634a32870d6865e6cb01702a3c8cca68eeb3dccde871aa031ef4b2dbd0",
+    "echarts-6.1.0.min.js": "b66b25aeb4df84e33199dc21694014d336d222cbd9deb0e5a7c14bd6aa0d0fd0",
     "three-0.180.0-gltf.bundle.js": "b3faa3da4cf40d0fad9883002324ed35bfb0a57cbc4fdb1584f1df8065ba061a",
+    "turf-7.4.0.bundle.js": "ab93309f52566b6cd998200485d4825be1c434c5c8f81a3e18dde0a92dd63940",
     "vega-6.4.0.min.js": "8f6a3587cf8d4f42c7e08120e3eb05d067e746d554e39d2dcf52acc0bd5ba28f",
+    "vega-interpreter-2.3.2.bundle.js": "54d2c534de8f0b35e29db6170a4776e666847c9b88c5fd15d56489575c89abdb",
     "vega-lite-6.4.3.min.js": "35a9821df838825b05a6a73e9414b58747a1b18321583858ed903c66393a5c7e",
 }
 
 # name -> (files to evaluate in order, an async-friendly expression, what it must equal/contain)
 CASES: dict[str, tuple[list[str], str, object]] = {
+    "d3": (
+        ["d3-force-3.0.0-delaunay-6.0.4.bundle.js"],
+        """(() => {
+          const nodes = [{id: 'a'}, {id: 'b'}, {id: 'c'}];
+          const sim = d3.forceSimulation(nodes)
+            .force('link', d3.forceLink([{source: 'a', target: 'b'}, {source: 'b', target: 'c'}])
+              .id(d => d.id))
+            .force('charge', d3.forceManyBody()).stop();
+          for (let i = 0; i < 50; i++) sim.tick();
+          const tri = d3.Delaunay.from([[0, 0], [1, 0], [0, 1], [1, 1]]).triangles.length;
+          return [d3.scaleLinear().domain([0, 10]).range([0, 100])(5), tri,
+                  nodes.every(n => Number.isFinite(n.x) && Number.isFinite(n.y))];
+        })()""",
+        [50, 6, True],
+    ),
+    "echarts-ssr": (
+        ["echarts-6.1.0.min.js"],
+        """(() => {
+          const chart = echarts.init(null, null, {renderer: 'svg', ssr: true, width: 400, height: 300});
+          chart.setOption({animation: false, xAxis: {type: 'category', data: ['a', 'b', 'c']},
+                           yAxis: {type: 'value'}, series: [{type: 'bar', data: [1, 3, 2]}]});
+          const svg = chart.renderToSVGString();
+          chart.dispose();
+          return [svg.startsWith('<svg'), svg.includes('<path'), svg.length > 1000];
+        })()""",
+        [True, True, True],
+    ),
+    "turf": (
+        ["turf-7.4.0.bundle.js"],
+        """(() => {
+          const km = turf.distance(turf.point([0, 0]), turf.point([0, 1]), {units: 'kilometers'});
+          const area = turf.area(turf.bboxPolygon([0, 0, 1, 1]));
+          return [Math.round(km), Math.round(area / 1e9)];
+        })()""",
+        [111, 12],
+    ),
     "dagre": (
         ["dagre.bundle.js"],
         """(() => {
@@ -58,6 +104,36 @@ CASES: dict[str, tuple[list[str], str, object]] = {
         })""",
         "glTF:true",
     ),
+    "vega-interpreter": (
+        # Vega's expression interpreter, which never compiles strings: what `strict_eval=True`
+        # needs. Parse with `{ast: true}` and pass `expr: vega.expressionInterpreter`.
+        [
+            "vega-6.4.0.min.js",
+            "vega-lite-6.4.3.min.js",
+            "vega-interpreter-2.3.2.bundle.js",
+        ],
+        """(async () => {
+          const view = new vega.View(vega.parse({
+            data: [{name: 'table', values: [{x: 1, y: 2}, {x: 2, y: 5}, {x: 3, y: 3}],
+                    transform: [{type: 'filter', expr: 'datum.y > 2 && isNumber(datum.x)'},
+                                {type: 'formula', as: 'z', expr: 'datum.x * 2 + PI - PI'}]}],
+            signals: [{name: 'k', value: 4}, {name: 'k2', update: 'k * k + length("ab")'}],
+          }, null, {ast: true}), {renderer: 'none', expr: vega.expressionInterpreter});
+          await view.runAsync();
+          const spec = {
+            data: {values: [{x: 1, y: 2}, {x: 2, y: 5}, {x: 3, y: 3}]},
+            transform: [{calculate: 'datum.y * 10', as: 'y10'}],
+            mark: 'line',
+            encoding: {x: {field: 'x', type: 'quantitative'}, y: {field: 'y10', type: 'quantitative'}},
+          };
+          const lite = new vega.View(vega.parse(vegaLite.compile(spec).spec, null, {ast: true}),
+                                     {renderer: 'none', expr: vega.expressionInterpreter});
+          const svg = await lite.toSVG();
+          return [view.data('table').map(d => d.z), view.signal('k2'),
+                  svg.startsWith('<svg'), svg.includes('<path')];
+        })()""",
+        [[4, 6], 18, True, True],
+    ),
     "vega-lite": (
         ["vega-6.4.0.min.js", "vega-lite-6.4.3.min.js"],
         """(async () => {
@@ -78,6 +154,11 @@ CASES: dict[str, tuple[list[str], str, object]] = {
 
 def _sources(files: list[str]) -> str:
     return "\n;\n".join((LIBS / name).read_text() for name in files)
+
+
+# The libraries that work under `strict_eval=True` exactly as they are. Vega and Vega-Lite compile
+# their expressions with `Function` and need the interpreter ("vega-interpreter") instead.
+STRICT_CASES = sorted(set(CASES) - {"vega-lite"})
 
 
 def _run(runtime: object, files: list[str], expr: str) -> object:
@@ -116,13 +197,45 @@ def test_library_result_matches_the_in_process_runtime(name: str) -> None:
         assert _run(rt, files, expr) == in_process
 
 
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_library_works_without_the_newest_language_features(name: str) -> None:
+    """The documented opt-in `v8_flags=["--no-js-shipping"]` (no `Temporal`, `Float16Array`,
+    explicit resource management, `Promise.try`, `RegExp.escape`, ...; see the isolation guide)
+    leaves every vendored library working."""
+    files, expr, expected = CASES[name]
+    with IsolatedRuntime(_config(), v8_flags=["--no-js-shipping"]) as rt:
+        assert rt.eval("typeof Temporal") == "undefined"
+        assert _run(rt, files, expr) == expected
+
+
+@pytest.mark.parametrize("name", STRICT_CASES)
+def test_library_works_with_strict_eval(name: str) -> None:
+    """No code generation from strings in the guest, and the library computes the same."""
+    files, expr, expected = CASES[name]
+    with IsolatedRuntime(_config(), strict_eval=True) as rt:
+        assert rt.strict_eval
+        assert _run(rt, files, expr) == expected
+        with pytest.raises(JavaScriptError, match="EvalError"):
+            rt.eval("new Function('return 1')()")
+
+
+def test_vega_without_the_interpreter_needs_code_generation() -> None:
+    """Why `strict_eval=True` needs `vega-interpreter`: Vega's default expression path calls
+    `Function`, which strict mode refuses."""
+    files, expr, _ = CASES["vega-lite"]
+    with IsolatedRuntime(_config(), strict_eval=True) as rt:
+        with pytest.raises(JavaScriptError, match="Code generation from strings"):
+            _run(rt, files, expr)
+
+
 def test_the_libraries_run_with_jitless_and_with_the_jit_alike() -> None:
     files, expr, expected = CASES["dagre"]
     with IsolatedRuntime(_config(), jitless=False) as rt:
         assert _run(rt, files, expr) == expected
 
 
-def test_pptxgenjs_builds_a_valid_deck_inside_the_sandbox() -> None:
+@pytest.mark.parametrize("strict_eval", [False, True])
+def test_pptxgenjs_builds_a_valid_deck_inside_the_sandbox(strict_eval: bool) -> None:
     bundle = (ROOT / "pptxgenjs" / "pptxgen.bundle.js").read_text()
     code = """(async () => {
       const pptx = new PptxGenJS();
@@ -135,7 +248,7 @@ def test_pptxgenjs_builds_a_valid_deck_inside_the_sandbox() -> None:
     })()"""
 
     async def go() -> str:
-        with IsolatedRuntime(_config()) as rt:
+        with IsolatedRuntime(_config(), strict_eval=strict_eval) as rt:
             await rt.eval_async(
                 bundle + "\n;0", timeout=60
             )  # a UMD bundle ends in a function

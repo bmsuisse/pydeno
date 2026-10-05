@@ -112,6 +112,8 @@ pub struct RuntimeStatsSnapshot {
     pub total_py_streams: u64,
     pub bytes_streamed_js_to_py: u64,
     pub bytes_streamed_py_to_js: u64,
+    /// JS functions handed out and not yet released (internal; read by a test hook).
+    pub function_handles: u64,
 }
 
 impl RuntimeStatsSnapshot {
@@ -147,6 +149,7 @@ impl RuntimeStatsSnapshot {
             total_py_streams: streams.total_py_streams,
             bytes_streamed_js_to_py: streams.bytes_streamed_js_to_py,
             bytes_streamed_py_to_js: streams.bytes_streamed_py_to_js,
+            function_handles: 0,
         }
     }
 }

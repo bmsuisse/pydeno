@@ -2,6 +2,7 @@
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::ops::{indexed_length, proxy_target, MAX_INDEXED_ELEMENTS};
 use crate::runtime::stream::JsStreamRegistry;
 use deno_core::error::JsError;
 use deno_core::v8;
@@ -59,6 +60,16 @@ pub(super) struct Converter {
     pub(super) next_fn_id: Rc<RefCell<u32>>,
     pub(super) limits: SerializationLimits,
     pub(super) streams: Rc<JsStreamRegistry>,
+    /// `ReadableStream.prototype` as it was when the runtime was created, before any guest code.
+    pub(super) stream_prototype: Option<Rc<v8::Global<v8::Object>>>,
+}
+
+/// Handles one top-level conversion registered, released again if that conversion fails (the
+/// caller never sees their ids, so nothing else would release them).
+#[derive(Default)]
+struct Registered {
+    functions: Vec<u32>,
+    streams: Vec<u32>,
 }
 
 fn circular_check<'s>(
@@ -77,24 +88,54 @@ fn circular_check<'s>(
     Ok(())
 }
 
-pub(super) fn is_readable_stream(
+/// Read `globalThis.ReadableStream.prototype` once, at runtime creation (before guest code), so
+/// that recognising a stream later never consults the live global.
+pub(super) fn capture_stream_prototype(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> Option<v8::Global<v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "ReadableStream")?;
+    let ctor = global.get(scope, key.into())?.to_object(scope)?;
+    let key = v8::String::new(scope, "prototype")?;
+    let prototype = ctor.get(scope, key.into())?.to_object(scope)?;
+    Some(v8::Global::new(scope, prototype))
+}
+
+/// Whether `value` has the captured `ReadableStream.prototype` on its prototype chain.
+///
+/// Not `instanceof`: that would call a guest `Symbol.hasInstance` and follow whatever
+/// `globalThis.ReadableStream` is now. A Proxy anywhere on the chain counts as "no", because
+/// asking a Proxy for its prototype runs its `getPrototypeOf` trap.
+fn is_readable_stream(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
+    stream_prototype: Option<&v8::Global<v8::Object>>,
 ) -> bool {
-    if !value.is_object() {
+    let Some(stream_prototype) = stream_prototype else {
         return false;
+    };
+    let stream_prototype = v8::Local::new(scope, stream_prototype);
+    let mut current = value;
+    // Bounded: a prototype chain is short, and an object cannot be its own ancestor.
+    for _ in 0..64 {
+        if current.is_proxy() {
+            return false;
+        }
+        let Some(object) = current.to_object(scope) else {
+            return false;
+        };
+        let Some(prototype) = object.get_prototype(scope) else {
+            return false;
+        };
+        if !prototype.is_object() {
+            return false;
+        }
+        if prototype.strict_equals(stream_prototype.into()) {
+            return true;
+        }
+        current = prototype;
     }
-    let Some(key) = v8::String::new(scope, "ReadableStream") else {
-        return false;
-    };
-    let global = scope.get_current_context().global(scope);
-    let Some(ctor) = global
-        .get(scope, key.into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-    else {
-        return false;
-    };
-    value.instance_of(scope, ctor.into()).unwrap_or_default()
+    false
 }
 
 /// Look up the global JS helper function `name` (installed by the ops bootstrap).
@@ -140,6 +181,23 @@ impl Converter {
         Ok(func.call(scope, receiver, &v8_args))
     }
 
+    /// Release the function and stream handles in `value`, a converted value its caller will
+    /// never receive (the deadline passed, the caller stopped waiting, post-processing failed).
+    pub(super) fn release_handles(&self, value: &JSValue) {
+        let mut stack = vec![value];
+        while let Some(value) = stack.pop() {
+            match value {
+                JSValue::Function { id } => {
+                    self.fn_registry.borrow_mut().remove(id);
+                }
+                JSValue::JsStream { id } => self.streams.release(*id),
+                JSValue::Array(items) | JSValue::Set(items) => stack.extend(items),
+                JSValue::Object(map) => stack.extend(map.values()),
+                _ => {}
+            }
+        }
+    }
+
     /// Convert a V8 value to JSValue with circular reference detection and limits enforced.
     pub(super) fn to_js_value<'s>(
         &self,
@@ -147,7 +205,25 @@ impl Converter {
         value: v8::Local<'s, v8::Value>,
     ) -> RuntimeResult<JSValue> {
         let mut tracker = LimitTracker::new(self.limits.max_depth, self.limits.max_bytes);
-        self.to_js_value_inner(scope, value, &mut Vec::new(), &mut tracker, None)
+        let mut registered = Registered::default();
+        let result = self.to_js_value_inner(
+            scope,
+            value,
+            &mut Vec::new(),
+            &mut tracker,
+            &mut registered,
+            None,
+        );
+        if result.is_err() {
+            let mut functions = self.fn_registry.borrow_mut();
+            for fn_id in registered.functions {
+                functions.remove(&fn_id);
+            }
+            for stream_id in registered.streams {
+                self.streams.release(stream_id);
+            }
+        }
+        result
     }
 
     /// Recursive converter. `seen` is the current path of container objects,
@@ -159,9 +235,18 @@ impl Converter {
         value: v8::Local<'s, v8::Value>,
         seen: &mut Vec<v8::Local<'s, v8::Object>>,
         tracker: &mut LimitTracker,
+        registered: &mut Registered,
         receiver: Option<v8::Global<v8::Value>>,
     ) -> RuntimeResult<JSValue> {
         tracker.enter()?;
+
+        // A Proxy is converted as its innermost target, and none of its traps runs (see
+        // `ops::proxy_target`): each reference then costs what converting the target costs.
+        let value = if value.is_proxy() {
+            proxy_target(scope, value).map_err(RuntimeError::internal)?
+        } else {
+            value
+        };
 
         let result = if value.is_undefined() {
             tracker.add_bytes(0)?;
@@ -177,8 +262,12 @@ impl Converter {
                 .to_number(scope)
                 .ok_or_else(|| RuntimeError::internal("Failed to convert value to number"))?
                 .value();
-            // NaN/±Infinity and non-integral values stay floats.
-            if num_val.is_finite() && num_val.fract() == 0.0 && num_val as i64 as f64 == num_val {
+            // NaN/±Infinity, non-integral values and anything outside i64 stay floats. Not
+            // `num_val as i64 as f64 == num_val`: the cast saturates, and `i64::MAX as f64` rounds
+            // back up to 2**63, so 2**63 came back as 2**63 - 1.
+            const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+            if num_val.is_finite() && num_val.fract() == 0.0 && (-TWO_63..TWO_63).contains(&num_val)
+            {
                 tracker.add_bytes(20)?;
                 Ok(JSValue::Int(num_val as i64))
             } else {
@@ -219,6 +308,7 @@ impl Converter {
             self.fn_registry
                 .borrow_mut()
                 .insert(fn_id, StoredFunction { function, receiver });
+            registered.functions.push(fn_id);
             tracker.add_bytes(8)?; // ID size
             Ok(JSValue::Function { id: fn_id })
         } else if value.is_symbol() {
@@ -283,7 +373,7 @@ impl Converter {
                 let item = array.get_index(scope, i as u32).ok_or_else(|| {
                     RuntimeError::internal(format!("Failed to get array index {}", i))
                 })?;
-                items.push(self.to_js_value_inner(scope, item, seen, tracker, None)?);
+                items.push(self.to_js_value_inner(scope, item, seen, tracker, registered, None)?);
             }
 
             seen.pop();
@@ -306,7 +396,8 @@ impl Converter {
                 let element = entries
                     .get_index(scope, index as u32)
                     .ok_or_else(|| RuntimeError::internal("Failed to get Set entry"))?;
-                values.push(self.to_js_value_inner(scope, element, seen, tracker, None)?);
+                values
+                    .push(self.to_js_value_inner(scope, element, seen, tracker, registered, None)?);
             }
 
             seen.pop();
@@ -320,14 +411,35 @@ impl Converter {
             }
             tracker.add_bytes(16)?;
             Ok(JSValue::Date(epoch_ms.round() as i64))
-        } else if value.is_object() && is_readable_stream(scope, value) {
+        } else if value.is_object()
+            && is_readable_stream(scope, value, self.stream_prototype.as_deref())
+        {
             let stream_id = self.streams.register_stream(scope, value);
+            registered.streams.push(stream_id);
             tracker.add_bytes(size_of::<u32>())?;
             Ok(JSValue::JsStream { id: stream_id })
         } else if value.is_object() {
             let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             circular_check(seen, obj)?;
+
+            // Typed arrays (other than `Uint8Array`, handled above) and boxed strings have one
+            // virtual own property per element: listing them for a 16 MB `Int8Array` builds 16
+            // million index strings in one native call that termination cannot interrupt. So
+            // before the listing: every element costs at least one byte of key, checked against
+            // the budget, and a fixed cap bounds the listing however large the budget is. The
+            // check is not added to the total, because the walk below charges each key and value
+            // as it converts them. Nothing runs between the check and the listing: `value` is not
+            // a Proxy (unwrapped above), and listing an ordinary object's keys calls no getter.
+            let indexed = indexed_length(scope, value);
+            tracker.check_room(indexed)?;
+            if indexed > MAX_INDEXED_ELEMENTS {
+                return Err(RuntimeError::internal(format!(
+                    "Cannot serialize a typed array or String object of more than \
+                     {MAX_INDEXED_ELEMENTS} elements (whatever max_serialization_bytes is); \
+                     return a Uint8Array over its buffer, or a slice"
+                )));
+            }
 
             let prop_names = obj
                 .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
@@ -354,7 +466,8 @@ impl Converter {
                 });
 
                 tracker.add_bytes(key_str.len())?;
-                let converted = self.to_js_value_inner(scope, val, seen, tracker, receiver)?;
+                let converted =
+                    self.to_js_value_inner(scope, val, seen, tracker, registered, receiver)?;
                 map.insert(key_str, converted);
             }
 
@@ -409,14 +522,14 @@ impl Converter {
                     .into()
             }
             JSValue::Array(items) => {
-                let array = v8::Array::new(scope, items.len() as i32);
-                for (index, item) in items.iter().enumerate() {
-                    let v8_value = self.to_v8(scope, item)?;
-                    array
-                        .set_index(scope, index as u32, v8_value)
-                        .ok_or_else(|| RuntimeError::internal("Failed to set array element"))?;
-                }
-                array.into()
+                // Built from its elements in one go, not `set_index` on a holey
+                // array: that assignment would run an index setter the guest
+                // planted on `Array.prototype` instead of storing the element.
+                let elements = items
+                    .iter()
+                    .map(|item| self.to_v8(scope, item))
+                    .collect::<RuntimeResult<Vec<_>>>()?;
+                v8::Array::new_with_elements(scope, &elements).into()
             }
             JSValue::Set(values) => {
                 let set = v8::Set::new(scope);

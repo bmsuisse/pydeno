@@ -1,13 +1,16 @@
 //! The runtime thread's main loop: drive the event loop, poll the active job,
 //! handle commands, and park when there is nothing to do.
 
-use super::core::{runtime_error_indicates_termination, RuntimeCoreState};
+use super::core::{
+    is_stalled_module_evaluation, runtime_error_indicates_termination, RuntimeCoreState,
+};
 use super::jobs::{
     call_function_async_job, eval_async_job, resume_function_call_job, stream_read_job,
     EvalModuleAsyncJob, Responder, RuntimeJob,
 };
 use super::RuntimeCommand;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
+use crate::runtime::stats::RuntimeCallKind;
 use deno_core::PollEventLoopOptions;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -115,19 +118,50 @@ impl RuntimeDispatcher {
                 Poll::Ready(Err(err)) => {
                     let runtime_err = self.core.translate_core_error(err);
                     // A termination error is left for the job's own poll to report.
-                    if !runtime_error_indicates_termination(&runtime_err) {
-                        let runtime_err_debug = format!("{runtime_err:?}");
-                        if self.active_job.is_some() {
-                            log::error!("Unexpected event loop error: {runtime_err_debug}");
-                            self.complete_active_job(Err(runtime_err));
-                        } else {
-                            log::error!(
-                                "JavaScript event loop failed without an active job: {runtime_err_debug}"
-                            );
+                    if runtime_error_indicates_termination(&runtime_err) {
+                        true
+                    } else if is_stalled_module_evaluation(&runtime_err)
+                        && self.active_job.is_some()
+                    {
+                        // Nothing else is left to run. If the active job has settled, the report
+                        // is not about it: let it finish with its own outcome. If it has not and
+                        // an earlier evaluation was abandoned, the report may be that one's; keep
+                        // the job waiting (its deadline still applies). Otherwise it is stuck.
+                        let settled = self.active_job.as_mut().map(|job| job.poll(&mut self.core));
+                        match settled {
+                            Some(Poll::Ready(result)) => {
+                                self.complete_active_job(result);
+                                continue;
+                            }
+                            _ if self.core.abandoned_module_evaluation => true,
+                            _ => {
+                                self.complete_active_job(Err(runtime_err));
+                                continue;
+                            }
                         }
+                    } else if is_stalled_module_evaluation(&runtime_err) {
+                        // An abandoned module evaluation that deno_core keeps reporting on every
+                        // poll. Nothing else is outstanding (deno_core only reports a stall then),
+                        // so treat the loop as drained: serve commands, honour termination, and
+                        // park while idle. `continue` here re-polled at once, forever, and never
+                        // reached the command channel.
+                        if !self.core.abandoned_module_evaluation {
+                            log::debug!("Module evaluation abandoned: {runtime_err:?}");
+                        }
+                        self.core.abandoned_module_evaluation = true;
+                        true
+                    } else if self.active_job.is_some() {
+                        log::error!("Unexpected event loop error: {runtime_err:?}");
+                        self.complete_active_job(Err(runtime_err));
                         continue;
+                    } else {
+                        // Nobody to report it to; fall through to the command channel rather
+                        // than re-polling at once.
+                        log::error!(
+                            "JavaScript event loop failed without an active job: {runtime_err:?}"
+                        );
+                        true
                     }
-                    true
                 }
                 Poll::Ready(Ok(())) => true,
                 Poll::Pending => false,
@@ -187,6 +221,12 @@ impl RuntimeDispatcher {
     /// Record, finish and clear the active job, then activate the next one.
     fn complete_active_job(&mut self, result: RuntimeResult<crate::runtime::js_value::JSValue>) {
         if let Some(job) = self.active_job.take() {
+            // A module evaluation that did not complete may stay pending in deno_core for good.
+            if job.kind() == RuntimeCallKind::EvalModuleAsync {
+                if let Err(err) = &result {
+                    self.core.note_module_evaluation_failure(err);
+                }
+            }
             self.core
                 .stats_state
                 .record(job.kind(), job.start_time().elapsed());
@@ -265,7 +305,7 @@ impl RuntimeDispatcher {
                     self.core
                         .run_timed(wd, "Sync evaluation", |core| core.eval_sync(&code))
                 });
-                let _ = responder.send(result);
+                self.core.send_sync_result(responder, result);
             }
             RuntimeCommand::EvalModule {
                 specifier,
@@ -279,7 +319,7 @@ impl RuntimeDispatcher {
                         core.eval_module_sync(&specifier)
                     })
                 });
-                let _ = responder.send(result);
+                self.core.send_sync_result(responder, result);
             }
             RuntimeCommand::CallFunctionSync {
                 fn_id,
@@ -298,7 +338,7 @@ impl RuntimeDispatcher {
                         core.call_function_sync(fn_id, args, timeout_ms)
                     })
                 });
-                let _ = responder.send(result);
+                self.core.send_sync_result(responder, result);
             }
             RuntimeCommand::EvalAsync {
                 code,

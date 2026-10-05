@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import contextlib
 import functools
 import contextvars
 import inspect
@@ -38,12 +37,14 @@ import time
 import warnings
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import _sandbox, _wire
+from ._limits import limit_int, limit_seconds
 from ._result import (
+    UNSAFE_TEXT,
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_RESULT_BYTES,
     ExecutionResult,
@@ -57,6 +58,7 @@ from ._pydeno import (
     RuntimeForceKilled,
     RuntimeTerminated,
     RuntimeTimeout,
+    _v8_flags_undone_by_engine,
 )
 
 __all__ = ["IsolatedRuntime", "WorkerCrashed"]
@@ -90,6 +92,8 @@ _CONFIG_KEYS = (
 _UNSUPPORTED_CONFIG = ("inspector", "snapshot")
 
 _MAX_REMOTE_MESSAGE = 64 * 1024
+# The largest integer the wire carries as a plain JSON number (see `_wire`).
+_MAX_WIRE_INT = 2**53 - 1
 _POLL_SECONDS = 0.1
 _RSS_EVERY_SECONDS = 0.05
 _STDERR_TAIL_BYTES = 2048
@@ -101,6 +105,11 @@ _IDLE_CPU_LIMIT_SECONDS = 2.0
 # Worker CPU may exceed wall-clock time (V8 collects garbage on other threads), so the CPU cap
 # is a multiple of the hard deadline rather than equal to it.
 _CPU_CAP_FACTOR = 2.0
+# A command's CPU baseline is the latest reading of the worker's CPU time (the previous command's
+# final sample, or the idle watchdog's), not a fresh one: CPU time only grows, so an older reading
+# can only charge the command MORE (the idle CPU since), never less. Older than this, it is read
+# afresh, so that charge stays bounded (a quarter-second watchdog tick, plus slack for a late one).
+_CPU_BASELINE_MAX_AGE = 2 * _IDLE_CHECK_SECONDS
 
 # Defaults for code you do not trust. Pass `None` to remove one; a sandbox that
 # silently has no limits until you remember to set them is not much of a sandbox.
@@ -119,7 +128,9 @@ _IN_HOST_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 _NATIVE_FRAME = re.compile(r"0x[0-9a-fA-F]{4,}|\.(?:so|dylib)\b|\+\s*\d+\s*$")
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Control and escape characters, the Unicode bidirectional controls that reorder a line, and the
+# invisible format characters (see `_result._CONTROL` for the list and the reasoning).
+_CONTROL = UNSAFE_TEXT  # one filter for console text and worker error text
 
 
 def _clean(text: str, limit: int = 500) -> str:
@@ -139,6 +150,80 @@ _HARDENING_V8_FLAGS = (
     "--enable-experimental-regexp-engine-on-excessive-backtracks",
     "--freeze-flags-after-init",
 )
+# `strict_eval=True`: `eval`, `new Function` (and the async/generator function constructors) throw
+# an EvalError in the guest. V8 sets this once per context at start-up and the freeze above keeps
+# it set. It does not cover WebAssembly (`jitless=False` compiles Wasm bytes regardless), nor
+# `import()`, which the module loader decides.
+_STRICT_EVAL_FLAG = "--disallow-code-generation-from-strings"
+_STRICT_EVAL_NAME = _STRICT_EVAL_FLAG[2:]
+
+
+def _bool_flag_setting(flags: Sequence[str], name: str) -> bool | None:
+    """What `flags` leave the boolean V8 flag `name` (without dashes) at, the last mention winning
+    as in V8, or None when they do not mention it. V8's spellings: `--x`, `--no-x`, `--nox`, with
+    `_` or `-`. V8 does not accept `--x=true` / `--x=false` for these flags (the worker refuses to
+    start), so that spelling is not a mention."""
+    value: bool | None = None
+    for flag in flags:
+        if not isinstance(flag, str):
+            continue  # refused by the worker's own check
+        bare = flag.lstrip("-").replace("_", "-")
+        if bare == name:
+            value = True
+        elif bare in (f"no-{name}", f"no{name}"):
+            value = False
+    return value
+
+
+def _strict_eval_setting(flags: Sequence[str]) -> bool | None:
+    """`_bool_flag_setting` for V8's code-generation flag."""
+    return _bool_flag_setting(flags, _STRICT_EVAL_NAME)
+
+
+def _strict_eval_requested(options: Mapping[str, Any]) -> bool:
+    """Whether runtime keyword arguments (`strict_eval=`, `v8_flags=`) make a strict runtime:
+    `IsolatedRuntime(**options).strict_eval`, without starting one."""
+    if options.get("strict_eval", False) is True:
+        return True
+    return bool(_strict_eval_setting(list(options.get("v8_flags", ()))))
+
+
+def _worker_v8_flags(
+    *,
+    jitless: bool,
+    random_seed: int | None,
+    v8_flags: Sequence[str],
+    strict_eval: bool,
+) -> list[str]:
+    """The V8 flags a worker starts with: `--jitless`, the hardening flags, the seed, the
+    caller's own, and then the strict-eval flag (last, so nothing before it can undo it)."""
+    if not isinstance(strict_eval, bool):
+        raise TypeError("strict_eval must be a bool")
+    v8_flags = list(v8_flags)
+    undone = _v8_flags_undone_by_engine([f for f in v8_flags if isinstance(f, str)])
+    if undone:
+        # deno_core's start-up sets these after the worker's flags and V8 keeps its value: refuse
+        # here, before a worker exists, rather than report a restriction that never applied.
+        raise ValueError(
+            f"these V8 flags cannot take effect: the engine's own start-up sets {undone} "
+            "afterwards and V8 keeps that value"
+        )
+    if strict_eval:
+        for flag in (_STRICT_EVAL_NAME, "freeze-flags-after-init"):
+            if _bool_flag_setting(v8_flags, flag) is False:
+                # Without the freeze the setting is no longer fixed for the worker's life.
+                raise ValueError(
+                    f"strict_eval=True contradicts v8_flags, which switch --{flag} off"
+                )
+    return (
+        (["--jitless"] if jitless else [])
+        + list(_HARDENING_V8_FLAGS)
+        + ([] if random_seed is None else [f"--random-seed={random_seed}"])
+        + v8_flags
+        + ([_STRICT_EVAL_FLAG] if strict_eval else [])
+    )
+
+
 # A worker runs about 13 threads (17 on macOS); this is far past that and far below a thread bomb.
 _MAX_WORKER_THREADS = 64
 
@@ -212,6 +297,20 @@ def _checked_console(fn: Callable[..., Any]) -> Callable[..., Any]:
     return call
 
 
+def _check_wire_limits(config: RuntimeConfig, max_memory: int | None) -> None:
+    """Refuse limits the worker cannot receive: the wire carries integers past 2**53 - 1 as a
+    tagged object, which the worker's `RuntimeConfig` cannot take, so they would otherwise surface
+    as a startup crash ("'dict' object cannot be interpreted as an integer")."""
+    if max_memory is not None and max_memory > _MAX_WIRE_INT:
+        raise ValueError(
+            f"max_memory must be at most {_MAX_WIRE_INT} bytes (2**53 - 1)"
+        )
+    for key in _CONFIG_KEYS:
+        value = getattr(config, key)
+        if isinstance(value, int) and value > _MAX_WIRE_INT:
+            raise ValueError(f"{key} must be at most {_MAX_WIRE_INT} (2**53 - 1)")
+
+
 class _Default:
     def __repr__(self) -> str:
         return "<default>"
@@ -253,6 +352,10 @@ def _seconds(value: float | int | timedelta | None) -> float | None:
     return value.total_seconds() if isinstance(value, timedelta) else float(value)
 
 
+_limit_seconds = limit_seconds
+_limit_int = limit_int
+
+
 # The options that only the parent enforces: none of them reaches the worker, so a worker started
 # ahead of time (`SandboxPool`) can be given them when it is handed out.
 SESSION_OPTIONS = (
@@ -279,31 +382,33 @@ def _session_options(
     """The parent-side options, validated and normalised, as the runtime attributes that hold
     them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
     an option set at checkout means exactly what it means in the constructor."""
-    if max_host_calls is not None and max_host_calls < 0:
-        raise ValueError("max_host_calls must be non-negative")
+    max_host_calls = _limit_int("max_host_calls", max_host_calls, minimum=0)
     max_inflight = (
         DEFAULT_MAX_INFLIGHT_HOST_CALLS
         if max_inflight_host_calls is _DEFAULT
-        else max_inflight_host_calls
+        else _limit_int("max_inflight_host_calls", max_inflight_host_calls, minimum=1)
     )
-    if max_inflight is not None and max_inflight < 1:
-        raise ValueError("max_inflight_host_calls must be at least 1")
+    grace = _limit_seconds("timeout_grace", timeout_grace, allow_zero=True)
+    if grace is None:
+        raise TypeError("timeout_grace must be a number of seconds")
     return {
         "_request_timeout": (
-            _DEFAULT if request_timeout is _DEFAULT else _seconds(request_timeout)
+            _DEFAULT
+            if request_timeout is _DEFAULT
+            else _limit_seconds("request_timeout", request_timeout)
         ),
-        "_grace": float(timeout_grace),
+        "_grace": grace,
         "_max_host_calls": max_host_calls,
         "_max_host_wait": (
             DEFAULT_MAX_HOST_WAIT
             if max_host_wait is _DEFAULT
-            else _seconds(max_host_wait)
+            else _limit_seconds("max_host_wait", max_host_wait)
         ),
         "_max_inflight": max_inflight,
         "_stall": (
             DEFAULT_WRITE_STALL_TIMEOUT
             if write_stall_timeout is _DEFAULT
-            else _seconds(write_stall_timeout)
+            else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
     }
@@ -321,7 +426,29 @@ class _Pump:
       always keeping one asynchronous call in flight;
     - a cap on the **CPU the worker burns**, which is the one thing a guest cannot hide:
       computing costs CPU whether or not a callback is outstanding.
+
+    Console output is not a tool call: it is the guest's own work, but the host's handling of it
+    (a slow terminal, a log shipper) is not. So console time pauses the deadline only up to an
+    allowance of one hard deadline per command: one slow write does not kill a run, and a flood
+    of them can at most double it (it used to stretch it up to `max_host_wait`). Console time
+    while a tool call is outstanding is covered by that call's pause and not charged twice.
     """
+
+    __slots__ = (
+        "loop",
+        "hard",
+        "deadline",
+        "max_host_wait",
+        "cpu_cap",
+        "cpu_start",
+        "_outstanding",
+        "_paused_at",
+        "_paused_total",
+        "_console_at",
+        "_console_left",
+        "_resumed_at",
+        "_lock",
+    )
 
     def __init__(
         self,
@@ -343,6 +470,9 @@ class _Pump:
         self._outstanding = 0
         self._paused_at = 0.0
         self._paused_total = 0.0
+        self._console_at = 0.0  # when the console call in progress began (0: none)
+        self._console_left = hard_timeout  # the console allowance still unspent
+        self._resumed_at = 0.0  # when the last tool pause ended
         self._lock = threading.Lock()
 
     @property
@@ -360,16 +490,37 @@ class _Pump:
         with self._lock:
             self._outstanding -= 1
             if self._outstanding == 0:
-                paused = time.monotonic() - self._paused_at
+                now = self._resumed_at = time.monotonic()
+                paused = now - self._paused_at
                 self._paused_total += paused
                 if self.deadline is not None:
                     self.deadline += paused
+
+    def begin_console(self) -> None:
+        with self._lock:
+            self._console_at = time.monotonic()
+
+    def end_console(self) -> None:
+        with self._lock:
+            grant = self._console_grant(time.monotonic())
+            if self.deadline is not None and grant:
+                self.deadline += grant
+                self._console_left -= grant  # type: ignore[operator]
+            self._console_at = 0.0
+
+    def _console_grant(self, now: float) -> float:
+        """How much of the console call in progress pauses the deadline (lock held)."""
+        if not self._console_at or self._console_left is None or self._outstanding:
+            return 0.0
+        spent = now - max(self._console_at, self._resumed_at)
+        return max(0.0, min(spent, self._console_left))
 
     def expired(self) -> bool:
         with self._lock:
             if self.deadline is None or self._outstanding:
                 return False
-            return time.monotonic() > self.deadline
+            now = time.monotonic()
+            return now > self.deadline + self._console_grant(now)
 
     def waited_too_long(self) -> bool:
         """Has the guest spent more than `max_host_wait` waiting on host callbacks?"""
@@ -388,7 +539,10 @@ class IsolatedRuntime:
     Args:
         config: Limits and bootstrap for the guest. `inspector` and `snapshot` are not
             supported across the boundary yet. `on_console` is: each `console.*` call is a
-            (synchronous) host call, counted by `max_host_calls`.
+            (synchronous) host call, counted by `max_host_calls`. It receives the guest's
+            arguments as they are, text included: sanitise before printing or logging them
+            (`execute()`'s `stdout`/`stderr` are already stripped of control, escape and
+            bidirectional characters; a callback is not).
         max_memory: Kill the worker if its resident memory exceeds this many bytes
             (default 1 GiB; `None` removes the limit). Enforced twice: by the worker itself every ~20ms (it exits with a dedicated
             code) and by the parent every ~50ms (Linux and macOS).
@@ -405,9 +559,14 @@ class IsolatedRuntime:
             callbacks in total. The hard deadline does not run while a callback does, which a
             guest could exploit by always keeping one asynchronous call in flight; this bounds it.
             The worker's CPU use is also capped at twice the hard deadline per command, which
-            callbacks cannot pause. `None` removes the wait cap.
+            callbacks cannot pause. `None` removes the wait cap. Console output is not a
+            callback in this sense: handling it pauses the hard deadline for at most one hard
+            deadline in total per command (a flood of slow console writes at most doubles a run),
+            and it does not count toward this wait cap. Console output while a tool call is in
+            flight is covered by that call's pause.
         max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);
-            further ones are answered with an error instead of being run.
+            further ones are answered with an error instead of being run. Console calls are
+            synchronous and never refused by it (they still count toward `max_host_calls`).
         write_stall_timeout: If the worker stops reading its input and the pipe stays full this
             long (seconds, default 10), the worker is killed rather than letting the host block
             forever. `None` waits indefinitely.
@@ -426,7 +585,19 @@ class IsolatedRuntime:
         jitless: Run V8 in the worker with `--jitless`: no JIT compiler and no
             WebAssembly, which removes the largest class of V8 exploits at a modest
             speed cost. Pass `False` to allow WebAssembly and JIT speed.
-        v8_flags: Extra V8 flags for the worker, applied before the isolate exists.
+        v8_flags: Extra V8 flags for the worker, applied before the isolate exists. A flag the
+            engine's own start-up would override (for example `--no-harmony-temporal`) is
+            refused rather than silently undone.
+        strict_eval: Forbid code generation from strings in the guest: ``eval(...)``,
+            ``new Function(...)`` and the async, generator and async-generator function
+            constructors throw ``EvalError``, however the guest reaches them. The host's own
+            `eval` / `execute` of a script is unaffected. Set with V8's
+            ``--disallow-code-generation-from-strings`` and frozen with the other flags, so the
+            guest cannot switch it off. It removes no engine code and does not cover WebAssembly
+            (with ``jitless=False``), and it guards trusted code against injected strings: it
+            is not a boundary against hostile guest code, which can ship its own interpreter (see
+            the isolation guide). Refuses ``v8_flags`` that switch it or
+            ``--freeze-flags-after-init`` off. Read `.strict_eval`.
         clock: Freeze the guest's clock at this instant (a `datetime`, naive meaning UTC, or
             epoch seconds). `Date.now()`, `new Date()` and `Intl.DateTimeFormat#format()`
             then never advance, which removes the wall clock as a timing source (a busy loop
@@ -458,6 +629,7 @@ class IsolatedRuntime:
         empty_root: bool = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
+        strict_eval: bool = False,
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
         capture_console: bool = False,
@@ -471,14 +643,17 @@ class IsolatedRuntime:
             or not 0 <= random_seed < 2**31
         ):
             raise ValueError("random_seed must be an integer in [0, 2**31)")
+        worker_flags = _worker_v8_flags(
+            jitless=jitless,
+            random_seed=random_seed,
+            v8_flags=v8_flags,
+            strict_eval=strict_eval,
+        )
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
-        if max_host_calls is not None and max_host_calls < 0:
-            raise ValueError("max_host_calls must be non-negative")
+        max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
-        if max_memory is not None and max_memory <= 0:
-            raise ValueError("max_memory must be a positive integer")
         if os.name != "posix":
             raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
         config = config or RuntimeConfig()
@@ -488,6 +663,7 @@ class IsolatedRuntime:
                     f"RuntimeConfig.{attr} is not supported by IsolatedRuntime yet"
                 )
 
+        _check_wire_limits(config, max_memory)
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # ArrayBuffer storage is outside the V8 heap, so `max_heap_size` cannot bound it, and
@@ -496,7 +672,7 @@ class IsolatedRuntime:
             # survives. (No default heap cap: with one, V8 turns an over-cap allocation into a
             # fatal "heap limit exceeded" instead of that RangeError.)
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
-        self._soft_timeout = _seconds(config.timeout)
+        self._soft_timeout = _limit_seconds("RuntimeConfig.timeout", config.timeout)
         self._max_memory = max_memory
         self._host_calls = 0
         # `_request_timeout` has three states: unset (soft timeout + grace, else a default
@@ -513,14 +689,10 @@ class IsolatedRuntime:
         ).items():
             setattr(self, attr, value)
         self._python = python or sys.executable
-        seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
         self._options: dict[str, Any] = {
             "sandbox": sandbox,
             "empty_root": empty_root,
-            "v8_flags": (["--jitless"] if jitless else [])
-            + list(_HARDENING_V8_FLAGS)
-            + seed_flags
-            + list(v8_flags),
+            "v8_flags": worker_flags,
             "max_memory": max_memory,
         }
         if clock_ms is not None:
@@ -557,6 +729,12 @@ class IsolatedRuntime:
 
         self._idle_cpu_base: float | None = None
         self._idle_since = time.monotonic()
+        # The latest reading of the worker's CPU time and when it was taken: the next command's
+        # baseline (see `_CPU_BASELINE_MAX_AGE`). Written only by whoever holds `_lock`.
+        self._last_cpu: float | None = None
+        self._last_cpu_at = 0.0
+        # The CPU reading `_pump` took as the command's answer arrived (see `_request`).
+        self._end_cpu: float | None = None
 
         # A worker started ahead of time (Python up, everything imported, waiting for `init`)
         # saves most of the ~55 ms start-up. The default interpreter only: a custom `python=`
@@ -587,11 +765,13 @@ class IsolatedRuntime:
         self._revoked_hids: dict[int, None] = {}
         _LIVE.add(self)
         self._handshake()
+        self._check_termination_authority()
         self._check_limits_can_be_enforced()
         if prewarm and python is None:
             _refill_spare()
         self._idle_since = time.monotonic()
-        self._idle_cpu_base = _sandbox.cpu_seconds(self._proc.pid)
+        self._idle_cpu_base = self._last_cpu = _sandbox.cpu_seconds(self._proc.pid)
+        self._last_cpu_at = time.monotonic()
         threading.Thread(
             target=_idle_watch,
             args=(weakref.ref(self),),
@@ -599,7 +779,27 @@ class IsolatedRuntime:
             daemon=True,
         ).start()
 
+    @property
+    def strict_eval(self) -> bool:
+        """Whether the guest is refused code generation from strings (`strict_eval=True`, or the
+        same V8 flag passed in `v8_flags`), read from the flags the worker is started with.
+        Sessions record it in their journal."""
+        return bool(_strict_eval_setting(self._options["v8_flags"]))
+
     # -- lifecycle ---------------------------------------------------------
+
+    def _check_termination_authority(self) -> None:
+        # Check the actual worker after its privilege drop and confinement, before guest code
+        # can run. Even sandbox='off' promises parent-enforced time and resource limits.
+        try:
+            os.kill(self._proc.pid, 0)
+        except PermissionError:
+            # The trusted worker is still waiting for its first command. Let it exit through
+            # the protocol: a kill fallback cannot be relied upon in this configuration.
+            self.close()
+            raise WorkerCrashed(
+                "worker failed to start: supervisor termination authority is unavailable"
+            ) from None
 
     def _apply_session(self, options: dict[str, Any]) -> None:
         """Install `_session_options(...)` on a runtime nobody has used yet (a pool checkout)."""
@@ -812,16 +1012,15 @@ class IsolatedRuntime:
             return self._request_timeout  # a number, or None: the caller opted out
         return DEFAULT_REQUEST_TIMEOUT if soft is None else soft + self._grace
 
-    @contextlib.contextmanager
-    def _command_slot(self, soft_timeout: float | None) -> Iterator[None]:
-        """Hold the runtime for one command, but never wait for it forever.
+    def _acquire_slot(self, hard: float | None) -> None:
+        """Take the runtime for one command (the caller releases `_lock`), but never wait for it
+        forever. A plain method, not a context manager: this is on every command's path.
 
         Commands run one at a time. A host function that hands work to *another* thread which then
         calls back into this runtime waits on the lock its own command holds: the re-entrancy guard
         cannot see it (it is another thread), and the pump that enforces the deadline is the thread
         stuck in that host function, so nothing would ever time it out. Bounding the wait by the
         request's own deadline turns that deadlock into an error the guest can see."""
-        hard = self._hard_timeout(soft_timeout)
         wait = -1 if hard is None else hard + self._grace
         if not self._lock.acquire(timeout=wait):
             raise RuntimeTimeout(
@@ -829,10 +1028,6 @@ class IsolatedRuntime:
                 "(a host function that waits on another thread which calls back into the "
                 "same runtime would deadlock)"
             )
-        try:
-            yield
-        finally:
-            self._lock.release()
 
     def _request(
         self,
@@ -847,12 +1042,21 @@ class IsolatedRuntime:
             raise RuntimeError(
                 "this IsolatedRuntime belongs to the process that created it, not to a fork() of it"
             )
-        with self._command_slot(soft_timeout):
+        hard = self._hard_timeout(soft_timeout)
+        if not self._lock.acquire(
+            False
+        ):  # the usual case is a free runtime: no timed wait
+            self._acquire_slot(hard)
+        try:
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
             message["id"] = cmd_id = next(self._cmd_ids)
-            hard = self._hard_timeout(soft_timeout)
-            cpu_start = _sandbox.cpu_seconds(self._proc.pid)
+            cpu_start = self._last_cpu
+            if (
+                cpu_start is None
+                or time.monotonic() - self._last_cpu_at > _CPU_BASELINE_MAX_AGE
+            ):
+                cpu_start = _sandbox.cpu_seconds(self._proc.pid)
             pump = _Pump(
                 hard,
                 loop,
@@ -873,31 +1077,41 @@ class IsolatedRuntime:
                 self._kill()
                 raise WorkerCrashed(self._describe_death("worker is gone")) from None
             self._capture = capture
+            self._end_cpu = None
             try:
                 return self._pump(cmd_id, pump)
             finally:
                 self._capture = None
                 # Where "idle" starts: what the worker burns from here on, with no command
-                # running, is the idle watchdog's business.
-                self._idle_since = time.monotonic()
-                self._idle_cpu_base = _sandbox.cpu_seconds(self._proc.pid)
+                # running, is the idle watchdog's business. The reading is the one the pump took
+                # as the answer arrived (`_check_memory`), or a fresh one if it never got that far.
+                now = self._idle_since = time.monotonic()
+                cpu = self._end_cpu
+                if cpu is None and not self._closed:
+                    cpu = _sandbox.cpu_seconds(self._proc.pid)
+                self._idle_cpu_base = cpu
+                if cpu is not None:
+                    self._last_cpu, self._last_cpu_at = cpu, now
+        finally:
+            self._lock.release()
 
     def _pump(self, cmd_id: int, pump: _Pump) -> Any:
-        last_check = time.monotonic()
+        monotonic = time.monotonic
+        read = self._reader.read
+        last_check = monotonic()
         remote: Exception | None = None
         try:
             while True:
                 try:
-                    poll = time.monotonic() + _POLL_SECONDS
-                    payload = self._reader.read(poll)
+                    payload = read(monotonic() + _POLL_SECONDS)
                 except TimeoutError:
                     self._supervise(pump)
-                    last_check = time.monotonic()
+                    last_check = monotonic()
                     continue
                 # The limits are enforced on a clock, not on silence. If they ran only when
                 # the pipe went quiet, a guest that never lets it go quiet (a loop of cheap
                 # host calls) would switch the hard deadline and memory ceiling off.
-                now = time.monotonic()
+                now = monotonic()
                 if now - last_check >= _POLL_SECONDS:
                     self._supervise(pump)
                     last_check = now
@@ -909,7 +1123,7 @@ class IsolatedRuntime:
                 if kind == "call":
                     self._on_call(message, pump)
                 elif kind in ("result", "error") and message.get("id") == cmd_id:
-                    self._check_memory(force=True)
+                    self._end_cpu = self._check_memory(force=True)
                     if kind == "result":
                         return message.get("v")  # already decoded by `loads_decoded`
                     # Built here, raised after the guard below: a guest's own JavaScriptError is
@@ -956,13 +1170,14 @@ class IsolatedRuntime:
             if self._closed:
                 return
             try:
-                self._check_memory(force=True)
+                now_cpu = self._check_memory(force=True)
             except WorkerCrashed:
                 return  # `_check_memory` has already killed it
+            if now_cpu is not None:
+                self._last_cpu, self._last_cpu_at = now_cpu, time.monotonic()
             base = self._idle_cpu_base
             if base is None:
                 return
-            now_cpu = _sandbox.cpu_seconds(self._proc.pid)
             # A small flat allowance plus a thin trickle (1% of a core) that grows with idle time,
             # so a healthy worker that sits idle for days is never mistaken for a runaway one.
             allowed = _IDLE_CPU_LIMIT_SECONDS + 0.01 * (
@@ -986,38 +1201,41 @@ class IsolatedRuntime:
                 f"host callbacks kept the guest waiting for more than "
                 f"{pump.max_host_wait:g}s in one command (max_host_wait); worker killed"
             )
-        if pump.cpu_cap is not None and pump.cpu_start is not None:
-            now_cpu = _sandbox.cpu_seconds(self._proc.pid)
-            if now_cpu is not None and now_cpu - pump.cpu_start > pump.cpu_cap:
-                self._kill()
-                raise RuntimeTimeout(
-                    f"worker used more than {pump.cpu_cap:g}s of CPU in one command "
-                    f"and was killed"
-                )
-        self._check_memory()
+        # One reading for the CPU cap, the memory ceiling and the thread cap.
+        now_cpu = self._check_memory(force=True)
+        if (
+            pump.cpu_cap is not None
+            and pump.cpu_start is not None
+            and now_cpu is not None
+            and now_cpu - pump.cpu_start > pump.cpu_cap
+        ):
+            self._kill()
+            raise RuntimeTimeout(
+                f"worker used more than {pump.cpu_cap:g}s of CPU in one command "
+                f"and was killed"
+            )
 
-    def _check_memory(self, *, force: bool = False) -> None:
+    def _check_memory(self, *, force: bool = False) -> float | None:
         """Kill the worker if its RSS is over `max_memory` or it has far more threads than a
         worker has. Sampled, so a spike that ends between samples is only caught by the check
-        made as each command finishes."""
+        made as each command finishes. Returns the worker's CPU time from the same reading (None
+        if not sampled or unreadable)."""
         now = time.monotonic()
         if not force and now - self._last_rss_check < _RSS_EVERY_SECONDS:
-            return
+            return None
         self._last_rss_check = now
-        threads = _sandbox.thread_count(self._proc.pid)
+        rss, cpu, threads = _sandbox.usage(self._proc.pid)
         if threads is not None and threads > _MAX_WORKER_THREADS:
             self._kill_reason = f"worker started {threads} threads (limit {_MAX_WORKER_THREADS}); killed"
             self._kill()
             raise WorkerCrashed(self._kill_reason)
-        if self._max_memory is None:
-            return
-        rss = _sandbox.rss_bytes(self._proc.pid)
-        if rss is not None and rss > self._max_memory:
+        if self._max_memory is not None and rss is not None and rss > self._max_memory:
             self._kill_reason = (
                 f"worker used {rss} bytes, over max_memory={self._max_memory}; killed"
             )
             self._kill()
             raise WorkerCrashed(self._kill_reason)
+        return cpu
 
     @staticmethod
     def _remote_error(message: dict[str, Any]) -> Exception:
@@ -1073,6 +1291,18 @@ class IsolatedRuntime:
         # All the arguments under one budget: decoding each on its own would multiply the limit
         # by the argument count.
         decoded = args  # `loads_decoded` already decoded them, under one shared budget
+        if hid == self._options.get("console_hid"):
+            # Console output is the guest's own work, not a tool call: it pauses the deadline
+            # only within the command's console allowance (see `_Pump`), not up to
+            # `max_host_wait`. It is synchronous (the worker waits for it), so it is never one of
+            # the calls in flight, and the in-flight cap does not refuse it; `max_host_calls`
+            # still counts it (above).
+            pump.begin_console()
+            try:
+                self._run_sync_handler(handler, decoded, cid, None)
+            finally:
+                pump.end_console()
+            return
         if self._max_inflight is not None and (
             pump.outstanding >= self._max_inflight
             or self._async_inflight >= self._max_inflight
@@ -1107,6 +1337,15 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
+        self._run_sync_handler(handler, decoded, cid, pump)
+
+    def _run_sync_handler(
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump | None,
+    ) -> None:
         try:
             self._guard.in_host_call = True
             try:
@@ -1162,7 +1401,7 @@ class IsolatedRuntime:
         self, code: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate JavaScript, awaiting promises. Async host functions run on this loop."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
@@ -1211,7 +1450,7 @@ class IsolatedRuntime:
         """`eval_async` (promises are awaited) returning an `ExecutionResult`; see `execute`."""
         capture = OutputCapture(max_output_bytes)
         check_limit("max_result_bytes", max_result_bytes)
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()
@@ -1395,7 +1634,7 @@ class IsolatedRuntime:
         self, specifier: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate a module, awaiting top-level await; async host callbacks run on this loop."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         loop = asyncio.get_running_loop()

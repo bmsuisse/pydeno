@@ -32,7 +32,12 @@ pub(crate) fn js_value_to_python(
     handle: Option<&super::handle::RuntimeHandle>,
 ) -> PyResult<Py<PyAny>> {
     let mut unlimited = LimitTracker::new(usize::MAX, usize::MAX);
-    js_value_to_python_tracked(py, value, handle, &mut unlimited)
+    let result = js_value_to_python_tracked(py, value, handle, &mut unlimited);
+    // The caller gets the error, never the value: release what no wrapper took over.
+    if let (Err(_), Some(handle)) = (&result, handle) {
+        handle.release_unowned_handles(value);
+    }
+    result
 }
 
 /// Convert a JSValue into a Python object against a caller-supplied

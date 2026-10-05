@@ -45,7 +45,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import _isolated, _sandbox, _wire
+from . import _compat, _isolated, _sandbox, _wire
 from ._isolated import (
     DEFAULT_MAX_MEMORY,
     DEFAULT_REQUEST_TIMEOUT,
@@ -53,8 +53,8 @@ from ._isolated import (
     WorkerCrashed,
     _CONFIG_KEYS,
     _CPU_CAP_FACTOR,
+    _check_wire_limits,
     _DEFAULT,
-    _HARDENING_V8_FLAGS,
     _HostCallBudgetExceeded,
     _IDLE_CHECK_SECONDS,
     _IDLE_CPU_LIMIT_SECONDS,
@@ -71,11 +71,14 @@ from ._isolated import (
     _clock_ms,
     _error_reply,
     _is_token,
+    _limit_int,
+    _limit_seconds,
     _revoked_handler,
-    _seconds,
     _session_options,
     _start_worker,
+    _strict_eval_setting,
     _terminate_process,
+    _worker_v8_flags,
 )
 from ._pydeno import RuntimeConfig, RuntimeTimeout
 
@@ -94,6 +97,12 @@ _SAMPLE_CHUNK = 64
 # frames between commands). Above one maximal frame, so a single legitimate frame always fits.
 _READ_HIGH_WATER = 2 * _wire.MAX_FRAME_BYTES + 8
 _READ_LOW_WATER = _wire.MAX_FRAME_BYTES
+# Payload bytes do not account for deque entries and bytes objects (empty frames cost zero).
+# As with the byte watermark, the current transport delivery may overshoot this threshold.
+# CPython's pipe transport reads at most 256 KiB per delivery: up to 65,536 empty frames
+# (roughly 0.5 MiB of deque entries) beyond the point where a pause becomes necessary.
+_READ_HIGH_FRAMES = 1024
+_READ_LOW_FRAMES = 512
 _HANDSHAKE_SECONDS = 30.0
 _CLOSE_GRACE_SECONDS = 1.0
 # Frames already buffered are handled without suspending; yield to the loop every so many so that
@@ -146,10 +155,7 @@ def _pool(name: str) -> ThreadPoolExecutor:
 
 def _sample_many(pids: list[int]) -> list[_Sample]:
     """Runs on the metrics thread: one batch of blocking reads, never on the loop."""
-    return [
-        (_sandbox.rss_bytes(p), _sandbox.cpu_seconds(p), _sandbox.thread_count(p))
-        for p in pids
-    ]
+    return [_sandbox.usage(p) for p in pids]  # (rss, cpu, threads) from one read each
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +340,10 @@ class _FrameReader(asyncio.Protocol):
             self.frames.append(bytes(buf[_HEADER.size : end]))
             self._queued += length
             del buf[:end]
-        if self._queued + len(buf) > _READ_HIGH_WATER:
+        if (
+            self._queued + len(buf) > _READ_HIGH_WATER
+            or len(self.frames) >= _READ_HIGH_FRAMES
+        ):
             self._pause()
         self.wake()
 
@@ -355,7 +364,13 @@ class _FrameReader(asyncio.Protocol):
         if (
             self._paused
             and self.error is None
-            and self._queued + len(self._buf) < _READ_LOW_WATER
+            and (
+                not self.frames  # an unfinished frame needs input when nothing can be popped
+                or (
+                    self._queued + len(self._buf) < _READ_LOW_WATER
+                    and len(self.frames) < _READ_LOW_FRAMES
+                )
+            )
         ):
             self._paused = False
             if self._transport is not None:
@@ -492,12 +507,12 @@ class _Supervisor:
             return
         _SUPERVISORS.setdefault(self.loop, self)
         if self.task is None or self.task.done():
-            # An empty context: the supervisor must not carry the creating task's contextvars.
+            # An empty context: the supervisor must not carry the creating task's contextvars. A
+            # task copies the context it is created in, so create it inside an empty one
+            # (`create_task(context=...)` needs Python 3.11; this supports 3.10).
             try:
-                self.task = self.loop.create_task(
-                    self._run(),
-                    name="pydeno-aio-supervisor",
-                    context=contextvars.Context(),
+                self.task = contextvars.Context().run(
+                    self.loop.create_task, self._run(), name="pydeno-aio-supervisor"
                 )
             except RuntimeError:  # a loop on its way down; atexit reaps what is left
                 pass
@@ -653,6 +668,7 @@ class AsyncIsolatedRuntime:
         empty_root: bool = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
+        strict_eval: bool = False,
         clock: datetime | float | int | None = None,
         random_seed: int | None = None,
         python: str | None = None,
@@ -667,14 +683,17 @@ class AsyncIsolatedRuntime:
             or not 0 <= random_seed < 2**31
         ):
             raise ValueError("random_seed must be an integer in [0, 2**31)")
+        worker_flags = _worker_v8_flags(
+            jitless=jitless,
+            random_seed=random_seed,
+            v8_flags=v8_flags,
+            strict_eval=strict_eval,
+        )
         if max_memory is _DEFAULT:
             max_memory = DEFAULT_MAX_MEMORY
-        if max_host_calls is not None and max_host_calls < 0:
-            raise ValueError("max_host_calls must be non-negative")
+        max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
-        if max_memory is not None and max_memory <= 0:
-            raise ValueError("max_memory must be a positive integer")
         if os.name != "posix":
             raise NotImplementedError(
                 "AsyncIsolatedRuntime currently supports POSIX only"
@@ -686,11 +705,12 @@ class AsyncIsolatedRuntime:
                     f"RuntimeConfig.{attr} is not supported by AsyncIsolatedRuntime yet"
                 )
 
+        _check_wire_limits(config, max_memory)
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # See IsolatedRuntime: a catchable RangeError instead of an RSS kill.
             self._config["max_buffer_bytes"] = max(1, max_memory // 4)
-        self._soft_timeout = _seconds(config.timeout)
+        self._soft_timeout = _limit_seconds("RuntimeConfig.timeout", config.timeout)
         self._max_memory = max_memory
         self._host_calls = 0
         self._request_timeout: float | None | Any
@@ -707,14 +727,10 @@ class AsyncIsolatedRuntime:
         self._python = python
         self._prewarm = bool(prewarm)
         self._handler_executor = handler_executor
-        seed_flags = [] if random_seed is None else [f"--random-seed={random_seed}"]
         self._options: dict[str, Any] = {
             "sandbox": sandbox,
             "empty_root": empty_root,
-            "v8_flags": (["--jitless"] if jitless else [])
-            + list(_HARDENING_V8_FLAGS)
-            + seed_flags
-            + list(v8_flags),
+            "v8_flags": worker_flags,
             "max_memory": max_memory,
         }
         if clock_ms is not None:
@@ -762,6 +778,11 @@ class AsyncIsolatedRuntime:
         self._idle_cpu_base: float | None = None
         self._last_cpu: float | None = None
         self._last_idle_sample = 0.0
+
+    @property
+    def strict_eval(self) -> bool:
+        """As `IsolatedRuntime.strict_eval`."""
+        return bool(_strict_eval_setting(self._options["v8_flags"]))
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -833,6 +854,7 @@ class AsyncIsolatedRuntime:
                 (self._rtransport, self._wtransport),
             )
             await self._handshake()
+            await self._check_termination_authority()
             await self._check_limits_can_be_enforced()
         except BaseException:
             self._kill()
@@ -850,7 +872,7 @@ class AsyncIsolatedRuntime:
                     }
                 )
             )
-            async with asyncio.timeout(_HANDSHAKE_SECONDS):
+            async with _compat.timeout(_HANDSHAKE_SECONDS):
                 payload = await self._next_frame()
             if payload is None:
                 await self._reap(0.5)
@@ -901,6 +923,21 @@ class AsyncIsolatedRuntime:
         except WorkerCrashed:
             self._kill()
             raise
+
+    async def _check_termination_authority(self) -> None:
+        try:
+            os.kill(self._proc.pid, 0)
+        except PermissionError:
+            # Startup already holds a start slot; close() would acquire it again. No guest
+            # command has run, so the trusted worker can exit through the close protocol.
+            try:
+                self._write(_CLOSE_FRAME)
+            except OSError:
+                pass
+            await self._wait_exit(_CLOSE_GRACE_SECONDS)
+            raise WorkerCrashed(
+                "worker failed to start: supervisor termination authority is unavailable"
+            ) from None
 
     async def _check_limits_can_be_enforced(self) -> None:
         """As `IsolatedRuntime._check_limits_can_be_enforced`: a limit that cannot be measured
@@ -1185,7 +1222,7 @@ class AsyncIsolatedRuntime:
         if not self._wproto.paused:
             return
         try:
-            async with asyncio.timeout(self._stall):
+            async with _compat.timeout(self._stall):
                 await self._wproto.drain()
         except TimeoutError:
             raise _wire.StalledWrite(
@@ -1299,7 +1336,7 @@ class AsyncIsolatedRuntime:
         # then calls back into this runtime would otherwise wait on its own command forever.
         try:
             if self._lock.locked():
-                async with asyncio.timeout(
+                async with _compat.timeout(
                     None if hard is None else hard + self._grace
                 ):
                     await self._lock.acquire()
@@ -1362,9 +1399,9 @@ class AsyncIsolatedRuntime:
         assert self._sup is not None
         self._cmd = pump
         self._gen += 1
-        # The CPU baseline. IsolatedRuntime reads it right before sending; here it is the latest
-        # reading (the previous command's final check, or an idle sample at most
-        # `_IDLE_CHECK_SECONDS` old), which costs no thread hop. It can only be *older*, so the
+        # The CPU baseline: the latest reading (the previous command's final check, or an idle
+        # sample at most `_IDLE_CHECK_SECONDS` old), as in IsolatedRuntime, which costs no thread
+        # hop. It can only be *older*, so the
         # command is charged for at most that much extra (idle, and itself capped) CPU: stricter,
         # never looser.
         if self._last_cpu is not None:
@@ -1461,9 +1498,18 @@ class AsyncIsolatedRuntime:
                 f"guest made more than max_host_calls={self._max_host_calls} host calls"
             )
         handler, is_async = entry
-        if self._max_inflight is not None and (
-            pump.outstanding >= self._max_inflight
-            or self._async_inflight >= self._max_inflight
+        # Console output is the guest's own work, not a tool call: it pauses the deadline only
+        # within the command's console allowance (see `_Pump`). It is synchronous (the worker waits
+        # for it), so it is never one of the calls in flight and the in-flight cap does not refuse
+        # it; `max_host_calls` still counts it (above).
+        console = hid == self._options.get("console_hid")
+        if (
+            not console
+            and self._max_inflight is not None
+            and (
+                pump.outstanding >= self._max_inflight
+                or self._async_inflight >= self._max_inflight
+            )
         ):
             await self._send_reply(
                 {
@@ -1475,9 +1521,12 @@ class AsyncIsolatedRuntime:
                 None,
             )
             return
-        pump.begin_call()
+        if console:
+            pump.begin_console()
+        else:
+            pump.begin_call()
         loop = asyncio.get_running_loop()
-        if is_async:
+        if is_async and not console:
             self._async_inflight += 1
             # `create_task` copies the current context, which is the caller's: the handler sees
             # the caller's contextvars.
@@ -1498,8 +1547,12 @@ class AsyncIsolatedRuntime:
             self._redact,
             self._serial,
         )
-        frame = await self._await_or_death(fut)
-        await self._send_reply(frame, pump)
+        try:
+            frame = await self._await_or_death(fut)
+            await self._send_reply(frame, None if console else pump)
+        finally:
+            if console:
+                pump.end_console()
 
     async def _async_call(
         self, handler: Callable[..., Any], args: list[Any], cid: int, pump: _Pump
@@ -1563,7 +1616,7 @@ class AsyncIsolatedRuntime:
     ) -> Any:
         """Evaluate JavaScript in the worker, awaiting a promise result. Host functions (sync or
         async) run while it waits, with the caller's contextvars."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         return await self._request(
@@ -1576,7 +1629,7 @@ class AsyncIsolatedRuntime:
         self, specifier: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
         """Evaluate a module (awaiting top-level await) and return its namespace as a dict."""
-        soft = _seconds(timeout)
+        soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
         return await self._request(
