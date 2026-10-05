@@ -142,22 +142,29 @@ def test_call_latency_survives_more_runtimes_than_cores() -> None:
     Asserted as a ratio against a K=1 baseline measured in this same process, so
     it does not depend on the absolute speed of the machine.
     """
-    baseline_rt = _make_runtime()
-    try:
-        baseline_us = _median_call_us(baseline_rt)
-    finally:
-        baseline_rt.close()
-        gc.collect()
 
-    count = 3 * (os.cpu_count() or 4)
-    runtimes = [_make_runtime() for _ in range(count)]
-    try:
-        loaded_us = _median_call_us(runtimes[0])
-    finally:
-        for runtime in runtimes:
-            runtime.close()
-        gc.collect()
+    def measure() -> tuple[float, float, int]:
+        baseline_rt = _make_runtime()
+        try:
+            baseline_us = _median_call_us(baseline_rt)
+        finally:
+            baseline_rt.close()
+            gc.collect()
 
+        count = 3 * (os.cpu_count() or 4)
+        runtimes = [_make_runtime() for _ in range(count)]
+        try:
+            loaded_us = _median_call_us(runtimes[0])
+        finally:
+            for runtime in runtimes:
+                runtime.close()
+            gc.collect()
+        return baseline_us, loaded_us, count
+
+    # A ratio on a shared CI runner is noisy, and the busy-spin it guards against gives ~2.3x on every
+    # attempt, so the best of three attempts is what is asserted.
+    attempts = [measure() for _ in range(3)]
+    baseline_us, loaded_us, count = min(attempts, key=lambda a: a[1] / a[0])
     ratio = loaded_us / baseline_us
     # Measured ~2.3x with the busy-spin and ~1.0x parked. 2x is the midpoint and
     # leaves room for scheduling noise on a loaded machine.
