@@ -54,10 +54,12 @@ Status below is a plan, not a promise of dates.
   Proposed experimental: `SessionPool`, the pydantic-ai integration, snapshots.
 - Pin the journal and snapshot formats with an explicit compatibility promise.
 
-## 0.9: worker loop, WebAssembly, CI coverage
+## 0.9: gates, worker caps, worker loop, WebAssembly, CI coverage
 
 | Item | Issue / PR |
 |---|---|
+| Gates: a host-side check of the exact source before it runs (`gate=`, `SourcePolicy`, `static_gate`) | #99 |
+| Opt-in worker caps for pools and the front door (`max_workers`, `checkout_timeout`) | #81, #101 |
 | Persistent worker loop | #60 |
 | Stream edge case | #58 |
 | `load_wasm` | #37 |

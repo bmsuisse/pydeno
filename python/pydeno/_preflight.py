@@ -43,6 +43,7 @@ contract.
 from __future__ import annotations
 
 import re
+from types import MappingProxyType
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -96,7 +97,7 @@ class PreflightResult:
 #: The message of every `SourcePolicy` rule. Public contract: shown to the author of the code
 #: (often a model) as the next step, so the wording only changes in a documented release. The
 #: placeholders are host-chosen (a name from the policy, `setTimeout`/`setInterval`, numbers).
-POLICY_MESSAGES: dict[str, str] = {
+_POLICY_MESSAGES: dict[str, str] = {
     "source-too-large": (
         "The code is {size} bytes, over the limit of {limit} bytes. Send a shorter program."
     ),
@@ -123,6 +124,8 @@ POLICY_MESSAGES: dict[str, str] = {
         "Looking up a global by a computed name is not allowed here. Use the name directly."
     ),
 }
+#: Read-only: the templates are a public contract, not a setting.
+POLICY_MESSAGES: MappingProxyType[str, str] = MappingProxyType(_POLICY_MESSAGES)
 
 
 _EXACT_SIZE_UP_TO = 16 * 1024 * 1024

@@ -78,11 +78,13 @@ Only load modules you trust, as you would a native library.
   toward `max_memory` (the worker's resident memory): past it the worker is killed (`WorkerCrashed`),
   not a catchable error. An in-process `Runtime` has no bound on it.
 
-### Not on `Pydeno`, `AgentSandbox` or `SandboxPool`
+### Not on `Pydeno`, `AgentSandbox` or `SessionPool`
 
 Those sessions are journaled and replayed on fresh single-use workers, and a module loaded by the
 host is not part of the journal: a replayed or restored session would silently lack it. Use
-`IsolatedRuntime(jitless=False)` or `AsyncIsolatedRuntime(jitless=False)` directly.
+`IsolatedRuntime(jitless=False)` or `AsyncIsolatedRuntime(jitless=False)` directly, or a runtime
+from `SandboxPool(jitless=False)` / `AsyncSandboxPool(jitless=False)`: a pool checkout is a plain
+isolated runtime, not journaled, so `checkout().load_wasm(...)` works.
 
 ### Is it faster?
 

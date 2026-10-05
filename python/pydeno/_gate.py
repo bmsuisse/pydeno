@@ -129,8 +129,12 @@ class GateContext:
         )
 
 
-#: A gate: ``(source, context) -> Verdict``, or a coroutine function returning one.
-Gate = Callable[[str, GateContext], Union[Verdict, Awaitable[Verdict]]]
+#: A gate: ``(source, context) -> Verdict`` or ``(source) -> Verdict``, sync, or a coroutine
+#: function returning one.
+Gate = Union[
+    Callable[[str, GateContext], Union[Verdict, Awaitable[Verdict]]],
+    Callable[[str], Union[Verdict, Awaitable[Verdict]]],
+]
 
 
 class GateDenied(PydenoError):
@@ -403,6 +407,7 @@ class _GatePool:
         self.jobs: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.threads = 0
         self.idle = 0
+        self.pending = 0  # queued jobs no thread has taken yet
 
     def submit(
         self, fn: Callable[..., Any], *args: Any
@@ -414,7 +419,10 @@ class _GatePool:
             ):  # a fork() child: the parent's threads are not here
                 self._reset()
             self.jobs.put((future, fn, args))
-            if self.idle == 0 and self.threads < self.size:
+            self.pending += 1
+            # One idle thread serves one queued job: a burst while one thread is idle must still
+            # start threads, or every job but the first waits behind it and times out.
+            if self.pending > self.idle and self.threads < self.size:
                 self.threads += 1
                 threading.Thread(
                     target=self._work,
@@ -434,6 +442,7 @@ class _GatePool:
             future, fn, args = jobs.get()
             with self.lock:
                 self.idle -= 1
+                self.pending -= 1
             if not future.set_running_or_notify_cancel():
                 continue  # its caller already gave up
             try:
