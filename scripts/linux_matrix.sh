@@ -119,7 +119,7 @@ r.close()
 " || echo "layers: could not start a worker"
 
 mkdir -p /work
-cp -r /src/tests /src/vendor /src/examples /work/
+cp -r /src/tests /src/vendor /src/examples /src/docs /src/scripts /work/
 cp /src/pyproject.toml /src/CLAUDE.md /work/
 cd /work
 echo "== $(. /etc/os-release; echo "$PRETTY_NAME") | $(/tmp/v/bin/python -V) | glibc $(ldd --version 2>/dev/null | head -1 | grep -o '[0-9.]*$' || echo '?') | kernel $(uname -r) | $(uname -m)"

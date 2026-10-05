@@ -50,6 +50,8 @@ jobs:
   # cannot see that class of bug at all.
   pytest:
     name: pytest (${{ matrix.profile }})
+    env:
+      PYDENO_TEST_PROFILE: ${{ matrix.profile }}
     timeout-minutes: 45
     # macos-latest, matching `benchmarks.yml`: the Linux cdylib build currently
     # fails to link V8 (rust-lld TLS relocation vs `-shared`), a pre-existing

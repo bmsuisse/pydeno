@@ -562,6 +562,7 @@ def test_the_native_scan_is_linear(shape: str, mode: str) -> None:
     assert big < 16 * 4 * small + 0.02, (small, big)
 
 
+@pytest.mark.release_performance
 def test_one_mib_of_ordinary_code_scans_well_under_100_ms() -> None:
     code = _sized(_ORDINARY, _MIB)
     for mode in ("default", "precise-rules", "plain"):

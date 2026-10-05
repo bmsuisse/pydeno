@@ -105,6 +105,7 @@ collect_ignore = (
 )
 
 _PLATFORM_MARKERS = {
+    "release_performance": os.environ.get("PYDENO_TEST_PROFILE") != "debug",
     "linux_only": sys.platform.startswith("linux"),
     "darwin_only": sys.platform == "darwin",
     # Assertions that every dangerous operation is denied only make sense where every
