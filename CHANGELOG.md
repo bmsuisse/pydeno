@@ -445,6 +445,9 @@ and the red-team restrictions under Security; see
 
 ### Changed
 
+- Large buffered frames avoid a redundant payload-sized temporary copy in the sync and async
+  readers. Small frames retain the slice path, and the sync single-read fast path is unchanged (#66).
+
 - **`python -m pydeno` now runs code in the sandboxed worker**, not the in-process `Runtime`, and a
   positional argument is JavaScript, not a file name (use `-f FILE`). Results print as JSON. See
   [`docs/guides/upgrading.md`](docs/guides/upgrading.md).
