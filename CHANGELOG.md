@@ -244,6 +244,12 @@ and the red-team restrictions under Security; see
 
 ### Fixed
 
+- macOS on Intel (x86_64): sandboxed workers no longer abort at start-up. V8 on x86_64 calls `uname()`
+  while it starts, which reads the kernel version through one `sysctl` name the Seatbelt profile
+  denied; the profile now allows that read-only name (`kern.osrelease`, for example "24.6.0"). 0.7.0
+  shows the same failure on Intel Macs. Apple-silicon Macs were not affected.
+- `AsyncIsolatedRuntime` (and `AsyncSandboxPool`) start on Python 3.10 again: they used
+  `asyncio.timeout` and `create_task(context=...)`, which need Python 3.11.
 - `IsolatedRuntime` and `AsyncIsolatedRuntime` raise `ValueError` for a `max_memory` (or a
   `RuntimeConfig` limit) above 2^53 - 1. Such a value used to reach the worker as a tagged object
   and fail at startup as `WorkerCrashed` ("argument 'max_buffer_bytes': 'dict' object cannot be

@@ -45,6 +45,9 @@ _SEATBELT_PROFILE = """
 (version 1)
 (deny default)
 (allow sysctl-read (sysctl-name "hw.pagesize_compat"))
+; V8 on x86_64 macOS calls uname() while it starts and aborts if it fails; uname() reads this one name.
+; It is the Darwin kernel version (for example "24.6.0"): no host, user or hardware identity.
+(allow sysctl-read (sysctl-name "kern.osrelease"))
 (allow signal (target self))
 (deny process-info*)
 (allow process-info-pidinfo (target self))
