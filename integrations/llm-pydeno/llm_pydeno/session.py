@@ -16,7 +16,6 @@ earlier state is gone.
 
 from __future__ import annotations
 
-import math
 import threading
 from typing import Any
 
@@ -69,42 +68,34 @@ class JavaScriptSession:
         sandbox: str = "require",
         fresh_session_per_call: bool = False,
     ) -> None:
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout)
-            or not 0 < timeout <= MAX_TIMEOUT
-        ):
-            raise ValueError(
-                f"timeout must be a number of seconds above 0 and at most {MAX_TIMEOUT:g}"
-            )
+        from pydeno._limits import limit_int, limit_seconds
+
+        seconds = limit_seconds("timeout", timeout)
+        if seconds is None:
+            raise TypeError("timeout must be a number of seconds, not None")
+        if seconds > MAX_TIMEOUT:
+            raise ValueError(f"timeout must be at most {MAX_TIMEOUT:g} seconds")
+        normalized = {}
         for name, value in (
             ("max_memory_mb", max_memory_mb),
             ("max_output_bytes", max_output_bytes),
             ("max_result_bytes", max_result_bytes),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        # pydeno refuses limits it cannot send to the worker (above 2**53 - 1), at the first call;
-        # refuse them here, where the mistake is made.
-        if max_memory_mb * 1024 * 1024 > _MAX_LIMIT:
-            raise ValueError(
-                f"max_memory_mb must be at most {_MAX_LIMIT // (1024 * 1024)}"
+            maximum = (
+                _MAX_LIMIT // (1024 * 1024) if name == "max_memory_mb" else _MAX_LIMIT
             )
-        for name, value in (
-            ("max_output_bytes", max_output_bytes),
-            ("max_result_bytes", max_result_bytes),
-        ):
-            if value > _MAX_LIMIT:
-                raise ValueError(f"{name} must be at most {_MAX_LIMIT}")
+            count = limit_int(name, value, minimum=1, maximum=maximum)
+            if count is None:
+                raise TypeError(f"{name} must be an int, not None")
+            normalized[name] = count
         if sandbox not in ("require", "auto"):
             raise ValueError("sandbox must be 'require' or 'auto'")
         if not isinstance(fresh_session_per_call, bool):
             raise ValueError("fresh_session_per_call must be true or false")
-        self.timeout = float(timeout)
-        self.max_memory = max_memory_mb * 1024 * 1024
-        self.max_output_bytes = max_output_bytes
-        self.max_result_bytes = max_result_bytes
+        self.timeout = seconds
+        self.max_memory = normalized["max_memory_mb"] * 1024 * 1024
+        self.max_output_bytes = normalized["max_output_bytes"]
+        self.max_result_bytes = normalized["max_result_bytes"]
         self.sandbox = sandbox
         self.fresh_session_per_call = fresh_session_per_call
         self._sandbox: Any = None

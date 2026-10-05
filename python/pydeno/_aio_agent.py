@@ -63,6 +63,7 @@ from ._agent import (
 )
 from ._aio import AsyncIsolatedRuntime
 from ._isolated import WorkerCrashed
+from ._limits import limit_seconds as _limit_seconds
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_RESULT_BYTES,
@@ -298,6 +299,8 @@ class AsyncAgentSandbox(_SessionBase):
         runtime: AsyncIsolatedRuntime | None = None,
         **runtime_options: Any,
     ) -> None:
+        timeout = _limit_seconds("timeout", timeout)
+        max_pause = _limit_seconds("max_pause", max_pause)
         if runtime is not None:
             clock, random_seed = self._adopt_arguments(
                 "AsyncAgentSandbox",

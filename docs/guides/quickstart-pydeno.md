@@ -67,6 +67,10 @@ The same names, mapped onto pydeno's building blocks (`SandboxPool` underneath, 
 | `MontyError`, `MontyRuntimeError`, `MontySyntaxError`, `MontyCrashedError` | `PydenoError`, `PydenoRuntimeError`, `PydenoSyntaxError`, `PydenoCrashedError` | `exception()` returns the pydeno exception underneath, and `classify_error()` classifies it. `display('traceback' \| 'type-msg' \| 'msg')` and `traceback()` exist; the worker reports no JavaScript stack yet, so `'traceback'` is usually `'type-msg'` |
 | Timeouts | `PydenoTimeoutError` | A `TimeoutError` and a `PydenoCrashedError` (`timed_out=True`): pydeno's deadline kills the worker, so the session is over. Monty raises inside the sandbox and keeps the session; pydeno chose the kill because a V8 that is told to stop is not always able to (see the security report) |
 
+The default printer shares a 1 MiB UTF-8 payload budget across stdout and stderr per feed,
+then writes one additional `[truncated]` line (12 bytes). An explicit `print_callback` is
+not capped; keep it fast or buffer its output.
+
 ### Limits
 
 | `PydenoLimits` key | Maps onto | Notes |

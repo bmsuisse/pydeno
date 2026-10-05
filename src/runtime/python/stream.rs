@@ -50,9 +50,8 @@ pub struct JsStream {
 
 impl JsStream {
     pub fn new(py: Python<'_>, handle: RuntimeHandle, stream_id: u32) -> PyResult<Py<Self>> {
-        handle.track_js_stream_id(stream_id);
         let state = Arc::new(StreamSharedState {
-            handle: Mutex::new(Some(handle)),
+            handle: Mutex::new(Some(handle.clone())),
             stream_id,
             closed: AtomicBool::new(false),
         });
@@ -63,6 +62,8 @@ impl JsStream {
             },
         )?;
         attach_finalizer(py, &py_obj, JsStreamFinalizer { state })?;
+        // Rollback owns the ID until both wrapper and finalizer exist.
+        handle.track_js_stream_id(stream_id);
         Ok(py_obj)
     }
 }
