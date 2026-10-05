@@ -332,8 +332,8 @@ class WasmModule(_Base):
     def unload(self) -> None:
         """Drop the instance. Idempotent; later calls raise RuntimeError."""
         if not self._closed:
-            self._closed = True
             self._unload()
+            self._closed = True
 
     def __enter__(self) -> WasmModule:
         return self
@@ -377,8 +377,8 @@ class AsyncWasmModule(_Base):
 
     async def unload(self) -> None:
         if not self._closed:
-            self._closed = True
             await self._unload()
+            self._closed = True
 
     async def __aenter__(self) -> AsyncWasmModule:
         return self

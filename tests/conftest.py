@@ -97,6 +97,7 @@ collect_ignore = (
         "test_isolated_guest_surface.py",
         "test_isolated_wasm.py",
         "test_gate_hooks.py",
+        "test_pr105_gate_wasm.py",
         "test_worker_capacity.py",
         "test_stream_source_owner.py",
     ]

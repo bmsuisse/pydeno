@@ -409,15 +409,18 @@ class _GatePool:
         self.idle = 0
         self.pending = 0  # queued jobs no thread has taken yet
 
+    def _check_fork(self) -> None:
+        if self.pid != os.getpid():
+            # A fork child cannot acquire a mutex another parent thread held.
+            self.lock = threading.Lock()
+            self._reset()
+
     def submit(
         self, fn: Callable[..., Any], *args: Any
     ) -> concurrent.futures.Future[Any]:
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self._check_fork()
         with self.lock:
-            if (
-                self.pid != os.getpid()
-            ):  # a fork() child: the parent's threads are not here
-                self._reset()
             self.jobs.put((future, fn, args))
             self.pending += 1
             # One idle thread serves one queued job: a burst while one thread is idle must still
@@ -465,6 +468,7 @@ def set_gate_threads(count: int) -> None:
         raise TypeError("set_gate_threads takes an int")
     if not 1 <= count <= MAX_GATE_THREADS:
         raise ValueError(f"set_gate_threads takes 1 to {MAX_GATE_THREADS} threads")
+    _GATE_POOL._check_fork()
     with _GATE_POOL.lock:
         _GATE_POOL.size = count
 
@@ -615,14 +619,20 @@ def _gated_loader(
     before the worker compiles it (mode ``"module_loader"``). A refusal is passed to `record`
     with the command that was running when the import began (`current()`), so that command,
     and only that one, raises it; it is also raised into the worker, where the import fails
-    with an error named after it (its message, written by the host, is kept). The refusal keeps
-    its ``__cause__`` (the gate's own exception, for an unavailable gate).
+    with an ordinary gate error (control-flow exceptions travel separately to the caller).
+    The refusal keeps its ``__cause__`` (the gate's own exception, for an unavailable gate).
     With an async loader or an async gate the wrapper is async (a sync loader then runs in an
     executor, never on the event loop)."""
 
     def refused(command: int | None, exc: BaseException) -> None:
         record(command, exc)
         exc._pydeno_public = True  # type: ignore[attr-defined]
+        if not isinstance(exc, Exception):
+            # Complete the host reply instead of interrupting its pump. The importing
+            # command restores the original control-flow exception from `record`.
+            bridge = _raised(exc)
+            bridge._pydeno_public = True
+            raise bridge from exc
 
     def specifier_of(specifier: Any) -> str | None:
         return specifier if isinstance(specifier, str) else None
@@ -649,7 +659,7 @@ def _gated_loader(
                 return await hook.acheck(
                     source, "module_loader", tools(), specifier_of(specifier)
                 )
-            except (GateDenied, GateUnavailable) as exc:
+            except BaseException as exc:  # restored by importing command
                 refused(command, exc)
                 raise
 
@@ -661,7 +671,7 @@ def _gated_loader(
         need_text(source)
         try:
             return hook.check(source, "module_loader", tools(), specifier_of(specifier))
-        except (GateDenied, GateUnavailable) as exc:
+        except BaseException as exc:  # restored by importing command
             refused(command, exc)
             raise
 
