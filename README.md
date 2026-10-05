@@ -132,6 +132,35 @@ with Pydeno() as pool, pool.checkout(limits={"max_feed_duration_secs": 10, "max_
 - **Results you can bound:** `execute()` returns an `ExecutionResult` (stdout, stderr, result, error) with ordered,
   size-capped console output, so one runaway `console.log` cannot flood your logs or your context window.
 
+### A gate between the model and the sandbox
+
+A gate sees the exact code that is about to run and can refuse it before any worker is touched. Use it to
+reject obvious misuse cheaply and to give the model a precise reason it can act on. The isolated worker
+stays the boundary.
+
+```python
+from pydeno import GateContext, GateDenied, Pydeno, SourcePolicy, Verdict, all_of, static_gate
+
+static = static_gate(SourcePolicy(forbid_eval=True, forbid_function=True, forbid_dynamic_import=True))
+
+def my_check(source: str, context: GateContext) -> Verdict:     # your own policy, classifier, ...
+    if "while (true)" in source:
+        return Verdict(False, "Use a bounded loop.", ("unbounded-loop",))
+    return Verdict(True, "")
+
+with Pydeno(gate=all_of(static, my_check), strict_eval=True) as pool, pool.checkout() as session:
+    print(session.feed_run("[1, 2, 3].map(x => x * 2)"))       # [2, 4, 6]
+    try:
+        session.feed_run("eval('2 + 2')")
+    except GateDenied as denied:
+        print(denied.top_label, "|", denied.reason)            # forbidden-eval | 1:1 [forbidden-eval] eval is not allowed here...
+```
+
+The gate fails closed. If it raises, times out or answers with anything but a `Verdict`, the run is blocked with
+`GateUnavailable`, which is retryable. A denied call uses no budget and leaves no journal entry.
+`gate_check(gate, code)` runs the same check in your own process. See the
+[gate guide](docs/guides/gate.md), which also covers the limits of a gate.
+
 ## Security
 
 pydeno assumes the code is hostile and the engine can have bugs. Each layer assumes the one above has failed.

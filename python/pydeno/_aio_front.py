@@ -65,6 +65,7 @@ from ._front import (
     _load_failure,
     _not_available,
     _output,
+    _own,
     _prepare,
     _Prepared,
     _Printer,
@@ -74,6 +75,7 @@ from ._front import (
     _start_failure,
     _unpack,
 )
+from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import WorkerCrashed
 from ._sandbox_pool import AsyncSandboxPool
 
@@ -110,7 +112,8 @@ class AsyncPydeno:
     Takes `Pydeno`'s arguments. Constructing it validates them and starts nothing; the workers
     start on ``async with AsyncPydeno() as pool:`` (or ``await pool.start()``), on the loop that
     will use them: the first one before ``async with`` returns, so a platform that cannot sandbox
-    fails there with a `PydenoCrashedError`, the rest in the background."""
+    fails there with a `PydenoCrashedError`, the rest in the background. ``gate=`` may also be
+    async (awaited, and cancelled at ``gate_timeout``)."""
 
     def __init__(
         self,
@@ -124,9 +127,14 @@ class AsyncPydeno:
         strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         self._key = _check_pool_arguments(
             min_processes, sandbox, jitless, dump_key, strict_eval
+        )
+        self._gate = _hook(
+            gate, gate_timeout, who="AsyncPydenoSession", sync_only=False
         )
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
@@ -492,6 +500,8 @@ class AsyncPydenoSession:
         """See `PydenoSession.feed_run`; external functions may also be coroutine functions."""
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=False)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = await self._gated(code, "feed_run", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         self._refused = None
@@ -531,6 +541,8 @@ class AsyncPydenoSession:
         """See `PydenoSession.feed_start`."""
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=False)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = await self._gated(code, "feed_start", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         try:
@@ -626,6 +638,12 @@ class AsyncPydenoSession:
         return new
 
     # -- internals -----------------------------------------------------------
+
+    async def _gated(self, code: Any, mode: str, names: tuple[str, ...]) -> Any:
+        """The exact feed code the pool's gate allowed. Cancelled while it runs, nothing has been
+        sent: the session is as it was."""
+        gate = self._pool._gate  # noqa: SLF001
+        return code if gate is None else await gate.acheck(code, mode, names)
 
     async def _start(self, agent: AsyncAgentSandbox, prepared: _Prepared) -> Any:
         step = await agent.start(prepared.source)

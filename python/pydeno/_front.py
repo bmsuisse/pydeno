@@ -71,6 +71,8 @@ from ._agent import (
     _unavailable,
     preinstall,
 )
+from ._errors import PydenoError
+from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import _CONTROL, IsolatedRuntime, WorkerCrashed
 from ._limits import limit_int, limit_seconds
 from ._pydeno import JavaScriptError, JsUndefined, RuntimeConfig, RuntimeTimeout
@@ -213,21 +215,6 @@ def _resolve_limits(*layers: Mapping[str, Any] | None) -> _Limits:
 # ---------------------------------------------------------------------------
 # errors
 # ---------------------------------------------------------------------------
-
-
-class PydenoError(Exception):
-    """Base class of every error a `Pydeno` session raises for a feed (Monty's `MontyError`).
-
-    `exception()` returns the pydeno exception it wraps (a `JavaScriptError`, `WorkerCrashed`,
-    `RuntimeTimeout`, ...); `classify_error` classifies that one."""
-
-    def __init__(self, message: str, inner: BaseException | None = None) -> None:
-        super().__init__(message)
-        self._pydeno_inner = inner
-
-    def exception(self) -> BaseException:
-        """The exception pydeno raised underneath (this one if there is none)."""
-        return self._pydeno_inner if self._pydeno_inner is not None else self
 
 
 class _GuestError(PydenoError):
@@ -684,6 +671,12 @@ def _check_lookup(
                 )
             calls[name] = value
     return calls, tuple(calls)
+
+
+def _own(mapping: Any) -> Any:
+    """A shallow copy of a mapping argument, taken before the gate runs: whatever the gate (or
+    anything else) does to the caller's dict afterwards cannot change this feed."""
+    return dict(mapping) if isinstance(mapping, Mapping) else mapping
 
 
 def _values(external_lookup: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1222,6 +1215,15 @@ class Pydeno:
             guest; `ToolThreadLimitError` for the host). Clamped to the process ceiling
             (`pydeno._agent.MAX_TOOL_THREADS`, 512), which every pool draws from: a cap is an
             upper bound, not a reservation (a warning says so when open pools' caps exceed it).
+        gate: A `Gate` (sync) that every `feed_run` / `feed_start` of every session must pass
+            first. It sees exactly the feed's code (an exact `str`), with ``context.tools`` the
+            feed's external function names; the host adds only its own fixed setup (the stubs
+            and `inputs`, as data) and the rewrite of the trailing expression to ``return``. A
+            denial raises `GateDenied` (a gate that cannot decide, `GateUnavailable`) before
+            anything reaches the worker: no budget, journal entry or state is touched, and the
+            session stays usable. `load_session` / `load_snapshot` replay without it. See
+            ``docs/guides/gate.md``.
+        gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded.
 
     The first worker starts in the constructor (a platform that cannot sandbox fails here, not
     at the first checkout) and the rest in the background, so the first checkout is fast. Use
@@ -1240,10 +1242,13 @@ class Pydeno:
         strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         self._key = _check_pool_arguments(
             min_processes, sandbox, jitless, dump_key, strict_eval
         )
+        self._gate = _hook(gate, gate_timeout, who="PydenoSession", sync_only=True)
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
         self._limits = _resolve_limits(limits)
@@ -1595,9 +1600,13 @@ class PydenoSession:
             PydenoSyntaxError: the code does not parse (the session survives).
             PydenoTimeoutError: a deadline killed the worker (the session is over).
             PydenoCrashedError: the worker is gone (the session is over).
+            GateDenied / GateUnavailable: the pool's gate refused the code, or could not decide;
+                nothing ran (the session survives).
         """
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=True)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = self._gated(code, "feed_run", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         agent._core.refused = None  # noqa: SLF001
@@ -1636,6 +1645,8 @@ class PydenoSession:
         arguments as in `feed_run`; ``print_callback`` stays in force until the feed ends."""
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=False)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = self._gated(code, "feed_start", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         agent._core.refused = None  # noqa: SLF001
@@ -1753,6 +1764,11 @@ class PydenoSession:
         return new
 
     # -- internals -----------------------------------------------------------
+
+    def _gated(self, code: Any, mode: str, names: tuple[str, ...]) -> Any:
+        """The exact feed code the pool's gate allowed (`code` itself without a gate)."""
+        gate = self._pool._gate  # noqa: SLF001
+        return code if gate is None else gate.check(code, mode, names)
 
     def _start(
         self,

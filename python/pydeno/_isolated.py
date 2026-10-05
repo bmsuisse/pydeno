@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import _sandbox, _wasm, _wire
+from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._limits import limit_int, limit_seconds
 from ._result import (
     UNSAFE_TEXT,
@@ -609,6 +610,15 @@ class IsolatedRuntime:
             every `console.*` call is then a host call (counted by `max_host_calls`). With an
             `on_console`, console output is captured either way.
         python: Interpreter for the worker (default: this one).
+        gate: A `Gate` (sync) that every source this runtime compiles must pass first: the code
+            of `eval` / `eval_async` / `execute` / `execute_async`, the source given to
+            `add_static_module`, every source a `set_module_loader` loader returns, and
+            ``config.bootstrap`` (checked here, before the worker starts). A denial raises
+            `GateDenied` (a gate that cannot decide, `GateUnavailable`) and nothing is sent to
+            the worker; a loader's refusal fails the import and the command raises it. See
+            ``docs/guides/gate.md``.
+        gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded and
+            the code does not run. A sync gate cannot be interrupted, only outlasted.
 
     A worker crash, a hard timeout or a memory kill closes the runtime and raises
     (`WorkerCrashed` or `RuntimeTimeout`); create a new `IsolatedRuntime` to continue.
@@ -636,7 +646,10 @@ class IsolatedRuntime:
         capture_console: bool = False,
         python: str | None = None,
         prewarm: bool = True,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
+        self._gate = _hook(gate, gate_timeout, who="IsolatedRuntime", sync_only=True)
         clock_ms = _clock_ms(clock)
         if random_seed is not None and (
             isinstance(random_seed, bool)
@@ -666,6 +679,17 @@ class IsolatedRuntime:
 
         _check_wire_limits(config, max_memory)
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
+        # Names bound for the guest so far (the gate's `context.tools`), and a gate refusal raised
+        # inside a module loader during the command in flight (that command raises it).
+        self._bound_names: list[str] = []
+        # The command in flight, and refusals module loaders met during it (see `_request`).
+        self._current_cmd: int | None = None
+        self._gate_refusals: dict[int, BaseException] = {}
+        if self._gate is not None and self._config["bootstrap"]:
+            # Before any worker exists: a refused bootstrap starts nothing.
+            self._config["bootstrap"] = self._gate.check(
+                self._config["bootstrap"], "bootstrap"
+            )
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # ArrayBuffer storage is outside the V8 heap, so `max_heap_size` cannot bound it, and
             # without a cap a `new Uint8Array(2 ** 31)` is only caught by the RSS poll, which kills
@@ -1082,9 +1106,18 @@ class IsolatedRuntime:
                 raise WorkerCrashed(self._describe_death("worker is gone")) from None
             self._capture = capture
             self._end_cpu = None
+            self._current_cmd = cmd_id
             try:
-                return self._pump(cmd_id, pump)
+                try:
+                    result = self._pump(cmd_id, pump)
+                except Exception:
+                    self._raise_refusal(cmd_id)
+                    raise
+                self._raise_refusal(cmd_id)
+                return result
             finally:
+                self._current_cmd = None
+                self._gate_refusals.pop(cmd_id, None)
                 self._capture = None
                 # Where "idle" starts: what the worker burns from here on, with no command
                 # running, is the idle watchdog's business. The reading is the one the pump took
@@ -1395,8 +1428,29 @@ class IsolatedRuntime:
 
     # -- public API --------------------------------------------------------
 
+    def _gated(self, code: Any, mode: str, specifier: str | None = None) -> Any:
+        """The exact source the gate allowed (`code` itself without a gate)."""
+        if self._gate is None:
+            return code
+        if self._closed:  # a closed runtime does not pay for a gate (a classifier call)
+            raise WorkerCrashed("runtime is closed")
+        return self._gate.check(code, mode, tuple(self._bound_names), specifier)
+
+    def _record_refusal(self, command: int | None, exc: BaseException) -> None:
+        """A module loader's gate refused a source during `command`: that command raises it."""
+        if command is not None and command == self._current_cmd:
+            self._gate_refusals.setdefault(command, exc)
+
+    def _raise_refusal(self, command: int) -> None:
+        refusal = self._gate_refusals.pop(command, None)
+        if refusal is not None:
+            # Raised even if the guest caught the failed import: the host must know. Its own
+            # `__cause__` (the gate's exception, for an unavailable gate) is kept.
+            raise refusal
+
     def eval(self, code: str) -> Any:
         """Evaluate JavaScript synchronously in the worker."""
+        code = self._gated(code, "eval")
         return self._request(
             {"t": "eval", "code": code}, soft_timeout=self._soft_timeout
         )
@@ -1408,6 +1462,7 @@ class IsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
+        code = self._gated(code, "eval_async")
         loop = asyncio.get_running_loop()
         message = {"t": "eval_async", "code": code, "timeout": soft}
         try:
@@ -1430,9 +1485,11 @@ class IsolatedRuntime:
         `capture_console=True` or an `on_console` (empty otherwise), each capped at
         `max_output_bytes`; a result over `max_result_bytes` of JSON is a ``Failed`` result with
         ``error_type="ResultTooLarge"``. Every failure of the run (a JavaScript error, a timeout,
-        a crashed worker) is reported in the result, not raised."""
+        a crashed worker) is reported in the result, not raised; a gate's refusal is raised
+        (`GateDenied` / `GateUnavailable`), since nothing ran."""
         capture = OutputCapture(max_output_bytes)
         check_limit("max_result_bytes", max_result_bytes)
+        code = self._gated(code, "execute")
         try:
             value = self._request(
                 {"t": "eval", "code": code},
@@ -1457,6 +1514,7 @@ class IsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
+        code = self._gated(code, "execute_async")
         loop = asyncio.get_running_loop()
         message = {"t": "eval_async", "code": code, "timeout": soft}
         try:
@@ -1545,6 +1603,7 @@ class IsolatedRuntime:
             self._kill()
             raise WorkerCrashed("worker returned a malformed capability token")
         self._register_token(token, hid)
+        self._bound_names.append(name)
         return token
 
     def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
@@ -1584,6 +1643,7 @@ class IsolatedRuntime:
             raise WorkerCrashed("worker returned malformed capability tokens")
         for key, token in tokens.items():
             self._register_token(token, hids[key])
+        self._bound_names.append(name)
         return tokens
 
     def revoke_op(self, op_id: int) -> bool:
@@ -1599,6 +1659,9 @@ class IsolatedRuntime:
         return bool(self._request({"t": "revoke", "token": op_id}))
 
     def add_static_module(self, name: str, source: str) -> None:
+        source = self._gated(
+            source, "add_static_module", name if isinstance(name, str) else None
+        )
         self._request({"t": "add_module", "name": name, "source": source})
 
     def load_wasm(
@@ -1676,7 +1739,16 @@ class IsolatedRuntime:
         """Supply module source with a host function: `(specifier) -> str`, sync or async.
 
         The source comes back across the process boundary as plain text; the worker, which
-        is the one that compiles it, never sees the loader itself."""
+        is the one that compiles it, never sees the loader itself. With a ``gate``, every source
+        it returns must pass the gate first."""
+        if self._gate is not None:
+            loader = _gated_loader(
+                self._gate,
+                loader,
+                lambda: tuple(self._bound_names),
+                lambda: self._current_cmd,
+                self._record_refusal,
+            )
         hid = next(self._hids)
         self._handlers[hid] = (
             _checked_specifiers(loader, 1),

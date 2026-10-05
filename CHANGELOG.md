@@ -4,6 +4,58 @@
 
 ### Added
 
+- **Gates: a host-side check of the exact source before it runs.** A gate is a callable
+  `(source, GateContext) -> Verdict(allow, reason, labels)`, sync or async.
+  - **Where it attaches.** Pass it as `gate=` (with `gate_timeout=`, default 10 s) to:
+    - `Pydeno` / `AsyncPydeno`: every `feed_run` / `feed_start`;
+    - `AgentSandbox` / `AsyncAgentSandbox`: `start` / `run` / `execute`;
+    - `IsolatedRuntime` / `AsyncIsolatedRuntime`: `eval*`, `execute*`, `add_static_module` sources,
+      module-loader sources, and `RuntimeConfig.bootstrap` (checked before the worker starts).
+  - **It fails closed.** A denial raises `GateDenied` (kind `gate_denied`, not retryable). A gate that
+    raises, times out or answers with anything but an exact `Verdict` raises `GateUnavailable` (kind
+    `gate_unavailable`, retryable, and the run is still blocked). Both are `PydenoError` subclasses.
+    Cancellation propagates unchanged.
+  - **No gap between check and use.** The source is normalised to an exact `str` once. The gate sees
+    it, and the same string runs. Sources over 16 MiB are refused before the gate is called.
+  - **No side effects.** A denied call sends nothing to the worker and uses no budget, in-flight
+    slot or journal record. Journal replay (`load_session`, `load_snapshot`, `AgentSandbox.load`) is
+    not re-gated.
+  - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
+  - **Sync gates and async callers.** In the async classes and `async_gate_check`, sync gates run on
+    a gate thread, never on the event loop. There `gate_timeout=None` is refused. The gate threads
+    form one process-wide pool of daemon threads, 32 by default; change it with
+    `set_gate_threads(n)` or `PYDENO_GATE_THREADS`.
+  - **Module loaders and closed sessions.** A module-loader refusal is raised by the command that
+    imported, keeps its `__cause__`, and is raised even when the guest catches the failed import.
+    A closed session or runtime never calls its gate.
+  - **Pools.** `SandboxPool` / `SessionPool` pass `gate=` through.
+  - **Without fixing the source.** `check_source(source)` without a policy no longer retries a
+    regex scan after one fails on the same line, and caps its `\u{` look-ahead. Results are
+    unchanged; hostile input no longer takes quadratic time.
+  - **Signatures checked up front.** A gate may also take only the source (`async def
+    classify(source)`). A gate whose signature fits neither form raises `TypeError` when it is
+    configured or passed to `gate_check`, so a programming error is not mistaken for an outage.
+  - **Static policy.** `check_source(source, policy=SourcePolicy(...))` covers:
+    - forbidden identifiers and globals;
+    - `import()`;
+    - `eval`, and timers given strings;
+    - the `Function` constructor and `WebAssembly`;
+    - `max_source_bytes`;
+    - optionally, computed access on a global (`forbid_computed_global_access`, best effort).
+
+    By default the scan fails closed. It decodes every escape (`\u`, `\u{...}`, `\x`, legacy
+    octal, identity escapes, line continuations) and reads the whole text, strings and comments
+    included. It runs in linear time, with `max_source_bytes` defaulting to 1 MiB.
+    `ignore_strings_and_comments=True` selects a tokenizer-based precise mode instead: opt-in,
+    best effort, with its known bypasses listed in the guide. The messages are fixed templates
+    (`POLICY_MESSAGES`, a public contract). `Finding.text` is the bare message without a location.
+    `static_gate(policy)` turns a policy into a gate, and `.check(source)` returns its findings. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
+    first allow. `check_source(source)` without a policy is unchanged.
+  - **Moved class.** `PydenoError` now lives in `pydeno._errors`. It is the same class, still
+    exported as `pydeno.PydenoError`.
+
+  See [`docs/guides/gate.md`](docs/guides/gate.md).
+
 - **`load_wasm()`: a trusted WebAssembly module, loaded by the host** (#37). On `Runtime`,
   `IsolatedRuntime` and `AsyncIsolatedRuntime`: `rt.load_wasm(bytes_or_path)` returns a
   `WasmModule` (`AsyncWasmModule`) with `.exports` (name -> callable), `.signatures`,

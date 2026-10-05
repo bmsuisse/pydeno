@@ -2248,6 +2248,124 @@ def wasm_hostile_bytes_end_the_session() -> bool:
         return rt.is_closed() or rt.eval("1 + 1") != 2
 
 
+@probe
+def gate_bypass_runs_refused_code() -> bool:
+    # A gate in front of the worker must fail closed: what it refuses, cannot judge or never saw
+    # must not run, and what it saw must be exactly what runs. Each attempt sets `ran` if it ran.
+    from pydeno import (
+        GateDenied,
+        GateUnavailable,
+        SourcePolicy,
+        Verdict,
+        all_of,
+        static_gate,
+    )
+
+    evil = "globalThis.ran = 1; eval('1')"
+
+    class Disguised(
+        str
+    ):  # what a gate would see through str() / ==, versus the real text
+        def __str__(self) -> str:
+            return "1"
+
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = str.__hash__
+
+    class AlwaysAllow(Verdict):
+        @property  # type: ignore[override]
+        def allow(self) -> bool:  # type: ignore[override]
+            return True
+
+    static = static_gate(SourcePolicy(forbid_eval=True))
+    attempts = [
+        (static, Disguised(evil)),
+        (static, "globalThis.ran = 1; \\u0065val('1')"),
+        (static, "// note globalThis.ran = 1; eval('1')"),
+        (static, "globalThis.ran = 1; globalThis['\\x65val']('1')"),
+        (static, "globalThis.ran = 1; '" + "x" * (17 * 1024 * 1024) + "'"),
+        (
+            lambda s, c: (_ for _ in ()).throw(RuntimeError("down")),
+            "globalThis.ran = 1",
+        ),
+        (lambda s, c: True, "globalThis.ran = 1"),
+        (lambda s, c: "allow", "globalThis.ran = 1"),
+        (lambda s, c: AlwaysAllow.__new__(AlwaysAllow), "globalThis.ran = 1"),
+        (all_of(lambda s, c: Verdict(True, ""), static), evil),
+    ]
+    probe_code = "typeof ran"
+
+    def letting_the_probe_through(gate):  # type: ignore[no-untyped-def]
+        return lambda s, c: Verdict(True, "") if s == probe_code else gate(s, c)
+
+    for gate, code in attempts:
+        with iso(gate=letting_the_probe_through(gate)) as rt:
+            try:
+                rt.eval(code)
+                return True  # ran
+            except (GateDenied, GateUnavailable):
+                pass
+            if rt.eval(probe_code) != "undefined":
+                return True
+    return False
+
+
+@probe
+def static_gate_misread_shapes_run_forbidden_code() -> bool:
+    # Shapes that once made a tokenizer-based scan read code as a regex, a template, a comment or
+    # a string, or hid a name in an escape or a computed key. The default policy scan reads the
+    # whole decoded text, so each must be denied; none may set `hit`.
+    from pydeno import GateDenied, SourcePolicy, Verdict, static_gate
+
+    gate = static_gate(
+        SourcePolicy(
+            forbid_eval=True,
+            forbid_function=True,
+            forbid_dynamic_import=True,
+            forbid_computed_global_access=True,
+        )
+    )
+    shapes = (
+        '#! `\nglobalThis.hit = eval("1")\n// `',
+        'var a = 1 <!-- `\nglobalThis.hit = eval("1")\n// `',
+        'x = function(){} / (globalThis.hit = eval("1")) / 2',
+        'x = class {} / (globalThis.hit = eval("1")) / 2',
+        "f = x => {}\n/`/\nglobalThis.hit = eval(1)//`",
+        'globalThis.hit = globalThis["\\145val"]("1")',
+        'globalThis.hit = globalThis["\\ev\\al"]("1")',
+        'globalThis.hit = globalThis[("eval")]("1")',
+        'globalThis.hit = Reflect.get(globalThis, "eval")("1")',
+        'const {["ev" + "al"]: e} = globalThis; globalThis.hit = e("1")',
+        'const {constructor: F} = function(){}; globalThis.hit = F("return 1")()',
+        "globalThis.hit = \\u{0000000065}val('1')",
+        # a backslash at the end of a comment line is comment text, not a line continuation
+        '//x\\\nglobalThis.hit = eval("1")',
+        '//x\\\r\nglobalThis.hit = eval("1")',
+        '//x\\ globalThis.hit = eval("1")',
+        '#!x\\\nglobalThis.hit = eval("1")',
+        'var q = 1 <!--x\\\nglobalThis.hit = eval("1")',
+        # inside `with (fn)` a bare `constructor` is the Function constructor
+        'with (()=>0) { globalThis.hit = constructor("return 1")() }',
+        "with (()=>0) { class A extends constructor('globalThis.hit = 1') {}; new A() }",
+        'with (()=>0) { globalThis.hit = constructor("1//){")() }',
+    )
+    probe_code = "typeof hit"
+    for code in shapes:
+        with iso(
+            gate=lambda s, c: Verdict(True, "") if s == probe_code else gate(s, c)
+        ) as rt:
+            try:
+                rt.eval(code)
+                return True
+            except GateDenied:
+                pass
+            if rt.eval(probe_code) != "undefined":
+                return True
+    return False
+
+
 def main() -> None:
     violations = []
     for name, fn in PROBES.items():
