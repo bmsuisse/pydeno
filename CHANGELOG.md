@@ -109,6 +109,13 @@
 
 ### Fixed
 
+- **A large backlog of async replies no longer gets a worker killed that is still reading, and the
+  parent's memory is bounded** (#86). Replies to async host calls are now written one at a time under
+  a send lock, a reply waits for its turn before it is encoded, and its host call stays in flight
+  until the reply has been written. A worker that stops reading or drips bytes is still killed
+  within one stall window (`write_stall_timeout`). Measured with 3000 concurrent calls of 200 KB:
+  the worker is no longer killed at a 1 s stall limit, the transport buffer peaks at about 0.1 MB
+  instead of about 590 MB, and the parent's peak RSS drops from about 3 GB to about 0.7 GB.
 - **A host function that re-enters its own runtime, or returns a stream source, no longer aborts the
   process** (#58). Calling `rt.eval` (or any `Runtime` method) from inside a host function made
   PyO3 raise a panic that was re-raised when the call returned and aborted the process, and a

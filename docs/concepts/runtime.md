@@ -274,7 +274,7 @@ A synchronous function bound with [`bind_function()`][pydeno.Runtime.bind_functi
 
 Keep a reference to a stream source until the guest has finished reading it. When the last Python reference goes away, the source's finalizer cancels the stream, and the guest's next read fails with `Unknown Python stream id`. A source created inside an async host function and returned without being stored anywhere is already gone when the guest reads it.
 
-A stream source belongs to the runtime that created it. Passing it to another runtime (returned from that runtime's host function, passed to one of its functions, bound with `bind_object()`, or yielded by one of its streams) raises `RuntimeError` ("this stream source belongs to a different runtime; ..."), and so does passing it anywhere once its runtime is closed. Before 0.9 the other runtime read its own stream with the same id instead.
+A stream source belongs to the runtime that created it. Passing it to another runtime (returned from that runtime's host function, passed to one of its functions, bound with `bind_object()`, or yielded by one of its streams) raises `RuntimeError` ("this stream source belongs to a different runtime; ..."), and so does passing it anywhere once its runtime is closed. Before 0.9 the other runtime could read its own stream with the same id instead.
 
 Before 0.9 both of the first two rows aborted the whole process.
 

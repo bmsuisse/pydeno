@@ -337,6 +337,9 @@ impl RuntimeConfig {
         value.map(Self::duration_from_py_timeout).transpose()
     }
 
+    /// Limits for a conversion that has no runtime behind it. They carry no runtime identity, so a
+    /// conversion of a stream source with these limits is refused; use the owning runtime's own
+    /// limits for anything that crosses into a runtime.
     pub fn serialization_limits(&self) -> SerializationLimits {
         SerializationLimits::new(self.max_serialization_depth, self.max_serialization_bytes)
     }
