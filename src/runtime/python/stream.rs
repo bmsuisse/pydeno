@@ -5,9 +5,8 @@ use crate::runtime::handle::RuntimeHandle;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio as pyo3_tokio;
-use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::error::{context, runtime_error_to_py};
 use super::utils::attach_finalizer;
@@ -130,11 +129,13 @@ impl JsStreamFinalizer {
     }
 }
 
-#[pyclass(module = "_pydeno", unsendable, weakref)]
+/// Not `unsendable`: a host function runs on the runtime thread and may return a stream source,
+/// which is then converted there (issue #58), so its state is behind a `Mutex` and an atomic.
+#[pyclass(module = "_pydeno", weakref)]
 pub struct PyStreamSource {
-    handle: RefCell<Option<RuntimeHandle>>,
+    handle: Mutex<Option<RuntimeHandle>>,
     stream_id: u32,
-    closed: Cell<bool>,
+    closed: AtomicBool,
 }
 
 impl PyStreamSource {
@@ -150,9 +151,9 @@ impl PyStreamSource {
         let py_obj = Py::new(
             py,
             Self {
-                handle: RefCell::new(Some(handle)),
+                handle: Mutex::new(Some(handle)),
                 stream_id,
-                closed: Cell::new(false),
+                closed: AtomicBool::new(false),
             },
         )?;
         attach_finalizer(py, &py_obj, finalizer)?;
@@ -160,10 +161,15 @@ impl PyStreamSource {
     }
 
     pub(crate) fn stream_id_for_transfer(&self) -> PyResult<u32> {
-        if self.closed.get() {
+        if self.closed.load(Ordering::SeqCst) {
             return Err(PyRuntimeError::new_err("Stream has been closed"));
         }
-        if self.handle.borrow().is_none() {
+        if self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none()
+        {
             return Err(PyRuntimeError::new_err("Runtime has been shut down"));
         }
         Ok(self.stream_id)
@@ -174,16 +180,22 @@ impl PyStreamSource {
 impl PyStreamSource {
     #[pyo3(name = "close")]
     fn close_py(&self) {
-        if self.closed.replace(true) {
+        if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Some(handle) = self.handle.borrow_mut().take() {
+        // Take the handle out first so the lock is not held while cancelling.
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
             handle.cancel_py_stream_async(self.stream_id);
         }
     }
 
     fn __repr__(&self) -> String {
-        if self.closed.get() {
+        if self.closed.load(Ordering::SeqCst) {
             "<PyStreamSource (closed)>".to_string()
         } else {
             format!("<PyStreamSource id={}>", self.stream_id)

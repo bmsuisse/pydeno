@@ -426,8 +426,38 @@ fn call_handler(
         .map(|arg| js_value_to_python_tracked(py, arg, None, &mut tracker).map_err(map_pyerr))
         .collect::<Result<Vec<_>, _>>()?;
     let py_args = PyTuple::new(py, py_args).map_err(map_pyerr)?;
-    entry.handler.call(py, py_args, None).map_err(map_pyerr)
+    catch_host_panic(|| entry.handler.call(py, py_args, None).map_err(map_pyerr))
 }
+
+/// Run `f` and turn a Rust panic inside it into a JS error instead of letting it unwind.
+///
+/// A host function runs on the runtime thread. If it uses an object tied to another thread there
+/// (`rt.eval` on the runtime that is calling it), PyO3's thread check panics; PyO3 raises that in
+/// Python as `PanicException` and resumes the panic when the call returns to Rust. A panic that
+/// unwinds out of an op aborts the process, so it stops here (issue #58).
+///
+/// The panic text names Rust internals, so it goes to the log only; the guest gets fixed text.
+fn catch_host_panic<T>(f: impl FnOnce() -> Result<T, JsErrorBox>) -> Result<T, JsErrorBox> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        log::error!("pydeno host function call panicked: {detail}");
+        let message = if detail.contains("unsendable") {
+            THREAD_BOUND_OBJECT_ERROR
+        } else {
+            "host function call failed"
+        };
+        Err(JsErrorBox::type_error(format!(
+            "{HOST_ERROR_MARKER}RuntimeError: {message}"
+        )))
+    })
+}
+
+const THREAD_BOUND_OBJECT_ERROR: &str = "this object cannot be used from the runtime thread, \
+     where host functions run; use it outside the host function";
 
 /// Marker prefixed onto op error messages carrying a Python exception class,
 /// which `restoreHostError` in the bridge JS lifts back onto `error.name`.
@@ -452,7 +482,9 @@ fn map_pyerr(err: PyErr) -> JsErrorBox {
 }
 
 fn to_js(result: Py<PyAny>, limits: &SerializationLimits) -> Result<JSValue, JsErrorBox> {
-    Python::attach(|py| python_to_js_value(result.into_bound(py), limits).map_err(map_pyerr))
+    Python::attach(|py| {
+        catch_host_panic(|| python_to_js_value(result.into_bound(py), limits).map_err(map_pyerr))
+    })
 }
 
 /// Most index properties one value may list when it is converted, whatever the serialization
@@ -556,7 +588,7 @@ fn op_pydeno_call_python_sync(
     // One GIL acquisition for the call and the result conversion.
     Python::attach(|py| {
         let result = call_handler(py, &entry, &args, &limits)?;
-        python_to_js_value(result.into_bound(py), &limits).map_err(map_pyerr)
+        catch_host_panic(|| python_to_js_value(result.into_bound(py), &limits).map_err(map_pyerr))
     })
 }
 
