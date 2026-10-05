@@ -225,6 +225,11 @@ class _Worker:
         self._pending_lock = threading.Lock()
         self._call_ids = itertools.count(1)
         self._runtime: Runtime | None = None
+        # One event loop for every async command, driven by the main thread for the length of
+        # the command and idle in between, instead of an `asyncio.run` (a new loop, its selector
+        # and self-pipe, and their teardown) per command. Created here, before the OS sandbox,
+        # like every import; it starts no thread. `_settle` leaves it empty after each command.
+        self._loop = asyncio.new_event_loop()
 
     # -- transport ---------------------------------------------------------
 
@@ -360,19 +365,40 @@ class _Worker:
             raise RuntimeError("worker is not initialised")
         return self._runtime
 
+    def _run_async(self, make: Callable[[], Any]) -> Any:
+        """Run one async command on the worker's loop. `make` is called from inside the
+        coroutine: `eval_async` binds to the running loop when *called*."""
+
+        async def run() -> Any:
+            return await make()
+
+        try:
+            return self._loop.run_until_complete(run())
+        finally:
+            self._settle()
+
+    def _settle(self) -> None:
+        """Leave nothing of a command on the loop for the next one, as `asyncio.run` closing
+        its loop did: every task still pending (an async host call the guest started and never
+        awaited) is cancelled and run until it has finished."""
+        loop = self._loop
+        tasks = asyncio.all_tasks(loop)
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+
     def _handle(self, message: dict[str, Any]) -> Any:
         kind = message["t"]
         if kind == "eval":
             return self._rt().eval(message["code"])
         if kind == "eval_async":
-            # `eval_async` binds to the running loop when *called*, so it must be
-            # called from inside the coroutine, not handed to asyncio.run.
-            async def run() -> Any:
-                return await self._rt().eval_async(
+            return self._run_async(
+                lambda: self._rt().eval_async(
                     message["code"], timeout=message.get("timeout")
                 )
-
-            return asyncio.run(run())
+            )
         if kind == "bind_function":
             return self._rt().bind_function(
                 message["name"], self._stub(message["hid"], bool(message["async"]))
@@ -397,13 +423,11 @@ class _Worker:
         if kind == "eval_module":
             return self._rt().eval_module(message["specifier"])
         if kind == "eval_module_async":
-
-            async def run_module() -> Any:
-                return await self._rt().eval_module_async(
+            return self._run_async(
+                lambda: self._rt().eval_module_async(
                     message["specifier"], timeout=message.get("timeout")
                 )
-
-            return asyncio.run(run_module())
+            )
         raise _wire.WireError(f"unknown command {kind!r}")
 
     def _run_command(self, message: dict[str, Any]) -> None:

@@ -43,6 +43,7 @@ collect_ignore = (
         "test_isolated_hardening_round2.py",
         "test_isolated_hardening_round3.py",
         "test_isolated_libraries.py",
+        "test_isolated_command_loop.py",
         "test_isolated_lifecycle.py",
         "test_isolated_limits.py",
         "test_isolated_review_findings.py",
