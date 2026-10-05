@@ -592,11 +592,15 @@ def test_both_variants_assemble(arch: str, allow_exec: bool) -> None:
 
 
 @pytest.mark.parametrize("name", ["fork", "vfork", "clone"])
-def test_starting_a_process_is_refused_not_killed(arch: str, prog: list, name: str) -> None:
+def test_starting_a_process_is_refused_not_killed(
+    arch: str, prog: list, name: str
+) -> None:
     """CPython's `subprocess` calls glibc's `vfork()`, which on x86_64 is the `vfork` syscall: a
     library that tries to run a program must get an error back, not lose the worker (found on a
     native x86_64 runner; aarch64 has no `vfork` and goes through `clone`)."""
     nr = _by_name(arch).get(name)
     if nr is None:
         return  # not on this architecture
-    assert run(prog, arch, nr, (0x4111, 0, 0, 0, 0, 0)) == ERRNO | EPERM  # CLONE_VM|CLONE_VFORK|SIGCHLD
+    assert (
+        run(prog, arch, nr, (0x4111, 0, 0, 0, 0, 0)) == ERRNO | EPERM
+    )  # CLONE_VM|CLONE_VFORK|SIGCHLD
