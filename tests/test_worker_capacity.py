@@ -1,4 +1,9 @@
-"""Opt-in caps count process lifetimes, including checked-out workers."""
+"""Opt-in caps count process lifetimes, including checked-out workers.
+
+Tests that start workers through `Pydeno` / `AsyncPydeno` are marked `full_sandbox`: the front
+door requires the OS sandbox and refuses to start without it, so a degraded-profile run (a kernel
+without Landlock or seccomp) deselects them instead of failing.
+"""
 
 import gc
 import os
@@ -135,6 +140,7 @@ def test_fork_resets_count_of_checked_out_processes():
         assert os.waitstatus_to_exitcode(status) == 0
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.parametrize("custom", ["memory", "seed"])
 def test_front_custom_runtime_respects_cap(custom):
     from dataclasses import replace
@@ -153,6 +159,7 @@ def test_front_custom_runtime_respects_cap(custom):
             held.close()
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.asyncio
 @pytest.mark.parametrize("custom", ["memory", "seed"])
 async def test_async_front_custom_runtime_respects_cap(custom):
@@ -174,6 +181,7 @@ async def test_async_front_custom_runtime_respects_cap(custom):
             await held.close()
 
 
+@pytest.mark.full_sandbox
 def test_custom_runtime_can_replace_ready_capacity():
     with pydeno.Pydeno(min_processes=2, max_workers=1, checkout_timeout=3) as pool:
         rt = pool._runtime(pool._limits, seed=123)
@@ -183,6 +191,7 @@ def test_custom_runtime_can_replace_ready_capacity():
             rt.close()
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.asyncio
 async def test_async_custom_runtime_can_replace_ready_capacity():
     async with pydeno.AsyncPydeno(
@@ -298,6 +307,7 @@ async def test_cancelled_async_start_keeps_its_reservation(monkeypatch):
             await asyncio.sleep(0.3)
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_custom_front_runtime_does_not_refill_global_spare(asynchronous):
     import subprocess
@@ -410,6 +420,7 @@ async def _adouble(n):
 _TWO_CALLS = "const a = await double(3)\nconst b = await double(a)\na + b"
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.parametrize("cap", [1, 2])
 def test_load_session_at_the_cap(cap):
     with pydeno.Pydeno(min_processes=1, max_workers=cap, checkout_timeout=1) as pool:
@@ -427,6 +438,7 @@ def test_load_session_at_the_cap(cap):
                 session.close()
 
 
+@pytest.mark.full_sandbox
 def test_load_snapshot_at_the_cap():
     with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
         with pool.checkout() as session:
@@ -439,6 +451,7 @@ def test_load_snapshot_at_the_cap():
             assert restored.resume(value=100).output == 106
 
 
+@pytest.mark.full_sandbox
 def test_load_of_the_wrong_kind_at_the_cap_keeps_the_session():
     """The state's kind is checked before the session's worker is given up."""
     with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
@@ -450,6 +463,7 @@ def test_load_of_the_wrong_kind_at_the_cap_keeps_the_session():
             assert session.feed_run("v") == 1
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cap", [1, 2])
 async def test_async_load_session_at_the_cap(cap):
@@ -470,6 +484,7 @@ async def test_async_load_session_at_the_cap(cap):
                 await session.close()
 
 
+@pytest.mark.full_sandbox
 @pytest.mark.asyncio
 async def test_async_load_snapshot_at_the_cap():
     async with pydeno.AsyncPydeno(
@@ -488,6 +503,7 @@ async def test_async_load_snapshot_at_the_cap():
             assert (await restored.resume(value=100)).output == 106
 
 
+@pytest.mark.full_sandbox
 def test_load_session_keeps_its_slot_against_a_waiting_checkout():
     """The slot of the worker a load kills goes to the replay, not to another waiting checkout."""
     with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
@@ -515,6 +531,7 @@ def test_load_session_keeps_its_slot_against_a_waiting_checkout():
             other.close()
 
 
+@pytest.mark.full_sandbox
 def test_a_failed_capped_load_says_how_to_recover(monkeypatch):
     from pydeno import _front
 
