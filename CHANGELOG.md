@@ -29,9 +29,6 @@
     imported, keeps its `__cause__`, and is raised even when the guest catches the failed import.
     A closed session or runtime never calls its gate.
   - **Pools.** `SandboxPool` / `SessionPool` pass `gate=` through.
-  - **Without fixing the source.** `check_source(source)` without a policy no longer retries a
-    regex scan after one fails on the same line, and caps its `\u{` look-ahead. Results are
-    unchanged; hostile input no longer takes quadratic time.
   - **Signatures checked up front.** A gate may also take only the source (`async def
     classify(source)`). A gate whose signature fits neither form raises `TypeError` when it is
     configured or passed to `gate_check`, so a programming error is not mistaken for an outage.
@@ -72,7 +69,8 @@
   (with the default, `load_wasm` raises `RuntimeError` in the parent and the worker is unchanged),
   and a module's linear memory is not bounded by `max_buffer_bytes` (it counts toward `max_memory`
   in the isolated runtimes; nothing bounds it in an in-process `Runtime`). Not on `Pydeno`,
-  `AgentSandbox` or `SandboxPool`, whose journaled sessions could not replay it. See
+  `AgentSandbox` or `SessionPool`, whose journaled sessions could not replay it (a `SandboxPool`
+  checkout is a plain runtime and works). See
   [`docs/guides/advanced/webassembly.md`](docs/guides/advanced/webassembly.md);
   `benches_py/wasm_kernel_bench.py` compares one kernel as JavaScript and as WebAssembly (no faster
   under the JIT; about 19x faster than jitless JavaScript).
@@ -109,10 +107,13 @@
 
 ### Fixed
 
+- **`check_source(source)` without a policy runs in linear time on hostile input.** It no longer
+  retries a regex scan after one failed on the same line, and its `\u{` look-ahead is capped.
+  Results are unchanged.
 - **A large backlog of async replies no longer gets a worker killed that is still reading, and the
-  parent's memory is bounded** (#86). Replies to async host calls are now written one at a time under
-  a send lock, a reply waits for its turn before it is encoded, and its host call stays in flight
-  until the reply has been written. A worker that stops reading or drips bytes is still killed
+  parent's memory is bounded** (#86, #91). Replies to async host calls are now written one at a time
+  under a send lock, a reply waits for its turn before it is encoded, and its host call stays in
+  flight (and counts toward `max_inflight_host_calls`) until the reply has been written. A worker that stops reading or drips bytes is still killed
   within one stall window (`write_stall_timeout`). Measured with 3000 concurrent calls of 200 KB:
   the worker is no longer killed at a 1 s stall limit, the transport buffer peaks at about 0.1 MB
   instead of about 590 MB, and the parent's peak RSS drops from about 3 GB to about 0.7 GB.

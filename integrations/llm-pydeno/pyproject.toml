@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-pydeno"
-version = "0.1.0"
+version = "0.1.1"
 description = "llm plugin: a sandboxed JavaScript interpreter for models, backed by pydeno."
 readme = "README.md"
 requires-python = ">=3.10"

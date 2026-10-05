@@ -1205,3 +1205,53 @@ async def test_hung_gates_starve_later_ones_into_unavailable_not_a_hang() -> Non
     finally:
         release.set()
         _gate.set_gate_threads(before)
+
+
+async def test_a_burst_of_sync_gates_gets_threads_while_one_is_idle() -> None:
+    """With one gate thread already idle, a burst of slow sync gates must each get a thread (up
+    to the cap), not queue behind that one thread and time out."""
+    from pydeno import _gate
+
+    assert (
+        await async_gate_check(allow, "warm", timeout=5) == ALLOW
+    )  # leaves a thread idle
+    await asyncio.sleep(0.05)
+
+    def slow(source: str, context: GateContext) -> Verdict:
+        time.sleep(0.5)
+        return ALLOW
+
+    before = _gate.gate_threads()
+    _gate.set_gate_threads(16)
+    try:
+        started = time.monotonic()
+        results = await asyncio.gather(
+            *(async_gate_check(slow, f"{i}", timeout=4.0) for i in range(8)),
+            return_exceptions=True,
+        )
+        assert results == [ALLOW] * 8, results
+        assert time.monotonic() - started < 3.5  # in parallel, not 8 x 0.5 s in a row
+        alive = [t for t in threading.enumerate() if t.name.startswith("pydeno-gate")]
+        assert len(alive) >= 8
+    finally:
+        _gate.set_gate_threads(before)
+
+
+def test_a_policy_message_table_is_read_only() -> None:
+    from types import MappingProxyType
+
+    assert isinstance(POLICY_MESSAGES, MappingProxyType)
+    assert POLICY_MESSAGES["forbidden-eval"].startswith("eval is not allowed")
+    assert "forbidden-eval" in POLICY_MESSAGES and len(POLICY_MESSAGES) == len(
+        dict(POLICY_MESSAGES)
+    )
+    with pytest.raises(TypeError):
+        POLICY_MESSAGES["forbidden-eval"] = "x"  # type: ignore[index]
+
+
+def test_the_gate_type_alias_admits_the_one_argument_form() -> None:
+    import typing
+
+    params = [typing.get_args(t)[0] for t in typing.get_args(pydeno.Gate)]
+    assert [str] in params
+    assert [str, GateContext] in params
