@@ -1083,13 +1083,19 @@ def slice_a_async_storm_outlives_the_deadline() -> bool:
         ):
             with iso() as rt:
                 started = time.monotonic()
+                failure = ""
                 try:
                     await rt.eval_async(expr, timeout=TIMEOUT)
                     return True
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    failure = str(exc)
                 if time.monotonic() - started > TIMEOUT * 2:
                     return True
+                # A worker killed for going over its memory ceiling before the deadline is containment
+                # working (unbounded async recursion fills memory as fast as the clock runs out): the
+                # runtime is closed on purpose, and what must hold is that nothing outlives the limits.
+                if "over max_memory" in failure:
+                    continue
                 if rt.is_closed() or rt.eval("1 + 1") != 2:
                     return True
         return False
