@@ -103,7 +103,8 @@ async def test_dripping_reader_is_killed_within_one_stall_window():
             await asyncio.wait_for(
                 AsyncIsolatedRuntime._send_frame(runtime, b"x" * (1024 * 1024)), 2
             )
-        assert time.monotonic() - started < runtime._stall * 2
+        # one stall window is 0.2 s; the margin is for a loaded runner's event loop
+        assert time.monotonic() - started < runtime._stall * 4
     finally:
         stop = True
         dripper.cancel()

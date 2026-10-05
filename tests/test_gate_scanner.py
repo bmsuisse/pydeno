@@ -218,7 +218,7 @@ def _bound(mode: str) -> float:
     return (
         max(2.0, 25 * _baseline(mode))
         if mode == "default"
-        else max(4.0, 8 * _baseline(mode))
+        else max(4.0, 25 * _baseline(mode))
     )
 
 

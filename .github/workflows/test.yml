@@ -385,7 +385,7 @@ jobs:
             tests/test_isolated_*.py \
             tests/test_aio_isolated_runtime.py
 
-  # Every feature on its own must compile (default = inspector, bench). `cargo test` and clippy only
+  # Every feature on its own must compile (features: inspector, on by default, and bench). `cargo test` and clippy only
   # cover the default set, `bench`, and no-default-features, so a feature that stops building alone
   # would go unnoticed. cargo-hack is pinned and installed from a prebuilt binary.
   cargo-features:
