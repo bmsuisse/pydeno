@@ -32,7 +32,11 @@ reproduced a late-dispatch cleanup defect; the closed-session guard then passed 
 including six new lifecycle cases. The initial combined ARM64 run also passed the
 native wire-cap case; its one lifecycle failure is addressed by the guard. These runs
 used the retained 0771370 compiled release wheel with the current Python overlay,
-not an exact-head release artifact.
+not an exact-head release artifact. A CPython 3.14 async run passed 41 tests with zero
+skips. With the integration subpackage correctly overlaid and pydantic-ai installed,
+89 catalog/lifecycle/output/result tests passed on native ARM64 CPython 3.12, including
+the preview and wire regressions. The overlay runner now copies Python subpackages
+recursively without replacing the native extension.
 
 ## Required before merge
 

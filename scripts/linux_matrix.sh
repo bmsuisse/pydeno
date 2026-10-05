@@ -20,7 +20,7 @@
 # Environment:
 #   CONTAINER_RUNTIME  podman or docker (default: whichever is on PATH, podman first)
 #   PYTEST_TARGETS     what to run (default: the isolation and escape suites)
-#   OVERLAY_PY=1       copy ./python/pydeno/*.py over the installed wheel, for iterating on
+#   OVERLAY_PY=1       overlay Python files recursively over the installed wheel, for iterating on
 #                      Python-only changes without rebuilding the wheel (local use only)
 #   MIN_TESTS         minimum selected test count (default: 1 for focused local runs)
 #   KEEP_OUT=1         leave the junit/collect logs in OUT_DIR
@@ -107,8 +107,19 @@ if ! command -v "$PY" >/dev/null 2>&1; then bootstrap; fi
 /tmp/v/bin/pip install -q "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0" >/dev/null
 
 if [ "${OVERLAY_PY:-0}" = "1" ]; then
-  SITE=$(/tmp/v/bin/python -c "import pydeno,os;print(os.path.dirname(pydeno.__file__))")
-  cp /src/python/pydeno/*.py "$SITE"/
+  /tmp/v/bin/python - <<'OVERLAY_EOF'
+from pathlib import Path
+import shutil
+import pydeno
+
+source_root = Path("/src/python/pydeno")
+installed_root = Path(pydeno.__file__).parent
+# Include integration/tool subpackages, preserving the wheel's native extension.
+for source in source_root.rglob("*.py"):
+    destination = installed_root / source.relative_to(source_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+OVERLAY_EOF
 fi
 
 /tmp/v/bin/python -c "
