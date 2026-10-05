@@ -180,3 +180,127 @@ def test_idle_loop_runs_queued_completions_and_refuses_other_threads() -> None:
         timeout=60,
     )
     assert out.returncode == 0 and out.stdout.strip() == "ok", out.stderr
+
+
+def _command_loop_probe(body: str) -> None:
+    root = str(Path(pydeno.__file__).resolve().parent.parent)
+    script = """
+import asyncio, os, sys, threading
+sys.path.insert(0, sys.argv[1])
+from pydeno._worker import _Worker
+r, w = os.pipe()
+worker = _Worker(r, w)
+""" + textwrap.dedent(body)
+    out = subprocess.run(
+        [sys.executable, "-c", script, root],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_idle_flag_allows_cancellation_cleanup_to_run() -> None:
+    _command_loop_probe("""
+        finished = []
+        async def held():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finished.append("cancelled")
+        async def command():
+            asyncio.create_task(held())
+            await asyncio.sleep(0)
+            return 1
+        assert worker._run_async(command) == 1
+        assert worker._loop.is_closed()
+        assert finished == ["cancelled"], finished
+    """)
+
+
+def test_submission_racing_with_idle_transition_settles_before_next_command() -> None:
+    _command_loop_probe("""
+        loop = worker._loop
+        loop.idle = False
+        entered, release, settled = threading.Event(), threading.Event(), threading.Event()
+        phases = []
+        phase = "settling"
+        original = asyncio.SelectorEventLoop.call_soon_threadsafe
+        def delayed(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return original(self, *args, **kwargs)
+        asyncio.SelectorEventLoop.call_soon_threadsafe = delayed
+        def submit():
+            loop.call_soon_threadsafe(lambda: phases.append(phase))
+        producer = threading.Thread(target=submit)
+        producer.start()
+        assert entered.wait(5)
+        def settle():
+            loop.idle = True
+            worker._settle()
+            settled.set()
+        closer = threading.Thread(target=settle)
+        closer.start()
+        # With atomic submission, the idle transition waits for the producer. Before the fix,
+        # settlement finishes while the producer is still paused before actually enqueueing.
+        settled.wait(0.2)
+        release.set()
+        producer.join(5)
+        closer.join(5)
+        assert not producer.is_alive() and not closer.is_alive()
+        asyncio.SelectorEventLoop.call_soon_threadsafe = original
+        phase = "next command"
+        async def nothing():
+            return 0
+        worker._run_async(nothing)
+        assert phases == ["settling"], phases
+    """)
+
+
+def test_cancellation_created_tasks_are_settled_before_next_command() -> None:
+    _command_loop_probe("""
+        cancelled = []
+        async def held(generation):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.append(generation)
+                if generation < 3:
+                    asyncio.create_task(held(generation + 1))
+        async def command():
+            asyncio.create_task(held(0))
+            await asyncio.sleep(0)
+            return 1
+        assert worker._run_async(command) == 1
+        pending = asyncio.all_tasks(worker._loop)
+        assert not pending, pending
+        assert cancelled == [0, 1, 2, 3], cancelled
+    """)
+
+
+def test_cancellation_scheduled_timers_do_not_run_in_next_command() -> None:
+    _command_loop_probe("""
+        fired = []
+        cleanup = []
+        async def held():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                # Timers needed by cancellation cleanup must run before its leftover timer
+                # is discarded. This cleanup finishes while that timer is still in the future.
+                await asyncio.sleep(0.01)
+                cleanup.append("finished")
+                asyncio.get_running_loop().call_later(0.1, fired.append, "old command")
+        async def command():
+            asyncio.create_task(held())
+            await asyncio.sleep(0)
+            return 1
+        assert worker._run_async(command) == 1
+        assert cleanup == ["finished"], cleanup
+        async def next_command():
+            await asyncio.sleep(0.2)
+            return 2
+        assert worker._run_async(next_command) == 2
+        assert fired == [], fired
+    """)

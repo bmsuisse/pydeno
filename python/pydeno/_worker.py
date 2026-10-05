@@ -209,7 +209,20 @@ class _CommandLoop(asyncio.SelectorEventLoop):
     `asyncio.run` closed it: a late `call_soon_threadsafe` (a host call's start or completion
     owed to an earlier command) is refused instead of queued for the next one."""
 
-    idle = True
+    def __init__(self) -> None:
+        self._submission_lock = threading.Lock()
+        self._idle = True
+        super().__init__()
+
+    @property
+    def idle(self) -> bool:
+        return self._idle
+
+    @idle.setter
+    def idle(self, value: bool) -> None:
+        # A submission accepted before the idle transition must be queued before settlement.
+        with self._submission_lock:
+            self._idle = value
 
     def is_closed(self) -> bool:
         return self.idle or super().is_closed()
@@ -217,9 +230,10 @@ class _CommandLoop(asyncio.SelectorEventLoop):
     def call_soon_threadsafe(
         self, callback: Any, *args: Any, context: Any = None
     ) -> Any:
-        if self.idle:
-            raise RuntimeError("Event loop is closed")
-        return super().call_soon_threadsafe(callback, *args, context=context)
+        with self._submission_lock:
+            if self._idle:
+                raise RuntimeError("Event loop is closed")
+            return super().call_soon_threadsafe(callback, *args, context=context)
 
 
 class _Worker:
@@ -413,13 +427,24 @@ class _Worker:
         queued (a finished host call's completion) run now, not at the start of the next
         command."""
         loop = self._loop
-        tasks = asyncio.all_tasks(loop)
-        if tasks:
-            for task in tasks:
-                task.cancel()
-            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-        loop.call_soon(loop.stop)
-        loop.run_forever()
+        while True:
+            tasks = asyncio.all_tasks(loop)
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            loop.call_soon(loop.stop)
+            loop.run_forever()
+            # Cancellation handlers and done callbacks can create more tasks or queue another
+            # callback. Rescan after each pass instead of carrying those into the next command.
+            if not asyncio.all_tasks(loop) and not loop._ready:
+                break
+        # Keep timers alive while cancelled tasks finish (their cleanup may await sleep), then
+        # discard delayed callbacks as closing the old per-command loop used to do.
+        for handle in loop._scheduled:
+            handle.cancel()
+        loop._scheduled.clear()
+        loop._timer_cancelled_count = 0
 
     def _handle(self, message: dict[str, Any]) -> Any:
         kind = message["t"]
