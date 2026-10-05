@@ -1004,7 +1004,7 @@ class _Core(_sandbox_pool._Core):  # noqa: SLF001
     it; `Math.random` must not repeat across sessions) and arrives with the session's
     dispatcher and prelude installed (`preinstall`), so a checkout does no round trip."""
 
-    def new(self, session: dict[str, Any] | None = None) -> IsolatedRuntime:
+    def _create(self, session: dict[str, Any] | None = None) -> IsolatedRuntime:
         if session is None and self.ready:
             # A filler replacing a worker just checked out. Starting a process forks this one
             # and holds the GIL for about a millisecond, right when the new session runs its
@@ -1179,9 +1179,12 @@ class Pydeno:
         min_processes: Workers kept started and ready (default 2: enough that back-to-back
             checkouts find one ready while the next starts in the background, at ~30-40 MB of
             memory each). A checkout that finds none ready starts one on the spot (a cold start,
-            tens of milliseconds): exhaustion is never an error and never waits for a return.
-            Workers are single-use, so there is no ``max_processes``: a session's worker dies
-            with the session.
+            tens of milliseconds). Workers are single-use: a session's worker dies with it.
+        max_workers: Optional cap on starting and live workers, including checked-out sessions
+            and custom memory or replay workers. None (default) allows unlimited cold starts.
+            The ready target is clamped to the cap if it is smaller than min_processes.
+        checkout_timeout: Finite positive seconds to wait for capacity (default 30), then raise
+            CheckoutTimeout. The worker startup handshake has its own timeout.
         limits: Default `PydenoLimits` for every session (each key overrides the built-in
             default; ``checkout(limits=...)`` overrides these).
         sandbox: ``"require"`` (default): refuse to start unless every OS sandbox layer the
@@ -1219,6 +1222,8 @@ class Pydeno:
         self,
         *,
         min_processes: int = DEFAULT_MIN_PROCESSES,
+        max_workers: int | None = None,
+        checkout_timeout: float = 30.0,
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
@@ -1244,7 +1249,13 @@ class Pydeno:
         )  # may warn (or raise, under -W error): before anything starts
         try:
             self._reaper = _Reaper()
-            self._pool = _Pool(_CONFIG, size=min_processes, **self._spawn)
+            self._pool = _Pool(
+                _CONFIG,
+                size=min_processes,
+                max_workers=max_workers,
+                checkout_timeout=checkout_timeout,
+                **self._spawn,
+            )
         except WorkerCrashed as exc:
             _close_pool(self._budget)
             raise _start_failure(exc, sandbox) from exc
@@ -1301,10 +1312,13 @@ class Pydeno:
             if seed is None and limits.max_memory == self._limits.max_memory:
                 return self._pool.checkout()
             options = {**self._spawn, "max_memory": limits.max_memory}
-            return IsolatedRuntime(
-                _CONFIG,
-                random_seed=_fresh_seed() if seed is None else seed,
-                **options,
+            return self._pool._core.new(
+                factory=lambda: IsolatedRuntime(
+                    _CONFIG,
+                    prewarm=False,
+                    random_seed=_fresh_seed() if seed is None else seed,
+                    **options,
+                )
             )
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
