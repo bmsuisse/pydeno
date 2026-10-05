@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-10-05
+
+Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed
+contract and a static source policy), **`load_wasm()`** for trusted WebAssembly modules, **opt-in
+worker caps** for pools, a **persistent worker event loop** (about 35 to 40 percent faster async
+commands and feeds), bounded memory for large async reply backlogs, and a second hardening pass
+(stream sources belong to one runtime, host functions that re-enter their runtime get an error
+instead of killing the process, no `close()` hang, live registration ids are never reused). See
+"Upgrading" for the few behaviour changes.
+
+Security note: this release hardens behaviour of 0.8.0 and earlier. Several defects found in
+independent reviews are fixed (listed below, in neutral terms). The gate is defence in depth, never the
+boundary; the sandbox is.
 
 ### Added
 
