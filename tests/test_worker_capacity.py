@@ -486,3 +486,52 @@ async def test_async_load_snapshot_at_the_cap():
             )
             assert restored.args == (6,)
             assert (await restored.resume(value=100)).output == 106
+
+
+def test_load_session_keeps_its_slot_against_a_waiting_checkout():
+    """The slot of the worker a load kills goes to the replay, not to another waiting checkout."""
+    with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
+        with pool.checkout() as session:
+            session.feed_run("var v = 41")
+            state = session.dump()
+            other = pool.checkout()
+            refused = []
+
+            def enter():
+                try:
+                    other.__enter__()
+                except pydeno.CheckoutTimeout as exc:
+                    refused.append(exc)
+
+            thread = threading.Thread(target=enter)
+            thread.start()
+            deadline = time.monotonic() + 5
+            while pool.stats()["waiting"] == 0 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            session.load_session(state)
+            assert session.feed_run("v + 1") == 42
+            thread.join(5)
+            assert refused
+            other.close()
+
+
+def test_a_failed_capped_load_says_how_to_recover(monkeypatch):
+    from pydeno import _front
+
+    with pydeno.Pydeno(min_processes=1, max_workers=1, checkout_timeout=1) as pool:
+        with pool.checkout() as session:
+            session.feed_run("var v = 41")
+            state = session.dump()
+            real = _front.AgentSandbox.load
+
+            def broken(*args, **kwargs):
+                raise _front.JournalError("simulated replay failure")
+
+            monkeypatch.setattr(_front.AgentSandbox, "load", broken)
+            with pytest.raises(pydeno.PydenoError):
+                session.load_session(state)
+            with pytest.raises(pydeno.PydenoCrashedError, match="load_session"):
+                session.feed_run("v")
+            monkeypatch.setattr(_front.AgentSandbox, "load", real)
+            session.load_session(state)
+            assert session.feed_run("v + 1") == 42

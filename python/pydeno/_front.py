@@ -1318,7 +1318,9 @@ class Pydeno:
 
     # -- for sessions --------------------------------------------------------
 
-    def _runtime(self, limits: _Limits, seed: int | None = None) -> IsolatedRuntime:
+    def _runtime(
+        self, limits: _Limits, seed: int | None = None, token: object | None = None
+    ) -> IsolatedRuntime:
         try:
             if seed is None and limits.max_memory == self._limits.max_memory:
                 return self._pool.checkout()
@@ -1331,7 +1333,8 @@ class Pydeno:
                     prewarm=core.capacity.maximum is None,
                     random_seed=_fresh_seed() if seed is None else seed,
                     **options,
-                )
+                ),
+                token=token,
             )
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
@@ -1360,16 +1363,18 @@ class Pydeno:
         associated_data: bytes = b"",
         *,
         suspended: bool | None = None,
-        release: Callable[[], None] | None = None,
+        release: Callable[[], object | None] | None = None,
     ) -> AgentSandbox:
         seed = _journal_seed(
             state, self._key, self._spawn["strict_eval"], associated_data, suspended
         )
+        token = None
         if release is not None and self._pool._core.capacity.maximum is not None:  # noqa: SLF001
             # With a worker cap, the session's current worker holds a slot the replay needs:
-            # free it now (the state is authentic and of the right kind), not after the replay.
-            release()
-        rt = self._runtime(limits, seed)
+            # hand it over now (the state is authentic and of the right kind), not after the
+            # replay, and not through the queue of waiting checkouts.
+            token = release()
+        rt = self._runtime(limits, seed, token)
         try:
             agent = AgentSandbox.load(
                 state,
@@ -1492,6 +1497,8 @@ class PydenoSession:
         self._printer = _Printer()
         self._entered = False
         self._busy = threading.Lock()
+        # A capped load stopped the worker and its replay failed (see `_replace`).
+        self._load_failed = False
 
     def __enter__(self) -> PydenoSession:
         if self._entered:
@@ -1528,6 +1535,12 @@ class PydenoSession:
                 else "the session is closed"
             )
         if agent.is_closed():
+            if self._load_failed:
+                raise PydenoCrashedError(
+                    "the session's worker was stopped for a load that then failed (a pool with "
+                    "max_workers frees the slot before the replay); call load_session or "
+                    "load_snapshot again to recover the session, or check out a new one"
+                )
             raise PydenoCrashedError(
                 "the session's worker is gone (crashed, killed or timed out); check out a new "
                 "session"
@@ -1705,12 +1718,23 @@ class PydenoSession:
         )
         assert old is not None
 
-        def release() -> None:
+        def release() -> object | None:
             # Only with a worker cap (see `Pydeno._load`): the old worker is killed before the
-            # replay starts. If the load then fails, the session keeps its journal and has no
-            # worker, as after a crash: another load recovers it.
-            self._pool._reaper.kill(old._core.rt)  # noqa: SLF001
+            # replay starts, and its slot goes to the replay. If the load then fails, the
+            # session keeps its journal and has no worker, as after a crash: another load
+            # recovers it.
+            self._load_failed = True
+            rt = old._core.rt  # noqa: SLF001
+            core = self._pool._pool._core  # noqa: SLF001
+            with core.cond:
+                token = core.capacity.hand_over(rt._proc)  # noqa: SLF001
+            self._pool._reaper.kill(rt)  # noqa: SLF001
             old.close()
+            try:
+                rt._proc.wait(5)  # noqa: SLF001 - its slot is reused: let it exit first
+            except Exception:  # noqa: BLE001, S110
+                pass
+            return token
 
         new = self._pool._load(  # noqa: SLF001
             state,
@@ -1724,6 +1748,7 @@ class PydenoSession:
             raise _wrong_load(suspended)
         new._core.console.user = self._printer  # noqa: SLF001
         self._agent = new
+        self._load_failed = False
         old.close()
         return new
 

@@ -200,7 +200,7 @@ class AsyncPydeno:
     # -- for sessions --------------------------------------------------------
 
     async def _runtime(
-        self, limits: _Limits, seed: int | None = None
+        self, limits: _Limits, seed: int | None = None, token: object | None = None
     ) -> AsyncIsolatedRuntime:
         try:
             if seed is None and limits.max_memory == self._limits.max_memory:
@@ -213,7 +213,8 @@ class AsyncPydeno:
                     prewarm=self._pool._capacity.maximum is None,  # noqa: SLF001
                     random_seed=_fresh_seed() if seed is None else seed,
                     **options,
-                )
+                ),
+                token=token,
             )
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
@@ -242,14 +243,15 @@ class AsyncPydeno:
         associated_data: bytes = b"",
         *,
         suspended: bool | None = None,
-        release: Callable[[], Awaitable[None]] | None = None,
+        release: Callable[[], Awaitable[object | None]] | None = None,
     ) -> AsyncAgentSandbox:
         seed = _journal_seed(
             state, self._key, self._spawn["strict_eval"], associated_data, suspended
         )
+        token = None
         if release is not None and self._pool._capacity.maximum is not None:  # noqa: SLF001
-            await release()  # see `Pydeno._load`
-        rt = await self._runtime(limits, seed)
+            token = await release()  # see `Pydeno._load`
+        rt = await self._runtime(limits, seed, token)
         try:
             return await AsyncAgentSandbox.load(
                 state,
@@ -384,6 +386,7 @@ class AsyncPydenoSession:
         self._printer = _Printer()
         self._entered = False
         self._busy = False
+        self._load_failed = False  # see `PydenoSession._load_failed`
         # One id namespace with the agent sessions' (the self-close guard compares them).
         self._sid = next(_SESSION_IDS)
         self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}", pool._budget)  # noqa: SLF001
@@ -442,6 +445,12 @@ class AsyncPydenoSession:
                 else "the session is closed"
             )
         if agent.is_closed():
+            if self._load_failed:
+                raise PydenoCrashedError(
+                    "the session's worker was stopped for a load that then failed (a pool with "
+                    "max_workers frees the slot before the replay); call load_session or "
+                    "load_snapshot again to recover the session, or check out a new one"
+                )
             raise PydenoCrashedError(
                 "the session's worker is gone (crashed, killed, timed out or cancelled); check "
                 "out a new session"
@@ -589,11 +598,15 @@ class AsyncPydenoSession:
         self._printer.callback = None
         assert old is not None
 
-        async def release() -> None:
+        async def release() -> object | None:
             # See `PydenoSession._replace`: only with a worker cap.
+            self._load_failed = True
+            rt = old._core.rt  # noqa: SLF001
+            token = self._pool._pool._capacity.hand_over(rt._proc)  # noqa: SLF001
             if not old._core.closed:  # noqa: SLF001
                 old._core.kill("the session loaded new state")  # noqa: SLF001
             await old.close()
+            return token
 
         new = await self._pool._load(  # noqa: SLF001
             state,
@@ -608,6 +621,7 @@ class AsyncPydenoSession:
         new._core.console.user = self._printer  # noqa: SLF001
         new._core.rt._handler_executor = self._console  # noqa: SLF001
         self._agent = new
+        self._load_failed = False
         await old.close()
         return new
 

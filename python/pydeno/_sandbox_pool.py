@@ -106,6 +106,16 @@ class _WorkerCapacity:
             "checkout_timeouts": self.timeouts,
         }
 
+    def hand_over(self, proc: Any) -> object | None:
+        """Turn `proc`'s slot into a reservation for its replacement (a session loading state
+        kills its worker and starts another), so no other waiter can take the slot in between.
+        None if `proc` holds no slot (already exited and pruned, or no cap)."""
+        for token, held in self.workers.items():
+            if held is proc:
+                self.workers[token] = None
+                return token
+        return None
+
     def reserve(self) -> object:
         token = object()
         if self.maximum is not None:

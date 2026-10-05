@@ -32,9 +32,17 @@
   new `pydeno.CheckoutTimeout` (a `TimeoutError`; `classify_error` kind `checkout_timeout`,
   retryable). `load_session` / `load_snapshot` on a capped pool kill the session's current worker
   after the state is authenticated and before the replay, so a load never needs a second slot; if
-  the replay then fails, the session has no worker until the next successful load. `stats()` adds
-  `max_workers`, `workers`, `waiting` and `checkout_timeouts`; a checkout that timed out is no
-  longer counted in `checkouts` / `cold_starts`. Based on the contribution in #93.
+  the replay then fails, the session has no worker until the next successful load (the next feed
+  raises `PydenoCrashedError` saying so; another `load_session` / `load_snapshot` recovers it). The
+  killed worker's slot is handed to the replay, so a checkout already waiting cannot take it in
+  between. `stats()` adds `max_workers`, `workers`, `waiting` and `checkout_timeouts`.
+  Based on the contribution in #93.
+
+### Changed
+
+- **`stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker**, with or
+  without a cap: a cold start that fails to start (or, with a cap, a checkout that raised
+  `CheckoutTimeout`) is no longer counted in either.
 
 ## 0.8.0 — 2026-10-04
 
