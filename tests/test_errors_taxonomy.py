@@ -555,7 +555,9 @@ class TestClosed:
             "passed to the runtime that created it, or else",
         ],
     )
-    def test_only_the_whole_other_runtime_phrase_is_invalid_input(self, text: str) -> None:
+    def test_only_the_whole_other_runtime_phrase_is_invalid_input(
+        self, text: str
+    ) -> None:
         assert classify_error(RuntimeError(text)).kind == "unknown"
 
     def test_a_real_closed_in_process_runtime(self) -> None:

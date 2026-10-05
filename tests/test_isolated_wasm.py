@@ -125,7 +125,9 @@ def test_linear_memory_counts_against_max_memory() -> None:
         assert wasm.call("fill", 16) is None  # 1 MiB is fine
         with pytest.raises(WorkerCrashed):
             for step in (1, 2, 3):
-                wasm.call("fill", 8192 * step)  # 512 MiB, then 1 GiB, then 1.5 GiB touched
+                wasm.call(
+                    "fill", 8192 * step
+                )  # 512 MiB, then 1 GiB, then 1.5 GiB touched
             rt.eval("1 + 1")  # the next command at the latest
         assert rt.is_closed()
 

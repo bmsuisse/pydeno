@@ -143,6 +143,25 @@
   RSS ~3.1 GB -> ~0.7 GB, and the burst completes at `write_stall_timeout=1`, where the worker
   used to be killed; 10000 x 20 KB: parent max RSS ~1.8 GB -> ~0.13-0.27 GB. A worker that does
   not drain one reply within the stall window is still killed, however slowly it reads.
+- **`Runtime.close()` no longer hangs when a host function returning a stream source is running.**
+  `close()` holds the runtime's shutdown lock while it waits for the runtime thread, and converting
+  the returned source on that thread checked the same lock, so the host deadlocked (for example
+  when an `eval_async` task was cancelled inside `with Runtime()`). The check no longer waits for
+  the lock.
+- **A `JsFunction` or `JsStream` garbage-collected inside a host function no longer hangs the
+  process or panics.** Its finalizer then runs on the runtime thread and waited for that same
+  thread; the stream finalizer hung forever. On the runtime thread the handle is now released
+  without waiting.
+- **`load_wasm` on `IsolatedRuntime` / `AsyncIsolatedRuntime`: instances of dropped modules are no
+  longer left in the worker.** The ids of dropped modules ride along with the next wasm command;
+  a command that failed before it was sent lost them, and two threads sending at once could lose
+  ids appended in between. The ids are now taken one at a time and put back if the command fails.
+- **`classify_error` gives the new refusals stable kinds.** A stream source whose runtime is closed
+  and an unloaded WebAssembly module are `closed`; a stream source from another runtime is
+  `invalid_input` (previously all `unknown`). The messages are unchanged.
+- Tests: the worker-capacity and pool tests that need the OS sandbox are marked `full_sandbox`,
+  so a run on a kernel without Landlock or seccomp deselects them instead of failing, and the
+  WebAssembly `max_memory` test no longer depends on the sampled kill landing during the one call.
 
 ## 0.8.0 — 2026-10-04
 

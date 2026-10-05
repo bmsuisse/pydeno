@@ -278,7 +278,6 @@ def test_isolated_runtime_is_unaffected() -> None:
     assert _child("isolated") == ["ISO 5"]
 
 
-
 def test_close_while_a_host_function_returns_a_source_does_not_hang() -> None:
     """`Runtime.close()` racing a host function that returns a stream source.
 
