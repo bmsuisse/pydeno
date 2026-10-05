@@ -35,8 +35,11 @@ concurrency:
 
 jobs:
   run:
-    # a failed publish has nothing to test
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # Only a successful publish of a release has anything to test. The release gate also runs "Publish to PyPI"
+    # on pull requests; those runs have no release tag to install.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'release')
     name: examples (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
