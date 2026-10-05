@@ -290,6 +290,11 @@ impl PyStreamRegistry {
         }
     }
 
+    /// The runtime's serialization limits, carrying its owner identity.
+    pub(crate) fn serialization_limits(&self) -> SerializationLimits {
+        self.serialization_limits
+    }
+
     pub fn add_release_listener<F>(&self, listener: F)
     where
         F: Fn(u32) + Send + Sync + 'static,
