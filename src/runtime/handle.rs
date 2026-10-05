@@ -628,12 +628,9 @@ impl RuntimeHandle {
         if self.termination.is_requested() || self.termination.is_terminated() {
             return;
         }
-        let Ok(shutdown) = self.shutdown.try_lock() else {
-            return;
-        };
-        if *shutdown {
-            return;
-        }
+        // No shutdown-lock check: a try_lock that fails because some other thread holds the lock
+        // briefly would drop the release and leak the handle for the runtime's lifetime. The channel
+        // is unbounded, and a send after shutdown returns an error that is ignored.
         if let Some(tx) = self.tx.as_ref() {
             let _ = tx.send(command);
         }
