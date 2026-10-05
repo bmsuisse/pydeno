@@ -528,10 +528,19 @@ skips the Proxy’s `apply` trap.
 
 ## Console callback deadlines
 
-In the synchronous isolated runtime, deadline checks happen between console callbacks. A
-single slow `on_console` or `print_callback` can therefore delay enforcement until it returns;
-the twice-deadline bound for console floods applies between calls. The async supervisor checks
-the deadline independently. Buffer output in host callbacks instead of blocking on a sink.
+Console output pauses the hard deadline only within an allowance of one hard deadline per
+command, so console handling can at most double a run. This holds while a handler runs, too, in
+both runtimes: a 6 s `on_console` or `print_callback` under a 1 s deadline gets the worker killed
+at about 2 s. `max_host_wait` is enforced the same way while a synchronous tool runs.
+
+The synchronous runtimes (`IsolatedRuntime`, agent sessions, `Pydeno` feeds) run a synchronous
+handler on the thread that runs the command, and they do not move it to another thread or
+interrupt it: a handler can rely on thread-local state, a terminal or the caller's context. A
+watchdog thread kills the *worker* when a limit passes; the command then raises `RuntimeTimeout`
+(`PydenoTimeoutError` in a feed) once the handler returns. So the guest cannot extend its run
+with a slow handler, but your thread still waits for your own handler. The async runtimes run
+synchronous handlers on a worker thread and raise as soon as the limit passes. Either way, buffer
+output in host callbacks instead of blocking on a sink.
 
 ## Duration type validation
 
