@@ -58,6 +58,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         ToolCall,
         ToolNotDiscoveredError,
         describe_tools,
+        describe_tool_catalog,
         typescript_stubs,
     )
     from ._errors import ErrorInfo, classify_error
@@ -141,6 +142,7 @@ _LAZY = {
     "ReplayDivergence": "_agent",
     "JournalError": "_agent",
     "describe_tools": "_agent",
+    "describe_tool_catalog": "_agent",
     "typescript_stubs": "_agent",
     "ToolNotDiscoveredError": "_agent",
     "ExecutionResult": "_result",
@@ -554,6 +556,7 @@ __all__ = [
     "ReplayDivergence",
     "JournalError",
     "describe_tools",
+    "describe_tool_catalog",
     "typescript_stubs",
     "ExecutionResult",
     "ResultTooLarge",

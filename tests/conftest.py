@@ -28,6 +28,8 @@ _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 collect_ignore = (
     [
         "test_agent_sandbox.py",
+        "test_agent_async_lifecycle.py",
+        "test_tool_catalog_budget.py",
         "test_agent_limit_names.py",
         "test_frame_buffer_bounds.py",
         "test_isolated_limit_values.py",
