@@ -90,6 +90,9 @@ with `Pydeno` and file the building blocks under "Advanced".
 | Console calls are no longer refused by `max_inflight_host_calls` (they still count toward `max_host_calls`) | runtimes with a small in-flight cap and console routing | Nobody, unless they relied on console output being dropped while tools were in flight | Nothing |
 | `Pydeno` / `AsyncPydeno` without a `print_callback` write at most 1 MiB of console output per feed to stdout/stderr, then one `[truncated]` line | the front door's default printer | Feeds that print more than 1 MiB and read it from the host's stdout | Pass a `print_callback` (it is not capped) |
 
+`RuntimeConfig.timeout` uses Rust-side numeric conversion; it is excluded from the shared
+Python validator’s uniform type-error contract.
+
 Restrictions and fixes from the 0.8 red team (host boundary and state). The first three can change
 behaviour you have today:
 
@@ -110,11 +113,15 @@ behaviour you have today:
 
 ## 0.8.x to 0.9.0: gates, `load_wasm`, worker caps
 
-Mostly additions. Two things can change behaviour you have today: a stream source now belongs to one
-runtime, and a host function that re-enters its runtime gets an error instead of killing the process.
+Mostly additions. **Stored session state does not survive the upgrade** (the first row): finish or
+drop stored sessions before you upgrade. Otherwise, a stream source now belongs to one runtime, and a
+host function that re-enters its runtime gets an error instead of killing the process.
 
 | Change | Affects | Who notices | What to change |
 |---|---|---|---|
+| **Journals are bound to the pydeno release.** Every 0.8.x `dump()` (agent sessions, `PydenoSession`, `PydenoSnapshot`), every journal a `SessionPool` stored, and any state for `load_session` / `load_snapshot` is refused by 0.9.0 | agent sessions, `SessionPool`, `Pydeno` | Loading raises `JournalError` ("the journal was recorded by pydeno '0.8.0+<platform>', this is '0.9.0+<platform>'"; the release string includes the platform, so a journal does not move between platforms either; `classify_error` kind `journal_invalid`); the front door wraps it in a `PydenoError` ("cannot load this state: JournalError: ...") | Finish or drop stored sessions before upgrading, or clear the journal store; new sessions start empty |
+| An async host call counts toward `max_inflight_host_calls` until its reply has been written to the worker (it used to stop counting when the host function returned) | `AsyncIsolatedRuntime`, async agent sessions, `AsyncPydeno` | Guests that fire large bursts of async calls with big answers can reach the cap sooner (calls past it are refused as before) | Raise `max_inflight_host_calls`, or return smaller answers |
+| `AgentSandbox(runtime=...)` / `AsyncAgentSandbox(runtime=...)` refuse a runtime built with its own `gate=` (`ValueError`) | agent sessions | Nobody unless both are used | Pass `gate=` to the session instead |
 | New: `Gate`, `Verdict`, `GateContext`, `GateDenied`, `GateUnavailable`, `gate_check`, `async_gate_check`, `SourcePolicy`, `static_gate`, `all_of`, `any_of`, `check_source(source, policy=...)`, `gate=` / `gate_timeout=` on the front door, agent sessions and isolated runtimes | new, opt-in | Adopters | See the [gate guide](gate.md); a gate is defence in depth, never the boundary |
 | `PydenoError` is defined in `pydeno._errors` (same class, still `pydeno.PydenoError`) | internal | Code that imported it from `pydeno._front` | Import it from `pydeno` |
 | New: `load_wasm()` on `Runtime`, `IsolatedRuntime`, `AsyncIsolatedRuntime`, for trusted WebAssembly (the isolated runtimes need `jitless=False`; a module's memory is not bounded by `max_buffer_bytes`) | new, opt-in | Adopters | See the [WebAssembly guide](advanced/webassembly.md) |
@@ -145,6 +152,3 @@ runtime, and a host function that re-enters its runtime gets an error instead of
 - [ ] Large typed arrays in guests fit `max_buffer_bytes` (`max_memory // 4` by default).
 - [ ] On your deployment hosts `pydeno.sandbox_status().complete` is `True`.
 - [ ] You handle `WorkerCrashed` by cause: see [Error kinds](../reference/error-kinds.md).
-
-`RuntimeConfig.timeout` uses Rust-side numeric conversion; it is excluded from the shared
-Python validator’s uniform type-error contract.

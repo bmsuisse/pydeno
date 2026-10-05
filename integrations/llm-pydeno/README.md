@@ -108,3 +108,8 @@ python -m pytest
 
 `tests/test_session.py` needs only pydeno; `tests/test_llm_plugin.py` drives the toolbox through
 `llm`'s tool-calling chain with a scripted model (no API key) and needs `llm` installed.
+
+## Changes
+
+- **0.1.1**: limits of the wrong type (`None`, a bool, a string) raise `TypeError` instead of
+  `ValueError`, matching pydeno's shared limit validation; needs `pydeno>=0.8.0`.
