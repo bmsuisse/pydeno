@@ -243,6 +243,9 @@ def _confinement_probe() -> dict[str, Any]:
     applied = _sandbox.apply()
     out["applied"] = applied
     out["extras"] = list(_sandbox.EXTRAS)
+    out["landlock_abi"] = _sandbox.LANDLOCK_ABI
+    out["landlock_note"] = _sandbox.LANDLOCK_NOTE
+    out["seccomp_kill_verified"] = _sandbox.SECCOMP_KILL_VERIFIED
     out["missing"] = sorted(_sandbox.missing_layers(applied))
     if applied != "none" and not out["missing"]:
         try:
@@ -452,14 +455,27 @@ def _sandbox_status() -> SandboxStatus:
     if linux:
         abi, abi_why = _landlock_abi()
         abi_text = f"kernel Landlock ABI {abi}" if abi else abi_why
+        landlock_note = probe.get("landlock_note")
         landlock = probe_layer(
             "landlock",
-            f"restricting the filesystem works; {abi_text}",
-            f"could not be applied; {abi_text}",
+            "restricting the filesystem works and the canary (a directory readable a moment "
+            f"earlier) was refused afterwards; {abi_text}",
+            f"could not be applied; {abi_text}"
+            + (
+                f"; {landlock_note}"
+                if isinstance(landlock_note, str) and landlock_note
+                else ""
+            ),
         )
+        killed = probe.get("seccomp_kill_verified") is True
         seccomp = probe_layer(
             "seccomp",
-            "the seccomp-bpf filter survived a throwaway child and installed",
+            "the allow-list filter survived a throwaway child and installed; a never-legitimate "
+            + (
+                "call in that child was killed"
+                if killed
+                else "call in that child was NOT killed (the self-test reports it)"
+            ),
             "a filter could not be installed (blocked by the container profile, an "
             "unsupported architecture, or no_new_privs refused)",
         )

@@ -1139,6 +1139,12 @@ class AsyncIsolatedRuntime:
             return (
                 f"{prefix}: worker went over max_memory={self._max_memory} and exited"
             )
+        if (
+            hasattr(signal, "SIGSYS")
+            and code == -signal.SIGSYS
+            and "seccomp" in self.sandbox.split("+")
+        ):
+            return f"{prefix}: {_isolated.SANDBOX_VIOLATION}"  # see IsolatedRuntime
         if code is not None and code < 0:
             try:
                 prefix += f" (killed by {signal.Signals(-code).name})"

@@ -99,6 +99,8 @@ collect_ignore = (
         "test_gate_hooks.py",
         "test_worker_capacity.py",
         "test_stream_source_owner.py",
+        "test_sandbox_violation.py",
+        "test_sandbox_canaries.py",
     ]
     if sys.platform == "win32"
     else []

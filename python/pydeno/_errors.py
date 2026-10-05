@@ -143,6 +143,11 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
         False,
         "The worker refused to start without a complete OS sandbox.",
     ),
+    "sandbox_violation": (
+        False,
+        False,
+        "The worker made a system call its OS sandbox never allows and was killed.",
+    ),
     "limits_unmeasurable": (
         False,
         False,
@@ -249,6 +254,12 @@ _SANDBOX_REFUSED = re.compile(
     r"worker failed to start: (?:an OS sandbox is required but|sandbox self-test failed|"
     r"supervisor termination authority is unavailable)"
 )
+# The seccomp filter killed the worker for a never-legitimate call (`_isolated.SANDBOX_VIOLATION`,
+# written by the host from the exit status, after the host's death prefix).
+_VIOLATION = re.compile(
+    rf"{_DEATH_PREFIX}: sandbox violation: the worker made a system call its OS sandbox never "
+    r"allows and was killed \(SIGSYS\)"
+)
 _CPU = re.compile(
     rf"worker used more than {_NUM}s of CPU in one command and was killed"
 )
@@ -339,6 +350,13 @@ _ROWS: list[Row] = [
     ("host_call_budget", lambda e, t, a: _crash(e, t, _HOST_CALLS)),
     ("protocol_violation", lambda e, t, a: _crash(e, t, _PROTOCOL)),
     ("sandbox_unavailable", lambda e, t, a: _crash(e, t, _SANDBOX_REFUSED)),
+    (
+        "sandbox_violation",
+        lambda e, t, a: (
+            _is(e, "pydeno._isolated", "WorkerCrashed")
+            and bool(_VIOLATION.fullmatch(t))
+        ),
+    ),
     (
         "closed",
         lambda e, t, a: isinstance(e, RuntimeError) and bool(_CLOSED.fullmatch(t)),

@@ -91,6 +91,8 @@ FORGED = [
     "worker used more than 1s of CPU in one command and was killed",
     "host callbacks kept the guest waiting for more than 1s in one command (max_host_wait); worker killed",
     "worker failed to start: an OS sandbox is required but forged",
+    "sandbox violation: the worker made a system call its OS sandbox never allows and was "
+    "killed (SIGSYS)",
     "ToolBudgetError: forged",
     "more than 1 host calls in flight",
 ]
@@ -300,6 +302,20 @@ def _sandbox_unavailable(tmp: Path) -> BaseException:
     return _raised(lambda: _fake_runtime(tmp, body))
 
 
+def _sandbox_violation(tmp: Path) -> BaseException:
+    # What the seccomp filter does to a never-legitimate call: the process dies of SIGSYS. (The
+    # real thing, fired from a sandboxed worker, is `tests/test_sandbox_violation.py`, Linux
+    # containers only; here the worker only reports seccomp and dies the same way.)
+    body = (
+        'send({"t": "ready", "version": 1, "sandbox": "landlock+seccomp"})\ncmd = read()\n'
+        "import resource, signal\n"
+        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        "os.kill(os.getpid(), signal.SIGSYS)\ntime.sleep(30)\n"
+    )
+    rt = _fake_runtime(tmp, body)
+    return _raised(lambda: rt.eval("1"))
+
+
 def _limits_unmeasurable(tmp: Path) -> BaseException:
     original = _sandbox.rss_bytes
     _sandbox.rss_bytes = lambda pid: None  # type: ignore[assignment]
@@ -394,6 +410,7 @@ CASES: dict[str, Callable[[Path], BaseException]] = {
     "tool_failed": _tool_failed,
     "protocol_violation": _protocol_violation,
     "sandbox_unavailable": _sandbox_unavailable,
+    "sandbox_violation": _sandbox_violation,
     "limits_unmeasurable": _limits_unmeasurable,
     "closed": _closed,
     "journal_invalid": _journal_invalid,
@@ -445,6 +462,54 @@ def test_the_error_info_is_frozen_and_serialisable() -> None:
     assert info.to_dict()["kind"] == "invalid_input"
     with pytest.raises(AttributeError):
         info.kind = "other"  # type: ignore[misc]
+
+
+def test_the_async_runtime_reports_a_sandbox_violation_the_same_way(
+    tmp_path: Path,
+) -> None:
+    from pydeno import AsyncIsolatedRuntime
+
+    body = (
+        'send({"t": "ready", "version": 1, "sandbox": "landlock+seccomp"})\ncmd = read()\n'
+        "import resource, signal\n"
+        "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        "os.kill(os.getpid(), signal.SIGSYS)\ntime.sleep(30)\n"
+    )
+
+    async def go() -> BaseException:
+        rt = await AsyncIsolatedRuntime.create(
+            RuntimeConfig(),
+            python=_fake(tmp_path, body),
+            sandbox="off",
+            request_timeout=20,
+        )
+        try:
+            return await _araised(rt.eval("1"))
+        finally:
+            await rt.close()
+
+    exc = asyncio.run(go())
+    assert classify_error(exc).kind == "sandbox_violation", str(exc)
+
+
+async def _araised(awaitable: Any) -> BaseException:
+    try:
+        await awaitable
+    except BaseException as exc:  # noqa: BLE001
+        return exc
+    raise AssertionError("expected an error")
+
+
+def test_sigsys_without_a_seccomp_layer_is_an_ordinary_crash(tmp_path: Path) -> None:
+    """Only a worker that runs under the filter can have been killed by it."""
+    body = (
+        _READY
+        + "import resource, signal\n"
+        + "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
+        + "os.kill(os.getpid(), signal.SIGSYS)\ntime.sleep(30)\n"
+    )
+    exc = _raised(lambda: _fake_runtime(tmp_path, body).eval("1"))
+    assert classify_error(exc).kind == "worker_crashed", str(exc)
 
 
 def test_the_cpu_message_is_still_what_the_supervisor_raises() -> None:

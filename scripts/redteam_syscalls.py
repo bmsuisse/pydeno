@@ -7,7 +7,8 @@ exactly that, for every syscall number, from a fresh sandboxed process each time
 record what the kernel says.
 
 The seccomp filter decides at syscall *entry*, before the kernel looks at the arguments, so a
-syscall our filter denies answers `EPERM` whatever we pass. A reachable one answers
+syscall our filter denies answers `EPERM` whatever we pass (or, for the never-legitimate ones,
+the process dies of SIGSYS before anything happens). A reachable one answers
 `EFAULT`/`EINVAL`/`EBADF`... or simply succeeds. That makes `EPERM` with garbage arguments a
 precise "blocked by the filter" signal, and everything else a precise inventory of what the
 attacker still has.
@@ -42,7 +43,8 @@ TABLES = HERE.parent / "tests" / "data" / "syscalls.json"
 # What the child does. It applies the real sandbox, then fires one syscall with junk
 # arguments and reports. No Python-level helper may touch the filesystem after apply().
 CHILD = r"""
-import ctypes, importlib.util, json, os, sys
+import ctypes, importlib.util, json, os, resource, sys
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # a SIGSYS kill must not leave a core file
 spec = importlib.util.spec_from_file_location("_sandbox", sys.argv[1])
 sb = importlib.util.module_from_spec(spec); spec.loader.exec_module(sb)
 nr = int(sys.argv[2])
@@ -76,6 +78,9 @@ SKIP = {
     "vhangup",
     "reboot",
 }
+
+
+REFUSED = {"EPERM", "signal 31"}
 
 
 def load_sandbox():
@@ -132,14 +137,17 @@ def sweep(arch: str, numbers: Iterable[int], mode: str = "sandbox") -> dict[int,
             return nr, {"name": name, "blocked": None, "outcomes": ["skipped"]}
         outcomes = [fire(nr, pat, mode)["outcome"] for pat in ARG_PATTERNS]
         raw = [fire(nr, pat, "raw")["outcome"] for pat in ARG_PATTERNS]
-        sandbox_eperm = all(o == "EPERM" for o in outcomes)
+        # Refused by the filter: EPERM, or for a never-legitimate call the process killed by
+        # SIGSYS (31 on x86_64 and aarch64), to every argument pattern.
+        sandbox_refused = all(o in REFUSED for o in outcomes)
         return nr, {
             "name": name,
-            # Blocked by *our filter*: EPERM to every argument pattern with the sandbox, and
+            # Blocked by *our filter*: refused to every argument pattern with the sandbox, and
             # not EPERM without it. If the kernel says EPERM anyway (no capability) the
             # protection is the worker's lack of privilege, not the filter: "cap_dependent".
-            "blocked": sandbox_eperm and any(o != "EPERM" for o in raw),
-            "cap_dependent": sandbox_eperm and all(o == "EPERM" for o in raw),
+            "blocked": sandbox_refused and any(o != "EPERM" for o in raw),
+            "cap_dependent": sandbox_refused and all(o == "EPERM" for o in raw),
+            "killed": all(o == "signal 31" for o in outcomes),
             "outcomes": outcomes,
             "raw": raw,
         }
@@ -169,12 +177,10 @@ def main() -> int:
     skipped = [r for r in results.values() if r["blocked"] is None]
     sb = load_sandbox()
     idx = 0 if arch == "x86_64" else 1
-    in_filter = {
-        name
-        for table in (sb._SYSCALLS, sb._SIGNALS, sb._SELF_PID_ARG0, sb._SELF_PID_ARG1)  # noqa: SLF001
-        for name, pair in table.items()
-        if pair[idx] is not None
-    } | {"clone", "clone3"}
+    # The filter is an allow-list: it refuses every name it does not allow outright.
+    allowed = {n for n, p in sb._ALLOWED.items() if p[idx] is not None}  # noqa: SLF001
+    in_filter = set(names.values()) - allowed
+    killed = sorted(r["name"] for r in results.values() if r.get("killed"))
     # EPERM both with and without the sandbox: whoever is denying it, if it is a name our
     # filter lists then the filter is doing the job too; only the rest depend on capabilities.
     cap_dep = [
@@ -195,12 +201,13 @@ def main() -> int:
     print(
         f"{arch}: {len(results)} syscalls; {len(filter_blocked)} denied by the filter, "
         f"{len(cap_dep)} denied only for lack of capability, {len(reachable)} reachable, "
-        f"{len(skipped)} skipped"
+        f"{len(skipped)} skipped; {len(killed)} of the denied ones kill the process"
     )
+    print("\nKILLED (never legitimate):", " ".join(killed))
     print("\nDENIED ONLY FOR LACK OF CAPABILITY (the filter does not stop these):")
     for r in sorted(cap_dep, key=lambda r: r["name"]):
         print(f"  {r['name']}")
-    print("\nREACHABLE (the sandboxed process gets something other than EPERM):")
+    print("\nREACHABLE (the sandboxed process gets something other than a refusal):")
     for r in sorted(reachable, key=lambda r: r["name"]):
         print(f"  {r['name']:28} {' '.join(r['outcomes'])}")
     print(f"\nfull report: {out}")
