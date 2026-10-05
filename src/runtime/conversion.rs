@@ -222,7 +222,7 @@ pub(crate) fn python_to_js_value(
     obj: Bound<'_, PyAny>,
     limits: &SerializationLimits,
 ) -> PyResult<JSValue> {
-    let mut tracker = LimitTracker::new(limits.max_depth, limits.max_bytes);
+    let mut tracker = LimitTracker::for_limits(limits);
     python_to_js_value_tracked(obj, &mut tracker)
 }
 
@@ -258,7 +258,7 @@ fn python_to_js_value_internal(
         Ok(JSValue::Undefined)
     } else if let Ok(stream) = obj.extract::<PyRef<PyStreamSource>>() {
         add_bytes(size_of::<u32>(), tracker)?;
-        let stream_id = stream.stream_id_for_transfer()?;
+        let stream_id = stream.stream_id_for_transfer(tracker.owner())?;
         Ok(JSValue::PyStream { id: stream_id })
     } else if let Ok(py_bytes) = obj.cast::<PyBytes>() {
         let data = py_bytes.as_bytes();

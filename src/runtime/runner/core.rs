@@ -15,7 +15,7 @@ use crate::runtime::inspector::{InspectorConnectionState, InspectorMetadata};
 use crate::runtime::inspector::{
     InspectorRegistration, InspectorRegistrationParams, InspectorServer,
 };
-use crate::runtime::js_value::{JSValue, SerializationLimits};
+use crate::runtime::js_value::{JSValue, RuntimeOwner, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{
     python_extension, BufferBudget, GlobalTaskLocals, OpToken, PythonOpMode, PythonOpRegistry,
@@ -271,8 +271,11 @@ impl RuntimeCoreState {
             );
         }
 
+        // The owner is fixed here, once per runtime: every conversion for this runtime (op
+        // results, stream chunks and, through the handle, the host's own calls) carries it.
         let serialization_limits =
-            SerializationLimits::new(max_serialization_depth, max_serialization_bytes);
+            SerializationLimits::new(max_serialization_depth, max_serialization_bytes)
+                .with_owner(RuntimeOwner::fresh());
 
         let mut snapshot_source = snapshot.map(OwnedSnapshot::new);
         let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
