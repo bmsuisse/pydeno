@@ -239,3 +239,46 @@ def test_oversized_and_hostile_length_headers_are_refused_before_buffering(
     assert not reader._buf and reader._transport.paused  # type: ignore[union-attr]
     reader.data_received(_frame(b"later"))
     assert not reader.frames  # nothing after a refusal is believed
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_failed_copy_releases_the_view_and_loses_no_frame(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A `MemoryError` while copying a large payload out of the view must neither leave a view
+    # exported (the next resize would raise `BufferError`) nor drop the frame: it stays buffered
+    # and is extracted on the next attempt.
+    payload = b"p" * THRESHOLD
+    stream = _frame(payload) + _frame(b"after")
+    module = _wire if kind == "sync" else _aio
+    real_bytes = bytes
+    failed = []
+
+    def failing_bytes(*args: object) -> bytes:
+        if not failed and args and isinstance(args[0], memoryview):
+            failed.append(True)
+            raise MemoryError("injected")
+        return real_bytes(*args)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(module, "bytes", failing_bytes, raising=False)
+    # The caught exception is kept alive, as asyncio's transport does when it hands a protocol
+    # error to `connection_lost`: its traceback pins the reader's frame and every local in it, so
+    # only an explicit release (not refcounting) frees the view.
+    if kind == "sync":
+        feed = _SyncFeed([stream[:100], stream[100:]])
+        with pytest.raises(MemoryError) as caught:
+            feed.reader.read()
+        buf = feed.reader._buf
+    else:
+        reader = _async_reader()
+        with pytest.raises(MemoryError) as caught:
+            reader.data_received(stream)
+        buf = reader._buf
+    assert failed and caught.tb is not None
+    buf.append(0)  # a resize: raises BufferError if a view leaked
+    buf.pop()
+    if kind == "sync":
+        assert feed.all() == [payload, b"after"]
+    else:
+        reader.data_received(b"")
+        assert [reader.pop(), reader.pop()] == [payload, b"after"]
