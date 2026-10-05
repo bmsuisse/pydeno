@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import os
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from types import MappingProxyType
 
 TYPE_CHECKING = False
@@ -399,10 +400,29 @@ def _bound(owner: WasmModule | AsyncWasmModule, name: str) -> Callable[..., Any]
 
 
 def drain(dropped: list[int]) -> list[int]:
-    """Take the ids queued by `track_drop` (a finalizer may append concurrently, at the end)."""
-    taken = dropped[:]
-    del dropped[: len(taken)]
+    """Take the ids queued by `track_drop`. One `pop` at a time, each atomic: a finalizer may
+    append meanwhile, and two threads draining at once each get their own ids, none twice and
+    none lost."""
+    taken: list[int] = []
+    while dropped:
+        try:
+            taken.append(dropped.pop(0))
+        except IndexError:  # another thread took the last one
+            break
     return taken
+
+
+@contextmanager
+def draining(dropped: list[int]) -> Iterator[list[int]]:
+    """`drain` for one request: if the request raises, the ids go back on the queue and ride
+    along with the next wasm command (it may not have been sent; forgetting twice is harmless),
+    so a failed request never leaves instances behind in the worker."""
+    taken = drain(dropped)
+    try:
+        yield taken
+    except BaseException:
+        dropped.extend(taken)
+        raise
 
 
 def track_drop(module: Any, dropped: list[int], wid: int) -> Any:
