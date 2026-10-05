@@ -512,10 +512,51 @@ class TestClosed:
             "Stream has been closed",
             "the session is closed",
             "the session was closed",
+            "the runtime that created this stream source has been closed or terminated",
+            "this WebAssembly module was unloaded",
         ],
     )
     def test_the_messages_pydeno_really_raises(self, text: str) -> None:
         assert classify_error(RuntimeError(text)).kind == "closed"
+
+    def test_real_stream_source_refusals(self) -> None:
+        async def gen() -> Any:
+            yield 1
+
+        async def go() -> tuple[BaseException, BaseException]:
+            with Runtime() as a, Runtime() as b:
+                setter = a.eval("(s) => { globalThis.s = s; }")
+                other = _raised(lambda: setter(b.stream_from_async_iterable(gen())))
+                c = Runtime()
+                source = c.stream_from_async_iterable(gen())
+                c.close()
+                closed = _raised(lambda: setter(source))
+            return other, closed
+
+        other, closed = asyncio.run(go())
+        assert type(other) is RuntimeError and type(closed) is RuntimeError
+        assert classify_error(other).kind == "invalid_input"
+        assert classify_error(closed).kind == "closed"
+
+    def test_an_unloaded_wasm_module(self) -> None:
+        from test_wasm import ADD
+
+        with Runtime() as rt:
+            wasm = rt.load_wasm(ADD)
+            wasm.unload()
+            exc = _raised(lambda: wasm.call("add", 1, 2))
+        assert classify_error(exc).kind == "closed"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "this stream source belongs to a different runtime",
+            "this stream source belongs to a different runtime; a stream source can only be "
+            "passed to the runtime that created it, or else",
+        ],
+    )
+    def test_only_the_whole_other_runtime_phrase_is_invalid_input(self, text: str) -> None:
+        assert classify_error(RuntimeError(text)).kind == "unknown"
 
     def test_a_real_closed_in_process_runtime(self) -> None:
         rt = Runtime()
