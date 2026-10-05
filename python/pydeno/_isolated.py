@@ -326,6 +326,14 @@ class WorkerCrashed(RuntimeError):
     """The worker process died, was killed, or broke protocol. The runtime is closed."""
 
 
+# What a worker killed by its seccomp filter is reported as (after "worker process died: " or
+# the like); `classify_error` gives it the kind `sandbox_violation`.
+SANDBOX_VIOLATION = (
+    "sandbox violation: the worker made a system call its OS sandbox never allows "
+    "and was killed (SIGSYS)"
+)
+
+
 class _HostCallBudgetExceeded(Exception):
     """Internal: the guest asked for more host calls than `max_host_calls` allows."""
 
@@ -947,6 +955,15 @@ class IsolatedRuntime:
             return (
                 f"{prefix}: worker went over max_memory={self._max_memory} and exited"
             )
+        if (
+            hasattr(signal, "SIGSYS")
+            and code == -signal.SIGSYS
+            and "seccomp" in self.sandbox.split("+")
+        ):
+            # The seccomp filter killed it for a call that is never legitimate in a worker
+            # (`_sandbox._KILL`): an escape probing the kernel, not a crash. Nothing the worker
+            # wrote is added: there is nothing a person needs from it, and it is the guest's text.
+            return f"{prefix}: {SANDBOX_VIOLATION}"
         if code is not None and code < 0:
             try:
                 prefix += f" (killed by {signal.Signals(-code).name})"
