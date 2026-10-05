@@ -35,7 +35,6 @@ impl JsFunction {
         fn_id: u32,
         serialization_limits: SerializationLimits,
     ) -> PyResult<Py<Self>> {
-        handle.track_function_id(fn_id);
         let finalizer = JsFunctionFinalizer {
             handle: Mutex::new(Some(handle.clone())),
             fn_id,
@@ -43,13 +42,15 @@ impl JsFunction {
         let py_obj = Py::new(
             py,
             Self {
-                handle: RefCell::new(Some(handle)),
+                handle: RefCell::new(Some(handle.clone())),
                 fn_id,
                 closed: Cell::new(false),
                 serialization_limits,
             },
         )?;
         attach_finalizer(py, &py_obj, finalizer)?;
+        // Rollback owns the ID until both wrapper and finalizer exist.
+        handle.track_function_id(fn_id);
         Ok(py_obj)
     }
 
@@ -78,10 +79,7 @@ impl JsFunction {
     /// Convert a call's arguments with one shared `LimitTracker`, so
     /// `max_serialization_bytes` is an aggregate budget for the whole call.
     fn convert_python_args(&self, args: &Bound<'_, PyTuple>) -> PyResult<Vec<JSValue>> {
-        let mut tracker = LimitTracker::new(
-            self.serialization_limits.max_depth,
-            self.serialization_limits.max_bytes,
-        );
+        let mut tracker = LimitTracker::for_limits(&self.serialization_limits);
         args.iter()
             .map(|arg| python_to_js_value_tracked(arg, &mut tracker))
             .collect()

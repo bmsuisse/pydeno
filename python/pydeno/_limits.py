@@ -54,7 +54,7 @@ def limit_seconds(name: str, value: Any, *, allow_zero: bool = False) -> float |
             f"{name} must be a finite number of seconds {low} and at most {MAX_SECONDS:.0f}, "
             "or None"
         )
-    return seconds
+    return 0.0 if seconds == 0 else seconds
 
 
 def limit_int(

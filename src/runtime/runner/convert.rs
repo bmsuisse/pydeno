@@ -303,11 +303,10 @@ impl Converter {
                 .map_err(|_| RuntimeError::internal("Failed to cast to function"))?;
             let function = v8::Global::new(scope, func);
             let mut next_id = self.next_fn_id.borrow_mut();
-            let fn_id = *next_id;
-            *next_id += 1;
-            self.fn_registry
-                .borrow_mut()
-                .insert(fn_id, StoredFunction { function, receiver });
+            let mut entries = self.fn_registry.borrow_mut();
+            let fn_id = crate::runtime::registration_id::allocate_id(&mut next_id, &entries)
+                .ok_or_else(|| RuntimeError::internal("Function registration IDs exhausted"))?;
+            entries.insert(fn_id, StoredFunction { function, receiver });
             registered.functions.push(fn_id);
             tracker.add_bytes(8)?; // ID size
             Ok(JSValue::Function { id: fn_id })
@@ -414,7 +413,7 @@ impl Converter {
         } else if value.is_object()
             && is_readable_stream(scope, value, self.stream_prototype.as_deref())
         {
-            let stream_id = self.streams.register_stream(scope, value);
+            let stream_id = self.streams.register_stream(scope, value)?;
             registered.streams.push(stream_id);
             tracker.add_bytes(size_of::<u32>())?;
             Ok(JSValue::JsStream { id: stream_id })

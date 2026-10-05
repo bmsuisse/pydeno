@@ -27,6 +27,13 @@
 
 ### Fixed
 
+- **A stream source is refused by any runtime other than the one that created it** (#98). Stream
+  ids are allocated per runtime, so a source from runtime B returned by runtime A's host function
+  (or passed to A's functions, bound into A, or yielded by one of A's streams) was read through A's
+  own stream with the same id, and A's guest received A's data. Each source now carries its
+  runtime's identity and the transfer raises `RuntimeError` ("this stream source belongs to a
+  different runtime; ..."); a source whose runtime is closed raises `RuntimeError` too. The same
+  runtime is unaffected, and `IsolatedRuntime` has no stream sources.
 - **`AsyncIsolatedRuntime`: a burst of async host replies no longer gets a worker killed that is
   still reading, and the parent's memory for it is bounded** (#86, #91). Replies are encoded and
   written one at a time under a send lock, so the transport buffer holds at most one reply above
@@ -182,8 +189,8 @@ and the red-team restrictions under Security; see
   their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
   before and turned the limit off without saying so (every comparison with NaN is false); Python's
   `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
-  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
-  wrong type raises `TypeError`, a bad value `ValueError`.
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Except for Rust-converted
+  `RuntimeConfig.timeout`, errors are uniform: a wrong type raises `TypeError`, a bad value `ValueError`.
 - **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
   host runs a tool, and console calls were treated the same way, so time spent handling a flood of
   `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`

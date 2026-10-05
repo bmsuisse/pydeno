@@ -6,6 +6,7 @@ use num_bigint::BigInt;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default serialization depth / byte limits.
 pub const MAX_JS_DEPTH: usize = 100;
@@ -71,11 +72,27 @@ fn stack_used_since_anchor() -> Option<usize> {
     })
 }
 
+/// Opaque identity of one runtime, assigned when the runtime is created and never reused.
+/// A value that only means something inside the runtime that made it (a stream source, whose
+/// id is allocated per runtime) carries it, so a conversion for another runtime refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeOwner(u64);
+
+impl RuntimeOwner {
+    pub(crate) fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Configurable serialization limits applied during Python<->JS transfers.
 #[derive(Clone, Copy, Debug)]
 pub struct SerializationLimits {
     pub max_depth: usize,
     pub max_bytes: usize,
+    /// The runtime these limits convert for; `None` outside a runtime, where a value bound to
+    /// a runtime (a stream source) is refused.
+    pub(crate) owner: Option<RuntimeOwner>,
 }
 
 impl SerializationLimits {
@@ -83,7 +100,13 @@ impl SerializationLimits {
         Self {
             max_depth,
             max_bytes,
+            owner: None,
         }
+    }
+
+    pub(crate) const fn with_owner(mut self, owner: RuntimeOwner) -> Self {
+        self.owner = Some(owner);
+        self
     }
 }
 
@@ -358,6 +381,7 @@ pub struct LimitTracker {
     max_bytes: usize,
     current_depth: usize,
     current_bytes: usize,
+    owner: Option<RuntimeOwner>,
 }
 
 impl LimitTracker {
@@ -367,7 +391,21 @@ impl LimitTracker {
             max_bytes,
             current_depth: 0,
             current_bytes: 0,
+            owner: None,
         }
+    }
+
+    /// A tracker for `limits`, converting for the runtime they belong to.
+    pub(crate) fn for_limits(limits: &SerializationLimits) -> Self {
+        Self {
+            owner: limits.owner,
+            ..Self::new(limits.max_depth, limits.max_bytes)
+        }
+    }
+
+    /// The runtime this conversion is for, if any.
+    pub(crate) fn owner(&self) -> Option<RuntimeOwner> {
+        self.owner
     }
 
     /// Enter a depth level. Errors past `max_depth`, or when more than
@@ -456,6 +494,17 @@ pub fn byte_limit_message(current_bytes: usize, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_runtime_owner_is_unique_and_carried_by_the_tracker() {
+        let a = RuntimeOwner::fresh();
+        let b = RuntimeOwner::fresh();
+        assert_ne!(a, b);
+        let limits = SerializationLimits::new(10, 1000).with_owner(a);
+        assert_eq!(LimitTracker::for_limits(&limits).owner(), Some(a));
+        assert_eq!(LimitTracker::new(10, 1000).owner(), None);
+        assert_eq!(SerializationLimits::default().owner, None);
+    }
 
     #[test]
     fn test_limit_tracker_basic() {

@@ -77,9 +77,10 @@ impl RuntimeHandle {
     /// # Errors
     /// Returns an error if the runtime thread fails to start or initialize.
     pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let serialization_limits = config.serialization_limits();
         let force_kill_grace = config.force_kill_grace;
         let (tx, termination, inspector_info, py_stream_registry) = spawn_runtime_thread(config)?;
+        // From the runtime itself, so the handle converts for the same owner as the runtime.
+        let serialization_limits = py_stream_registry.serialization_limits();
         let (metadata, connection) = inspector_info.unzip();
         let tracked_py_streams: IdSet = Arc::default();
         let tracked = Arc::downgrade(&tracked_py_streams);
