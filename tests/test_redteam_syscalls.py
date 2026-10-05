@@ -186,7 +186,7 @@ MUST_BLOCK = {
 ALL_BLOCKED = sorted({name for group in MUST_BLOCK.values() for name in group})
 # Of those, the ones that must end the process (SIGSYS) rather than fail: written by intent too.
 NEVER_LEGITIMATE = {
-    "memfd_create", "execve", "execveat", "fork", "vfork", "ptrace", "process_vm_readv",
+    "memfd_create", "execve", "execveat", "ptrace", "process_vm_readv",
     "process_vm_writev", "kcmp", "pidfd_getfd", "mount", "umount2", "pivot_root", "chroot",
     "setns", "unshare", "open_tree", "open_tree_attr", "mount_setattr", "fsconfig", "fsopen",
     "fsmount", "fspick", "move_mount", "swapon", "swapoff", "kexec_load", "kexec_file_load",

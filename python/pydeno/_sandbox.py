@@ -470,7 +470,11 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
 # swap, reboot, quotas, the kernel log). A process that makes one of these calls is not a runtime
 # hitting an edge case, so it is killed on the spot. Everything else that is refused gets EPERM,
 # because some libraries probe a call and fall back (sockets for name-service lookups, the
-# scheduler and identity calls): turning a harmless probe into a crash would be an outage.
+# scheduler and identity calls): turning a harmless probe into a crash would be an outage. That is
+# why `fork` and `vfork` are not here although `execve` is: CPython's `subprocess` calls glibc's
+# `vfork()`, which on x86_64 is the `vfork` syscall itself (aarch64 has none and uses `clone`), so
+# a library that tries to start a program must get EPERM back, not die. `execve` is only ever
+# reached after a fork succeeded, which the filter never lets happen.
 # Traced, not assumed: `scripts/trace_worker_syscalls.py` ran real workers through the isolation
 # suites on x86_64 and aarch64 and none of these was ever called (see docs/security-report.md).
 _KILL: frozenset[str] = frozenset(
@@ -482,8 +486,6 @@ _KILL: frozenset[str] = frozenset(
         "pidfd_getfd",
         "execve",
         "execveat",
-        "fork",
-        "vfork",
         "mount",
         "umount2",
         "pivot_root",
