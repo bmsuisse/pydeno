@@ -297,7 +297,9 @@ class _Template:
                 if len(self._exits) > _MAX_REMEMBERED_EXITS:
                     del self._exits[next(iter(self._exits))]
             elif kind == b"P":
-                self._exits.pop(pid, None)  # a reused pid must not inherit the old answer
+                self._exits.pop(
+                    pid, None
+                )  # a reused pid must not inherit the old answer
         return out
 
     def exit_code(self, pid: int, wait: float | None) -> int | None:
