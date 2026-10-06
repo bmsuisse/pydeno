@@ -22,22 +22,34 @@ TABLES = json.loads((Path(__file__).parent / "data" / "syscalls.json").read_text
 ARCHES = ("x86_64", "aarch64")
 
 
+# Every per-architecture table the filter is assembled from: the allow-list, the record of what is
+# denied (and killed) on purpose, and the argument-checked calls.
+_TABLES = {
+    "allowed": _sandbox._ALLOWED,  # noqa: SLF001
+    "denied": _sandbox._SYSCALLS,  # noqa: SLF001
+    "signals": _sandbox._SIGNALS,  # noqa: SLF001
+    "self_pid_arg0": _sandbox._SELF_PID_ARG0,  # noqa: SLF001
+    "self_pid_arg1": _sandbox._SELF_PID_ARG1,  # noqa: SLF001
+    "single": {
+        "clone": _sandbox._CLONE,  # noqa: SLF001
+        "clone3": _sandbox._CLONE3,  # noqa: SLF001
+        "fcntl": _sandbox._FCNTL,  # noqa: SLF001
+        "ioctl": _sandbox._IOCTL,  # noqa: SLF001
+        "prctl": _sandbox._PRCTL,  # noqa: SLF001
+        "socketpair": _sandbox._SOCKETPAIR,  # noqa: SLF001
+        "mmap": _sandbox._EXEC_CHECKED[0],  # noqa: SLF001
+        "mprotect": _sandbox._EXEC_CHECKED[1],  # noqa: SLF001
+    },
+}
+
+
 def _entries() -> list[tuple[str, str, int]]:
     rows: list[tuple[str, str, int]] = []
-    for name, (x86, arm) in _sandbox._SYSCALLS.items():  # noqa: SLF001
-        for arch, nr in (("x86_64", x86), ("aarch64", arm)):
-            if nr is not None:
-                rows.append((arch, name, nr))
-    for table in (_sandbox._SIGNALS,):  # noqa: SLF001
+    for table in _TABLES.values():
         for name, (x86, arm) in table.items():
-            rows.append(("x86_64", name, x86))
-            rows.append(("aarch64", name, arm))
-    for name, (x86, arm) in (
-        ("clone", _sandbox._CLONE),  # noqa: SLF001
-        ("clone3", _sandbox._CLONE3),  # noqa: SLF001
-    ):
-        rows.append(("x86_64", name, x86))
-        rows.append(("aarch64", name, arm))
+            for arch, nr in (("x86_64", x86), ("aarch64", arm)):
+                if nr is not None:
+                    rows.append((arch, name, nr))
     return rows
 
 
@@ -76,6 +88,42 @@ def test_the_tables_cover_what_the_filter_and_loader_depend_on(arch: str) -> Non
         "futex",
         "mmap",
     } <= names
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_the_allow_list_never_reopens_a_deliberate_denial(arch: str) -> None:
+    idx = 0 if arch == "x86_64" else 1
+    denied = {p[idx] for p in _sandbox._SYSCALLS.values() if p[idx] is not None}  # noqa: SLF001
+    allowed = {p[idx]: n for n, p in _sandbox._ALLOWED.items() if p[idx] is not None}  # noqa: SLF001
+    assert not {allowed[nr] for nr in allowed.keys() & denied}
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_the_allow_list_and_the_argument_checked_calls_do_not_overlap(
+    arch: str,
+) -> None:
+    """An argument-checked call must not also be allowed outright (the allow-list comes first in
+    the program, so its checks would never run). mmap/mprotect are the exception: their PROT_EXEC
+    check is placed before the allow-list."""
+    idx = 0 if arch == "x86_64" else 1
+    allowed = {p[idx] for p in _sandbox._ALLOWED.values() if p[idx] is not None}  # noqa: SLF001
+    for key in ("signals", "self_pid_arg0", "self_pid_arg1", "single"):
+        for name, pair in _TABLES[key].items():
+            if name in ("mmap", "mprotect"):
+                continue
+            assert pair[idx] not in allowed, name
+
+
+def test_the_kill_list_is_a_subset_of_the_deliberate_denials() -> None:
+    """Each killed call has its reason recorded in `_SYSCALLS`."""
+    assert _sandbox._KILL <= set(_sandbox._SYSCALLS)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_the_allow_list_has_no_duplicate_numbers(arch: str) -> None:
+    idx = 0 if arch == "x86_64" else 1
+    numbers = [p[idx] for p in _sandbox._ALLOWED.values() if p[idx] is not None]  # noqa: SLF001
+    assert len(numbers) == len(set(numbers))
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -130,6 +178,7 @@ def test_the_syscalls_the_worker_needs_are_not_in_the_deny_list(arch: str) -> No
         "newfstatat",
         "lseek",
         "readlinkat",
+        "fstatat",  # aarch64's newfstatat
     }
     denied_numbers = {
         pair[idx]
@@ -139,6 +188,15 @@ def test_the_syscalls_the_worker_needs_are_not_in_the_deny_list(arch: str) -> No
     by_name = {v: int(k) for k, v in TABLES[arch].items()}
     clash = sorted(n for n in needed if by_name.get(n) in denied_numbers)
     assert not clash, f"the deny list blocks syscalls the worker needs: {clash}"
+    # and each is on the allow-list or argument-checked, on every architecture that has it
+    reachable = {
+        p[idx]
+        for t in _TABLES.values()
+        if t is not _sandbox._SYSCALLS
+        for p in t.values()
+    }  # noqa: SLF001
+    missing = sorted(n for n in needed if n in by_name and by_name[n] not in reachable)
+    assert not missing, f"needed but on no list: {missing}"
 
 
 @pytest.mark.parametrize("arch", ARCHES)

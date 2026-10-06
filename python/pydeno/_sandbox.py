@@ -7,9 +7,9 @@ cannot make that argument about V8, so the worker applies one itself:
 
 - **macOS**: a deny-by-default Seatbelt profile (no files, no network, no fork/exec,
   no mach services beyond logging).
-- **Linux**: Landlock (no filesystem access, no TCP) plus a seccomp-bpf filter
-  (no exec, no new processes, no non-AF_UNIX sockets, no connect/bind, no ptrace,
-  mount, bpf, io_uring, ...), with `no_new_privs`.
+- **Linux**: Landlock (no filesystem access, no TCP) plus a seccomp-bpf filter that is an
+  allow-list (everything else is refused; calls no runtime ever makes, such as exec, ptrace,
+  mount, bpf and io_uring, kill the process), with `no_new_privs`.
 
 Both are one-way: once applied they cannot be lifted from inside the process. They
 must be applied *before* the isolate exists so that every thread V8 and tokio spawn
@@ -206,6 +206,16 @@ def _apply_seatbelt() -> bool:
 
 _PR_SET_NO_NEW_PRIVS = 38
 
+# The filter is an ALLOW-LIST (`_ALLOWED` below, plus the argument-checked calls after it): a
+# syscall nobody listed is refused with EPERM. Of the refused ones, those in `_KILL` end the
+# process instead (SECCOMP_RET_KILL_PROCESS), so an exploit probing for one gets no answer to
+# iterate on, and the parent reports a sandbox violation.
+#
+# `_SYSCALLS` is the record of what is refused *on purpose*, with the reason. The default already
+# refuses every one of them; the table stays because each entry says why the call must never be
+# allowed, and `tests/test_sandbox_syscall_tables.py` checks that the allow-list never re-opens one
+# (and every number against the kernel's own tables).
+#
 # (x86_64, aarch64) syscall numbers; None where the arch has no such call.
 _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     "execve": (59, 221),
@@ -447,18 +457,217 @@ _SYSCALLS: dict[str, tuple[int | None, int | None]] = {
     "uselib": (134, None),
     "modify_ldt": (154, None),
     "_sysctl": (156, None),
+    # Moving another process's memory between NUMA nodes (these were allowed on ourselves until the
+    # filter became an allow-list; nothing in the runtime calls them).
+    "migrate_pages": (256, 238),
+    "move_pages": (279, 239),
+}
+
+# Never legitimate in a worker, on any code path of CPython, V8, tokio or the C library: each is
+# an exploit's tool (debugging another process, executing a program, changing the mount table or
+# the namespaces, loading kernel code or BPF, the io_uring and userfaultfd attack surface, the
+# kernel keyring, anonymous memory files) or a system administrator's (the clock, the host name,
+# swap, reboot, quotas, the kernel log). A process that makes one of these calls is not a runtime
+# hitting an edge case, so it is killed on the spot. Everything else that is refused gets EPERM,
+# because some libraries probe a call and fall back (sockets for name-service lookups, the
+# scheduler and identity calls): turning a harmless probe into a crash would be an outage. That is
+# why `fork` and `vfork` are not here although `execve` is: CPython's `subprocess` calls glibc's
+# `vfork()`, which on x86_64 is the `vfork` syscall itself (aarch64 has none and uses `clone`), so
+# a library that tries to start a program must get EPERM back, not die. `execve` is only ever
+# reached after a fork succeeded, which the filter never lets happen.
+# Traced, not assumed: `scripts/trace_worker_syscalls.py` ran real workers through the isolation
+# suites on x86_64 and aarch64 and none of these was ever called (see docs/security-report.md).
+_KILL: frozenset[str] = frozenset(
+    {
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "kcmp",
+        "pidfd_getfd",
+        "execve",
+        "execveat",
+        "mount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "fchroot",
+        "setns",
+        "unshare",
+        "open_tree",
+        "open_tree_attr",
+        "mount_setattr",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "fspick",
+        "move_mount",
+        "swapon",
+        "swapoff",
+        "reboot",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "bpf",
+        "perf_event_open",
+        "userfaultfd",
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        "memfd_create",
+        "memfd_secret",
+        "keyctl",
+        "add_key",
+        "request_key",
+        "open_by_handle_at",
+        "name_to_handle_at",
+        "acct",
+        "iopl",
+        "ioperm",
+        "modify_ldt",
+        "uselib",
+        "_sysctl",
+        "lookup_dcookie",
+        "nfsservctl",
+        "quotactl",
+        "quotactl_fd",
+        "syslog",
+        "settimeofday",
+        "clock_settime",
+        "adjtimex",
+        "clock_adjtime",
+        "sethostname",
+        "setdomainname",
+        "lsm_set_self_attr",
+    }
+)
+
+# What a worker may call with any arguments, found by tracing real workers on both architectures
+# (`scripts/trace_worker_syscalls.py`; the list of what each trace saw is in
+# docs/security-report.md), plus the close relatives the C library picks between by version or
+# architecture (`epoll_wait`/`epoll_pwait`, `fstat`/`newfstatat`/`statx`, ...) and the calls the
+# kernel itself relies on (`rt_sigreturn`, `restart_syscall`). Nothing here reaches beyond the
+# process: descriptors it already holds, its own memory, threads, clocks and signal state. Path
+# lookups (`openat`, the stat family) are allowed because Landlock, not seccomp, decides what a
+# path may reach (seccomp cannot read the path), and refusing them would turn every "file not
+# found" in CPython's lazy imports into an error it does not expect.
+_ALLOWED: dict[str, tuple[int | None, int | None]] = {
+    # the hot path first: the filter compares in order
+    "futex": (202, 98),
+    "epoll_pwait": (281, 22),
+    "epoll_wait": (232, None),
+    "read": (0, 63),
+    "write": (1, 64),
+    "recvfrom": (45, 207),
+    "sendto": (44, 206),
+    "madvise": (28, 233),
+    "munmap": (11, 215),
+    "clock_nanosleep": (230, 115),
+    "getppid": (110, 173),
+    "gettid": (186, 178),
+    "pread64": (17, 67),
+    "sched_getaffinity": (204, 123),
+    "rt_sigprocmask": (14, 135),
+    "clock_gettime": (228, 113),
+    "getpid": (39, 172),
+    "sched_yield": (24, 124),
+    # memory (mmap/mprotect are checked for PROT_EXEC first when the worker is jitless)
+    "mmap": (9, 222),
+    "mprotect": (10, 226),
+    "brk": (12, 214),
+    "mremap": (25, 216),
+    # threads
+    "set_robust_list": (273, 99),
+    "rseq": (334, 293),
+    "set_tid_address": (218, 96),
+    "exit": (60, 93),
+    "exit_group": (231, 94),
+    "sched_getparam": (143, 121),
+    "sched_getscheduler": (145, 120),
+    "sched_getattr": (315, 275),
+    "sched_get_priority_max": (146, 125),
+    "sched_get_priority_min": (147, 126),
+    # time
+    "nanosleep": (35, 101),
+    "clock_getres": (229, 114),
+    "gettimeofday": (96, 169),
+    "time": (201, None),
+    # signals (delivery to this process only; sending is checked below)
+    "rt_sigaction": (13, 134),
+    "rt_sigreturn": (15, 139),
+    "sigaltstack": (131, 132),
+    "restart_syscall": (219, 128),
+    # the event loops (asyncio's selector, tokio's epoll) and their wake-ups
+    "epoll_create1": (291, 20),
+    "epoll_create": (213, None),
+    "epoll_ctl": (233, 21),
+    "epoll_pwait2": (441, 441),
+    "eventfd2": (290, 19),
+    "eventfd": (284, None),
+    "poll": (7, None),
+    "ppoll": (271, 73),
+    "select": (23, None),
+    "pselect6": (270, 72),
+    "pipe2": (293, 59),
+    "pipe": (22, None),
+    # descriptors the process already holds (the parent's pipes, asyncio's socketpair)
+    "readv": (19, 65),
+    "writev": (20, 66),
+    "pwrite64": (18, 68),
+    "preadv": (295, 69),
+    "pwritev": (296, 70),
+    "lseek": (8, 62),
+    "close": (3, 57),
+    "dup": (32, 23),
+    "dup2": (33, None),
+    "dup3": (292, 24),
+    "recvmsg": (47, 212),
+    "sendmsg": (46, 211),
+    "shutdown": (48, 210),
+    "fsync": (74, 82),
+    "fdatasync": (75, 83),
+    "ftruncate": (77, 46),
+    # paths: Landlock decides (see above)
+    "openat": (257, 56),
+    "open": (2, None),
+    "fstat": (5, 80),
+    "newfstatat": (262, None),
+    "fstatat": (None, 79),  # aarch64's name for newfstatat
+    "statx": (332, 291),
+    "stat": (4, None),
+    "lstat": (6, None),
+    "access": (21, None),
+    "faccessat": (269, 48),
+    "faccessat2": (439, 439),
+    "readlinkat": (267, 78),
+    "readlink": (89, None),
+    "getcwd": (79, 17),
+    # about this process only
+    "getrandom": (318, 278),
+    "getrlimit": (97, 163),
+    "getrusage": (98, 165),
+    "getuid": (102, 174),
+    "geteuid": (107, 175),
+    "getgid": (104, 176),
+    "getegid": (108, 177),
+    "getresuid": (118, 148),
+    "getresgid": (120, 150),
+    "getgroups": (115, 158),
+    # V8's x86_64 build calls uname() while it starts and aborts (`Check failed: 0 ==
+    # uname(&uname_buffer)`) if it is refused; aarch64 does not, but the answer is the same
+    # kernel release on both, and refusing it on one only would add a way to break that one.
+    "uname": (63, 160),
 }
 # Calls that act on *another process* chosen by a pid argument. Allowed only on ourselves
-# (pid 0 or our own), so a compromised worker cannot renice, re-pin, re-limit or migrate the
-# host process or anything else the same user runs.
+# (pid 0 or our own), so a compromised worker cannot renice, re-pin or re-limit the host process
+# or anything else the same user runs.
 _SELF_PID_ARG0 = {
     "sched_setscheduler": (144, 119),
     "sched_setparam": (142, 118),
     "sched_setattr": (314, 274),
     "sched_setaffinity": (203, 122),
     "prlimit64": (302, 261),
-    "migrate_pages": (256, 238),
-    "move_pages": (279, 239),
     # The read-only calls that leak something about another process: `get_robust_list(parent)`
     # returns a pointer into the host process (its ASLR), and `getpgid`/`getsid` over every number
     # enumerate the pids the user is running. (Not `sched_get*`, `getpriority` or `ioprio_get`:
@@ -484,16 +693,45 @@ _WHICH_PROCESS = {"setpriority": 0, "ioprio_set": 1}
 # but only on Linux 6.12+.)
 _FCNTL = (72, 25)
 _IOCTL = (16, 29)
-_FCNTL_DENIED_CMDS = (8, 10, 15, 1031)  # F_SETOWN, F_SETSIG, F_SETOWN_EX, F_SETPIPE_SZ
-# FIOSETOWN, SIOCSPGRP (signal ownership), TIOCSTI, TIOCLINUX. The worker has no controlling terminal
-# (it is its own session), so the last two are belt and braces: bubblewrap documents TIOCSTI as the
-# one thing a session alone does not cover if a terminal ever reaches the sandbox.
-_IOCTL_DENIED_CMDS = (0x8901, 0x8902, 0x5412, 0x541C)
-# The whole socket-ioctl block, `SIOCGIFCONF`, `SIOCGIFHWADDR` and friends. A descriptor that is a
-# socket answers these from the kernel's network stack (a unix socket falls through to it), which
-# tells a confined process the host's interfaces, addresses and MACs, and with CAP_NET_ADMIN lets
-# it change them. Nothing here needs one.
-_IOCTL_SOCKET_BLOCK = 0x8900
+# `fcntl` and `ioctl` are allow-lists of commands too. fcntl: duplicating, the descriptor and
+# status flags, record locks, and read-only queries. Not F_SETOWN/F_SETSIG/F_SETOWN_EX (signals to
+# a named owner, see above), F_SETPIPE_SZ (pipe buffers are memory the RSS poll misses),
+# F_SETLEASE/F_NOTIFY (signals again) or F_ADD_SEALS. The command is an `int`, so the filter
+# judges its low 32 bits, as the kernel does.
+_FCNTL_ALLOWED_CMDS = (
+    0,  # F_DUPFD
+    1,  # F_GETFD
+    2,  # F_SETFD
+    3,  # F_GETFL
+    4,  # F_SETFL
+    5,  # F_GETLK
+    6,  # F_SETLK
+    7,  # F_SETLKW
+    9,  # F_GETOWN
+    11,  # F_GETSIG
+    16,  # F_GETOWN_EX
+    36,  # F_OFD_GETLK
+    37,  # F_OFD_SETLK
+    38,  # F_OFD_SETLKW
+    1025,  # F_GETLEASE
+    1030,  # F_DUPFD_CLOEXEC
+    1032,  # F_GETPIPE_SZ
+    1034,  # F_GET_SEALS
+)
+# ioctl: what CPython, the C library and tokio ask of an ordinary descriptor (is it a terminal, how
+# much is buffered, blocking or not, close-on-exec). Every other command is refused, which closes
+# by construction what used to be denied one by one: FIOSETOWN/SIOCSPGRP (signal ownership),
+# TIOCSTI/TIOCLINUX (terminal injection), FIOASYNC, and the socket-ioctl block (`SIOCGIFCONF`,
+# `SIOCGIFHWADDR`, ...: the host's interfaces, addresses and MACs, answered even on a unix socket),
+# plus the filesystem ioctls of the one regular file the worker holds (its stderr).
+_IOCTL_ALLOWED_CMDS = (
+    0x5401,  # TCGETS (isatty)
+    0x5413,  # TIOCGWINSZ
+    0x541B,  # FIONREAD
+    0x5421,  # FIONBIO
+    0x5450,  # FIONCLEX
+    0x5451,  # FIOCLEX
+)
 _PRCTL = (157, 167)
 _SOCKETPAIR = (53, 199)
 # `prctl` can change how the process is traced, scheduled and killed (`PR_SET_DUMPABLE`,
@@ -513,9 +751,9 @@ _AF_UNIX, _SOCK_STREAM, _SOCK_TYPE_MASK = 1, 1, 0xF
 # Every syscall number below this has been looked at (`tests/data/syscalls.json`, from the
 # kernel's own tables, and `tests/test_sandbox_syscall_tables.py` fails if the table ever grows
 # past it). Numbers from here up are syscalls that did not exist when this filter was reviewed:
-# a future kernel's new interface, or the x32 ABI's flag bit. They get ENOSYS, which V8, CPython
-# and glibc all treat as "not available" and fall back from, until someone has read what the new
-# call does. That turns "default allow" into "default deny" for everything yet to be invented.
+# a future kernel's new interface, or the x32 ABI's flag bit. They get ENOSYS rather than the
+# allow-list's EPERM, because ENOSYS is what V8, CPython and glibc treat as "not available on this
+# kernel" and fall back from, which is the truth for a call the filter has never heard of.
 _FIRST_UNREVIEWED = 473
 # Needs argument inspection or a different errno, so handled separately below.
 _CLONE = (56, 220)
@@ -546,12 +784,22 @@ _CLONE_THREAD = 0x10000
 
 
 def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
-    """Assemble the filter. Default-allow with a deny list: V8, CPython and tokio use
-    far too many syscalls to allow-list safely, and the deny list targets what turns
-    code execution into host access (new processes, new network endpoints, kernel
-    attack surface)."""
+    """Assemble the filter: an allow-list. In order, a syscall is
+    1. killed if it comes from another architecture's ABI (the numbers would mean other calls);
+    2. ENOSYS if its number is past everything reviewed (`_FIRST_UNREVIEWED`);
+    3. EPERM if it would map memory executable in a jitless worker;
+    4. allowed if it is in `_ALLOWED`;
+    5. judged on its arguments if it is one of the calls checked below (threads only, signals and
+       scheduling on ourselves only, fcntl/ioctl/prctl commands from a list, ...);
+    6. killed if it is in `_KILL` (never legitimate: the parent reports a sandbox violation);
+    7. otherwise EPERM."""
     idx = 0 if arch == "x86_64" else 1
-    deny = [pair[idx] for pair in _SYSCALLS.values() if pair[idx] is not None]
+    allowed = [pair[idx] for pair in _ALLOWED.values() if pair[idx] is not None]
+    kill = [
+        _SYSCALLS[name][idx]
+        for name in sorted(_KILL)
+        if _SYSCALLS[name][idx] is not None
+    ]
 
     # (code, jt_label, jf_label, k); labels are resolved to relative offsets below.
     ins: list[tuple[int, str | None, str | None, int | str]] = []
@@ -571,6 +819,8 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
         if enosys:  # glibc falls back to clone() when clone3 reports ENOSYS
             label("enosys")
             ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _ENOSYS))
+            label("violation")
+            ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_KILL_PROCESS))
 
     ins.append((_BPF_LD_W_ABS, None, None, 4))  # arch
     ins.append((_BPF_JEQ_K, "nr", "kill", _AUDIT_ARCH[arch]))
@@ -581,8 +831,11 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     ins.append(
         (_BPF_JGE_K, "enosys", None, _FIRST_UNREVIEWED)
     )  # also catches the x32 bit
-    for nr in deny:
-        ins.append((_BPF_JEQ_K, "eperm", None, nr))
+    if not allow_exec:  # before the allow-list, which has mmap and mprotect
+        for pair in _EXEC_CHECKED:
+            ins.append((_BPF_JEQ_K, "noexec", None, pair[idx]))
+    for nr in allowed:
+        ins.append((_BPF_JEQ_K, "allow", None, nr))
     ins.append((_BPF_JEQ_K, "clone", None, _CLONE[idx]))
     ins.append((_BPF_JEQ_K, "enosys", None, _CLONE3[idx]))
     for pair in _SIGNALS.values():
@@ -594,10 +847,10 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     ins.append((_BPF_JEQ_K, "fcntl", None, _FCNTL[idx]))
     ins.append((_BPF_JEQ_K, "ioctl", None, _IOCTL[idx]))
     ins.append((_BPF_JEQ_K, "prctl", None, _PRCTL[idx]))
-    if not allow_exec:
-        for pair in _EXEC_CHECKED:
-            ins.append((_BPF_JEQ_K, "noexec", None, pair[idx]))
     ins.append((_BPF_JEQ_K, "socketpair", None, _SOCKETPAIR[idx]))
+    for nr in kill:
+        ins.append((_BPF_JEQ_K, "violation", None, nr))
+    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))  # the default
     stubs(enosys=True)
 
     label("clone")  # only thread creation: flags must contain CLONE_THREAD
@@ -622,17 +875,17 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
         ins.append((_BPF_JEQ_K, "allow", None, 0))
         ins.append((_BPF_JEQ_K, "allow", "eperm", os.getpid()))
         stubs()
-    label("fcntl")  # the command is arg1; naming a signal owner is closed
+    label("fcntl")  # the command is arg1 (its low 32 bits, an int)
     ins.append((_BPF_LD_W_ABS, None, None, 24))
-    for cmd in _FCNTL_DENIED_CMDS:
-        ins.append((_BPF_JEQ_K, "eperm", None, cmd))
+    for cmd in _FCNTL_ALLOWED_CMDS:
+        ins.append((_BPF_JEQ_K, "allow", None, cmd))
+    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
     stubs()
-    label("ioctl")
+    label("ioctl")  # the request is arg1; the kernel takes its low 32 bits too
     ins.append((_BPF_LD_W_ABS, None, None, 24))
-    for cmd in _IOCTL_DENIED_CMDS:
-        ins.append((_BPF_JEQ_K, "eperm", None, cmd))
-    ins.append((_BPF_AND_K, None, None, 0xFF00))
-    ins.append((_BPF_JEQ_K, "eperm", "allow", _IOCTL_SOCKET_BLOCK))
+    for cmd in _IOCTL_ALLOWED_CMDS:
+        ins.append((_BPF_JEQ_K, "allow", None, cmd))
+    ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))
     stubs()
     label("prctl")  # the option is arg0
     ins.append((_BPF_LD_W_ABS, None, None, 16))
@@ -693,10 +946,38 @@ def _apply_seccomp(*, allow_exec: bool = True) -> bool:
     prog = SockFprog(len(program) // 8, ctypes.cast(buf, ctypes.c_void_p))
     # TSYNC: apply to every existing thread, not just this one.
     libc.syscall.restype = ctypes.c_long
-    return libc.syscall(_SYS_SECCOMP[arch], 1, 1, ctypes.byref(prog)) == 0
+    if libc.syscall(_SYS_SECCOMP[arch], 1, 1, ctypes.byref(prog)) != 0:
+        return False
+    global _FILTER_IN_FORCE  # noqa: PLW0603
+    _FILTER_IN_FORCE = True
+    return True
 
 
-def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
+#: True once this process runs under the filter (`attest()` must then not fire a killing call).
+_FILTER_IN_FORCE = False
+#: What is known about the kill action on this kernel, set by `_seccomp_is_safe_here`:
+#: "verified" (a throwaway child under the filter made a never-legitimate call and was killed),
+#: "not-killed" (it made the call and came back), "available" (the kernel reports the action as
+#: supported; not exercised), "unavailable", or "" (not checked). `attest()` reports a breach for
+#: "not-killed" and "unavailable" once the filter is in force.
+SECCOMP_KILL = ""
+_SIGSYS = 31  # on x86_64 and aarch64 alike
+_SECCOMP_GET_ACTION_AVAIL = 2
+
+
+def _kill_action_available(arch_nr: int) -> bool:
+    """Does the kernel support SECCOMP_RET_KILL_PROCESS? A query; changes nothing."""
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    action = ctypes.c_uint32(_SECCOMP_RET_KILL_PROCESS)
+    return (
+        libc.syscall(arch_nr, _SECCOMP_GET_ACTION_AVAIL, 0, ctypes.byref(action)) == 0
+    )
+
+
+def _seccomp_is_safe_here(
+    *, allow_exec: bool = True, verify_kill: bool = False
+) -> bool:
     """Fire the filter in a throwaway child first.
 
     The filter hard-codes syscall numbers per architecture and kills the process if
@@ -704,30 +985,135 @@ def _seccomp_is_safe_here(*, allow_exec: bool = True) -> bool:
     (an x86_64 image on Apple silicon reports x86_64 while the kernel is aarch64), so
     instead of trusting it, find out whether this exact filter survives here, and skip
     the layer rather than kill the worker if it does not.
+
+    With `verify_kill=True` (what `sandbox_status()` asks for) the same child then makes one
+    never-legitimate call (`execve` of a path that cannot exist) and must die of SIGSYS before
+    the kernel looks at the path: the kill action, exercised. A worker start does not do that,
+    because the kernel audits every seccomp kill (`type=SECCOMP` in the audit log, or the kernel
+    log), and a record per worker start would bury the real ones a host's monitoring looks for;
+    it asks the kernel whether the action is supported instead. Either way the answer lands in
+    `SECCOMP_KILL`. (A filter in front of ours, such as a container runtime's, cannot weaken
+    the kill: the kernel applies the most severe action of all filters.)
     """
+    global SECCOMP_KILL  # noqa: PLW0603
+    SECCOMP_KILL = ""
+    idx = _arch_index()
+    read_end, write_end = os.pipe()
     pid = os.fork()
     if pid == 0:  # child: never returns
         code = 4
         try:
-            code = 0 if _apply_seccomp(allow_exec=allow_exec) and os.getpid() > 0 else 3
+            os.close(read_end)
+            # It may be killed on purpose: no core file, and not dumpable.
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            _libc().prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
+            if _apply_seccomp(allow_exec=allow_exec) and os.getpid() > 0:
+                os.write(write_end, b"1")
+                code = 0
+                if verify_kill and idx is not None:
+                    code = (
+                        5  # the canary call below came back: the kill is not in force
+                    )
+                    libc = _libc()
+                    libc.syscall.restype = ctypes.c_long
+                    libc.syscall(
+                        _SYSCALLS["execve"][idx],
+                        b"/nonexistent-pydeno-canary",
+                        None,
+                        None,
+                    )
+            else:
+                code = 3
         finally:
             os._exit(code)
+    os.close(write_end)
+    try:
+        installed = os.read(read_end, 1) == b"1"
+    finally:
+        os.close(read_end)
     _, status = os.waitpid(pid, 0)
-    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    exited = os.WEXITSTATUS(status) if os.WIFEXITED(status) else None
+    killed = os.WIFSIGNALED(status) and os.WTERMSIG(status) == _SIGSYS
+    if not installed:
+        return False
+    if verify_kill:
+        SECCOMP_KILL = "verified" if killed else "not-killed"
+        # Safe to install either way once it installed; a filter that does not kill is reported
+        # by `attest()`, which is what makes `sandbox="require"` refuse it.
+        return killed or exited == 5
+    arch = "aarch64" if _machine() in ("aarch64", "arm64") else _machine()
+    try:
+        available = _kill_action_available(_SYS_SECCOMP[arch])
+    except (KeyError, OSError, AttributeError):
+        available = False
+    SECCOMP_KILL = "available" if available else "unavailable"
+    return exited == 0
 
 
 _LANDLOCK_CREATE, _LANDLOCK_ADD, _LANDLOCK_RESTRICT = 444, 445, 446
 _LANDLOCK_CREATE_RULESET_VERSION = 1 << 0
 
 
+#: The kernel's Landlock ABI version as this process found it (0: none, or not asked yet).
+LANDLOCK_ABI = 0
+#: Why Landlock was not counted as applied although the kernel accepted it, or "" (diagnostics:
+#: the worker's start-up failure message and `sandbox_status()`).
+LANDLOCK_NOTE = ""
+# Directories a process can normally open for reading; the canary needs one that worked before.
+_CANARY_DIRS = ("/", "/tmp", "/usr", "/proc/self")
+
+
+def _readable_dir() -> str | None:
+    for path in _CANARY_DIRS:
+        try:
+            os.close(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+        except OSError:
+            continue
+        return path
+    return None
+
+
+def _landlock_canary(path: str | None) -> bool:
+    """After `landlock_restrict_self`: is reading `path`, which worked a moment ago, now refused
+    the way Landlock refuses it (EACCES)? A kernel, an LSM stack or a container runtime that
+    accepts the ruleset and then does not enforce it is otherwise invisible: the syscall said 0."""
+    global LANDLOCK_NOTE  # noqa: PLW0603
+    if path is None:
+        # Nothing was readable even before (an unusual root): no canary is possible, and the
+        # filesystem is closed to this process either way.
+        return True
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except PermissionError:
+        return True
+    except OSError as exc:
+        LANDLOCK_NOTE = (
+            f"canary open of {path} failed with errno {exc.errno}, not EACCES"
+        )
+        return False
+    os.close(fd)
+    LANDLOCK_NOTE = (
+        f"the kernel accepted the Landlock ruleset (ABI {LANDLOCK_ABI}) but {path} could "
+        "still be opened afterwards: Landlock is not enforced here"
+    )
+    return False
+
+
 def _apply_landlock() -> bool:
     """Deny all filesystem access (and TCP where the kernel can) to this thread and
-    everything it spawns afterwards. Already-open file descriptors keep working."""
+    everything it spawns afterwards. Already-open file descriptors keep working.
+
+    True only if a canary then proves it: a directory that could be opened before can no longer
+    be (`_landlock_canary`)."""
+    global LANDLOCK_ABI, LANDLOCK_NOTE  # noqa: PLW0603
+    LANDLOCK_NOTE = ""
     libc = _libc()
     libc.syscall.restype = ctypes.c_long
     abi = libc.syscall(_LANDLOCK_CREATE, None, 0, _LANDLOCK_CREATE_RULESET_VERSION)
     if abi < 1:
         return False
+    LANDLOCK_ABI = int(abi)
+    canary = _readable_dir()
     fs = (1 << 13) - 1  # ABI v1: EXECUTE .. MAKE_SYM
     if abi >= 2:
         fs |= 1 << 13  # REFER
@@ -753,9 +1139,20 @@ def _apply_landlock() -> bool:
         if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
             return False
         # No rules added: every handled access is denied.
-        return libc.syscall(_LANDLOCK_RESTRICT, fd, 0) == 0
+        if libc.syscall(_LANDLOCK_RESTRICT, fd, 0) != 0:
+            return False
     finally:
         os.close(fd)
+    return _landlock_canary(canary)
+
+
+def layer_notes() -> str:
+    """Why a layer did not count although the kernel offered it, for start-up failure messages
+    (parent-side diagnostics only, never shown to guest code)."""
+    notes = seatbelt_note()
+    if LANDLOCK_NOTE:
+        notes += f" (landlock: {LANDLOCK_NOTE})"
+    return notes
 
 
 # --------------------------------------------------------------------------- public
@@ -765,6 +1162,9 @@ def _apply_landlock() -> bool:
 #: that the core answer ("landlock+seccomp", "seatbelt") means the same on every machine. Today:
 #: "emptyroot", which only works where unprivileged user namespaces are allowed.
 EXTRAS: list[str] = []
+#: Kernel-enforced resource caps `apply()` set beyond the rlimits every worker gets: "tasklimit"
+#: (RLIMIT_NPROC per worker, see `_limit_tasks`). Diagnostics; never part of `apply()`'s answer.
+KERNEL_CAPS: list[str] = []
 
 _CLONE_NEWNS = 0x00020000
 _CLONE_NEWUTS = 0x04000000
@@ -896,6 +1296,34 @@ def _apply_empty_root() -> bool:
         libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
 
 
+#: Most tasks (threads) the worker may have, enforced by the kernel where it can be per worker.
+#: Twice the supervisor's sampled cap (`_isolated._MAX_WORKER_THREADS`, 64), so that one still
+#: fires first with its own message; this one is the ceiling a thread bomb cannot outrun.
+TASK_LIMIT = 128
+
+
+def _kernel_at_least(major: int, minor: int) -> bool:
+    try:
+        parts = os.uname().release.split(".")
+        return (int(parts[0]), int(parts[1].split("-")[0])) >= (major, minor)
+    except (ValueError, IndexError):
+        return False
+
+
+def _limit_tasks() -> bool:
+    """Linux, inside the worker's own user namespace: RLIMIT_NPROC at `TASK_LIMIT`.
+
+    RLIMIT_NPROC counts the tasks of a *user*, which on a plain host means every process the
+    host user runs, so it cannot cap one worker there. Since Linux 5.14 the count is kept per
+    user namespace (ucounts), and the empty-root layer gives the worker a namespace of its own:
+    in it, the count is exactly the worker's threads. Only then is it set. The hard limit can be
+    raised only with CAP_SYS_RESOURCE in the initial namespace, which the worker never has."""
+    if not _kernel_at_least(5, 14):
+        return False
+    resource.setrlimit(resource.RLIMIT_NPROC, (TASK_LIMIT, TASK_LIMIT))
+    return True
+
+
 _READ_IMPLIES_EXEC = 0x0400000
 
 
@@ -923,7 +1351,9 @@ def _thread_count_here() -> int:
         return threading.active_count()
 
 
-def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
+def apply(
+    *, empty_root: bool = True, allow_exec: bool = True, verify_kill: bool = False
+) -> str:
     """Confine the current process. Returns the layers applied, e.g. "landlock+seccomp",
     "seatbelt", or "none". Bonus layers land in `EXTRAS`.
 
@@ -931,6 +1361,7 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
     filesystem to stay visible."""
     layers: list[str] = []
     EXTRAS.clear()
+    KERNEL_CAPS.clear()
 
     def attempt(name: str, fn: Callable[[], bool], into: list[str]) -> None:
         # One layer failing must never stop the next from being tried: each gets its own try.
@@ -953,6 +1384,8 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
         # below take away.
         if empty_root and single_threaded:
             attempt("emptyroot", _apply_empty_root, EXTRAS)
+            if "emptyroot" in EXTRAS:
+                attempt("tasklimit", _limit_tasks, KERNEL_CAPS)
         if single_threaded:
             attempt("landlock", _apply_landlock, layers)
         if not allow_exec:
@@ -961,7 +1394,7 @@ def apply(*, empty_root: bool = True, allow_exec: bool = True) -> str:
         attempt(
             "seccomp",
             lambda: (
-                _seccomp_is_safe_here(allow_exec=allow_exec)
+                _seccomp_is_safe_here(allow_exec=allow_exec, verify_kill=verify_kill)
                 and _apply_seccomp(allow_exec=allow_exec)
             ),
             layers,
@@ -1099,10 +1532,16 @@ def attest() -> list[str]:
     check("spawn-process", spawn, cleanup_children)
     check("network-socket", connect)
     check("signal-parent", lambda: os.kill(ppid, 0))
-    if sys.platform.startswith("linux"):
-        # `execve` of a path that cannot exist: seccomp refuses at syscall entry with EPERM, and if
-        # exec is allowed the answer is ENOENT. Unlike spawning /bin/sh this does not depend on the
-        # image having a shell at all. (Not on macOS: there the path is looked up first, so even a
+    if sys.platform.startswith("linux") and _FILTER_IN_FORCE:
+        # Under the filter `execve` is never-legitimate: making it here would kill this process.
+        # `_seccomp_is_safe_here` checked the kill action before the filter went up (exercised in
+        # a throwaway child for `sandbox_status()`, asked of the kernel for a worker).
+        if SECCOMP_KILL in ("not-killed", "unavailable"):
+            breaches.append("exec-not-killed")
+    elif sys.platform.startswith("linux"):
+        # `execve` of a path that cannot exist: a filter refuses at syscall entry, and if exec is
+        # allowed the answer is ENOENT. Unlike spawning /bin/sh this does not depend on the image
+        # having a shell at all. (Not on macOS: there the path is looked up first, so even a
         # healthy sandbox answers ENOENT; the spawn probe above covers it.)
         try:
             os.execv("/nonexistent-pydeno-attest", ["x"])
@@ -1230,6 +1669,51 @@ def harden_process() -> dict[str, object]:
         # the filter later refuses `prctl` options, so a guest cannot switch it back on.
         _libc().prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
     return drop_privileges()
+
+
+# How far private writable memory may exceed `max_memory` before the kernel itself refuses more.
+# The limit the watchdogs enforce is resident memory, sampled every 20 ms; this is a hard ceiling
+# under it that needs no sampling and that code in the worker cannot lift (raising a hard limit
+# takes CAP_SYS_RESOURCE, which the worker never has). Private writable mappings run ahead of
+# resident memory: thread stacks, malloc arenas, and with the JIT about 250 MiB of code space are
+# counted before they are touched (measured: an idle jitless worker 86 MiB of data at 41 MiB
+# resident, a JIT worker 342 MiB at 45 MiB), so the headroom is generous. A normal workload meets
+# `max_memory` long before this; only a burst faster than the sampling (or native code mapping
+# memory directly) reaches it, and then the allocation fails inside the worker.
+DATA_HEADROOM = 1 << 30
+
+
+def _data_bytes_now() -> int:
+    """Private writable address space already reserved by this process (`VmData`). A free-threaded
+    CPython reserves 1 GiB of it before any script runs, and RLIMIT_DATA counts reservations."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmData:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def limit_data(max_memory: int | None) -> int | None:
+    """Linux: cap this process's private writable memory (RLIMIT_DATA) at what it has reserved
+    now plus `max_memory + DATA_HEADROOM`, so the interpreter's own baseline does not eat the
+    budget (`DATA_HEADROOM` is for what V8 and the guest add). Returns the limit set, or None (no `max_memory`, not Linux, or
+    refused). Not RLIMIT_AS: V8 reserves tens of GiB of address space it never uses (the
+    pointer-compression cage and its guard regions), so an address-space limit would either stop
+    V8 from starting or be too large to bound anything."""
+    if max_memory is None or not sys.platform.startswith("linux"):
+        return None
+    limit = _data_bytes_now() + max_memory + DATA_HEADROOM
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_DATA)
+        if hard != resource.RLIM_INFINITY:
+            limit = min(limit, hard)
+        resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))
+    except (ValueError, OSError, AttributeError):
+        return None
+    return limit
 
 
 def rss_reader(pid: int | None = None) -> Callable[[], int | None]:

@@ -564,6 +564,14 @@ class _Worker:
         # file can be opened at all. The descriptor keeps working through both.
         read_rss = _sandbox.rss_reader()
         hardened = _sandbox.harden_process()
+        max_memory = options.get("max_memory")
+        if (
+            isinstance(max_memory, int)
+            and not isinstance(max_memory, bool)
+            and max_memory > 0
+        ):
+            # A kernel ceiling under the sampled one (`_sandbox.DATA_HEADROOM` explains the gap).
+            _sandbox.limit_data(max_memory)
         applied = (
             "none"
             if mode == "off"
@@ -582,7 +590,7 @@ class _Worker:
             if breaches:
                 raise RuntimeError(
                     f"sandbox self-test failed: the worker could still {breaches} "
-                    f"(applied: {applied}){_sandbox.seatbelt_note()}"
+                    f"(applied: {applied}){_sandbox.layer_notes()}"
                 )
         if mode == "require":
             # "require" means every layer this platform has, not "at least one": a kernel that
@@ -591,7 +599,7 @@ class _Worker:
             if missing:
                 raise RuntimeError(
                     f"an OS sandbox is required but {sorted(missing)} could not be applied "
-                    f"here (applied: {applied}){_sandbox.seatbelt_note()}"
+                    f"here (applied: {applied}){_sandbox.layer_notes()}"
                 )
             if (
                 sys.platform.startswith("linux")

@@ -40,12 +40,14 @@ Status below is a plan, not a promise of dates.
 
 **Hardening** (each needs verification on native x86_64, not only emulation):
 
-- Seccomp as an allow-list with kill-on-violation, instead of today's deny-list.
-- Kernel-enforced thread and memory caps (cgroups where available), in addition to the polling checks.
+- Seccomp as an allow-list with kill-on-violation: implemented in 0.10 (#45); the aarch64 tables are
+  checked in a kernel-free interpreter, native aarch64 results come from CI.
+- Kernel-enforced thread and memory caps: `RLIMIT_DATA` and a per-namespace `RLIMIT_NPROC` in 0.10
+  (#45); cgroups only where a delegated subtree exists (not assumed).
 - Tool boundary: per-tool deadlines, result caps, redacted conversion errors, argument normalisation, a
   sandboxed tool process, safe preset tools (read-only files / SQL / HTTP fetch), call audit hooks.
 - macOS: close the path-existence side channel.
-- Landlock ABI probe plus a canary so a kernel that silently weakens it is noticed.
+- Landlock ABI probe plus a canary so a kernel that silently weakens it is noticed: done in 0.10 (#45).
 
 **API**:
 
@@ -66,12 +68,12 @@ Status below is a plan, not a promise of dates.
 | Follow-up pull requests: performance, hardening and test changes that came out of review | #85, #90, #91, #92, #93 |
 | CI additions: every cargo feature compiles on its own, a default-install smoke test (wheel in a clean venv, no extras), examples run only for release publishes | this release |
 
-## 0.10: cold start, allow-list, review preparation
+## 0.10: cold start, tool process, review preparation
 
 | Item | Issue / PR |
 |---|---|
 | Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap) | #72 |
-| Seccomp as an allow-list with kill-on-violation | #45 |
+| Seccomp as an allow-list with kill-on-violation, Landlock canary, kernel caps (a sandboxed process for host tools is design-only: `docs/contributing/sandboxed-tool-process.md`) | #45 |
 | Custom V8 build: research ([findings: don't for 0.10](contributing/research-custom-v8-build.md)) | #44 |
 | A deep review run over the whole tree | |
 | Preparation for an outside security review: threat model, scope, reproducible builds, known-issue list | [written](contributing/security-review-prep.md); builds are not yet bit-reproducible, no outside review has happened |

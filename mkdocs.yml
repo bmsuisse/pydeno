@@ -91,6 +91,7 @@ nav:
       - Strix pentest review: contributing/strix.md
       - Preparing for a security review: contributing/security-review-prep.md
       - Free-threaded CPython: contributing/free-threaded.md
+      - "Design note: sandboxed tool process": contributing/sandboxed-tool-process.md
 
 plugins:
   - search

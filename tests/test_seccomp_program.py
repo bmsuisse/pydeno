@@ -93,8 +93,21 @@ def _idx(arch: str) -> int:
     return 0 if arch == "x86_64" else 1
 
 
+ARG_SHAPES = ((), (0,) * 6, (1, 1, 1, 1, 1, 1), (2**32 - 1, 2**64 - 1, 5, 6, 7, 8))
+# Written by intent, not read from `_sandbox._KILL`: what a worker never does, so a probe for it is
+# an exploit and ends the process.
+NEVER_LEGITIMATE = {
+    "ptrace", "process_vm_readv", "process_vm_writev", "execve", "execveat", "mount",
+    "umount2", "pivot_root", "chroot", "setns", "unshare", "bpf", "perf_event_open",
+    "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "memfd_create",
+    "kexec_load", "kexec_file_load", "init_module", "finit_module", "delete_module", "keyctl",
+    "add_key", "request_key", "open_by_handle_at", "fsopen", "fsmount", "move_mount",
+    "open_tree", "settimeofday", "clock_settime", "sethostname", "reboot", "swapon",
+}  # fmt: skip
+
+
 class TestTheDenyList:
-    def test_every_denied_syscall_is_eperm_whatever_the_arguments(
+    def test_every_denied_syscall_is_refused_whatever_the_arguments(
         self, arch: str, prog: list
     ) -> None:
         nrs = {
@@ -104,21 +117,35 @@ class TestTheDenyList:
         }
         assert len(nrs) > 100
         for name, nr in nrs.items():
-            for args in (
-                (),
-                (0,) * 6,
-                (1, 1, 1, 1, 1, 1),
-                (2**32 - 1, 2**64 - 1, 5, 6, 7, 8),
-            ):
-                assert run(prog, arch, nr, args) == ERRNO | EPERM, f"{name} with {args}"
+            want = KILL_PROCESS if name in sb._KILL else ERRNO | EPERM  # noqa: SLF001
+            for args in ARG_SHAPES:
+                assert run(prog, arch, nr, args) == want, f"{name} with {args}"
 
-    def test_denial_is_an_errno_not_a_kill(self, arch: str, prog: list) -> None:
-        """A denied call must fail, not terminate: some libraries probe, and a kill would turn
-        a harmless probe into an outage."""
-        for pair in sb._SYSCALLS.values():  # noqa: SLF001
-            nr = pair[_idx(arch)]
-            if nr is not None:
-                assert run(prog, arch, nr) != KILL_PROCESS
+    @pytest.mark.parametrize("name", sorted(NEVER_LEGITIMATE))
+    def test_a_never_legitimate_call_kills_whatever_the_arguments(
+        self, arch: str, prog: list, name: str
+    ) -> None:
+        nr = _by_name(arch).get(name)
+        if nr is None:
+            return  # not on this architecture
+        for args in ARG_SHAPES:
+            assert run(prog, arch, nr, args) == KILL_PROCESS, f"{name} with {args}"
+
+    def test_only_the_never_legitimate_list_kills(self, arch: str, prog: list) -> None:
+        """Everything else that is refused fails with an errno: some libraries probe (sockets
+        for name lookups, the scheduler, identity), and a kill would turn a harmless probe into
+        an outage."""
+        killed = {
+            TABLES[arch][str(nr)]
+            for nr in range(sb._FIRST_UNREVIEWED)  # noqa: SLF001
+            if str(nr) in TABLES[arch]
+            for args in ARG_SHAPES
+            if run(prog, arch, nr, args) == KILL_PROCESS
+        }
+        present = {n for n in sb._KILL if _by_name(arch).get(n) is not None}  # noqa: SLF001
+        assert killed == present
+        for name in ("socket", "connect", "sysinfo", "setuid", "personality", "clone"):
+            assert name not in killed
 
 
 class TestWhatTheWorkerNeeds:
@@ -168,6 +195,10 @@ class TestWhatTheWorkerNeeds:
         "getrlimit",
         "sched_getaffinity",
         "uname",
+        "fstatat",  # aarch64's newfstatat
+        "rt_sigreturn",
+        "restart_syscall",
+        "getppid",
         "set_tid_address",
         "mremap",
         "getcwd",
@@ -190,22 +221,34 @@ class TestWhatTheWorkerNeeds:
             # socketpair is allowed for what the worker uses it for (an AF_UNIX stream pair);
             # every other call is checked with zeroed arguments.
             # a real call, not zeros: socketpair as an AF_UNIX stream pair, prctl as PR_SET_NAME
-            special = {"socketpair": (1, 1, 0, 0, 0, 0), "prctl": (15, 0, 0, 0, 0, 0)}
+            special = {
+                "socketpair": (1, 1, 0, 0, 0, 0),
+                "prctl": (15, 0, 0, 0, 0, 0),
+                "ioctl": (0, 0x5401, 0, 0, 0, 0),  # TCGETS
+            }
             args = special.get(name, (0, 0, 0, 0, 0, 0))
             if run(prog, arch, by[name], args) != ALLOW:
                 missing.append(name)
         assert not missing, f"the filter blocks calls the worker relies on: {missing}"
 
-    def test_a_large_part_of_the_table_stays_reachable(
-        self, arch: str, prog: list
-    ) -> None:
-        allowed = sum(
-            run(prog, arch, int(nr)) == ALLOW
-            for nr in TABLES[arch]
-            if int(nr) < sb._FIRST_UNREVIEWED  # noqa: SLF001
-        )
-        # a default-allow deny list: the runtime needs most of the kernel's plumbing
-        assert allowed > 150
+    def test_everything_not_on_a_list_is_refused(self, arch: str, prog: list) -> None:
+        """The filter is an allow-list: with any arguments, a call is allowed only if it is in
+        `_ALLOWED` or is one of the argument-checked calls (whose own tests are below)."""
+        checked = (
+            set(sb._SIGNALS) | set(sb._SELF_PID_ARG0) | set(sb._SELF_PID_ARG1)  # noqa: SLF001
+            | {"clone", "fcntl", "ioctl", "prctl", "socketpair"}
+        )  # fmt: skip
+        reachable = {
+            TABLES[arch][str(nr)]
+            for nr in range(sb._FIRST_UNREVIEWED)  # noqa: SLF001
+            if str(nr) in TABLES[arch]
+            for args in ARG_SHAPES + ((0, 15, 0, 0, 0, 0), (15, 0, 0, 0, 0, 0))
+            if run(prog, arch, nr, args) == ALLOW
+        }
+        listed = {n for n, pair in sb._ALLOWED.items() if pair[_idx(arch)] is not None}  # noqa: SLF001
+        assert reachable - checked == listed
+        # and it is a short list: about a fifth of the kernel's table
+        assert len(listed) < 100
 
 
 class TestClone:
@@ -238,7 +281,11 @@ class TestSignals:
     def test_to_itself_is_allowed(self, arch: str, prog: list, signal_nr: int) -> None:
         assert run(prog, arch, signal_nr, (ME, 0, 0)) == ALLOW
 
-    @pytest.mark.parametrize("victim", [1, 2, 0, ME + 1, ME - 1, 2**31 - 1, 2**32 - 1])
+    # In a container the test process can itself be pid 1 or 2: it is not "someone else" then.
+    @pytest.mark.parametrize(
+        "victim",
+        [v for v in (1, 2, 0, ME + 1, ME - 1, 2**31 - 1, 2**32 - 1) if v != ME],
+    )
     def test_to_anyone_else_is_denied(
         self, arch: str, prog: list, signal_nr: int, victim: int
     ) -> None:
@@ -310,16 +357,24 @@ class TestSignalOwnership:
             assert run(prog, arch, nr, (fd, cmd, ME)) == ERRNO | EPERM
 
     @pytest.mark.parametrize(
-        "cmd",
-        [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 12, 13, 14, 1024, 1025, 1030, 1032, 1033],
+        "cmd", [0, 1, 2, 3, 4, 5, 6, 7, 9, 11, 16, 36, 37, 38, 1025, 1030, 1032, 1034]
     )
-    def test_every_other_fcntl_command_is_untouched(
+    def test_the_fcntl_commands_a_runtime_uses_are_allowed(
         self, arch: str, prog: list, cmd: int
     ) -> None:
-        """F_GETFL/F_SETFL/F_DUPFD(_CLOEXEC)/F_GETFD/F_SETFD and friends are what asyncio and
-        the C library use every day."""
+        """F_GETFL/F_SETFL/F_DUPFD(_CLOEXEC)/F_GETFD/F_SETFD, record locks and read-only queries
+        are what asyncio and the C library use every day."""
         nr = sb._FCNTL[_idx(arch)]  # noqa: SLF001
         assert run(prog, arch, nr, (3, cmd, 0)) == ALLOW
+
+    @pytest.mark.parametrize(
+        "cmd", [12, 13, 14, 1024, 1026, 1031, 1033, 1035, 2**31 - 1]
+    )  # 32-bit lock spellings, F_SETLEASE, F_NOTIFY, F_SETPIPE_SZ, F_ADD_SEALS, unknown
+    def test_any_other_fcntl_command_is_refused(
+        self, arch: str, prog: list, cmd: int
+    ) -> None:
+        nr = sb._FCNTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (3, cmd, 0)) == ERRNO | EPERM
 
     @pytest.mark.parametrize(
         "cmd",
@@ -336,15 +391,20 @@ class TestSignalOwnership:
         nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
         assert run(prog, arch, nr, (3, cmd, os.getppid())) == ERRNO | EPERM
 
-    @pytest.mark.parametrize(
-        "cmd", [0x541B, 0x5421, 0x5452, 0x5401, 0x5413, 0x7001, 0x89]
-    )
-    def test_ordinary_ioctls_are_untouched(
-        self, arch: str, prog: list, cmd: int
-    ) -> None:
-        # FIONREAD, FIONBIO, FIOASYNC, TCGETS, TIOCGWINSZ, and two numbers just outside the block
+    @pytest.mark.parametrize("cmd", [0x541B, 0x5421, 0x5401, 0x5413, 0x5450, 0x5451])
+    def test_ordinary_ioctls_are_allowed(self, arch: str, prog: list, cmd: int) -> None:
+        # FIONREAD, FIONBIO, TCGETS, TIOCGWINSZ, FIONCLEX, FIOCLEX
         nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
         assert run(prog, arch, nr, (3, cmd, 0)) == ALLOW
+
+    @pytest.mark.parametrize(
+        "cmd", [0x5452, 0x7001, 0x89, 0x40086602, 0x9409, 0xC020660B, 0x4B3A]
+    )
+    def test_any_other_ioctl_is_refused(self, arch: str, prog: list, cmd: int) -> None:
+        # FIOASYNC, two arbitrary numbers, FS_IOC_SETFLAGS (chattr), FICLONE, FS_IOC_FIEMAP,
+        # KDSETMODE: the allow-list closes them without naming them
+        nr = sb._IOCTL[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (3, cmd, 0)) == ERRNO | EPERM
 
     @pytest.mark.parametrize(
         "cmd", [0x8900, 0x8903, 0x8904, 0x8912, 0x8913, 0x8927, 0x8933, 0x89FF]
@@ -413,11 +473,11 @@ class TestTheFutureAndTheWrongAbi:
         ):
             assert run(prog, arch, 1, audit_arch=other) == KILL_PROCESS
 
-    def test_every_reviewed_number_gets_an_explicit_answer_never_a_kill(
+    def test_every_reviewed_number_gets_one_of_four_answers(
         self, arch: str, prog: list
     ) -> None:
         verdicts = {run(prog, arch, nr) for nr in range(0, sb._FIRST_UNREVIEWED)}  # noqa: SLF001
-        assert verdicts <= {ALLOW, ERRNO | EPERM, ERRNO | ENOSYS}
+        assert verdicts <= {ALLOW, ERRNO | EPERM, ERRNO | ENOSYS, KILL_PROCESS}
 
     def test_the_tables_stop_below_the_unreviewed_range(self, arch: str) -> None:
         real = [int(n) for n, name in TABLES[arch].items() if name != "syscalls"]
@@ -524,7 +584,27 @@ def test_uname_stays_open_because_v8_on_x86_64_needs_it(arch: str, prog: list) -
     assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ALLOW
 
 
-def test_memfd_create_is_denied(arch: str, prog: list) -> None:
-    # hidden memory: an anonymous file the worker's RSS never shows
+def test_memfd_create_kills(arch: str, prog: list) -> None:
+    # hidden memory: an anonymous file the worker's RSS never shows; no runtime path calls it
     nr = _by_name(arch)["memfd_create"]
-    assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == ERRNO | EPERM
+    assert run(prog, arch, nr, (0, 0, 0, 0, 0, 0)) == KILL_PROCESS
+
+
+@pytest.mark.parametrize("allow_exec", [True, False])
+def test_both_variants_assemble(arch: str, allow_exec: bool) -> None:
+    assert sb._seccomp_program(arch, allow_exec=allow_exec) is not None  # noqa: SLF001
+
+
+@pytest.mark.parametrize("name", ["fork", "vfork", "clone"])
+def test_starting_a_process_is_refused_not_killed(
+    arch: str, prog: list, name: str
+) -> None:
+    """CPython's `subprocess` calls glibc's `vfork()`, which on x86_64 is the `vfork` syscall: a
+    library that tries to run a program must get an error back, not lose the worker (found on a
+    native x86_64 runner; aarch64 has no `vfork` and goes through `clone`)."""
+    nr = _by_name(arch).get(name)
+    if nr is None:
+        return  # not on this architecture
+    assert (
+        run(prog, arch, nr, (0x4111, 0, 0, 0, 0, 0)) == ERRNO | EPERM
+    )  # CLONE_VM|CLONE_VFORK|SIGCHLD

@@ -240,9 +240,15 @@ def _confinement_probe() -> dict[str, Any]:
     if sys.platform.startswith("linux"):
         # Asked before `apply()`: the seccomp filter then refuses this very prctl.
         out["nnp_before"] = _libc_prctl_get(39)  # PR_GET_NO_NEW_PRIVS
-    applied = _sandbox.apply()
+    # `verify_kill`: exercise the seccomp kill action in the throwaway child (a worker only asks
+    # the kernel whether it is supported, to keep one audited kill per start out of the logs).
+    applied = _sandbox.apply(verify_kill=True)
     out["applied"] = applied
     out["extras"] = list(_sandbox.EXTRAS)
+    out["landlock_abi"] = _sandbox.LANDLOCK_ABI
+    out["landlock_note"] = _sandbox.LANDLOCK_NOTE
+    out["seccomp_kill"] = _sandbox.SECCOMP_KILL
+    out["kernel_caps"] = list(_sandbox.KERNEL_CAPS)
     out["missing"] = sorted(_sandbox.missing_layers(applied))
     if applied != "none" and not out["missing"]:
         try:
@@ -452,22 +458,42 @@ def _sandbox_status() -> SandboxStatus:
     if linux:
         abi, abi_why = _landlock_abi()
         abi_text = f"kernel Landlock ABI {abi}" if abi else abi_why
+        landlock_note = probe.get("landlock_note")
         landlock = probe_layer(
             "landlock",
-            f"restricting the filesystem works; {abi_text}",
-            f"could not be applied; {abi_text}",
+            "restricting the filesystem works and the canary (a directory readable a moment "
+            f"earlier) was refused afterwards; {abi_text}",
+            f"could not be applied; {abi_text}"
+            + (
+                f"; {landlock_note}"
+                if isinstance(landlock_note, str) and landlock_note
+                else ""
+            ),
         )
+        killed = probe.get("seccomp_kill") == "verified"
         seccomp = probe_layer(
             "seccomp",
-            "the seccomp-bpf filter survived a throwaway child and installed",
+            "the allow-list filter survived a throwaway child and installed; a never-legitimate "
+            + (
+                "call in that child was killed"
+                if killed
+                else "call in that child was NOT killed (the self-test reports it)"
+            ),
             "a filter could not be installed (blocked by the container profile, an "
             "unsupported architecture, or no_new_privs refused)",
         )
         if not ran_probe:
             empty_root = Layer(False, note or "the probe did not run")
         elif "emptyroot" in extras:
+            caps = probe.get("kernel_caps") or []
             empty_root = Layer(
-                True, "private mount/net/IPC/UTS namespaces and an empty root"
+                True,
+                "private mount/net/IPC/UTS namespaces and an empty root"
+                + (
+                    f"; threads capped by the kernel at {_sandbox.TASK_LIMIT}"
+                    if "tasklimit" in caps
+                    else "; no per-worker kernel thread cap (needs Linux 5.14+)"
+                ),
             )
         else:
             hint = _userns_hint()
