@@ -1,7 +1,7 @@
 # Faster worker start: fork from a template (opt-in, Linux)
 
 A new `IsolatedRuntime` starts a Python worker process: interpreter, the `asyncio` import chain, the OS
-sandbox, the self-test, V8. On a Linux x86_64 box that is about 57 ms before the first call returns, and
+sandbox, the self-test, V8. On a Linux x86_64 box that is about 63 ms before the first call returns, and
 about 45 ms of it is Python starting and importing. The fork template removes that part.
 
 ```python

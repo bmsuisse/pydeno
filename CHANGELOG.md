@@ -12,8 +12,8 @@
   (300). `sandbox_status().worker_start` and `IsolatedRuntime.worker_start` say which mode is in force, and
   `sandbox_status()` warns while it is on. See "Faster worker start" in the advanced guides.
   Measured (Linux x86_64, release build, 25 interleaved pairs): new sandboxed worker plus first call
-  57.6 ms (exec) to 21.2 ms (fork template); 50 `SandboxPool` checkouts in a row against a pool of 4:
-  about 1000 ms to about 365 ms. Needs native x86_64 and aarch64 verification and independent review.
+  63.3 ms (exec) to 21.5 ms (fork template); 50 `SandboxPool` checkouts in a row against a pool of 4:
+  about 1120 ms to about 365 ms. Needs native x86_64 and aarch64 verification and independent review.
 
 ## 0.10.0 — 2026-10-06
 
