@@ -170,7 +170,9 @@ def test_eval_async_after_a_manual_run_of_the_exit_functions_completes() -> None
     assert stdout == "7"
 
 
-def test_work_delivered_from_an_atexit_handler_is_never_touched_by_a_worker_during_finalization() -> None:
+def test_work_delivered_from_an_atexit_handler_is_never_touched_by_a_worker_during_finalization() -> (
+    None
+):
     """The Tokio worker that delivers a late result must be out of Python before the handler returns.
 
     The handler's `asyncio.run` ends as soon as the worker queues the result; the worker is then
