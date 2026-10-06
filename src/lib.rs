@@ -7,6 +7,18 @@ mod scanner;
 pub use runtime::ops::PythonOpMode;
 pub use runtime::{RuntimeConfig, RuntimeHandle};
 
+/// The engine build this extension carries: crate version, target triple and the V8 version it
+/// links. A V8 snapshot is only valid for exactly this combination (see `_snapshot_auth`).
+#[pyfunction]
+fn _build_identity() -> String {
+    format!(
+        "pydeno-{}+{}+v8-{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("PYDENO_BUILD_TARGET"),
+        deno_core::v8::V8::get_version()
+    )
+}
+
 /// Python pydeno module
 ///
 /// This module provides Python bindings to the pydeno JavaScript runtime.
@@ -66,6 +78,7 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::wire_json::_wire_dumps, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(scanner::_scan_source, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(_build_identity, m)?)?;
     m.add(
         "WireNativeError",
         m.py().get_type::<runtime::wire::WireNativeError>(),

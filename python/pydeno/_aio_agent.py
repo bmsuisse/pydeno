@@ -44,6 +44,8 @@ from ._agent import (
     _MAX_ABANDONED_CALLS,
     _MISSING,
     _SESSION_IDS,
+    _regate_hook,
+    _replayed_runs,
     DEFAULT_MAX_JOURNAL_BYTES,
     DEFAULT_MAX_PAUSE,
     DEFAULT_TIMEOUT,
@@ -674,10 +676,12 @@ class AsyncAgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         associated_data: bytes = b"",
         tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
+        regate_replay: bool = False,
         **options: Any,
     ) -> AsyncAgentSandbox:
         """Rebuild a session from a journal (`dump()` output of this class or of `AgentSandbox`)
-        by replaying it on a fresh worker. See `AgentSandbox.load`."""
+        by replaying it on a fresh worker. See `AgentSandbox.load`, including ``regate_replay``
+        (the gate may be async here; it is awaited)."""
         if isinstance(blob, (bytes, bytearray)) and len(blob) > _OFFLOAD_BYTES:
             journal = await asyncio.get_running_loop().run_in_executor(
                 _aio._pool("codec"),  # noqa: SLF001
@@ -692,6 +696,13 @@ class AsyncAgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
+        hook = _regate_hook(
+            options, regate_replay, "AsyncAgentSandbox", sync_only=False
+        )
+        if hook is not None:
+            sources, names = _replayed_runs(journal)
+            for source in sources:
+                await hook.acheck(source, "replay", names)
         token = _JOURNAL_TOOLS.set(frozenset(journal["config"]["tools"]))
         try:
             session = cls(entries, **arguments, **options)

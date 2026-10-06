@@ -189,23 +189,43 @@ Sessions it restores from their journals replay without it, like any load.
 In these cases call `gate_check(gate, code)` yourself first, or build the runtime they use with a
 gate where they accept one.
 
-## Replay is not re-gated
+## Replay is not re-gated by default
 
 `load_session`, `load_snapshot`, `AgentSandbox.load` and `AsyncAgentSandbox.load` restore state by
-replaying a journal, and they do not consult the gate:
+replaying a journal, and by default they do not consult the gate:
 
 - the journal is HMAC-signed with the host's key, so it holds only runs this host already accepted;
 - every run in it passed the gate when it first ran;
 - replay must be deterministic. A classifier that answers differently today would make recovery fail
   halfway, or the replay diverge.
 
-The gate applies again to every new feed or run after the load. If you tighten a policy and need old
-state re-checked, check the journal's code yourself before loading it, or start a fresh session.
+The gate applies again to every new feed or run after the load.
+
+**Re-gating on load.** `AgentSandbox.load` and `AsyncAgentSandbox.load` take `regate_replay=True`,
+which runs the `gate=` you pass over the source of every recorded run (mode `"replay"`, the session's
+tool names in `context.tools`) before any worker starts. A refusal raises `GateDenied` (a gate that
+cannot decide, `GateUnavailable`) and nothing is replayed. It needs a `gate=` (`ValueError` without
+one). Use it with a deterministic gate such as `static_gate`: a tightened `SourcePolicy` then applies
+to stored sessions, and a journal made under a looser configuration is refused instead of replayed.
+
+```python
+g = static_gate(SourcePolicy(forbid_eval=True))
+AgentSandbox.load(blob, key, tools, gate=g, regate_replay=True)  # GateDenied if a run used eval
+```
+
+A gate that is not deterministic (a model classifier) can refuse state that was fine when it ran, so
+leave `regate_replay` off for it. The gate's identity is not recorded in the journal: no policy hash
+is checked, so a changed gate is only noticed by `regate_replay` refusing code, not by a mismatch.
+
+`PydenoSession.load_session` / `load_snapshot` (and the async ones) have no `regate_replay`: their
+journal holds each feed wrapped with the inputs and external-function setup, not the code the gate
+saw, so the gate cannot be re-run over the original text. For them, check the code yourself before
+loading, or start a fresh session.
 
 **Use one `dump_key` per gate configuration.** Replay trusts whatever the key signed. A dump from a
 pool with a lenient gate, or none, loads into a pool with a strict gate if both share a `dump_key`, and
-it replays code the strict gate would refuse. Give each gate configuration its own key, or put the
-configuration in `associated_data`.
+it replays code the strict gate would refuse (unless you load with `regate_replay=True`). Give each
+gate configuration its own key, or put the configuration in `associated_data`.
 
 ## Standalone use
 
