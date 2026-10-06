@@ -50,14 +50,18 @@ pub const MAX_OP_TOKEN: OpToken = (1 << 53) - 1;
 /// Draw a fresh token from a CSPRNG (`uuid` v4 uses OS entropy; avoids `rand`).
 fn random_op_token() -> OpToken {
     loop {
-        let bytes = *uuid::Uuid::new_v4().as_bytes();
-        let raw = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"));
-        let token = raw & MAX_OP_TOKEN;
+        let token = token_from_uuid_bytes(*uuid::Uuid::new_v4().as_bytes()) & MAX_OP_TOKEN;
         // Zero is excluded so a forged `__host_op_sync__(0, ...)` is never live.
         if token != 0 {
             return token;
         }
     }
+}
+
+/// 64 random bits of a v4 UUID: every byte except 6 (version nibble) and 8 (variant bits), which
+/// the format fixes. Using them would pin a bit of the 53-bit token.
+fn token_from_uuid_bytes(b: [u8; 16]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[7], b[9]])
 }
 
 /// Guest-facing message for any failure that would otherwise name a host data
@@ -1735,5 +1739,24 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
             state.put::<GlobalTaskLocals>(GlobalTaskLocals(None));
         })),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn every_bit_of_the_token_is_drawn() {
+        let mut seen_set = 0u64;
+        let mut seen_clear = 0u64;
+        for _ in 0..4096 {
+            let t = random_op_token();
+            assert!(t != 0 && t <= MAX_OP_TOKEN);
+            seen_set |= t;
+            seen_clear |= !t & MAX_OP_TOKEN;
+        }
+        assert_eq!(seen_set, MAX_OP_TOKEN, "a bit position is never set");
+        assert_eq!(seen_clear, MAX_OP_TOKEN, "a bit position is never clear");
     }
 }

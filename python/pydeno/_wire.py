@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
 import select
 import struct
@@ -81,7 +82,25 @@ def _reject_constant(name: str) -> Any:
     raise WireError(f"non-finite JSON constant {name}")
 
 
-_DECODER = json.JSONDecoder(parse_constant=_reject_constant)
+def _parse_float(text: str) -> float:
+    value = float(text)
+    if value in (math.inf, -math.inf):
+        raise WireError("non-finite JSON number must use the tagged form")
+    return value
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out = dict(pairs)
+    if len(out) != len(pairs):
+        raise WireError("frame has a duplicate object key")
+    return out
+
+
+_DECODER = json.JSONDecoder(
+    parse_constant=_reject_constant,
+    parse_float=_parse_float,
+    object_pairs_hook=_reject_duplicate_keys,
+)
 
 
 class Enc:
