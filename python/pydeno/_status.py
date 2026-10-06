@@ -247,7 +247,9 @@ def _reap(pid: int, *, killed: bool) -> None:
 def _confinement_probe() -> dict[str, Any]:
     """Runs in the throwaway child, mirroring what the worker does before its isolate exists."""
     out: dict[str, Any] = {}
-    parent = os.getppid()  # before anything else: the caller, which may legitimately be PID 1
+    parent = (
+        os.getppid()
+    )  # before anything else: the caller, which may legitimately be PID 1
     out["hardened"] = {
         k: v
         for k, v in _sandbox.harden_process().items()

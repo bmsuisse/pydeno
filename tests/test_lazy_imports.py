@@ -16,7 +16,14 @@ pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 15), reason="lazy imports need Python 3.15"
 )
 
-HEAVY = ("asyncio", "concurrent.futures", "inspect", "subprocess", "tempfile", "logging")
+HEAVY = (
+    "asyncio",
+    "concurrent.futures",
+    "inspect",
+    "subprocess",
+    "tempfile",
+    "logging",
+)
 
 
 def _run(code: str) -> str:

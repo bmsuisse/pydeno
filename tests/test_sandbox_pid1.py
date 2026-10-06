@@ -28,7 +28,15 @@ def _can_unshare_pid_namespace() -> bool:
     if not shutil.which("unshare"):
         return False
     done = subprocess.run(  # noqa: S603 - fixed argv
-        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"],
+        [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            "true",
+        ],
         capture_output=True,
         timeout=30,
     )
@@ -48,8 +56,17 @@ def test_a_sandboxed_worker_starts_under_a_pid_1_host() -> None:
         """
     )
     done = subprocess.run(  # noqa: S603 - fixed argv
-        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc",
-         sys.executable, "-c", code],
+        [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--pid",
+            "--fork",
+            "--mount-proc",
+            sys.executable,
+            "-c",
+            code,
+        ],
         capture_output=True,
         text=True,
         timeout=120,

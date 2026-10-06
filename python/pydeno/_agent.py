@@ -30,7 +30,14 @@ from __future__ import annotations
 # list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
 # applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
 # there would run after the sandbox closed the filesystem.
-__lazy_modules__ = ["asyncio", "concurrent.futures", "hashlib", "inspect", "logging", "secrets"]
+__lazy_modules__ = [
+    "asyncio",
+    "concurrent.futures",
+    "hashlib",
+    "inspect",
+    "logging",
+    "secrets",
+]
 
 import asyncio
 import base64

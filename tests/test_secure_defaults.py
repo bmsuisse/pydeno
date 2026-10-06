@@ -51,7 +51,13 @@ def test_a_pool_checkout_gets_the_same_defaults() -> None:
 
 @pytest.mark.parametrize(
     ("value", "mode"),
-    [(True, "auto"), (False, "off"), ("auto", "auto"), ("require", "require"), ("off", "off")],
+    [
+        (True, "auto"),
+        (False, "off"),
+        ("auto", "auto"),
+        ("require", "require"),
+        ("off", "off"),
+    ],
 )
 def test_empty_root_modes(value: object, mode: str) -> None:
     assert _isolated._empty_root_mode(value, "require") == mode  # noqa: SLF001

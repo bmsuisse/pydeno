@@ -50,7 +50,9 @@ def _engine_version() -> bytes:
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"cannot identify this pydeno engine build: {exc}") from exc
     if not identity or len(identity) > _MAX_ENGINE_LEN:
-        raise RuntimeError("cannot identify this pydeno engine build: unusable identity")
+        raise RuntimeError(
+            "cannot identify this pydeno engine build: unusable identity"
+        )
     return identity
 
 
