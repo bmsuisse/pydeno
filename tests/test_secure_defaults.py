@@ -16,6 +16,7 @@ def test_sandbox_defaults_to_require(cls: type) -> None:
 
 
 def test_the_default_runtime_helpers_inherit_require() -> None:
+    pydeno.close_default_runtime()  # an earlier test may have left a plain default runtime open
     try:
         pydeno.configure_default_runtime(isolated=True)
         runtime = pydeno.get_default_runtime()
