@@ -335,6 +335,75 @@ the absent surfaces as absent.
 - Circular reference detection during conversion
 - Automatic garbage collection by V8
 
+### Cold start of a sandboxed worker (#72)
+
+Where a new `IsolatedRuntime` spends its time, measured on a Linux x86_64 box with a release build
+(Python 3.13, `prewarm=False`; the timeline is read from inside the worker, so it is only as steady
+as the machine was):
+
+| Phase | Before | After the startup snapshot |
+|---|---:|---:|
+| `exec` to Python up (`-I -S`) | about 10 ms | about 10 ms |
+| Worker imports (`asyncio` chain about 15 ms of it) | about 20 ms | about 20 ms |
+| OS sandbox applied and self-tested | about 4 ms | about 4 ms |
+| `Runtime()` (V8, extensions, bootstrap) | about 14 ms | about 7 ms |
+| First command | 0.2 ms | 0.2 ms |
+
+`DENO_STARTUP_PHASES=1` makes `deno_core` print its own phases for a plain `Runtime`. They showed
+that nearly all of `Runtime()` went into the bridge script (`ext:pydeno/python_bridge.js`), and
+nearly all of that into `new Intl.Segmenter()`, which the bridge needs twice to learn two prototypes
+that only an instance reaches (`Intl.Segmenter` ICU start-up is about 6.5 ms, the first `Intl`
+object of a process).
+
+**The built-in startup snapshot.** `build.rs` runs plain `deno_core` in snapshot mode, executes
+`src/runtime/js/segmenter_prototypes.js` and parks the result on the global object. A runtime that
+restores from the snapshot finds it there, removes it before any other script runs and uses it;
+otherwise the bridge runs the same file. Rules that keep this safe:
+
+- The snapshot holds nothing from the host or a guest. It is made from files in this repository, on
+  the machine that builds the wheel, and only when that machine is the target (a cross build gets
+  an empty file and the old path).
+- Only things any runtime would find identical may be in it. The call-site prototype and the
+  `WebAssembly` intermediate prototype are created by the runtime itself, so a snapshot's copies are
+  different objects and the bridge still collects those at start-up
+  (`tests/test_bridge_poisoning.py::test_bind_object_refuses_*`).
+- **V8 checks a snapshot against the flags it runs with and refuses any other set** (every flag,
+  including `--random-seed`; it shows up as "Runtime thread initialization failed"). The snapshot is
+  therefore made under `STARTUP_SNAPSHOT_V8_FLAGS` (`src/runtime/startup_snapshot_flags.in`, which is
+  the default worker's flags; `tests/test_startup_snapshot.py` keeps it equal to
+  `_isolated._HARDENING_V8_FLAGS` plus `--jitless`) and `startup_snapshot::builtin()` hands it out
+  only to a process whose flags are exactly those. Any other start is the old path. If you change
+  a default worker flag, change that file too, or workers silently lose the speed-up (the test
+  fails).
+- A user `snapshot=` still wins, and still cannot be combined with `bootstrap=`.
+
+**What was tried and left out**
+
+- A V8 snapshot that holds the whole bridge extension: the call-site prototype and
+  `WebAssembly` are runtime-made (above), and the bridge's `Deno.core.ops` references need the
+  extension's ops declared at snapshot time, which means duplicating them in `build.rs`.
+  The remaining `init_extension_js` is about 3 ms.
+- Turning off the cyclic collector during the worker's imports (`gc.disable()`): measured no
+  difference beyond noise over 16 paired rounds, reverted.
+- Trimming the `asyncio` chain (stubbing `logging`, `subprocess`, `socket`, `inspect` in
+  `sys.modules` before the import): saves a few ms on paper, but it replaces stdlib modules with
+  fakes across Python 3.10 to 3.15, and the worker needs `inspect` itself. Not done.
+
+**Next steps for #72** (not in this change)
+
+1. The opt-in fork-from-template start is PR #124 (Linux, about 63 ms to about 21 ms there); it is
+   independent of the snapshot, whose restore happens in the forked child.
+2. A native Rust worker, estimated at 4 to 6 weeks, would remove the Python floor (about 30 ms of
+   the 45) and leave process spawn plus V8. Plan: port the sandbox code first (seccomp allow-list,
+   Landlock, `harden_process`, the self-test) into a Rust module shared by both workers through PyO3,
+   so one implementation is reviewed; then the wire protocol and command loop; then packaging
+   (maturin cannot put an extension and a binary in one wheel: either a small launcher that loads
+   the existing `_pydeno` library, or a separate statically linked binary, spiked on manylinux and
+   macOS first). Native x86_64 and aarch64 verification and an independent review are required before
+   it can replace the Python worker.
+3. A second snapshot made under `jitless=False`'s flags would give the `jitless=False` worker the
+   same speed-up; any further flag combination needs its own.
+
 ### Promise Polling
 
 Async evaluation (`eval_async`) polls promises by:

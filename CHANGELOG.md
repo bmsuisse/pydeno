@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Faster worker cold start (#72, step 2): a V8 startup snapshot made at build time.** Every
+  runtime used to spend about 7 ms on ICU start-up just to find two built-in prototypes the bridge
+  needs (`Intl.Segmenter`'s). `build.rs` now makes a snapshot holding them, and a runtime restores
+  from it, which also skips most of `deno_core`'s extension set-up. Measured on the release build
+  of one Linux x86_64 box that was heavily loaded by other jobs (so absolute times are inflated),
+  with the old and new build alternated: the new-sandbox-plus-first-call time
+  (`metric_speed.py cold`) has a median of 95 ms before and 72 ms after, the
+  worker's CPU time per start (`prewarm=False`) goes from 68 ms to 52 ms, and 50 sequential `SandboxPool`
+  checkouts from about 1.85 s to about 1.53 s. On the same build with the machine less busy the
+  old path measured about 50 ms. Nothing about the sandbox, limits or
+  wire changed: the snapshot is plain `deno_core` plus those two objects, made from files in this
+  repository. V8 refuses a snapshot under flags other than the ones it was made with, so only a
+  worker started with exactly the default flags (`--jitless` and the hardening flags) uses it; every
+  other start (`jitless=False`, `strict_eval`, a seed, extra `v8_flags`, an in-process `Runtime`, a
+  user snapshot, a build that could not make one such as a cross-compiled one) starts as before.
+  `PYDENO_STARTUP_SNAPSHOT=0` switches it off at run time and `PYDENO_NO_STARTUP_SNAPSHOT=1` at
+  build time. The wheel grows by about 650 KB.
+
 ## 0.10.0 — 2026-10-06
 
 ### Added

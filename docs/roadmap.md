@@ -82,7 +82,7 @@ Status below is a plan, not a promise of dates.
 
 | Item | Issue / PR |
 |---|---|
-| Cold start in the same class as Monty. Step one, an opt-in fork-from-template worker start (about 63 ms to about 21 ms on x86_64), is in PR #124 and waits for independent review (shared ASLR layout and stack canary across forked workers, `empty_root` under fork, aarch64 and macOS) | #72 |
+| Cold start in the same class as Monty. Step two, a V8 startup snapshot made at build time (default workers only, flag-exact, about 7 ms of the worker's runtime start and about a quarter of its CPU time), is on `perf/cold-start-72`; see [architecture](contributing/architecture.md#cold-start-of-a-sandboxed-worker-72). Step one, an opt-in fork-from-template worker start (about 63 ms to about 21 ms on x86_64), is in PR #124 and waits for independent review (shared ASLR layout and stack canary across forked workers, `empty_root` under fork, aarch64 and macOS) | #72 |
 
 ## Before 1.0: external review and soak
 
