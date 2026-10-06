@@ -6,7 +6,8 @@ The `kind` strings are a public contract: lowercase, only ever added to, and lis
 
 **Retry rule (one rule for every kind).** `retryable` is true only when the failure was
 environmental or transient, so running the *same work* again on a *fresh* runtime could plausibly
-succeed: the worker process died or failed to start. A deadline, a memory overrun, a CPU cap or a
+succeed: the worker process died or failed to start, a capped pool had no free worker slot in
+time (`checkout_timeout`; nothing ran), or a gate could not reach a decision. A deadline, a memory overrun, a CPU cap or a
 spent budget is a property of the work under the limits it was given; the same code fails the same
 way again, so those are `retryable=False`. Where a larger limit would let the work finish,
 `retry_with_larger_limits` says so (`timeout=`, `max_memory=`, `max_calls=`, ...): that is a
@@ -34,7 +35,24 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
-__all__ = ["ErrorInfo", "KINDS", "classify_error"]
+__all__ = ["ErrorInfo", "KINDS", "PydenoError", "classify_error"]
+
+
+class PydenoError(Exception):
+    """Base class of every error a `Pydeno` session raises for a feed (Monty's `MontyError`), and
+    of the gate errors (`GateDenied`, `GateUnavailable`).
+
+    `exception()` returns the pydeno exception it wraps (a `JavaScriptError`, `WorkerCrashed`,
+    `RuntimeTimeout`, ...); `classify_error` classifies that one. Defined here, in the module
+    that imports nothing heavy, so the gate can use it anywhere."""
+
+    def __init__(self, message: str, inner: BaseException | None = None) -> None:
+        super().__init__(message)
+        self._pydeno_inner = inner
+
+    def exception(self) -> BaseException:
+        """The exception pydeno raised underneath (this one if there is none)."""
+        return self._pydeno_inner if self._pydeno_inner is not None else self
 
 
 @dataclass(frozen=True)
@@ -76,6 +94,11 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
         True,
         False,
         "The worker process died, hung or failed to start.",
+    ),
+    "checkout_timeout": (
+        True,
+        False,
+        "A pool with max_workers had no free worker slot within checkout_timeout.",
     ),
     "terminated": (False, False, "The runtime was terminated on request."),
     "force_killed": (
@@ -128,7 +151,7 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
     "closed": (
         False,
         False,
-        "The runtime, function, stream or session is already closed.",
+        "The runtime, function, stream, module or session is already closed.",
     ),
     "journal_invalid": (
         False,
@@ -147,6 +170,12 @@ KINDS: dict[str, tuple[bool, bool, str]] = {
         "A value or argument was refused (wire or API misuse).",
     ),
     "cancelled": (False, False, "The surrounding asyncio task was cancelled."),
+    "gate_denied": (False, False, "A gate refused the code before it ran."),
+    "gate_unavailable": (
+        True,
+        False,
+        "A gate could not decide (it failed, timed out or answered wrongly); nothing ran.",
+    ),
     "unknown": (False, False, "An error pydeno does not classify."),
 }
 
@@ -206,7 +235,14 @@ _PROTOCOL = re.compile(
 )
 _CLOSED = re.compile(
     r"(?:runtime is closed|Runtime has been closed|Function has been closed"
-    r"|Stream has been closed|the session is closed|the session was closed)"
+    r"|Stream has been closed|the session is closed|the session was closed"
+    r"|the runtime that created this stream source has been closed or terminated"
+    r"|this WebAssembly module was unloaded)"
+)
+# A stream source handed to a runtime other than the one that created it.
+_OTHER_RUNTIME = re.compile(
+    r"this stream source belongs to a different runtime; a stream source can only be passed "
+    r"to the runtime that created it"
 )
 # The worker reports why it would not start (its text, but only ever a refusal: no retry helps).
 _SANDBOX_REFUSED = re.compile(
@@ -253,6 +289,8 @@ Row = tuple[str, Callable[[BaseException, str, bool], bool]]
 # First match wins; most specific first.
 _ROWS: list[Row] = [
     ("cancelled", lambda e, t, a: _cancelled(e)),
+    ("gate_denied", lambda e, t, a: _is(e, "pydeno._gate", "GateDenied")),
+    ("gate_unavailable", lambda e, t, a: _is(e, "pydeno._gate", "GateUnavailable")),
     ("force_killed", lambda e, t, a: _is(e, "pydeno._pydeno", "RuntimeForceKilled")),
     ("terminated", lambda e, t, a: _is(e, "pydeno._pydeno", "RuntimeTerminated")),
     (
@@ -274,6 +312,11 @@ _ROWS: list[Row] = [
         lambda e, t, a: (
             _is(e, "pydeno._pydeno", "RuntimeTimeout") and bool(_HOST_WAIT.fullmatch(t))
         ),
+    ),
+    # A `TimeoutError` subclass: before both `timeout` rows. Nothing ran; capacity is transient.
+    (
+        "checkout_timeout",
+        lambda e, t, a: _is(e, "pydeno._sandbox_pool", "CheckoutTimeout"),
     ),
     ("timeout", lambda e, t, a: _is(e, "pydeno._pydeno", "RuntimeTimeout")),
     ("tool_budget", lambda e, t, a: _is(e, "pydeno._tools", "ToolBudgetError")),
@@ -316,7 +359,13 @@ _ROWS: list[Row] = [
             and bool(_INFLIGHT.fullmatch(t) or _ABANDONED.fullmatch(t))
         ),
     ),
-    ("invalid_input", lambda e, t, a: isinstance(e, (TypeError, ValueError))),
+    (
+        "invalid_input",
+        lambda e, t, a: (
+            isinstance(e, (TypeError, ValueError))
+            or (isinstance(e, RuntimeError) and bool(_OTHER_RUNTIME.fullmatch(t)))
+        ),
+    ),
 ]
 
 

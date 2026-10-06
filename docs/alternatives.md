@@ -94,9 +94,10 @@ protocol channel the guest cannot write to, timeouts, memory and CPU limits, cra
 engine itself is escaped. That is most of pydeno.
 
 **...QuickJS (or another small engine), compiled to WebAssembly?** A genuine alternative, and arguably a stronger
-isolation story: a small engine inside a WebAssembly runtime has a much smaller trusted base. We have not built or
-measured it. The usual costs are speed (no JIT) and the ecosystem: large browser-oriented libraries are less
-likely to run unmodified.
+isolation story: a small engine inside a WebAssembly runtime has a much smaller trusted base, and fuel metering gives a CPU limit that is deterministic. A measured spike is in
+[Research: engine hardening](contributing/research-engine-hardening.md#108-a-wasm-hosted-engine-with-fuel-metering).
+The costs are speed (roughly 1x to 10x slower than pydeno's jitless worker, more against a JIT), no `Intl`,
+and fewer libraries that run well.
 
 **...isolated-vm or a bare V8 isolate?** The same engine risk as pydeno without the process and OS layers around it.
 

@@ -50,7 +50,7 @@ The same names, mapped onto pydeno's building blocks (`SandboxPool` underneath, 
 
 | Monty | pydeno | What differs |
 |---|---|---|
-| `Monty()` / `AsyncMonty()` | `Pydeno()` / `AsyncPydeno()` | Workers are single-use, so there is no `max_processes`, `max_checkouts_per_worker` or `checkout_timeout`: an empty pool starts a worker on the spot (a cold start, never an error, never a wait). `min_processes` is the number kept ready. `Pydeno()` starts its first worker in the constructor; `AsyncPydeno` on `async with` |
+| `Monty()` / `AsyncMonty()` | `Pydeno()` / `AsyncPydeno()` | Workers are single-use, so there is no `max_checkouts_per_worker`. By default an empty pool starts a worker on the spot (a cold start, never an error, never a wait). The opt-in `max_workers=` caps the pool's live worker processes, checked-out sessions included (Monty's `max_processes`); at the cap a checkout waits up to `checkout_timeout=` (default 30 s) and then raises `CheckoutTimeout`. `min_processes` is the number kept ready. `Pydeno()` starts its first worker in the constructor; `AsyncPydeno` on `async with` |
 | Speed, warm pool (checkout / with first feed / next feed) | the same calls | pydeno 0.11 / about 1.5 / 0.4 ms (the first feed also freezes the clock in a round trip of its own); Monty about 0.04 / 0.04 to 0.15 / 0.01 ms on the same machine. A pydeno checkout does no worker round trip (the session's setup is pre-installed on each pooled worker); the per-feed floor is the worker's async evaluation. Monty reuses workers, pydeno never does (see [Performance](#performance)) |
 | `pool.checkout(script_name=, limits=)` | `pool.checkout(script_name=, limits=)` | No type checking, `os_policy` or `print_flush_interval` (see below) |
 | `MontySession` / `AsyncMontySession` | `PydenoSession` / `AsyncPydenoSession` | `session_id` is always `None` (as for Monty's local workers) |
@@ -66,6 +66,10 @@ The same names, mapped onto pydeno's building blocks (`SandboxPool` underneath, 
 | `ResourceLimits` | `PydenoLimits` | See the table below |
 | `MontyError`, `MontyRuntimeError`, `MontySyntaxError`, `MontyCrashedError` | `PydenoError`, `PydenoRuntimeError`, `PydenoSyntaxError`, `PydenoCrashedError` | `exception()` returns the pydeno exception underneath, and `classify_error()` classifies it. `display('traceback' \| 'type-msg' \| 'msg')` and `traceback()` exist; the worker reports no JavaScript stack yet, so `'traceback'` is usually `'type-msg'` |
 | Timeouts | `PydenoTimeoutError` | A `TimeoutError` and a `PydenoCrashedError` (`timed_out=True`): pydeno's deadline kills the worker, so the session is over. Monty raises inside the sandbox and keeps the session; pydeno chose the kill because a V8 that is told to stop is not always able to (see the security report) |
+
+The default printer shares a 1 MiB UTF-8 payload budget across stdout and stderr per feed,
+then writes one additional `[truncated]` line (12 bytes). An explicit `print_callback` is
+not capped; keep it fast or buffer its output.
 
 ### Limits
 

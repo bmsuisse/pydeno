@@ -28,8 +28,10 @@ _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 collect_ignore = (
     [
         "test_agent_sandbox.py",
+        "test_agent_limit_names.py",
         "test_frame_buffer_bounds.py",
         "test_isolated_limit_values.py",
+        "test_sync_handler_deadline.py",
         "test_limit_values_review.py",
         "test_module_timeout_recovery.py",
         "test_timeout_error_prototype.py",
@@ -43,6 +45,7 @@ collect_ignore = (
         "test_isolated_hardening_round2.py",
         "test_isolated_hardening_round3.py",
         "test_isolated_libraries.py",
+        "test_isolated_command_loop.py",
         "test_isolated_lifecycle.py",
         "test_isolated_limits.py",
         "test_isolated_review_findings.py",
@@ -59,6 +62,7 @@ collect_ignore = (
         "test_sandbox_attest_edges.py",
         "test_review_regressions.py",
         "test_aio_isolated_runtime.py",
+        "test_async_reply_backpressure.py",
         "test_aio_agent.py",
         "test_session_pool.py",
         "test_strict_eval.py",
@@ -91,12 +95,18 @@ collect_ignore = (
         "test_worker_startup.py",
         "test_result_conversion_bounds.py",
         "test_isolated_guest_surface.py",
+        "test_isolated_wasm.py",
+        "test_gate_hooks.py",
+        "test_pr105_gate_wasm.py",
+        "test_worker_capacity.py",
+        "test_stream_source_owner.py",
     ]
     if sys.platform == "win32"
     else []
 )
 
 _PLATFORM_MARKERS = {
+    "release_performance": os.environ.get("PYDENO_TEST_PROFILE") != "debug",
     "linux_only": sys.platform.startswith("linux"),
     "darwin_only": sys.platform == "darwin",
     # Assertions that every dangerous operation is denied only make sense where every

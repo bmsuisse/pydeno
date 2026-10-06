@@ -62,7 +62,9 @@ from ._agent import (
     _wrap,
 )
 from ._aio import AsyncIsolatedRuntime
+from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import WorkerCrashed
+from ._limits import limit_seconds as _limit_seconds
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_MAX_RESULT_BYTES,
@@ -278,7 +280,9 @@ class AsyncAgentSandbox(_SessionBase):
     * `close()` on a session that is running or paused at a tool call kills the worker at once
       rather than asking it to exit;
     * a session belongs to the event loop it was started on;
-    * calling into a session from one of its own tools raises `RuntimeError` ("busy").
+    * calling into a session from one of its own tools raises `RuntimeError` ("busy");
+    * ``gate=`` may also be async: it is awaited (and cancelled at ``gate_timeout``), and
+      cancelling the task while the gate runs leaves the session as it was (nothing was sent).
     """
 
     def __init__(
@@ -296,8 +300,13 @@ class AsyncAgentSandbox(_SessionBase):
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
         runtime: AsyncIsolatedRuntime | None = None,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
         **runtime_options: Any,
     ) -> None:
+        self._gate = _hook(gate, gate_timeout, who="AsyncAgentSandbox", sync_only=False)
+        timeout = _limit_seconds("timeout", timeout)
+        max_pause = _limit_seconds("max_pause", max_pause)
         if runtime is not None:
             clock, random_seed = self._adopt_arguments(
                 "AsyncAgentSandbox",
@@ -479,6 +488,12 @@ class AsyncAgentSandbox(_SessionBase):
         See `AgentSandbox.start`."""
         self._enter()
         try:
+            self._check_usable()  # a closed session does not pay for a gate
+            code = await self._agated(code, "start")
+        except BaseException:  # nothing was sent: the session is as it was
+            self._busy = False
+            raise
+        try:
             return await self._start(code)
         except asyncio.CancelledError:
             self._abort("start() was cancelled; the worker was killed")
@@ -507,7 +522,7 @@ class AsyncAgentSandbox(_SessionBase):
         """`start` the code and answer every tool call with the real tool (awaited if it is a
         coroutine function, on the handler thread pool if it is a plain one); return the result
         or raise what the run failed with. See `AgentSandbox.run`."""
-        step = await self._drive(code)
+        step = await self._drive(code, "run")
         if isinstance(step, Failed):
             raise step.error
         return step.value
@@ -515,11 +530,17 @@ class AsyncAgentSandbox(_SessionBase):
     async def execute(self, code: str) -> ExecutionResult:
         """`run` the code, but return an `ExecutionResult` instead of raising. See
         `AgentSandbox.execute`."""
-        step = await self._drive(code)
+        step = await self._drive(code, "execute")
         return step.to_result(max_error_bytes=self._max_output_bytes)
 
-    async def _drive(self, code: str) -> Done | Failed:
+    async def _drive(self, code: str, mode: str) -> Done | Failed:
         self._enter()
+        try:
+            self._check_usable()  # a closed session does not pay for a gate
+            code = await self._agated(code, mode)
+        except BaseException:  # nothing was sent: the session is as it was
+            self._busy = False
+            raise
         try:
             step = await self._start(code)
             while isinstance(step, ToolCall):

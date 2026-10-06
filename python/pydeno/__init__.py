@@ -67,7 +67,28 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
     from ._result import ExecutionResult, ResultTooLarge
     from ._schema import SchemaTool
     from ._polyfills import WEB_POLYFILLS
-    from ._preflight import Finding, PreflightResult, check_source
+    from ._preflight import (
+        POLICY_MESSAGES,
+        Finding,
+        PreflightResult,
+        SourcePolicy,
+        check_source,
+    )
+    from ._gate import (
+        Gate,
+        GateContext,
+        GateDenied,
+        GateUnavailable,
+        StaticGate,
+        Verdict,
+        all_of,
+        any_of,
+        async_gate_check,
+        gate_check,
+        gate_threads,
+        set_gate_threads,
+        static_gate,
+    )
     from ._pool import (
         InMemoryJournalStore,
         JournalStore,
@@ -82,7 +103,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
         sign_snapshot,
         verify_snapshot,
     )
-    from ._sandbox_pool import AsyncSandboxPool, SandboxPool
+    from ._sandbox_pool import AsyncSandboxPool, CheckoutTimeout, SandboxPool
     from ._status import Layer, SandboxStatus, sandbox_status
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
     from .tools.http_fetch import (
@@ -104,7 +125,7 @@ _LAZY = {
     "PydenoSnapshot": "_front",
     "PydenoComplete": "_front",
     "PydenoLimits": "_front",
-    "PydenoError": "_front",
+    "PydenoError": "_errors",
     "PydenoRuntimeError": "_front",
     "PydenoSyntaxError": "_front",
     "PydenoCrashedError": "_front",
@@ -136,6 +157,7 @@ _LAZY = {
     "JournalTooLarge": "_pool",
     "IsolatedRuntime": "_isolated",
     "WorkerCrashed": "_isolated",
+    "CheckoutTimeout": "_sandbox_pool",
     "SandboxPool": "_sandbox_pool",
     "AsyncSandboxPool": "_sandbox_pool",
     "WEB_POLYFILLS": "_polyfills",
@@ -151,6 +173,21 @@ _LAZY = {
     "Finding": "_preflight",
     "PreflightResult": "_preflight",
     "check_source": "_preflight",
+    "SourcePolicy": "_preflight",
+    "POLICY_MESSAGES": "_preflight",
+    "Gate": "_gate",
+    "GateContext": "_gate",
+    "GateDenied": "_gate",
+    "GateUnavailable": "_gate",
+    "StaticGate": "_gate",
+    "Verdict": "_gate",
+    "all_of": "_gate",
+    "any_of": "_gate",
+    "async_gate_check": "_gate",
+    "gate_check": "_gate",
+    "gate_threads": "_gate",
+    "set_gate_threads": "_gate",
+    "static_gate": "_gate",
     "Layer": "_status",
     "SandboxStatus": "_status",
     "sandbox_status": "_status",
@@ -259,6 +296,13 @@ def _schedule_owner_cleanup(slot: _RuntimeSlot) -> None:
 
 
 setattr(Runtime, "bind", _runtime_bind)
+
+
+# Standard library only, so importing it costs next to nothing (the isolation worker needs it too).
+from ._wasm import AsyncWasmModule, WasmModule  # noqa: E402
+from ._wasm import runtime_load_wasm as _runtime_load_wasm  # noqa: E402
+
+setattr(Runtime, "load_wasm", _runtime_load_wasm)
 
 
 _default_runtime_var: contextvars.ContextVar[_RuntimeSlot | None] = (
@@ -464,6 +508,21 @@ __all__ = [
     "check_source",
     "PreflightResult",
     "Finding",
+    "SourcePolicy",
+    "POLICY_MESSAGES",
+    "Gate",
+    "GateContext",
+    "GateDenied",
+    "GateUnavailable",
+    "StaticGate",
+    "Verdict",
+    "all_of",
+    "any_of",
+    "async_gate_check",
+    "gate_check",
+    "gate_threads",
+    "set_gate_threads",
+    "static_gate",
     "sandbox_status",
     "SandboxStatus",
     "Layer",
@@ -485,6 +544,7 @@ __all__ = [
     "bind_object",
     "Runtime",
     "IsolatedRuntime",
+    "CheckoutTimeout",
     "SandboxPool",
     "AsyncSandboxPool",
     "AgentSandbox",
@@ -501,6 +561,8 @@ __all__ = [
     "ToolNotDiscoveredError",
     "WEB_POLYFILLS",
     "WorkerCrashed",
+    "WasmModule",
+    "AsyncWasmModule",
     "SnapshotAuthenticationError",
     "sign_snapshot",
     "verify_snapshot",

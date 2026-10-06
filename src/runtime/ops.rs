@@ -426,8 +426,38 @@ fn call_handler(
         .map(|arg| js_value_to_python_tracked(py, arg, None, &mut tracker).map_err(map_pyerr))
         .collect::<Result<Vec<_>, _>>()?;
     let py_args = PyTuple::new(py, py_args).map_err(map_pyerr)?;
-    entry.handler.call(py, py_args, None).map_err(map_pyerr)
+    catch_host_panic(|| entry.handler.call(py, py_args, None).map_err(map_pyerr))
 }
+
+/// Run `f` and turn a Rust panic inside it into a JS error instead of letting it unwind.
+///
+/// A host function runs on the runtime thread. If it uses an object tied to another thread there
+/// (`rt.eval` on the runtime that is calling it), PyO3's thread check panics; PyO3 raises that in
+/// Python as `PanicException` and resumes the panic when the call returns to Rust. A panic that
+/// unwinds out of an op aborts the process, so it stops here (issue #58).
+///
+/// The panic text names Rust internals, so it goes to the log only; the guest gets fixed text.
+fn catch_host_panic<T>(f: impl FnOnce() -> Result<T, JsErrorBox>) -> Result<T, JsErrorBox> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        log::error!("pydeno host function call panicked: {detail}");
+        let message = if detail.contains("unsendable") {
+            THREAD_BOUND_OBJECT_ERROR
+        } else {
+            "host function call failed"
+        };
+        Err(JsErrorBox::type_error(format!(
+            "{HOST_ERROR_MARKER}RuntimeError: {message}"
+        )))
+    })
+}
+
+const THREAD_BOUND_OBJECT_ERROR: &str = "this object cannot be used from the runtime thread, \
+     where host functions run; use it outside the host function";
 
 /// Marker prefixed onto op error messages carrying a Python exception class,
 /// which `restoreHostError` in the bridge JS lifts back onto `error.name`.
@@ -452,7 +482,9 @@ fn map_pyerr(err: PyErr) -> JsErrorBox {
 }
 
 fn to_js(result: Py<PyAny>, limits: &SerializationLimits) -> Result<JSValue, JsErrorBox> {
-    Python::attach(|py| python_to_js_value(result.into_bound(py), limits).map_err(map_pyerr))
+    Python::attach(|py| {
+        catch_host_panic(|| python_to_js_value(result.into_bound(py), limits).map_err(map_pyerr))
+    })
 }
 
 /// Most index properties one value may list when it is converted, whatever the serialization
@@ -556,7 +588,7 @@ fn op_pydeno_call_python_sync(
     // One GIL acquisition for the call and the result conversion.
     Python::attach(|py| {
         let result = call_handler(py, &entry, &args, &limits)?;
-        python_to_js_value(result.into_bound(py), &limits).map_err(map_pyerr)
+        catch_host_panic(|| python_to_js_value(result.into_bound(py), &limits).map_err(map_pyerr))
     })
 }
 
@@ -1490,6 +1522,83 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
   }
   globalThis.__pydeno_from_py_stream = fromPyStream;
 
+  // `load_wasm` (python/pydeno/_wasm.py): compile and instantiate a host-supplied, trusted module
+  // and hand the host a closure over its exported functions. The instance lives only in that
+  // closure, which the host holds as a function handle; nothing guest-reachable refers to it.
+  // The WebAssembly intrinsics are captured here, before any guest code exists, so a guest that
+  // has replaced `WebAssembly.Module`, `WebAssembly.Instance` or the `exports` getter by the time
+  // the host loads a module cannot see the bytes or substitute its own instance. Installed only
+  // when this V8 has WebAssembly at all: under `--jitless` (the isolated worker's default) the
+  // global does not exist, so that guest's surface is unchanged.
+  if (typeof WebAssembly === "object" && WebAssembly !== null) {
+    const WasmModuleCtor = WebAssembly.Module;
+    const WasmInstanceCtor = WebAssembly.Instance;
+    const WasmModuleImports = WebAssembly.Module.imports;
+    const WasmModuleExports = WebAssembly.Module.exports;
+    const WasmInstanceExports = uncurry(
+      GetOwnPropertyDescriptor(WebAssembly.Instance.prototype, "exports").get
+    );
+    const ReflectApply = Reflect.apply;
+    const ObjectFreeze = Object.freeze;
+    const TypedArrayTag = uncurry(
+      GetOwnPropertyDescriptor(GetPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get
+    );
+
+    const wasmLoad = function (bytes) {
+      if (!IsView(bytes) || TypedArrayTag(bytes) !== "Uint8Array") {
+        throw new TypeErrorCtor("load_wasm expects the module's bytes");
+      }
+      const module = new WasmModuleCtor(bytes);
+      if (WasmModuleImports(module).length !== 0) {
+        throw new TypeErrorCtor("load_wasm: modules with imports are not supported");
+      }
+      const exported = WasmInstanceExports(new WasmInstanceCtor(module));
+      let functions = { __proto__: null };
+      const names = WasmModuleExports(module);
+      for (let index = 0; index < names.length; index++) {
+        const entry = names[index];
+        if (entry.kind === "function") {
+          setOwn(functions, entry.name, exported[entry.name]);
+        }
+      }
+      // `call(name, args, wide)`: `args` are numbers, except where `wide[i] === true` marks an
+      // i64 parameter (the host parsed the signatures): that one is a decimal string, because a
+      // host integer up to 2^64 would cross as a lossy double, and V8 takes an i64 only as a BigInt.
+      // `call(null)` unloads: the instance becomes unreachable and later calls fail.
+      return function (name, args, wide) {
+        if (name === null) {
+          functions = null;
+          return undefined;
+        }
+        if (functions === null) {
+          throw new TypeErrorCtor("this WebAssembly module was unloaded");
+        }
+        if (typeof name !== "string" || !HasOwn(functions, name)) {
+          throw new TypeErrorCtor("the module exports no function of that name");
+        }
+        if (!ArrayIsArray(args) || !ArrayIsArray(wide)) {
+          throw new TypeErrorCtor("load_wasm: invalid call");
+        }
+        const callArgs = [];
+        for (let index = 0; index < args.length; index++) {
+          const value = args[index];
+          if (wide[index] === true) {
+            if (typeof value !== "string") {
+              throw new TypeErrorCtor("load_wasm: invalid call");
+            }
+            setOwn(callArgs, index, BigIntCtor(value));
+          } else if (typeof value === "number") {
+            setOwn(callArgs, index, value);
+          } else {
+            throw new TypeErrorCtor("WebAssembly arguments must be numbers");
+          }
+        }
+        return ReflectApply(functions[name], undefined, callArgs);
+      };
+    };
+    globalThis.__pydeno_wasm_load = ObjectFreeze(wasmLoad);
+  }
+
   // Library code (or a guest) that assigns to one of these would silently reroute every bound
   // host function, since they look the bridge up by name at call time, and the Rust side looks up
   // `__pydeno_bind_object` and `__pydeno_from_py_stream` on the live global. Fixed in place and
@@ -1503,6 +1612,9 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     "__pydeno_bind_function",
     "__pydeno_from_py_stream",
   ];
+  if (HasOwn(globalThis, "__pydeno_wasm_load")) {
+    FIXED_GLOBALS[FIXED_GLOBALS.length] = "__pydeno_wasm_load";
+  }
   for (let index = 0; index < FIXED_GLOBALS.length; index++) {
     DefineProperty(globalThis, FIXED_GLOBALS[index], {
       writable: false,

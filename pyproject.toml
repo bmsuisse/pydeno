@@ -77,6 +77,7 @@ python-source = "python"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    "release_performance: absolute speed budget for optimized builds; deselected with PYDENO_TEST_PROFILE=debug",
     "linux_only: needs Linux (seccomp, Landlock, abstract sockets); deselected, not skipped, elsewhere",
     "darwin_only: needs macOS (Seatbelt); deselected, not skipped, elsewhere",
     "full_sandbox: asserts every dangerous operation is denied; deselected where PYDENO_EXPECT_SANDBOX names a degraded set of layers",

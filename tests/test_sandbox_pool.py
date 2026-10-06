@@ -48,6 +48,7 @@ def _ready_procs(pool: SandboxPool) -> list[subprocess.Popen[bytes]]:
 
 
 class TestCheckout:
+    @pytest.mark.full_sandbox
     def test_a_checkout_is_a_started_isolated_runtime(self) -> None:
         with SandboxPool(_cfg(), size=2) as pool:
             assert pool.wait_ready(30)
@@ -219,14 +220,14 @@ class TestExhaustion:
         with SandboxPool(_cfg(), size=1) as pool:
             assert pool.wait_ready(30)
             core = pool._core  # noqa: SLF001
-            real_new = core.new
+            real_new = core._create
 
             def failing_new(session: object = None) -> IsolatedRuntime:
                 if session is None:  # a background start; checkouts pass their session
                     raise OSError("no processes left")
                 return real_new(session)  # type: ignore[arg-type]
 
-            core.new = failing_new  # type: ignore[method-assign]
+            core._create = failing_new  # type: ignore[method-assign]
             first = pool.checkout()
             second = pool.checkout()  # pool empty, the filler failing: a cold start
             try:
@@ -240,7 +241,7 @@ class TestExhaustion:
             finally:
                 first.close()
                 second.close()
-                core.new = real_new  # type: ignore[method-assign]
+                core._create = real_new  # type: ignore[method-assign]
 
 
 class TestClose:

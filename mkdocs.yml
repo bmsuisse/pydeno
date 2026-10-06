@@ -48,6 +48,7 @@ nav:
           - Network access (http_fetch): guides/http-fetch.md
           - "Pydeno: the front door": guides/quickstart-pydeno.md
           - pydantic-ai code mode: guides/pydantic-ai.md
+          - A gate in front of the sandbox: guides/gate.md
           - Upgrading: guides/upgrading.md
           - Advanced:
               - Agent sessions: guides/agent-sessions.md
@@ -71,6 +72,7 @@ nav:
   - Reference:
       - Error kinds: reference/error-kinds.md
       - Pre-check and sandbox status: reference/preflight-and-status.md
+      - Gate: reference/gate.md
   - Alternatives: alternatives.md
   - Roadmap to 1.0: roadmap.md
   - API Reference:
@@ -83,6 +85,7 @@ nav:
       - Architecture: contributing/architecture.md
       - Upstream provenance: contributing/upstream-divergence.md
       - Supply-chain security: contributing/supply-chain.md
+      - "Research: engine hardening": contributing/research-engine-hardening.md
       - Autoresearch loops: contributing/autoresearch.md
       - Strix pentest review: contributing/strix.md
 

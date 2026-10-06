@@ -39,7 +39,7 @@ OUT=${OUT_DIR:-$(mktemp -d)}
 mkdir -p "$OUT"
 # The monty-parity file is left out by default: its strict xfails run the in-process crash
 # probes for minutes and do not depend on the kernel. One cell runs it (PYTEST_TARGETS=...).
-TARGETS=${PYTEST_TARGETS:-"tests/test_isolated_runtime.py tests/test_isolated_lifecycle.py tests/test_isolated_determinism.py tests/test_isolated_fuzz.py tests/test_snapshot_auth.py tests/test_redteam_syscalls.py tests/test_sandbox_syscall_tables.py tests/test_known_escape_techniques.py tests/test_guest_globals.py tests/test_isolated_libraries.py tests/test_isolated_review_findings.py tests/test_aio_isolated_runtime.py tests/test_isolated_limits.py tests/test_status.py tests/test_sandbox_attest.py tests/test_sandbox_attest_edges.py"}
+TARGETS=${PYTEST_TARGETS:-"tests/test_isolated_runtime.py tests/test_isolated_lifecycle.py tests/test_isolated_determinism.py tests/test_isolated_fuzz.py tests/test_snapshot_auth.py tests/test_redteam_syscalls.py tests/test_sandbox_syscall_tables.py tests/test_known_escape_techniques.py tests/test_guest_globals.py tests/test_isolated_libraries.py tests/test_isolated_review_findings.py tests/test_aio_isolated_runtime.py tests/test_isolated_limits.py tests/test_status.py tests/test_sandbox_attest.py tests/test_sandbox_attest_edges.py tests/test_isolated_command_loop.py tests/test_isolated_wasm.py"}
 
 case "$PROFILE" in
   default)     BLOCK=""; EXPECT="landlock+seccomp" ;;
@@ -119,7 +119,7 @@ r.close()
 " || echo "layers: could not start a worker"
 
 mkdir -p /work
-cp -r /src/tests /src/vendor /src/examples /work/
+cp -r /src/tests /src/vendor /src/examples /src/docs /src/scripts /work/
 cp /src/pyproject.toml /src/CLAUDE.md /work/
 cd /work
 echo "== $(. /etc/os-release; echo "$PRETTY_NAME") | $(/tmp/v/bin/python -V) | glibc $(ldd --version 2>/dev/null | head -1 | grep -o '[0-9.]*$' || echo '?') | kernel $(uname -r) | $(uname -m)"

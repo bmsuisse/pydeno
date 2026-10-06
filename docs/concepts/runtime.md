@@ -262,6 +262,22 @@ async def handle_request():
         return result
 ```
 
+### Inside a host function
+
+A synchronous function bound with [`bind_function()`][pydeno.Runtime.bind_function] runs on the runtime's own thread, not on the thread that created the `Runtime`. What it may use there:
+
+| Object or call | From inside a host function |
+|---|---|
+| [`Runtime`][pydeno.Runtime] methods (`eval`, `bind_function`, ...) on the calling runtime, or a `JsFunction` it returned (calling it or returning it) | Not allowed. The guest gets a `RuntimeError` ("this object cannot be used from the runtime thread, ..."), which it can catch; the runtime stays usable. The details go to the `log` output, and PyO3 also prints a panic message to stderr. |
+| A stream source from [`stream_from_async_iterable()`][pydeno.Runtime.stream_from_async_iterable] | Allowed: create it outside the host function and return it; the guest receives a `ReadableStream`. Read it from code run with `eval_async()`, because its chunks come from the event loop the source was created on. |
+| Plain values (numbers, strings, lists, dicts, bytes, ...) | Allowed. |
+
+Keep a reference to a stream source until the guest has finished reading it. When the last Python reference goes away, the source's finalizer cancels the stream, and the guest's next read fails with `Unknown Python stream id`. A source created inside an async host function and returned without being stored anywhere is already gone when the guest reads it.
+
+A stream source belongs to the runtime that created it. Passing it to another runtime (returned from that runtime's host function, passed to one of its functions, bound with `bind_object()`, or yielded by one of its streams) raises `RuntimeError` ("this stream source belongs to a different runtime; ..."), and so does passing it anywhere once its runtime is closed. Before 0.9 the other runtime could read its own stream with the same id instead.
+
+Before 0.9 both of the first two rows aborted the whole process.
+
 ## Best Practices
 
 - Prefer `with Runtime()` context manager to ensure memory is released.

@@ -2,7 +2,7 @@
 
 use crate::runtime::conversion::{js_value_to_python, python_to_js_value_tracked};
 use crate::runtime::handle::RuntimeHandle;
-use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::js_value::{on_runtime_thread, JSValue, LimitTracker, SerializationLimits};
 use crate::runtime::runner::FunctionCallResult;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -35,7 +35,6 @@ impl JsFunction {
         fn_id: u32,
         serialization_limits: SerializationLimits,
     ) -> PyResult<Py<Self>> {
-        handle.track_function_id(fn_id);
         let finalizer = JsFunctionFinalizer {
             handle: Mutex::new(Some(handle.clone())),
             fn_id,
@@ -43,13 +42,15 @@ impl JsFunction {
         let py_obj = Py::new(
             py,
             Self {
-                handle: RefCell::new(Some(handle)),
+                handle: RefCell::new(Some(handle.clone())),
                 fn_id,
                 closed: Cell::new(false),
                 serialization_limits,
             },
         )?;
         attach_finalizer(py, &py_obj, finalizer)?;
+        // Rollback owns the ID until both wrapper and finalizer exist.
+        handle.track_function_id(fn_id);
         Ok(py_obj)
     }
 
@@ -78,10 +79,7 @@ impl JsFunction {
     /// Convert a call's arguments with one shared `LimitTracker`, so
     /// `max_serialization_bytes` is an aggregate budget for the whole call.
     fn convert_python_args(&self, args: &Bound<'_, PyTuple>) -> PyResult<Vec<JSValue>> {
-        let mut tracker = LimitTracker::new(
-            self.serialization_limits.max_depth,
-            self.serialization_limits.max_bytes,
-        );
+        let mut tracker = LimitTracker::for_limits(&self.serialization_limits);
         args.iter()
             .map(|arg| python_to_js_value_tracked(arg, &mut tracker))
             .collect()
@@ -213,6 +211,13 @@ impl JsFunctionFinalizer {
         let fn_id = self.fn_id;
         py.detach(move || {
             if !runtime_handle.is_function_tracked(fn_id) {
+                return;
+            }
+            if on_runtime_thread() {
+                // Run by a collection inside a host function: waiting for the runtime thread
+                // from itself never ends, and `close` may hold the shutdown lock meanwhile.
+                runtime_handle.release_function_detached(fn_id);
+                runtime_handle.untrack_function_id(fn_id);
                 return;
             }
             if !runtime_handle.is_shutdown() {

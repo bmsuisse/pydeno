@@ -19,7 +19,7 @@ import contextvars
 import functools
 import inspect
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from ._agent import (
@@ -41,7 +41,6 @@ from ._aio_agent import AsyncAgentSandbox, apreinstall
 from ._front import (
     _CONFIG,
     _EXTERNAL,
-    _REFILL_DELAY,
     PydenoComplete,
     PydenoCrashedError,
     PydenoError,
@@ -61,18 +60,22 @@ from ._front import (
     _fresh_seed,
     _is_js_syntax,
     _journal_seed,
+    _wrong_load,
     _Limits,
     _load_failure,
     _not_available,
     _output,
+    _own,
     _prepare,
     _Prepared,
     _Printer,
+    _REFILL_DELAY,
     _printer_for,
     _resolve_limits,
     _start_failure,
     _unpack,
 )
+from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import WorkerCrashed
 from ._sandbox_pool import AsyncSandboxPool
 
@@ -85,22 +88,22 @@ class _Pool(AsyncSandboxPool):
     """`AsyncSandboxPool`, except that every worker gets its own random seed and has run its
     first command (see `_front._Core`)."""
 
-    async def _new(self, session: dict[str, Any] | None = None) -> AsyncIsolatedRuntime:
-        if session is None and self._ready:
-            await asyncio.sleep(_REFILL_DELAY)  # see `_front._Core.new`
-        rt = await AsyncIsolatedRuntime.create(
+    def _build(self, session: dict[str, Any] | None = None) -> AsyncIsolatedRuntime:
+        return AsyncIsolatedRuntime(
             self._config,
             prewarm=False,
             random_seed=_fresh_seed(),
             **self._spawn,
             **(self._session if session is None else session),
         )
-        try:
-            await apreinstall(rt, [_EXTERNAL])  # off the checkout path, as in `Pydeno`
-        except BaseException:
-            await rt.close()
-            raise
-        return rt
+
+    async def _start_runtime(
+        self, rt: AsyncIsolatedRuntime, session: dict[str, Any] | None
+    ) -> None:
+        if session is None and self._ready:
+            await asyncio.sleep(_REFILL_DELAY)
+        await rt._start()
+        await apreinstall(rt, [_EXTERNAL])
 
 
 class AsyncPydeno:
@@ -109,21 +112,29 @@ class AsyncPydeno:
     Takes `Pydeno`'s arguments. Constructing it validates them and starts nothing; the workers
     start on ``async with AsyncPydeno() as pool:`` (or ``await pool.start()``), on the loop that
     will use them: the first one before ``async with`` returns, so a platform that cannot sandbox
-    fails there with a `PydenoCrashedError`, the rest in the background."""
+    fails there with a `PydenoCrashedError`, the rest in the background. ``gate=`` may also be
+    async (awaited, and cancelled at ``gate_timeout``)."""
 
     def __init__(
         self,
         *,
         min_processes: int = 2,
+        max_workers: int | None = None,
+        checkout_timeout: float = 30.0,
         limits: PydenoLimits | None = None,
         sandbox: Literal["require", "auto", "off"] = "require",
         jitless: bool = True,
         strict_eval: bool = False,
         dump_key: bytes | None = None,
         max_tool_threads: int = DEFAULT_MAX_TOOL_THREADS,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         self._key = _check_pool_arguments(
             min_processes, sandbox, jitless, dump_key, strict_eval
+        )
+        self._gate = _hook(
+            gate, gate_timeout, who="AsyncPydenoSession", sync_only=False
         )
         self._budget = _tool_budget(max_tool_threads)
         self._limits_in = limits
@@ -135,7 +146,13 @@ class AsyncPydeno:
             "strict_eval": strict_eval,
             "max_memory": self._limits.max_memory,
         }
-        self._pool = _Pool(_CONFIG, size=min_processes, **self._spawn)
+        self._pool = _Pool(
+            _CONFIG,
+            size=min_processes,
+            max_workers=max_workers,
+            checkout_timeout=checkout_timeout,
+            **self._spawn,
+        )
 
     async def start(self) -> AsyncPydeno:
         """Start the first worker (errors surface here) and the background refill."""
@@ -191,14 +208,21 @@ class AsyncPydeno:
     # -- for sessions --------------------------------------------------------
 
     async def _runtime(
-        self, limits: _Limits, seed: int | None = None
+        self, limits: _Limits, seed: int | None = None, token: object | None = None
     ) -> AsyncIsolatedRuntime:
         try:
             if seed is None and limits.max_memory == self._limits.max_memory:
                 return await self._pool.checkout()
             options = {**self._spawn, "max_memory": limits.max_memory}
-            return await AsyncIsolatedRuntime.create(
-                _CONFIG, random_seed=_fresh_seed() if seed is None else seed, **options
+            return await self._pool._new(  # noqa: SLF001
+                factory=lambda: AsyncIsolatedRuntime(
+                    _CONFIG,
+                    # A spare is an extra process: only without a cap, as before caps existed.
+                    prewarm=self._pool._capacity.maximum is None,  # noqa: SLF001
+                    random_seed=_fresh_seed() if seed is None else seed,
+                    **options,
+                ),
+                token=token,
             )
         except WorkerCrashed as exc:
             raise _start_failure(exc, self._sandbox) from exc
@@ -221,12 +245,21 @@ class AsyncPydeno:
         return agent
 
     async def _load(
-        self, state: bytes, limits: _Limits, associated_data: bytes = b""
+        self,
+        state: bytes,
+        limits: _Limits,
+        associated_data: bytes = b"",
+        *,
+        suspended: bool | None = None,
+        release: Callable[[], Awaitable[object | None]] | None = None,
     ) -> AsyncAgentSandbox:
         seed = _journal_seed(
-            state, self._key, self._spawn["strict_eval"], associated_data
+            state, self._key, self._spawn["strict_eval"], associated_data, suspended
         )
-        rt = await self._runtime(limits, seed)
+        token = None
+        if release is not None and self._pool._capacity.maximum is not None:  # noqa: SLF001
+            token = await release()  # see `Pydeno._load`
+        rt = await self._runtime(limits, seed, token)
         try:
             return await AsyncAgentSandbox.load(
                 state,
@@ -361,6 +394,7 @@ class AsyncPydenoSession:
         self._printer = _Printer()
         self._entered = False
         self._busy = False
+        self._load_failed = False  # see `PydenoSession._load_failed`
         # One id namespace with the agent sessions' (the self-close guard compares them).
         self._sid = next(_SESSION_IDS)
         self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}", pool._budget)  # noqa: SLF001
@@ -419,6 +453,12 @@ class AsyncPydenoSession:
                 else "the session is closed"
             )
         if agent.is_closed():
+            if self._load_failed:
+                raise PydenoCrashedError(
+                    "the session's worker was stopped for a load that then failed (a pool with "
+                    "max_workers frees the slot before the replay); call load_session or "
+                    "load_snapshot again to recover the session, or check out a new one"
+                )
             raise PydenoCrashedError(
                 "the session's worker is gone (crashed, killed, timed out or cancelled); check "
                 "out a new session"
@@ -460,6 +500,8 @@ class AsyncPydenoSession:
         """See `PydenoSession.feed_run`; external functions may also be coroutine functions."""
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=False)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = await self._gated(code, "feed_run", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         self._refused = None
@@ -499,6 +541,8 @@ class AsyncPydenoSession:
         """See `PydenoSession.feed_start`."""
         agent = self._live()
         calls, names = _check_lookup(external_lookup, sync=False)
+        inputs, external_lookup = _own(inputs), _own(external_lookup)
+        code = await self._gated(code, "feed_start", names)
         prepared = _prepare(code, inputs, external_lookup, names)
         self._printer.callback = _printer_for(print_callback)
         try:
@@ -564,22 +608,47 @@ class AsyncPydenoSession:
         if old is None:
             self._live()
         self._printer.callback = None
-        new = await self._pool._load(state, self._limits, associated_data)  # noqa: SLF001
+        assert old is not None
+
+        async def release() -> object | None:
+            # See `PydenoSession._replace`: only with a worker cap.
+            self._load_failed = True
+            rt = old._core.rt  # noqa: SLF001
+            capacity = self._pool._pool._capacity  # noqa: SLF001
+            token = capacity.hand_over(rt._proc)  # noqa: SLF001
+            try:
+                if not old._core.closed:  # noqa: SLF001
+                    old._core.kill("the session loaded new state")  # noqa: SLF001
+                await old.close()
+            except BaseException:
+                capacity.release(token)
+                raise
+            return token
+
+        new = await self._pool._load(  # noqa: SLF001
+            state,
+            self._limits,
+            associated_data,
+            suspended=suspended,
+            release=release,
+        )
         if (new.pending is not None) != suspended:
             await new.close()
-            raise PydenoError(
-                "this state was dumped mid-feed; use load_snapshot"
-                if not suspended
-                else "this state was dumped between feeds; use load_session"
-            )
+            raise _wrong_load(suspended)
         new._core.console.user = self._printer  # noqa: SLF001
         new._core.rt._handler_executor = self._console  # noqa: SLF001
         self._agent = new
-        assert old is not None
+        self._load_failed = False
         await old.close()
         return new
 
     # -- internals -----------------------------------------------------------
+
+    async def _gated(self, code: Any, mode: str, names: tuple[str, ...]) -> Any:
+        """The exact feed code the pool's gate allowed. Cancelled while it runs, nothing has been
+        sent: the session is as it was."""
+        gate = self._pool._gate  # noqa: SLF001
+        return code if gate is None else await gate.acheck(code, mode, names)
 
     async def _start(self, agent: AsyncAgentSandbox, prepared: _Prepared) -> Any:
         step = await agent.start(prepared.source)

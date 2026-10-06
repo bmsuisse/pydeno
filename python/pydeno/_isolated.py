@@ -41,7 +41,8 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import _sandbox, _wire
+from . import _sandbox, _wasm, _wire
+from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._limits import limit_int, limit_seconds
 from ._result import (
     UNSAFE_TEXT,
@@ -430,8 +431,12 @@ class _Pump:
     Console output is not a tool call: it is the guest's own work, but the host's handling of it
     (a slow terminal, a log shipper) is not. So console time pauses the deadline only up to an
     allowance of one hard deadline per command: one slow write does not kill a run, and a flood
-    of them can at most double it (it used to stretch it up to `max_host_wait`). Console time
-    while a tool call is outstanding is covered by that call's pause and not charged twice.
+    of them, or one handler that never returns, can at most double it. Console time while a tool
+    call is outstanding is covered by that call's pause and not charged twice.
+
+    In the synchronous runtime a host handler runs on the pump's own thread, so while one runs
+    the idle watchdog applies these limits instead (`IsolatedRuntime._idle_check`): it kills the
+    worker on time and leaves the verdict for the pump, which raises it once the handler returns.
     """
 
     __slots__ = (
@@ -561,9 +566,11 @@ class IsolatedRuntime:
             The worker's CPU use is also capped at twice the hard deadline per command, which
             callbacks cannot pause. `None` removes the wait cap. Console output is not a
             callback in this sense: handling it pauses the hard deadline for at most one hard
-            deadline in total per command (a flood of slow console writes at most doubles a run),
-            and it does not count toward this wait cap. Console output while a tool call is in
-            flight is covered by that call's pause.
+            deadline in total per command, and it does not count toward this wait cap. Console
+            output while a tool call is in flight is covered by that call's pause. These limits
+            are enforced while a synchronous handler (`on_console`, a tool) runs, too: the
+            worker is killed on time, the handler is not interrupted (it runs on the calling
+            thread), and the command raises `RuntimeTimeout` once the handler returns.
         max_inflight_host_calls: Most host calls that may be outstanding at once (default 64);
             further ones are answered with an error instead of being run. Console calls are
             synchronous and never refused by it (they still count toward `max_host_calls`).
@@ -608,6 +615,15 @@ class IsolatedRuntime:
             every `console.*` call is then a host call (counted by `max_host_calls`). With an
             `on_console`, console output is captured either way.
         python: Interpreter for the worker (default: this one).
+        gate: A `Gate` (sync) that every source this runtime compiles must pass first: the code
+            of `eval` / `eval_async` / `execute` / `execute_async`, the source given to
+            `add_static_module`, every source a `set_module_loader` loader returns, and
+            ``config.bootstrap`` (checked here, before the worker starts). A denial raises
+            `GateDenied` (a gate that cannot decide, `GateUnavailable`) and nothing is sent to
+            the worker; a loader's refusal fails the import and the command raises it. See
+            ``docs/guides/gate.md``.
+        gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded and
+            the code does not run. A sync gate cannot be interrupted, only outlasted.
 
     A worker crash, a hard timeout or a memory kill closes the runtime and raises
     (`WorkerCrashed` or `RuntimeTimeout`); create a new `IsolatedRuntime` to continue.
@@ -635,7 +651,10 @@ class IsolatedRuntime:
         capture_console: bool = False,
         python: str | None = None,
         prewarm: bool = True,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
+        self._gate = _hook(gate, gate_timeout, who="IsolatedRuntime", sync_only=True)
         clock_ms = _clock_ms(clock)
         if random_seed is not None and (
             isinstance(random_seed, bool)
@@ -665,6 +684,17 @@ class IsolatedRuntime:
 
         _check_wire_limits(config, max_memory)
         self._config = {k: getattr(config, k) for k in _CONFIG_KEYS}
+        # Names bound for the guest so far (the gate's `context.tools`), and a gate refusal raised
+        # inside a module loader during the command in flight (that command raises it).
+        self._bound_names: list[str] = []
+        # The command in flight, and refusals module loaders met during it (see `_request`).
+        self._current_cmd: int | None = None
+        self._gate_refusals: dict[int, BaseException] = {}
+        if self._gate is not None and self._config["bootstrap"]:
+            # Before any worker exists: a refused bootstrap starts nothing.
+            self._config["bootstrap"] = self._gate.check(
+                self._config["bootstrap"], "bootstrap"
+            )
         if max_memory is not None and self._config["max_buffer_bytes"] is None:
             # ArrayBuffer storage is outside the V8 heap, so `max_heap_size` cannot bound it, and
             # without a cap a `new Uint8Array(2 ** 31)` is only caught by the RSS poll, which kills
@@ -716,6 +746,11 @@ class IsolatedRuntime:
         # Why the idle watchdog killed the worker, for the pump to report: the watchdog thread
         # cannot raise into the caller, so without this the caller sees only "killed by SIGKILL".
         self._kill_reason: str | None = None
+        # The pump of a command whose synchronous host handler is running right now (None
+        # otherwise), and the watchdog's verdict on it: see `_run_watched`.
+        self._handler_pump: _Pump | None = None
+        self._handler_verdict: RuntimeTimeout | None = None
+        self._handler_lock = threading.Lock()
         # Where `execute()` collects the console output of the command in flight.
         self._capture: OutputCapture | None = None
         if config.on_console is not None or capture_console:
@@ -763,6 +798,9 @@ class IsolatedRuntime:
         self._async_inflight_lock = threading.Lock()
         # Recently revoked handler ids, oldest first (bounded): see `_on_call`.
         self._revoked_hids: dict[int, None] = {}
+        # Ids of `load_wasm` instances whose module object was dropped without `unload()`: sent
+        # along with the next wasm command, so the worker forgets them (see `_wasm.track_drop`).
+        self._wasm_dropped: list[int] = []
         _LIVE.add(self)
         self._handshake()
         self._check_termination_authority()
@@ -1078,9 +1116,18 @@ class IsolatedRuntime:
                 raise WorkerCrashed(self._describe_death("worker is gone")) from None
             self._capture = capture
             self._end_cpu = None
+            self._current_cmd = cmd_id
             try:
-                return self._pump(cmd_id, pump)
+                try:
+                    result = self._pump(cmd_id, pump)
+                except Exception:
+                    self._raise_refusal(cmd_id)
+                    raise
+                self._raise_refusal(cmd_id)
+                return result
             finally:
+                self._current_cmd = None
+                self._gate_refusals.pop(cmd_id, None)
                 self._capture = None
                 # Where "idle" starts: what the worker burns from here on, with no command
                 # running, is the idle watchdog's business. The reading is the one the pump took
@@ -1154,18 +1201,32 @@ class IsolatedRuntime:
         assert remote is not None
         raise remote
 
-    def _idle_check(self) -> None:
+    def _idle_check(self) -> float | None:
         """One pass of the idle watchdog. While a command holds the runtime the pump supervises
         (deadline, CPU, memory), except that the pump can be stuck inside a host handler for as
         long as the handler takes, and a hostile worker can allocate then. So memory and thread
-        count are still checked here, without taking the lock."""
+        count are still checked here, without taking the lock, and while a synchronous handler
+        runs, the whole of the pump's supervision (see `_run_watched`).
+
+        Returns how long to wait before the next pass while a command is in flight (None: the
+        idle interval), so a deadline that passes during a handler is acted on within about
+        `_POLL_SECONDS`."""
         if not self._lock.acquire(blocking=False):
             if not self._closed:
                 try:
+                    with self._handler_lock:
+                        pump = self._handler_pump
+                        if pump is not None:
+                            try:
+                                self._supervise(pump)
+                            except RuntimeTimeout as exc:
+                                # Already killed; the pump raises it when the handler returns.
+                                self._handler_verdict = exc
+                            return _POLL_SECONDS
                     self._check_memory()
                 except WorkerCrashed:
                     pass  # killed; the pump sees the pipe close and reports it
-            return
+            return _POLL_SECONDS
         try:
             if self._closed:
                 return
@@ -1299,7 +1360,7 @@ class IsolatedRuntime:
             # still counts it (above).
             pump.begin_console()
             try:
-                self._run_sync_handler(handler, decoded, cid, None)
+                self._run_watched(handler, decoded, cid, pump, None)
             finally:
                 pump.end_console()
             return
@@ -1337,7 +1398,32 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
-        self._run_sync_handler(handler, decoded, cid, pump)
+        self._run_watched(handler, decoded, cid, pump, pump)
+
+    def _run_watched(
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump,
+        reply_pump: _Pump | None,
+    ) -> None:
+        """Run a synchronous handler on this (the pump's) thread, with the idle watchdog standing
+        in for the pump meanwhile. The handler is never interrupted and never moved to another
+        thread: a host handler may rely on the caller's thread (thread-locals, a terminal, a
+        loop). Only the worker is killed when a limit passes, so a guest cannot make a slow
+        handler extend its run, and the command raises the watchdog's `RuntimeTimeout` once the
+        handler has returned. `reply_pump` is the pump to `end_call` on (None for console)."""
+        self._handler_pump = pump
+        try:
+            self._run_sync_handler(handler, decoded, cid, reply_pump)
+        finally:
+            # Under the lock: a verdict the watchdog is still reaching is seen here, not lost.
+            with self._handler_lock:
+                self._handler_pump = None
+                verdict, self._handler_verdict = self._handler_verdict, None
+        if verdict is not None:
+            raise verdict
 
     def _run_sync_handler(
         self,
@@ -1391,8 +1477,29 @@ class IsolatedRuntime:
 
     # -- public API --------------------------------------------------------
 
+    def _gated(self, code: Any, mode: str, specifier: str | None = None) -> Any:
+        """The exact source the gate allowed (`code` itself without a gate)."""
+        if self._gate is None:
+            return code
+        if self._closed:  # a closed runtime does not pay for a gate (a classifier call)
+            raise WorkerCrashed("runtime is closed")
+        return self._gate.check(code, mode, tuple(self._bound_names), specifier)
+
+    def _record_refusal(self, command: int | None, exc: BaseException) -> None:
+        """A module loader's gate refused a source during `command`: that command raises it."""
+        if command is not None and command == self._current_cmd:
+            self._gate_refusals.setdefault(command, exc)
+
+    def _raise_refusal(self, command: int) -> None:
+        refusal = self._gate_refusals.pop(command, None)
+        if refusal is not None:
+            # Raised even if the guest caught the failed import: the host must know. Its own
+            # `__cause__` (the gate's exception, for an unavailable gate) is kept.
+            raise refusal
+
     def eval(self, code: str) -> Any:
         """Evaluate JavaScript synchronously in the worker."""
+        code = self._gated(code, "eval")
         return self._request(
             {"t": "eval", "code": code}, soft_timeout=self._soft_timeout
         )
@@ -1404,6 +1511,7 @@ class IsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
+        code = self._gated(code, "eval_async")
         loop = asyncio.get_running_loop()
         message = {"t": "eval_async", "code": code, "timeout": soft}
         try:
@@ -1426,9 +1534,11 @@ class IsolatedRuntime:
         `capture_console=True` or an `on_console` (empty otherwise), each capped at
         `max_output_bytes`; a result over `max_result_bytes` of JSON is a ``Failed`` result with
         ``error_type="ResultTooLarge"``. Every failure of the run (a JavaScript error, a timeout,
-        a crashed worker) is reported in the result, not raised."""
+        a crashed worker) is reported in the result, not raised; a gate's refusal is raised
+        (`GateDenied` / `GateUnavailable`), since nothing ran."""
         capture = OutputCapture(max_output_bytes)
         check_limit("max_result_bytes", max_result_bytes)
+        code = self._gated(code, "execute")
         try:
             value = self._request(
                 {"t": "eval", "code": code},
@@ -1453,6 +1563,7 @@ class IsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
+        code = self._gated(code, "execute_async")
         loop = asyncio.get_running_loop()
         message = {"t": "eval_async", "code": code, "timeout": soft}
         try:
@@ -1541,6 +1652,7 @@ class IsolatedRuntime:
             self._kill()
             raise WorkerCrashed("worker returned a malformed capability token")
         self._register_token(token, hid)
+        self._bound_names.append(name)
         return token
 
     def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
@@ -1580,6 +1692,7 @@ class IsolatedRuntime:
             raise WorkerCrashed("worker returned malformed capability tokens")
         for key, token in tokens.items():
             self._register_token(token, hids[key])
+        self._bound_names.append(name)
         return tokens
 
     def revoke_op(self, op_id: int) -> bool:
@@ -1595,7 +1708,73 @@ class IsolatedRuntime:
         return bool(self._request({"t": "revoke", "token": op_id}))
 
     def add_static_module(self, name: str, source: str) -> None:
+        source = self._gated(
+            source, "add_static_module", name if isinstance(name, str) else None
+        )
         self._request({"t": "add_module", "name": name, "source": source})
+
+    def load_wasm(
+        self,
+        module: Any,
+        /,
+        *,
+        max_bytes: int = _wasm.MAX_WASM_BYTES,
+        timeout: float | int | timedelta | None = None,
+    ) -> _wasm.WasmModule:
+        """Load a **trusted** WebAssembly module into the worker; returns a `WasmModule`.
+
+        Needs ``jitless=False`` (the default jitless worker has no WebAssembly, and this raises
+        `RuntimeError` before anything reaches it). `module` is the binary as bytes, or a path this
+        process reads; the worker never gets file access. At most `max_bytes` (default and ceiling
+        8 MiB), no imports. A call runs under the runtime's timeout (or `timeout=`) like `eval`.
+        The module's linear memory counts against `max_memory` but not `max_buffer_bytes`.
+        """
+        if _wasm.flags_disable_wasm(self._options["v8_flags"]):
+            raise RuntimeError(_wasm.JITLESS_MESSAGE)
+        data = _wasm.read_module(module, max_bytes)
+        signatures = _wasm.parse_signatures(data)
+        soft = _limit_seconds("timeout", timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        with _wasm.draining(self._wasm_dropped) as drop:
+            wid = self._request(
+                {
+                    "t": "wasm_load",
+                    "bytes": _wire.Enc(data),
+                    "timeout": soft,
+                    "drop": drop,
+                },
+                soft_timeout=soft,
+            )
+        if not _is_token(wid):
+            self._kill()
+            raise WorkerCrashed("worker returned a malformed module id")
+
+        def call(
+            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+        ) -> Any:
+            soft = _limit_seconds("timeout", call_timeout)
+            if soft is None:
+                soft = self._soft_timeout
+            with _wasm.draining(self._wasm_dropped) as drop:
+                message = {
+                    "t": "wasm_call",
+                    "wid": wid,
+                    "name": name,
+                    "args": _wire.Enc(values),
+                    "wide": wide,
+                    "timeout": soft,
+                    "drop": drop,
+                }
+                return self._request(message, soft_timeout=soft)
+
+        def unload() -> None:
+            if not self._closed:
+                self._request({"t": "wasm_unload", "wid": wid})
+
+        return _wasm.track_drop(
+            _wasm.WasmModule(signatures, call, unload), self._wasm_dropped, wid
+        )
 
     def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
         """Resolve import specifiers with a host function: `(specifier, referrer) -> str | None`."""
@@ -1611,7 +1790,16 @@ class IsolatedRuntime:
         """Supply module source with a host function: `(specifier) -> str`, sync or async.
 
         The source comes back across the process boundary as plain text; the worker, which
-        is the one that compiles it, never sees the loader itself."""
+        is the one that compiles it, never sees the loader itself. With a ``gate``, every source
+        it returns must pass the gate first."""
+        if self._gate is not None:
+            loader = _gated_loader(
+                self._gate,
+                loader,
+                lambda: tuple(self._bound_names),
+                lambda: self._current_cmd,
+                self._record_refusal,
+            )
         hid = next(self._hids)
         self._handlers[hid] = (
             _checked_specifiers(loader, 1),
@@ -1799,12 +1987,13 @@ def _idle_watch(ref: weakref.ref[IsolatedRuntime]) -> None:
         rt = ref()
         if rt is None or rt._closed:  # noqa: SLF001
             return
+        delay = None
         try:
-            rt._idle_check()  # noqa: SLF001
+            delay = rt._idle_check()  # noqa: SLF001
         except Exception:  # noqa: BLE001, S110 - a watchdog must never die of its own check
             pass
         del rt
-        time.sleep(_IDLE_CHECK_SECONDS)
+        time.sleep(delay or _IDLE_CHECK_SECONDS)
 
 
 def _kill_all_at_exit() -> None:

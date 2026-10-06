@@ -45,6 +45,8 @@ MAX_DEPTH = 128
 MAX_NODES = 2_000_000
 
 _HEADER = struct.Struct("<I")
+# Views cost more than a slice for tiny frames; avoid the extra copy for large payloads.
+_COPY_VIEW_THRESHOLD = 64 * 1024
 
 
 class WireError(Exception):
@@ -283,6 +285,13 @@ class FrameReader:
         while len(self._buf) < end:
             if not self._fill(deadline):
                 raise WireError("peer closed mid-frame")
-        payload = bytes(self._buf[_HEADER.size : end])
+        if length < _COPY_VIEW_THRESHOLD:
+            payload = bytes(self._buf[_HEADER.size : end])
+        else:
+            with (
+                memoryview(self._buf) as view,
+                view[_HEADER.size : end] as payload_view,
+            ):
+                payload = bytes(payload_view)
         del self._buf[:end]
         return payload

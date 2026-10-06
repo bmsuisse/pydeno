@@ -7,6 +7,7 @@ use deno_core::v8;
 use indexmap::IndexMap;
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3_async_runtimes::TaskLocals;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -166,20 +167,23 @@ impl JsStreamRegistry {
         &self,
         scope: &mut v8::PinScope<'_, '_>,
         stream_value: v8::Local<'_, v8::Value>,
-    ) -> u32 {
-        let id = self.next_id.get();
-        self.next_id.set(id.wrapping_add(1));
+    ) -> RuntimeResult<u32> {
+        let mut entries = self.entries.borrow_mut();
+        let mut next = self.next_id.get();
+        let id = crate::runtime::registration_id::allocate_id(&mut next, &entries)
+            .ok_or_else(|| RuntimeError::internal("JS stream registration IDs exhausted"))?;
+        self.next_id.set(next);
         let entry = JsStreamEntry {
             stream: v8::Global::new(scope, stream_value),
             reader: None,
             chunks: 0,
             transferred_bytes: 0,
         };
-        self.entries.borrow_mut().insert(id, entry);
+        entries.insert(id, entry);
         let mut stats = self.stats.borrow_mut();
         stats.active = stats.active.saturating_add(1);
         stats.total = stats.total.saturating_add(1);
-        id
+        Ok(id)
     }
 
     pub fn release(&self, stream_id: u32) {
@@ -290,6 +294,11 @@ impl PyStreamRegistry {
         }
     }
 
+    /// The runtime's serialization limits, carrying its owner identity.
+    pub(crate) fn serialization_limits(&self) -> SerializationLimits {
+        self.serialization_limits
+    }
+
     pub fn add_release_listener<F>(&self, listener: F)
     where
         F: Fn(u32) + Send + Sync + 'static,
@@ -313,7 +322,12 @@ impl PyStreamRegistry {
         iterable: Py<PyAny>,
         task_locals: TaskLocals,
     ) -> RuntimeResult<u32> {
-        let stream_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut entries = self.entries.lock().unwrap();
+        // The entries lock serializes allocation and insertion across clones.
+        let mut next = self.next_id.load(Ordering::Relaxed);
+        let stream_id = crate::runtime::registration_id::allocate_id(&mut next, &entries)
+            .ok_or_else(|| RuntimeError::internal("Python stream registration IDs exhausted"))?;
+        self.next_id.store(next, Ordering::Relaxed);
         let entry = Arc::new(PyStreamEntry {
             iterable,
             iterator: AsyncMutex::new(None),
@@ -321,7 +335,7 @@ impl PyStreamRegistry {
             closed: AtomicBool::new(false),
             serialization_limits: self.serialization_limits,
         });
-        self.entries.lock().unwrap().insert(stream_id, entry);
+        entries.insert(stream_id, entry);
         self.active.fetch_add(1, Ordering::Relaxed);
         self.total.fetch_add(1, Ordering::Relaxed);
         Ok(stream_id)
@@ -351,6 +365,16 @@ impl PyStreamRegistry {
             entry.cancel().await?;
         }
         Ok(())
+    }
+
+    /// Cancel a stream from a thread that holds the GIL, without leaving work for a background
+    /// thread: the iterator's `aclose()` is handed to its own event loop, and nothing of ours
+    /// touches Python afterwards. A Tokio worker that waits for the GIL while the interpreter
+    /// finalizes is ended inside CPython (before 3.14), which aborts the process.
+    pub fn cancel_now(&self, py: Python<'_>, stream_id: u32) {
+        if let Some(entry) = self.remove_entry(stream_id) {
+            entry.cancel_now(py);
+        }
     }
 
     pub fn release(&self, stream_id: u32) {
@@ -438,6 +462,59 @@ impl PyStreamEntry {
                 "Python stream errored: {err}"
             ))),
         }
+    }
+
+    /// [`Self::cancel`] for a caller that holds the GIL: `aclose()` is scheduled on the
+    /// iterator's event loop (`call_soon_threadsafe(asyncio.ensure_future, ...)`) instead of
+    /// being awaited here. A closed loop means nobody can run it; the awaitable is closed then.
+    fn cancel_now(&self, py: Python<'_>) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Held only briefly by `ensure_iterator`, which may itself be waiting for the GIL we
+        // hold: never wait for it. A busy lock leaves the iterator to the loop's async
+        // generator hooks.
+        let iterator = match self.iterator.try_lock() {
+            Ok(guard) => guard.as_ref().map(|it| it.clone_ref(py)),
+            Err(_) => None,
+        };
+        let Some(iterator) = iterator else {
+            return;
+        };
+        if let Err(err) = self.schedule_aclose(py, iterator.bind(py)) {
+            log::debug!("PyStream aclose() could not be scheduled: {err}");
+        }
+    }
+
+    /// Plain `&str` names, no `intern!`: this runs inside a stream source's finalizer, which
+    /// can fire while the first `intern!` of the same name is being initialized on this thread
+    /// (pyo3 drops deferred references when it reattaches inside that initialization), and a
+    /// reentrant initialization waits for itself forever.
+    fn schedule_aclose(&self, py: Python<'_>, iterator: &Bound<'_, PyAny>) -> PyResult<()> {
+        if !iterator.hasattr("aclose")? {
+            return Ok(());
+        }
+        let awaitable = py
+            .import("pydeno._awaitable")?
+            .getattr("aclose_quietly")?
+            .call1((iterator,))?;
+        let ensure_future = py.import("asyncio")?.getattr("ensure_future")?;
+        // The source's saved contextvars, as pyo3-async-runtimes passes them for its own
+        // callbacks: `aclose()` (the generator's `finally`) runs in the context it was made in.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("context", self.task_locals.context(py))?;
+        let scheduled = self.task_locals.event_loop(py).call_method(
+            "call_soon_threadsafe",
+            (ensure_future, &awaitable),
+            Some(&kwargs),
+        );
+        if scheduled.is_err() {
+            // Not scheduled: close it so it is not reported as never awaited.
+            if let Ok(close) = awaitable.getattr("close") {
+                let _ = close.call0();
+            }
+        }
+        scheduled.map(drop)
     }
 
     async fn cancel(&self) -> RuntimeResult<()> {

@@ -10,9 +10,9 @@ use crate::runtime::runner::{
 };
 use crate::runtime::stats::RuntimeStatsSnapshot;
 use crate::runtime::stream::{PyStreamRegistry, StreamChunk};
-use pyo3::prelude::Py;
+use pyo3::prelude::{Py, Python};
 use pyo3::PyAny;
-use pyo3_async_runtimes::{tokio as pyo3_tokio, TaskLocals};
+use pyo3_async_runtimes::TaskLocals;
 use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -77,9 +77,10 @@ impl RuntimeHandle {
     /// # Errors
     /// Returns an error if the runtime thread fails to start or initialize.
     pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let serialization_limits = config.serialization_limits();
         let force_kill_grace = config.force_kill_grace;
         let (tx, termination, inspector_info, py_stream_registry) = spawn_runtime_thread(config)?;
+        // From the runtime itself, so the handle converts for the same owner as the runtime.
+        let serialization_limits = py_stream_registry.serialization_limits();
         let (metadata, connection) = inspector_info.unzip();
         let tracked_py_streams: IdSet = Arc::default();
         let tracked = Arc::downgrade(&tracked_py_streams);
@@ -572,14 +573,13 @@ impl RuntimeHandle {
         Ok(stream_id)
     }
 
-    /// Cancel a Python stream on a background task without blocking.
-    pub fn cancel_py_stream_async(&self, stream_id: u32) {
-        let registry = self.py_stream_registry.clone();
-        pyo3_tokio::get_runtime().spawn(async move {
-            if let Err(err) = registry.cancel(stream_id).await {
-                log::debug!("PyStream cancellation for id {} failed: {}", stream_id, err);
-            }
-        });
+    /// Cancel a Python stream on the calling thread, which holds the GIL, without blocking.
+    ///
+    /// Not on a background task: one could still be waiting for the GIL when the interpreter
+    /// finalizes, and CPython ends such a thread inside the GIL wait (before 3.14), which
+    /// aborts the process.
+    pub fn cancel_py_stream(&self, py: Python<'_>, stream_id: u32) {
+        self.py_stream_registry.cancel_now(py, stream_id);
         self.untrack_py_stream_id(stream_id);
     }
 
@@ -608,6 +608,47 @@ impl RuntimeHandle {
         self.termination.is_requested()
             || self.termination.is_terminated()
             || *self.shutdown.lock().unwrap()
+    }
+
+    /// `is_shutdown` that never waits for the shutdown lock: the runtime thread may ask, and
+    /// `close` holds that lock while it waits for the runtime thread. A busy lock reads as
+    /// "not shut down yet" (a close under way finishes on its own).
+    pub(crate) fn is_shutdown_nonblocking(&self) -> bool {
+        self.termination.is_requested()
+            || self.termination.is_terminated()
+            || self.shutdown.try_lock().is_ok_and(|guard| *guard)
+    }
+
+    /// Send `command` without waiting for the shutdown lock or for a reply. For code that may run
+    /// on a runtime thread (a finalizer fired by a garbage collection inside a host function):
+    /// a reply would never come, and `close` may hold the lock. Nothing is sent when the runtime
+    /// is shut down, terminated, or being closed (closing frees the isolate anyway).
+    fn send_detached(&self, command: RuntimeCommand) {
+        if self.termination.is_requested() || self.termination.is_terminated() {
+            return;
+        }
+        // No shutdown-lock check: a try_lock that fails because some other thread holds the lock
+        // briefly would drop the release and leak the handle for the runtime's lifetime. The channel
+        // is unbounded, and a send after shutdown returns an error that is ignored.
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(command);
+        }
+    }
+
+    /// [`Self::release_function`] without waiting (see [`Self::send_detached`]).
+    pub(crate) fn release_function_detached(&self, fn_id: u32) {
+        let (responder, _) = oneshot::channel();
+        self.send_detached(RuntimeCommand::ReleaseFunction { fn_id, responder });
+    }
+
+    /// [`Self::stream_cancel`] without waiting (see [`Self::send_detached`]).
+    pub(crate) fn stream_cancel_detached(&self, stream_id: u32) {
+        let (responder, _) = mpsc::channel();
+        self.send_detached(RuntimeCommand::StreamCancel {
+            stream_id,
+            responder,
+        });
+        self.untrack_js_stream_id(stream_id);
     }
 
     /// Clone of the `Send + Sync` `TerminationController`. Unlike the

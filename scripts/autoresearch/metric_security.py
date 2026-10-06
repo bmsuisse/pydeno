@@ -20,7 +20,7 @@ import time
 import traceback
 from collections.abc import Callable
 
-from pydeno import IsolatedRuntime, Runtime, RuntimeConfig
+from pydeno import IsolatedRuntime, JavaScriptError, Runtime, RuntimeConfig
 
 TIMEOUT = 3.0
 Probe = Callable[[], bool]
@@ -1083,13 +1083,19 @@ def slice_a_async_storm_outlives_the_deadline() -> bool:
         ):
             with iso() as rt:
                 started = time.monotonic()
+                failure = ""
                 try:
                     await rt.eval_async(expr, timeout=TIMEOUT)
                     return True
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    failure = str(exc)
                 if time.monotonic() - started > TIMEOUT * 2:
                     return True
+                # A worker killed for going over its memory ceiling before the deadline is containment
+                # working (unbounded async recursion fills memory as fast as the clock runs out): the
+                # runtime is closed on purpose, and what must hold is that nothing outlives the limits.
+                if "over max_memory" in failure:
+                    continue
                 if rt.is_closed() or rt.eval("1 + 1") != 2:
                     return True
         return False
@@ -2071,6 +2077,41 @@ def console_flood_does_not_stretch_the_hard_deadline() -> bool:
 
 
 @probe
+def slow_console_handler_does_not_keep_the_worker_alive() -> bool:
+    # A 1 s hard deadline and one console call whose handler takes 6 s. The synchronous runtime runs
+    # the handler on the thread that supervises the command; the worker must still die at about the
+    # deadline plus the console allowance (2 s), not when the handler returns (it used to: ~6 s).
+    code = (
+        "import json, os, time\n"
+        "from pydeno import IsolatedRuntime, RuntimeConfig\n"
+        "box = {}\n"
+        "def slow(level, args):\n"
+        "    t = time.monotonic(); end = t + 6\n"
+        "    while time.monotonic() < end:\n"
+        "        try:\n"
+        "            os.kill(box['pid'], 0)\n"
+        "        except ProcessLookupError:\n"
+        "            box.setdefault('died', time.monotonic() - t)\n"
+        "        time.sleep(0.02)\n"
+        "with IsolatedRuntime(RuntimeConfig(on_console=slow), request_timeout=1, sandbox='require') as rt:\n"
+        "    box['pid'] = rt._proc.pid\n"
+        "    try:\n"
+        "        rt.eval(\"console.log('x')\")\n"
+        "    except Exception as exc:\n"
+        "        box['exc'] = type(exc).__name__\n"
+        "print(json.dumps(box))\n"
+    )
+    try:
+        out = _subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=40
+        )
+        box = json.loads(out.stdout.strip().splitlines()[-1])
+    except (_subprocess.TimeoutExpired, ValueError, IndexError):
+        return True
+    return box.get("exc") != "RuntimeTimeout" or not 0 < box.get("died", 99) < 3.5
+
+
+@probe
 def default_printer_volume_is_capped_per_feed() -> bool:
     # Pydeno's default print_callback writes the guest's console to the host's stdout (often a log
     # pipeline). A feed may write at most about 1 MiB there; it used to be unbounded (~150 MB in 2 s).
@@ -2152,6 +2193,218 @@ def stalled_dns_lookups_cannot_pile_up() -> bool:
             getattr(pool, "executor", pool).shutdown(wait=True)
         hf.DNS_THREADS, hf.DNS_MAX_PENDING, hf._dns_pool = saved
     return len(ran) > 4
+
+
+# --- load_wasm (#37) -------------------------------------------------------------------------------------------
+# A trusted module loaded by the host. The surface it adds: one bridge global where V8 has WebAssembly
+# (`jitless=False`), and bytes and calls crossing into the worker.
+_WASM_ADD = bytes.fromhex(
+    "0061736d0100000001070160027f7f017f030201000707010361646400000a09010700200020016a0b"
+)
+
+
+@probe
+def wasm_load_refused_on_jitless_worker() -> bool:
+    # The default worker has no WebAssembly; the helper must refuse there and add nothing to its surface.
+    with iso() as rt:
+        try:
+            rt.load_wasm(_WASM_ADD)
+        except RuntimeError as exc:
+            refused = "jitless=False" in str(exc)
+        else:
+            refused = False
+        return not refused or rt.eval("typeof __pydeno_wasm_load") != "undefined"
+
+
+@probe
+def wasm_guest_poisoned_api_reaches_host() -> bool:
+    # A guest that replaced the WebAssembly API before the host loads a module must neither see the bytes
+    # nor substitute its own instance.
+    with iso(jitless=False) as rt:
+        rt.eval(
+            "globalThis.seen = 0;"
+            "WebAssembly.Module = function () { seen++; throw new Error('guest'); };"
+            "WebAssembly.Instance = function () { seen++; throw new Error('guest'); };"
+            "Object.defineProperty(WebAssembly.Instance.prototype, 'exports',"
+            " { get() { seen++; return { add: () => 666 }; } });"
+            "Object.defineProperty(Object.prototype, 'add', { get() { seen++; return () => 667; } }); 0"
+        )
+        return rt.load_wasm(_WASM_ADD).call("add", 2, 3) != 5 or rt.eval("seen") != 0
+
+
+@probe
+def wasm_guest_planted_loader_gets_the_bytes() -> bool:
+    # A flag that implies jitless without the word (`--lite-mode`) leaves V8 without WebAssembly, so the
+    # bridge installs no loader and a guest can define one. The host's bytes must never reach it, even when
+    # the parent's flag check is bypassed: the worker uses only the loader it took before guest code.
+    from pydeno import _wasm
+
+    plant = (
+        "globalThis.stolen = null; globalThis.__pydeno_wasm_load = (b) => {"
+        " globalThis.stolen = b.length; return () => 666; }; 0"
+    )
+    saved = _wasm.flags_disable_wasm
+    try:
+        for bypass in (False, True):
+            _wasm.flags_disable_wasm = (lambda flags: False) if bypass else saved
+            with iso(jitless=False, v8_flags=["--lite-mode"]) as rt:
+                rt.eval(plant)
+                try:
+                    result = rt.load_wasm(_WASM_ADD).call("add", 2, 3)
+                except RuntimeError:
+                    result = None
+                if result is not None or rt.eval("stolen") is not None:
+                    return True
+    finally:
+        _wasm.flags_disable_wasm = saved
+    return False
+
+
+@probe
+def wasm_loader_global_replaceable() -> bool:
+    with iso(jitless=False) as rt:
+        rt.eval("__pydeno_wasm_load = () => 'guest'; 0")
+        if rt.eval("delete globalThis.__pydeno_wasm_load") is not False:
+            return True
+        if rt.eval("Object.keys(globalThis).includes('__pydeno_wasm_load')"):
+            return True
+        return rt.load_wasm(_WASM_ADD).call("add", 1, 2) != 3
+
+
+@probe
+def wasm_hostile_bytes_end_the_session() -> bool:
+    # Malformed modules must be a clean error, never a lost worker.
+    with iso(jitless=False) as rt:
+        for data in (
+            b"\x00asm\x01\x00\x00\x00\x01\xff\xff\xff\xff\x0f",
+            b"\x00asm\x01\x00\x00\x00\x01\x05\xff\xff\xff\xff\xff",
+            _WASM_ADD[:-1],
+            _WASM_ADD[:-2] + b"\xff\x0b",
+            b"\x00asm\x01\x00\x00\x00" + b"\x0a" + b"\xff" * 64,
+        ):
+            try:
+                rt.load_wasm(data)
+            except (ValueError, JavaScriptError):
+                pass
+        return rt.is_closed() or rt.eval("1 + 1") != 2
+
+
+@probe
+def gate_bypass_runs_refused_code() -> bool:
+    # A gate in front of the worker must fail closed: what it refuses, cannot judge or never saw
+    # must not run, and what it saw must be exactly what runs. Each attempt sets `ran` if it ran.
+    from pydeno import (
+        GateDenied,
+        GateUnavailable,
+        SourcePolicy,
+        Verdict,
+        all_of,
+        static_gate,
+    )
+
+    evil = "globalThis.ran = 1; eval('1')"
+
+    class Disguised(
+        str
+    ):  # what a gate would see through str() / ==, versus the real text
+        def __str__(self) -> str:
+            return "1"
+
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = str.__hash__
+
+    class AlwaysAllow(Verdict):
+        @property  # type: ignore[override]
+        def allow(self) -> bool:  # type: ignore[override]
+            return True
+
+    static = static_gate(SourcePolicy(forbid_eval=True))
+    attempts = [
+        (static, Disguised(evil)),
+        (static, "globalThis.ran = 1; \\u0065val('1')"),
+        (static, "// note globalThis.ran = 1; eval('1')"),
+        (static, "globalThis.ran = 1; globalThis['\\x65val']('1')"),
+        (static, "globalThis.ran = 1; '" + "x" * (17 * 1024 * 1024) + "'"),
+        (
+            lambda s, c: (_ for _ in ()).throw(RuntimeError("down")),
+            "globalThis.ran = 1",
+        ),
+        (lambda s, c: True, "globalThis.ran = 1"),
+        (lambda s, c: "allow", "globalThis.ran = 1"),
+        (lambda s, c: AlwaysAllow.__new__(AlwaysAllow), "globalThis.ran = 1"),
+        (all_of(lambda s, c: Verdict(True, ""), static), evil),
+    ]
+    probe_code = "typeof ran"
+
+    def letting_the_probe_through(gate):  # type: ignore[no-untyped-def]
+        return lambda s, c: Verdict(True, "") if s == probe_code else gate(s, c)
+
+    for gate, code in attempts:
+        with iso(gate=letting_the_probe_through(gate)) as rt:
+            try:
+                rt.eval(code)
+                return True  # ran
+            except (GateDenied, GateUnavailable):
+                pass
+            if rt.eval(probe_code) != "undefined":
+                return True
+    return False
+
+
+@probe
+def static_gate_misread_shapes_run_forbidden_code() -> bool:
+    # Shapes that once made a tokenizer-based scan read code as a regex, a template, a comment or
+    # a string, or hid a name in an escape or a computed key. The default policy scan reads the
+    # whole decoded text, so each must be denied; none may set `hit`.
+    from pydeno import GateDenied, SourcePolicy, Verdict, static_gate
+
+    gate = static_gate(
+        SourcePolicy(
+            forbid_eval=True,
+            forbid_function=True,
+            forbid_dynamic_import=True,
+            forbid_computed_global_access=True,
+        )
+    )
+    shapes = (
+        '#! `\nglobalThis.hit = eval("1")\n// `',
+        'var a = 1 <!-- `\nglobalThis.hit = eval("1")\n// `',
+        'x = function(){} / (globalThis.hit = eval("1")) / 2',
+        'x = class {} / (globalThis.hit = eval("1")) / 2',
+        "f = x => {}\n/`/\nglobalThis.hit = eval(1)//`",
+        'globalThis.hit = globalThis["\\145val"]("1")',
+        'globalThis.hit = globalThis["\\ev\\al"]("1")',
+        'globalThis.hit = globalThis[("eval")]("1")',
+        'globalThis.hit = Reflect.get(globalThis, "eval")("1")',
+        'const {["ev" + "al"]: e} = globalThis; globalThis.hit = e("1")',
+        'const {constructor: F} = function(){}; globalThis.hit = F("return 1")()',
+        "globalThis.hit = \\u{0000000065}val('1')",
+        # a backslash at the end of a comment line is comment text, not a line continuation
+        '//x\\\nglobalThis.hit = eval("1")',
+        '//x\\\r\nglobalThis.hit = eval("1")',
+        '//x\\ globalThis.hit = eval("1")',
+        '#!x\\\nglobalThis.hit = eval("1")',
+        'var q = 1 <!--x\\\nglobalThis.hit = eval("1")',
+        # inside `with (fn)` a bare `constructor` is the Function constructor
+        'with (()=>0) { globalThis.hit = constructor("return 1")() }',
+        "with (()=>0) { class A extends constructor('globalThis.hit = 1') {}; new A() }",
+        'with (()=>0) { globalThis.hit = constructor("1//){")() }',
+    )
+    probe_code = "typeof hit"
+    for code in shapes:
+        with iso(
+            gate=lambda s, c: Verdict(True, "") if s == probe_code else gate(s, c)
+        ) as rt:
+            try:
+                rt.eval(code)
+                return True
+            except GateDenied:
+                pass
+            if rt.eval(probe_code) != "undefined":
+                return True
+    return False
 
 
 def main() -> None:

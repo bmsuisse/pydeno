@@ -125,7 +125,9 @@ The exact behaviour is pinned by tests, so this cannot drift from reality.
 V8's JIT compilers are where most of its exploitable bugs live, and an interpreter-only V8 is a
 much smaller target. The cost is speed on hot compute loops (about 3x on a recursion
 microbenchmark) and **no WebAssembly**. If you need either, pass `jitless=False`; the other layers
-still apply, and `max_memory` still bounds WebAssembly memory.
+still apply, and `max_memory` still bounds WebAssembly memory. To run a trusted compiled module
+next to the guest, `rt.load_wasm(...)` loads it from the host (only with `jitless=False`; see
+[WebAssembly](webassembly.md)).
 
 `v8_flags=[...]` passes extra flags to the worker. Unknown flags are an error, not ignored.
 
@@ -427,10 +429,18 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   options: the same handshake, `sandbox="require"` check, self-test and limits, only earlier. The
   constructor starts the first one itself, so invalid options, or a platform that cannot satisfy
   `sandbox="require"`, fail there and not in the background.
-- **Exhaustion is a cold start, never an error.** If every pooled runtime is taken, `checkout()`
-  starts one on the spot. Replacements start in the background as soon as a runtime is handed out
-  (`max_concurrent_starts`, default 2, at a time); a replacement that fails to start is retried with
-  a backoff and shown in `stats()["last_error"]`.
+- **By default, exhaustion is a cold start, never an error.** If every pooled runtime is taken,
+  `checkout()` starts one on the spot. Replacements start in the background as soon as a runtime is
+  handed out (`max_concurrent_starts`, default 2, at a time); a replacement that fails to start is
+  retried with a backoff and shown in `stats()["last_error"]`.
+- **An opt-in cap bounds the processes.** `max_workers=N` counts every worker process of the pool
+  that has not exited: starting, ready and checked out (until it is closed, crashes, is killed by a
+  limit or is garbage-collected). At the cap, a checkout waits up to `checkout_timeout` seconds
+  (default 30, always finite) for a process to exit, then raises `CheckoutTimeout`
+  (`classify_error` kind `checkout_timeout`, retryable). Waiting is by polling every 20 ms, not a
+  queue: when a slot frees, any waiter may take it. A checkout made while the same thread or task
+  already holds every slot cannot succeed and waits the full `checkout_timeout`. `size` is clamped
+  to the cap. The cap is per pool, not per host.
 - **Options split in two.** What the worker receives when it starts (the `RuntimeConfig`, `sandbox`,
   `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
@@ -439,7 +449,9 @@ The rules, which are what keep a pool as safe as a fresh runtime:
 
 Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
 a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports
-`ready`, `starting`, `checkouts` and `cold_starts`; `wait_ready()` blocks until the pool is full.
+`ready`, `starting`, `checkouts` and `cold_starts`, and for the cap `max_workers`, `workers` (slots
+in use), `waiting` and `checkout_timeouts` (a checkout that timed out counts as neither a checkout nor
+a cold start); `wait_ready()` blocks until the pool is full.
 
 A forked child never receives the parent's pooled workers: its copy of the pool forgets them and
 refills on its first checkout.
@@ -503,8 +515,35 @@ surfaces as `WorkerCrashed` naming the flag.
 ## Proxies crossing the boundary
 
 A Proxy in a result, a stream chunk or a host-function argument crosses as its innermost target,
-found natively, and **none of its traps runs**. Running them would let guest code act in the middle
+found natively, and **none of that Proxy’s traps runs**. Running those traps would let guest code
+act in the middle
 of a conversion (grow a buffer after its size was checked, or answer `ownKeys` with `[]` while the
 engine walks the whole target). So `new Proxy({a: 1}, {get: () => 'x'})` arrives as `{"a": 1}`, a
 Proxy around an Array arrives as a list, and a revoked Proxy or one behind more than 64 others is
-refused.
+refused. A Proxy on an argument’s prototype chain can still run a `getPrototypeOf` trap
+during the bridge’s type checks.
+
+A Proxy around a function crosses as the underlying function; invoking its Python wrapper
+skips the Proxy’s `apply` trap.
+
+## Console callback deadlines
+
+Console output pauses the hard deadline only within an allowance of one hard deadline per
+command, so console handling can at most double a run. This holds while a handler runs, too, in
+both runtimes: a 6 s `on_console` or `print_callback` under a 1 s deadline gets the worker killed
+at about 2 s. `max_host_wait` is enforced the same way while a synchronous tool runs.
+
+The synchronous runtimes (`IsolatedRuntime`, agent sessions, `Pydeno` feeds) run a synchronous
+handler on the thread that runs the command, and they do not move it to another thread or
+interrupt it: a handler can rely on thread-local state, a terminal or the caller's context. A
+watchdog thread kills the *worker* when a limit passes; the command then raises `RuntimeTimeout`
+(`PydenoTimeoutError` in a feed) once the handler returns. So the guest cannot extend its run
+with a slow handler, but your thread still waits for your own handler. The async runtimes run
+synchronous handlers on a worker thread and raise as soon as the limit passes. Either way, buffer
+output in host callbacks instead of blocking on a sink.
+
+## Duration type validation
+
+`RuntimeConfig.timeout` still follows the Rust binding’s numeric conversion rules, which can
+coerce booleans and float-like objects. The shared Python limit validators cover the other
+public duration/count arguments; they do not imply identical type validation for this field.

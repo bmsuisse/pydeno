@@ -50,6 +50,7 @@ import weakref  # noqa: F401
 from collections.abc import Callable
 
 from . import _awaitable  # noqa: F401
+from . import _wasm
 from . import _wire
 from ._pydeno import (
     JavaScriptError,
@@ -203,6 +204,38 @@ _CONFIG_KEYS = (
 )
 
 
+class _CommandLoop(asyncio.SelectorEventLoop):
+    """Between commands this loop looks closed to other threads, as the per-command loop did once
+    `asyncio.run` closed it: a late `call_soon_threadsafe` (a host call's start or completion
+    owed to an earlier command) is refused instead of queued for the next one."""
+
+    def __init__(self) -> None:
+        self._submission_lock = threading.Lock()
+        self._idle = True
+        super().__init__()
+
+    @property
+    def idle(self) -> bool:
+        return self._idle
+
+    @idle.setter
+    def idle(self, value: bool) -> None:
+        # A submission accepted before the idle transition must be queued before settlement.
+        with self._submission_lock:
+            self._idle = value
+
+    def is_closed(self) -> bool:
+        return self.idle or super().is_closed()
+
+    def call_soon_threadsafe(
+        self, callback: Any, *args: Any, context: Any = None
+    ) -> Any:
+        with self._submission_lock:
+            if self._idle:
+                raise RuntimeError("Event loop is closed")
+            return super().call_soon_threadsafe(callback, *args, context=context)
+
+
 class _Worker:
     def __init__(self, in_fd: int, out_fd: int) -> None:
         self._reader = _wire.FrameReader(in_fd)
@@ -225,6 +258,18 @@ class _Worker:
         self._pending_lock = threading.Lock()
         self._call_ids = itertools.count(1)
         self._runtime: Runtime | None = None
+        # One event loop for every async command, driven by the main thread for the length of
+        # the command and idle in between, instead of an `asyncio.run` (a new loop, its selector
+        # and self-pipe, and their teardown) per command. Created here, before the OS sandbox,
+        # like every import; it starts no thread. `_settle` leaves it empty after each command,
+        # and between commands it refuses work from other threads (`_CommandLoop`).
+        self._loop = _CommandLoop()
+        # `load_wasm` instances, by id: the bridge's function handles (the parent holds only ids).
+        self._wasm: dict[int, Any] = {}
+        self._wasm_ids = itertools.count(1)
+        # The bridge's loader, taken once before any guest code (see `_init`), never looked up by
+        # name later: where V8 has no WebAssembly a guest could plant a global of that name.
+        self._wasm_loader: Any = None
 
     # -- transport ---------------------------------------------------------
 
@@ -360,19 +405,57 @@ class _Worker:
             raise RuntimeError("worker is not initialised")
         return self._runtime
 
+    def _run_async(self, make: Callable[[], Any]) -> Any:
+        """Run one async command on the worker's loop. `make` is called from inside the
+        coroutine: `eval_async` binds to the running loop when *called*."""
+
+        async def run() -> Any:
+            return await make()
+
+        self._loop.idle = False
+        try:
+            return self._loop.run_until_complete(run())
+        finally:
+            # From here on other threads see a closed loop: nothing more can be queued for later.
+            self._loop.idle = True
+            self._settle()
+
+    def _settle(self) -> None:
+        """Leave nothing of a command on the loop for the next one, as `asyncio.run` closing
+        its loop did: every task still pending (an async host call the guest started and never
+        awaited) is cancelled and run until it has finished, and whatever callbacks the last pass
+        queued (a finished host call's completion) run now, not at the start of the next
+        command."""
+        loop = self._loop
+        while True:
+            tasks = asyncio.all_tasks(loop)
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            loop.call_soon(loop.stop)
+            loop.run_forever()
+            # Cancellation handlers and done callbacks can create more tasks or queue another
+            # callback. Rescan after each pass instead of carrying those into the next command.
+            if not asyncio.all_tasks(loop) and not loop._ready:
+                break
+        # Keep timers alive while cancelled tasks finish (their cleanup may await sleep), then
+        # discard delayed callbacks as closing the old per-command loop used to do.
+        for handle in loop._scheduled:
+            handle.cancel()
+        loop._scheduled.clear()
+        loop._timer_cancelled_count = 0
+
     def _handle(self, message: dict[str, Any]) -> Any:
         kind = message["t"]
         if kind == "eval":
             return self._rt().eval(message["code"])
         if kind == "eval_async":
-            # `eval_async` binds to the running loop when *called*, so it must be
-            # called from inside the coroutine, not handed to asyncio.run.
-            async def run() -> Any:
-                return await self._rt().eval_async(
+            return self._run_async(
+                lambda: self._rt().eval_async(
                     message["code"], timeout=message.get("timeout")
                 )
-
-            return asyncio.run(run())
+            )
         if kind == "bind_function":
             return self._rt().bind_function(
                 message["name"], self._stub(message["hid"], bool(message["async"]))
@@ -397,13 +480,40 @@ class _Worker:
         if kind == "eval_module":
             return self._rt().eval_module(message["specifier"])
         if kind == "eval_module_async":
-
-            async def run_module() -> Any:
-                return await self._rt().eval_module_async(
+            return self._run_async(
+                lambda: self._rt().eval_module_async(
                     message["specifier"], timeout=message.get("timeout")
                 )
-
-            return asyncio.run(run_module())
+            )
+        if kind in ("wasm_load", "wasm_call"):
+            # Instances whose `WasmModule` the parent dropped without unloading.
+            for wid in message.get("drop", ()):
+                self._wasm.pop(wid, None)
+        if kind == "wasm_load":
+            data = _wire.decode_value(message["bytes"])
+            if not isinstance(data, bytes) or len(data) > _wasm.MAX_WASM_BYTES:
+                raise _wire.WireError("wasm_load takes at most MAX_WASM_BYTES bytes")
+            if self._wasm_loader is None:
+                raise RuntimeError(_wasm.JITLESS_MESSAGE)
+            handle = self._wasm_loader(data, timeout=message.get("timeout"))
+            wid = next(self._wasm_ids)
+            self._wasm[wid] = handle
+            return wid
+        if kind == "wasm_call":
+            handle = self._wasm.get(message["wid"])
+            if handle is None:
+                raise RuntimeError("this WebAssembly module was unloaded")
+            return handle(
+                message["name"],
+                _wire.decode_value(message["args"]),
+                message["wide"],
+                timeout=message.get("timeout"),
+            )
+        if kind == "wasm_unload":
+            handle = self._wasm.pop(message["wid"], None)
+            if handle is not None:
+                handle(None, [], [])
+            return None
         raise _wire.WireError(f"unknown command {kind!r}")
 
     def _run_command(self, message: dict[str, Any]) -> None:
@@ -526,6 +636,9 @@ class _Worker:
                 kwargs.get("bootstrap") or ""
             )
         self._runtime = Runtime(RuntimeConfig(**kwargs))
+        if "--jitless" not in flags:
+            # Before any guest code: only the host's own bootstrap has run.
+            self._wasm_loader = _wasm.bridge_loader(self._runtime)
         self._writer.send(
             {
                 "t": "ready",

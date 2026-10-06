@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llm-pydeno"
-version = "0.1.0"
+version = "0.1.1"
 description = "llm plugin: a sandboxed JavaScript interpreter for models, backed by pydeno."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,8 +18,8 @@ classifiers = [
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
 ]
-# AgentSandbox.execute and ExecutionResult are in pydeno 0.7.0; llm.Toolbox in llm 0.26.
-dependencies = ["pydeno>=0.7.0", "llm>=0.26"]
+# Shared limit validation requires pydeno 0.8.0; llm.Toolbox requires llm 0.26.
+dependencies = ["pydeno>=0.8.0", "llm>=0.26"]
 
 [project.urls]
 Homepage = "https://github.com/bmsuisse/pydeno/tree/main/integrations/llm-pydeno"

@@ -86,9 +86,12 @@ with `Pydeno` and file the building blocks under "Advanced".
 | A JavaScript error exits with code 1 and `pydeno: js_error: ...` on stderr; a timeout exits 3, a missing sandbox 4, another failure 5, a result with no JSON form 6 (all used to exit 1) | the CLI | Scripts that match on the old `JavaScript Error:` text or treat every failure the same | See the exit codes in [Command line](cli.md) |
 | The code runs in a separate worker with `--jitless` V8 (no WebAssembly), a 30 s default deadline and a 1 GiB memory cap; the old CLI had no deadline | the CLI | Code that ran long, used a lot of memory or used WebAssembly from the CLI | `--timeout`, `--max-memory`; for WebAssembly use the API (`IsolatedRuntime(jitless=False)`) |
 | Limit values are validated: NaN, infinity, durations of zero or below (where 0 is not meaningful) or above about 70 years, and counts outside their range raise `ValueError`; a bool, a string, `None` where a value is required, or a float for a count raises `TypeError` (`max_memory` must be an int between 1 and 2**53 - 1) | `IsolatedRuntime`, `AsyncIsolatedRuntime`, pool constructors and `checkout()`, `AgentSandbox`/`AsyncAgentSandbox`, `SessionPool` (and `get(timeout=)`), `PydenoLimits`, per-call `timeout=` | Code passing such values (NaN and infinity silently disabled the limit before); code that caught `ValueError` for a wrong *type* (`OutputCapture(1.5)`, `AgentSandbox(max_tool_calls=True)`, ...) now gets `TypeError`; a `Decimal` used as a *count* (it was accepted by comparison) | Pass `None` to remove a limit; use an int (or numpy int) for byte and call counts; real numbers (`Fraction`, `Decimal`, numpy floats) still work as seconds |
-| Console output pauses the hard deadline only within an allowance of one hard deadline per command (it used to pause it like a tool call, up to `max_host_wait`); console time during an in-flight tool call is covered by the tool's pause | runtimes with `on_console` / `capture_console`, agent sessions, `Pydeno` feeds | A host with a slow `on_console` or `print_callback` and a very chatty guest: the run now ends by about twice its deadline instead of running up to `max_host_wait` | Make the console handler fast (buffer it), or raise the deadline |
+| Console output pauses the hard deadline only within an allowance of one hard deadline per command (it used to pause it like a tool call, up to `max_host_wait`); console time during an in-flight tool call is covered by the tool's pause | runtimes with `on_console` / `capture_console`, agent sessions, `Pydeno` feeds | A host with a slow `on_console` or `print_callback` and a very chatty guest: the console allowance is bounded, also while one handler runs (0.9: the synchronous runtimes kill the worker on time and raise `RuntimeTimeout` once the handler returns) | Make the console handler fast (buffer it), or raise the deadline |
 | Console calls are no longer refused by `max_inflight_host_calls` (they still count toward `max_host_calls`) | runtimes with a small in-flight cap and console routing | Nobody, unless they relied on console output being dropped while tools were in flight | Nothing |
 | `Pydeno` / `AsyncPydeno` without a `print_callback` write at most 1 MiB of console output per feed to stdout/stderr, then one `[truncated]` line | the front door's default printer | Feeds that print more than 1 MiB and read it from the host's stdout | Pass a `print_callback` (it is not capped) |
+
+`RuntimeConfig.timeout` uses Rust-side numeric conversion; it is excluded from the shared
+Python validator’s uniform type-error contract.
 
 Restrictions and fixes from the 0.8 red team (host boundary and state). The first three can change
 behaviour you have today:
@@ -107,6 +110,27 @@ behaviour you have today:
 | A front-door snapshot is no longer used up by an answer the session refuses (`resume(error="...")`) | `Pydeno` | Nobody (fix) | Nothing |
 | `feed_start` surfaces snapshots only for functions in that feed's `external_lookup`; a call to another name throws a `ReferenceError` in the guest | `Pydeno` | Drivers that expected snapshots for names they did not declare | Declare every function the feed may call |
 | Journal associated data may be up to 4096 bytes (was 1024) | agent sessions, `SessionPool` | Nobody (a relaxation: 256-character non-ASCII pool ids now persist) | Nothing |
+
+## 0.8.x to 0.9.0: gates, `load_wasm`, worker caps
+
+Mostly additions. **Stored session state does not survive the upgrade** (the first row): finish or
+drop stored sessions before you upgrade. Otherwise, a stream source now belongs to one runtime, and a
+host function that re-enters its runtime gets an error instead of killing the process.
+
+| Change | Affects | Who notices | What to change |
+|---|---|---|---|
+| **Journals are bound to the pydeno release.** Every 0.8.x `dump()` (agent sessions, `PydenoSession`, `PydenoSnapshot`), every journal a `SessionPool` stored, and any state for `load_session` / `load_snapshot` is refused by 0.9.0 | agent sessions, `SessionPool`, `Pydeno` | Loading raises `JournalError` ("the journal was recorded by pydeno '0.8.0+<platform>', this is '0.9.0+<platform>'"; the release string includes the platform, so a journal does not move between platforms either; `classify_error` kind `journal_invalid`); the front door wraps it in a `PydenoError` ("cannot load this state: JournalError: ...") | Finish or drop stored sessions before upgrading, or clear the journal store; new sessions start empty |
+| An async host call counts toward `max_inflight_host_calls` until its reply has been written to the worker (it used to stop counting when the host function returned) | `AsyncIsolatedRuntime`, async agent sessions, `AsyncPydeno` | Guests that fire large bursts of async calls with big answers can reach the cap sooner (calls past it are refused as before) | Raise `max_inflight_host_calls`, or return smaller answers |
+| `AgentSandbox(runtime=...)` / `AsyncAgentSandbox(runtime=...)` refuse a runtime built with its own `gate=` (`ValueError`) | agent sessions | Nobody unless both are used | Pass `gate=` to the session instead |
+| New: `Gate`, `Verdict`, `GateContext`, `GateDenied`, `GateUnavailable`, `gate_check`, `async_gate_check`, `SourcePolicy`, `static_gate`, `all_of`, `any_of`, `check_source(source, policy=...)`, `gate=` / `gate_timeout=` on the front door, agent sessions and isolated runtimes | new, opt-in | Adopters | See the [gate guide](gate.md); a gate is defence in depth, never the boundary |
+| `PydenoError` is defined in `pydeno._errors` (same class, still `pydeno.PydenoError`) | internal | Code that imported it from `pydeno._front` | Import it from `pydeno` |
+| New: `load_wasm()` on `Runtime`, `IsolatedRuntime`, `AsyncIsolatedRuntime`, for trusted WebAssembly (the isolated runtimes need `jitless=False`; a module's memory is not bounded by `max_buffer_bytes`) | new, opt-in | Adopters | See the [WebAssembly guide](advanced/webassembly.md) |
+| New: `max_workers=` and `checkout_timeout=` on the pools and the front door, `CheckoutTimeout` (`classify_error` kind `checkout_timeout`, retryable), more `stats()` fields | new, opt-in | Nobody unless set | See [Pools](advanced/isolation.md) |
+| `stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker | pools, front door | Dashboards that counted failed starts | Nothing |
+| A `PyStreamSource` from one runtime handed to another runtime raises `RuntimeError` (it used to be read through the other runtime's stream of the same id) | `Runtime` | Code that passed one runtime's source to another | Create the source with the runtime that will read it |
+| A host function that calls its own runtime, or returns a stream source from a sync callback, no longer aborts the process: the guest gets a catchable `RuntimeError` | `Runtime` | Nobody (a fix); code that relied on the crash | Call the runtime from outside the host function |
+| The isolated worker keeps one event loop for its life (a warm `eval_async` or `feed_run` is about 35 to 40 percent faster) | `IsolatedRuntime`, front door | Nobody | Nothing |
+| Agent sessions name the passed argument in limit errors (`timeout`, `max_pause`); `-0.0` is stored as `0.0` | agent sessions | Tests that match the old argument names | Match on the new names |
 
 ## Safe to bump?
 

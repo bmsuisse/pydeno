@@ -1,5 +1,212 @@
 # Changelog
 
+## 0.9.0 — 2026-10-05
+
+Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed
+contract and a static source policy), **`load_wasm()`** for trusted WebAssembly modules, **opt-in
+worker caps** for pools, a **persistent worker event loop** (about 35 to 40 percent faster async
+commands and feeds), bounded memory for large async reply backlogs, and a second hardening pass
+(stream sources belong to one runtime, host functions that re-enter their runtime get an error
+instead of killing the process, no `close()` hang, live registration ids are never reused). See
+"Upgrading" for the few behaviour changes.
+
+Security note: this release hardens behaviour of 0.8.0 and earlier. Several defects found in
+independent reviews are fixed (listed below, in neutral terms). The gate is defence in depth, never the
+boundary; the sandbox is.
+
+### Added
+
+- **Gates: a host-side check of the exact source before it runs.** A gate is a callable
+  `(source, GateContext) -> Verdict(allow, reason, labels)`, sync or async.
+  - **Where it attaches.** Pass it as `gate=` (with `gate_timeout=`, default 10 s) to:
+    - `Pydeno` / `AsyncPydeno`: every `feed_run` / `feed_start`;
+    - `AgentSandbox` / `AsyncAgentSandbox`: `start` / `run` / `execute`;
+    - `IsolatedRuntime` / `AsyncIsolatedRuntime`: `eval*`, `execute*`, `add_static_module` sources,
+      module-loader sources, and `RuntimeConfig.bootstrap` (checked before the worker starts).
+  - **It fails closed.** A denial raises `GateDenied` (kind `gate_denied`, not retryable). A gate that
+    raises, times out or answers with anything but an exact `Verdict` raises `GateUnavailable` (kind
+    `gate_unavailable`, retryable, and the run is still blocked). Both are `PydenoError` subclasses.
+    Cancellation propagates unchanged.
+  - **No gap between check and use.** The source is normalised to an exact `str` once. The gate sees
+    it, and the same string runs. Sources over 16 MiB are refused before the gate is called.
+  - **No side effects.** A denied call sends nothing to the worker and uses no budget, in-flight
+    slot or journal record. Journal replay (`load_session`, `load_snapshot`, `AgentSandbox.load`) is
+    not re-gated.
+  - **Standalone use.** `gate_check` / `async_gate_check` run a gate in your own process.
+  - **Sync gates and async callers.** In the async classes and `async_gate_check`, sync gates run on
+    a gate thread, never on the event loop. There `gate_timeout=None` is refused. The gate threads
+    form one process-wide pool of daemon threads, 32 by default; change it with
+    `set_gate_threads(n)` or `PYDENO_GATE_THREADS`.
+  - **Module loaders and closed sessions.** A module-loader refusal is raised by the command that
+    imported, keeps its `__cause__`, and is raised even when the guest catches the failed import.
+    A closed session or runtime never calls its gate.
+  - **Pools.** `SandboxPool` / `SessionPool` pass `gate=` through.
+  - **Signatures checked up front.** A gate may also take only the source (`async def
+    classify(source)`). A gate whose signature fits neither form raises `TypeError` when it is
+    configured or passed to `gate_check`, so a programming error is not mistaken for an outage.
+  - **Static policy.** `check_source(source, policy=SourcePolicy(...))` covers:
+    - forbidden identifiers and globals;
+    - `import()`;
+    - `eval`, and timers given strings;
+    - the `Function` constructor and `WebAssembly`;
+    - `max_source_bytes`;
+    - optionally, computed access on a global (`forbid_computed_global_access`, best effort).
+
+    By default the scan fails closed. It decodes every escape (`\u`, `\u{...}`, `\x`, legacy
+    octal, identity escapes, line continuations) and reads the whole text, strings and comments
+    included. It runs in linear time, with `max_source_bytes` defaulting to 1 MiB.
+    `ignore_strings_and_comments=True` selects a tokenizer-based precise mode instead: opt-in,
+    best effort, with its known bypasses listed in the guide. The messages are fixed templates
+    (`POLICY_MESSAGES`, a public contract). `Finding.text` is the bare message without a location.
+    `static_gate(policy)` turns a policy into a gate, and `.check(source)` returns its findings. `all_of(*gates)` stops at the first denial; `any_of(*gates)` stops at the
+    first allow. `check_source(source)` without a policy is unchanged.
+  - **Moved class.** `PydenoError` now lives in `pydeno._errors`. It is the same class, still
+    exported as `pydeno.PydenoError`.
+
+  See [`docs/guides/gate.md`](docs/guides/gate.md).
+
+- **`load_wasm()`: a trusted WebAssembly module, loaded by the host** (#37). On `Runtime`,
+  `IsolatedRuntime` and `AsyncIsolatedRuntime`: `rt.load_wasm(bytes_or_path)` returns a
+  `WasmModule` (`AsyncWasmModule`) with `.exports` (name -> callable), `.signatures`,
+  `.call(name, *args, timeout=)` and `.unload()`. The host reads the bytes (the guest never gets
+  file access), refuses more than `max_bytes` (default and ceiling 8 MiB), parses the type, import,
+  function and export sections with bounded reads, refuses modules with imports, checks each
+  argument against the signature (`int` for `i32`/`i64`, exact up to 64 bits; `int`/`float` for
+  `f32`/`f64`) and runs each call under the runtime's timeout. The bridge compiles and instantiates
+  the module with WebAssembly intrinsics captured before any guest code, through one new fixed
+  global, `__pydeno_wasm_load`, installed only where V8 has WebAssembly; the instance is held only by
+  the host (the isolated worker takes its reference to it before any guest code, so a loader the
+  guest planted where V8 has no WebAssembly, for example under `--lite-mode`, is never called).
+  **Explicit opt-in for trusted modules:** the isolated runtimes need `jitless=False`
+  (with the default, `load_wasm` raises `RuntimeError` in the parent and the worker is unchanged),
+  and a module's linear memory is not bounded by `max_buffer_bytes` (it counts toward `max_memory`
+  in the isolated runtimes; nothing bounds it in an in-process `Runtime`). Not on `Pydeno`,
+  `AgentSandbox` or `SessionPool`, whose journaled sessions could not replay it (a `SandboxPool`
+  checkout is a plain runtime and works). See
+  [`docs/guides/advanced/webassembly.md`](docs/guides/advanced/webassembly.md);
+  `benches_py/wasm_kernel_bench.py` compares one kernel as JavaScript and as WebAssembly (no faster
+  under the JIT; about 19x faster than jitless JavaScript).
+- **Opt-in worker caps for pools** (#81). `SandboxPool`, `AsyncSandboxPool`, `Pydeno` and
+  `AsyncPydeno` take `max_workers=None` (default: unchanged, cold starts without limit) and
+  `checkout_timeout=30.0`. With a cap, the pool counts every worker process that has not exited
+  (starting, ready, checked out, and the custom-memory and replay workers of `Pydeno` sessions); a
+  checkout at the cap waits up to `checkout_timeout` (polling every 20 ms, not FIFO) and raises the
+  new `pydeno.CheckoutTimeout` (a `TimeoutError`; `classify_error` kind `checkout_timeout`,
+  retryable). `load_session` / `load_snapshot` on a capped pool kill the session's current worker
+  after the state is authenticated and before the replay, so a load never needs a second slot; if
+  the replay then fails, the session has no worker until the next successful load (the next feed
+  raises `PydenoCrashedError` saying so; another `load_session` / `load_snapshot` recovers it). The
+  killed worker's slot is handed to the replay, so a checkout already waiting cannot take it in
+  between. `stats()` adds `max_workers`, `workers`, `waiting` and `checkout_timeouts`.
+  Based on the contribution in #93.
+
+### Changed
+
+- **The static source scanner is native** (#107): `check_source` and `static_gate` scan in Rust
+  with the GIL released, with findings identical to the Python scanner, which stays as the reference.
+- **Faster async commands in the isolated worker** (#60). The worker keeps one event loop for its
+  whole life instead of building one per command, created before the OS sandbox goes up (no thread
+  starts). Each command still ends with the loop emptied: pending tasks are cancelled and finished,
+  and callbacks that a finished host call left queued run before the next command starts, so nothing
+  is held over to a later command. Measured on macOS arm64 (release build, paired runs): a warm
+  `eval_async` about 237 to 150 microseconds, a warm `feed_run` about 220 to 140 microseconds,
+  checkout plus 11 feeds about 4.4 to 3.4 ms. The synchronous paths are unchanged.
+- **Large reply frames are copied once, not twice, in the host's frame readers** (#66). The sync
+  and async readers took a payload out of the reassembly buffer as `bytes(buf[start:end])`, which
+  first builds a payload-sized `bytearray` slice; payloads of 64 KiB and more are now copied
+  through a memoryview released before the buffer is resized. Smaller frames, the sync single-read
+  fast path, the 16 MiB cap and all frame checks are unchanged, and a payload is still owned `bytes`.
+  Measured on macOS arm64 (release build, one native extension, 9 interleaved fresh-process rounds,
+  medians): reading 16 MiB frames, Python-heap peak 52.1 to 35.3 MB and peak RSS 69.8 to 53.0 MB,
+  reader CPU 17.6 to 12.3 ms (async) and 27.8 to 22.8 ms (sync) per three frames. End to end, a
+  16 MiB `eval` reply has a Python-heap peak of 52.1 to 35.3 MB, and 1 to 16 MiB replies use about
+  2 to 4 percent less host CPU; the process's peak RSS for such a call is unchanged, because a later
+  phase sets it. Small frames, warm `eval`, host calls and `feed_run` are unchanged within noise.
+- **Clearer limit and diagnostics wording** (#84). Agent sessions name the argument the caller passed
+  (`timeout`, `max_pause`) when they reject a value; `-0.0` is stored as `0.0`; the docs describe
+  how the Proxy, console-deadline and default-printer limits behave.
+- **`stats()["checkouts"]` / `["cold_starts"]` count only checkouts that got a worker**, with or
+  without a cap: a cold start that fails to start (or, with a cap, a checkout that raised
+  `CheckoutTimeout`) is no longer counted in either.
+
+### Fixed
+
+- Final integration review: gate pools reset their synchronization before child threads run;
+  module-loader gates restore control-flow exceptions after completing the worker reply.
+  Failed or cancelled Wasm unloads remain retryable.
+- Persistent command-loop cleanup serializes the idle transition with submissions and drains
+  cancellation descendants and old delayed callbacks before the next command.
+- Capped session replay keeps the old worker counted until its process exits. A replacement
+  waits or raises `CheckoutTimeout`; cancellation retains accounting for a still-live process.
+- Release containment tests receive the complete scanner corpus assets. The scanner's absolute
+  speed budget runs on optimized builds; correctness and linearity remain tested in debug too.
+
+- **The synchronous isolated runtimes enforce their limits while a host handler runs** (#84). In
+  `IsolatedRuntime`, agent sessions and `Pydeno` feeds, the hard deadline (with its console
+  allowance), `max_host_wait` and the CPU cap were checked only after a synchronous `on_console`,
+  `print_callback` or tool returned: a 6 s console handler under a 1 s deadline kept the worker
+  alive for about 6 s (the async runtimes: about 2 s). The idle watchdog now applies them while a
+  handler runs and kills the worker on time (about 2 s in that case); the handler is not
+  interrupted and still runs on the calling thread, and the command raises `RuntimeTimeout` once
+  it returns.
+- **`check_source(source)` without a policy runs in linear time on hostile input.** It no longer
+  retries a regex scan after one failed on the same line, and its `\u{` look-ahead is capped.
+  Results are unchanged.
+- **A large backlog of async replies no longer gets a worker killed that is still reading, and the
+  parent's memory is bounded** (#86, #91). Replies to async host calls are now written one at a time
+  under a send lock, a reply waits for its turn before it is encoded, and its host call stays in
+  flight (and counts toward `max_inflight_host_calls`) until the reply has been written. A worker that stops reading or drips bytes is still killed
+  within one stall window (`write_stall_timeout`). Measured with 3000 concurrent calls of 200 KB:
+  the worker is no longer killed at a 1 s stall limit, the transport buffer peaks at about 0.1 MB
+  instead of about 590 MB, and the parent's peak RSS drops from about 3 GB to about 0.7 GB.
+- **A host function that re-enters its own runtime, or returns a stream source, no longer aborts the
+  process** (#58). Calling `rt.eval` (or any `Runtime` method) from inside a host function made
+  PyO3 raise a panic that was re-raised when the call returned and aborted the process, and a
+  returned `PyStreamSource` hit the same check. The guest now gets a catchable `RuntimeError`
+  ("this object cannot be used from the runtime thread, where host functions run; ...") with fixed
+  text, the panic detail goes to the log, and the runtime stays usable. `PyStreamSource` no longer
+  has to stay on the thread that made it. Keep a reference to a source until the guest has read it
+  (the finalizer cancels the stream); see the "Inside a host function" section of the runtime guide.
+- **Registered function and stream ids are never reused while live** (#89 follow-up). The ids are
+  32-bit counters; after a wrap a new registration could overwrite a live entry. Allocation now skips
+  live ids, and a wrapper that fails to build rolls its registration back without a double release.
+- **A stream source is refused by any runtime other than the one that created it** (#98). Stream
+  ids are allocated per runtime, so a source from runtime B returned by runtime A's host function
+  (or passed to A's functions, bound into A, or yielded by one of A's streams) was read through A's
+  own stream with the same id, and A's guest received A's data. Each source now carries its
+  runtime's identity and the transfer raises `RuntimeError` ("this stream source belongs to a
+  different runtime; ..."); a source whose runtime is closed raises `RuntimeError` too. The same
+  runtime is unaffected, and `IsolatedRuntime` has no stream sources.
+- **`AsyncIsolatedRuntime`: a burst of async host replies no longer gets a worker killed that is
+  still reading, and the parent's memory for it is bounded** (#86, #91). Replies are encoded and
+  written one at a time under a send lock, so the transport buffer holds at most one reply above
+  its 64 KiB high watermark, and each reply gets its own `write_stall_timeout` window. A host call
+  stays in flight (and counts toward `max_inflight_host_calls`) until its reply is written.
+  3000 concurrent 200 KB replies on macOS: peak transport buffer ~595 MB -> ~0.1 MB, parent max
+  RSS ~3.1 GB -> ~0.7 GB, and the burst completes at `write_stall_timeout=1`, where the worker
+  used to be killed; 10000 x 20 KB: parent max RSS ~1.8 GB -> ~0.13-0.27 GB. A worker that does
+  not drain one reply within the stall window is still killed, however slowly it reads.
+- **`Runtime.close()` no longer hangs when a host function returning a stream source is running.**
+  `close()` holds the runtime's shutdown lock while it waits for the runtime thread, and converting
+  the returned source on that thread checked the same lock, so the host deadlocked (for example
+  when an `eval_async` task was cancelled inside `with Runtime()`). The check no longer waits for
+  the lock.
+- A process no longer intermittently aborts at interpreter exit after using `Runtime`: `close()` cancels stream sources on the calling thread, and background threads stop entering Python once the interpreter exits. `eval_async` started later than that (in an `atexit` handler registered before `import pydeno`, or after `atexit._run_exitfuncs()`) still completes. The stream's `aclose()` runs in the contextvars the source was created in, and its exceptions are not reported as "Task exception was never retrieved".
+- **A `JsFunction` or `JsStream` garbage-collected inside a host function no longer hangs the
+  process or panics.** Its finalizer then runs on the runtime thread and waited for that same
+  thread; the stream finalizer hung forever. On the runtime thread the handle is now released
+  without waiting.
+- **`load_wasm` on `IsolatedRuntime` / `AsyncIsolatedRuntime`: instances of dropped modules are no
+  longer left in the worker.** The ids of dropped modules ride along with the next wasm command;
+  a command that failed before it was sent lost them, and two threads sending at once could lose
+  ids appended in between. The ids are now taken one at a time and put back if the command fails.
+- **`classify_error` gives the new refusals stable kinds.** A stream source whose runtime is closed
+  and an unloaded WebAssembly module are `closed`; a stream source from another runtime is
+  `invalid_input` (previously all `unknown`). The messages are unchanged.
+- Tests: the worker-capacity and pool tests that need the OS sandbox are marked `full_sandbox`,
+  so a run on a kernel without Landlock or seccomp deselects them instead of failing, and the
+  WebAssembly `max_memory` test no longer depends on the sampled kill landing during the one call.
+
 ## 0.8.0 — 2026-10-04
 
 Highlights: one Monty-shaped front door (`Pydeno` / `AsyncPydeno`) as the default path, much faster
@@ -145,8 +352,8 @@ and the red-team restrictions under Security; see
   their minimum and 2**53 - 1 (`max_memory`: between 1 and 2**53 - 1). NaN or infinity was accepted
   before and turned the limit off without saying so (every comparison with NaN is false); Python's
   `json` parses both, so they could come from a config file. Any real number (`Fraction`, `Decimal`,
-  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Errors are uniform: a
-  wrong type raises `TypeError`, a bad value `ValueError`.
+  numpy floats) works as seconds and any integer-like (numpy ints) as a count. Except for Rust-converted
+  `RuntimeConfig.timeout`, errors are uniform: a wrong type raises `TypeError`, a bad value `ValueError`.
 - **Console output pauses the hard deadline only within an allowance.** The deadline pauses while the
   host runs a tool, and console calls were treated the same way, so time spent handling a flood of
   `console.*` output stretched a run (or a `Pydeno` feed) past its deadline, up to `max_host_wait`

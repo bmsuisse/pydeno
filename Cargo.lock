@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "pydeno"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1437,6 +1437,7 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "pyo3-build-config 0.25.1",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_bytes",
  "serde_json",

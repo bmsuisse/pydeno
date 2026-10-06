@@ -45,7 +45,8 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import _compat, _isolated, _sandbox, _wire
+from . import _compat, _isolated, _sandbox, _wasm, _wire
+from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._isolated import (
     DEFAULT_MAX_MEMORY,
     DEFAULT_REQUEST_TIMEOUT,
@@ -337,7 +338,11 @@ class _FrameReader(asyncio.Protocol):
             end = _HEADER.size + length
             if len(buf) < end:
                 break
-            self.frames.append(bytes(buf[_HEADER.size : end]))
+            if length < _wire._COPY_VIEW_THRESHOLD:
+                self.frames.append(bytes(buf[_HEADER.size : end]))
+            else:
+                with memoryview(buf) as view, view[_HEADER.size : end] as payload:
+                    self.frames.append(bytes(payload))
             self._queued += length
             del buf[:end]
         if (
@@ -424,7 +429,11 @@ class _Writer(asyncio.BaseProtocol):
             return
         waiter = asyncio.get_running_loop().create_future()
         self._waiters.append(waiter)
-        await waiter
+        try:
+            await waiter
+        finally:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
 
 
 # ---------------------------------------------------------------------------
@@ -639,6 +648,9 @@ class AsyncIsolatedRuntime:
         handler_executor: Where synchronous host functions run (default: a shared pool of
             `DEFAULT_HANDLER_THREADS` threads). Pass your own to size it, or to keep one tenant's
             slow tools from occupying threads another tenant needs.
+        gate / gate_timeout: As for `IsolatedRuntime`, except that the gate may also be async
+            (awaited, and cancelled at ``gate_timeout``). ``config.bootstrap`` is gated when the
+            runtime starts, before the worker is spawned.
 
     Use it as `async with AsyncIsolatedRuntime(config) as rt:` or
     `rt = await AsyncIsolatedRuntime.create(config)`. Constructing the object starts nothing; the
@@ -674,8 +686,16 @@ class AsyncIsolatedRuntime:
         python: str | None = None,
         prewarm: bool = True,
         handler_executor: Executor | None = None,
+        gate: Any = None,
+        gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
     ) -> None:
         # Validation is `IsolatedRuntime.__init__`'s, line for line; nothing here blocks.
+        self._gate = _hook(
+            gate, gate_timeout, who="AsyncIsolatedRuntime", sync_only=False
+        )
+        self._bound_names: list[str] = []
+        self._current_cmd: int | None = None
+        self._gate_refusals: dict[int, BaseException] = {}
         clock_ms = _clock_ms(clock)
         if random_seed is not None and (
             isinstance(random_seed, bool)
@@ -744,6 +764,9 @@ class AsyncIsolatedRuntime:
         self._handlers: dict[int, tuple[Callable[..., Any], bool]] = {}
         self._token_to_hid: dict[int, int] = {}
         self._revoked_hids: dict[int, None] = {}
+        # Ids of `load_wasm` instances whose module object was dropped without `unload()`: sent
+        # along with the next wasm command, so the worker forgets them (see `_wasm.track_drop`).
+        self._wasm_dropped: list[int] = []
         self._hids = itertools.count(1)
         self._cmd_ids = itertools.count(1)
         self._serial = next(_SERIALS)
@@ -756,6 +779,7 @@ class AsyncIsolatedRuntime:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._sup: _Supervisor | None = None
         self._lock: asyncio.Lock | None = None
+        self._send_lock: asyncio.Lock | None = None
         self._proc: Any = None
         self._stderr: Any = None
         self._rproto = _FrameReader()
@@ -807,9 +831,19 @@ class AsyncIsolatedRuntime:
         if self._starting or self._closed:
             raise RuntimeError("this AsyncIsolatedRuntime has already been started")
         self._starting = True
+        if self._gate is not None and self._config["bootstrap"]:
+            # Before any worker exists: a refused bootstrap starts nothing.
+            try:
+                self._config["bootstrap"] = await self._gate.acheck(
+                    self._config["bootstrap"], "bootstrap"
+                )
+            except BaseException:
+                self._closed = True
+                raise
         loop = asyncio.get_running_loop()
         self._loop = loop
         self._lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         self._sup = _supervisor_for(loop)
         try:
             async with self._sup.start_slots:
@@ -1230,8 +1264,12 @@ class AsyncIsolatedRuntime:
             ) from None
 
     async def _send_frame(self, frame: bytes) -> None:
-        self._write(frame)
-        await self._drain()
+        # Wait before entering the transport buffer, so a burst of replies cannot all
+        # queue ahead of drain(). Its backlog is at most one frame above the high watermark.
+        assert self._send_lock is not None
+        async with self._send_lock:
+            self._write(frame)
+            await self._drain()
 
     async def _encode(self, message: dict[str, Any], big: bool) -> bytes:
         if big:
@@ -1382,7 +1420,14 @@ class AsyncIsolatedRuntime:
                     raise WorkerCrashed(
                         await self._describe_death("worker is gone")
                     ) from None
-                return await self._pump(cmd_id, pump)
+                self._current_cmd = cmd_id
+                try:
+                    result = await self._pump(cmd_id, pump)
+                except Exception:
+                    self._raise_refusal(cmd_id)
+                    raise
+                self._raise_refusal(cmd_id)
+                return result
             except asyncio.CancelledError:
                 # The worker is mid-command and nothing can interrupt V8 from here; a worker left
                 # to finish would hand its answer to the next command. Kill it.
@@ -1391,6 +1436,8 @@ class AsyncIsolatedRuntime:
                 )
                 raise
             finally:
+                self._current_cmd = None
+                self._gate_refusals.pop(cmd_id, None)
                 self._end()
         finally:
             self._lock.release()
@@ -1569,9 +1616,9 @@ class AsyncIsolatedRuntime:
                 big = _big_value(value)
             except BaseException as exc:  # noqa: BLE001 - as IsolatedRuntime: an error reply
                 reply = self._error(cid, exc)
+            await self._send_reply(reply, pump, big=big)
         finally:
             self._async_inflight -= 1
-        await self._send_reply(reply, pump, big=big)
 
     async def _send_reply(
         self, reply: dict[str, Any] | bytes, pump: _Pump | None, *, big: bool = False
@@ -1579,14 +1626,19 @@ class AsyncIsolatedRuntime:
         try:
             if self._closed:
                 return  # nobody to answer
-            if isinstance(reply, bytes):
-                frame = reply
-            else:
-                try:
-                    frame = await self._encode(reply, big)
-                except _wire.WireError as exc:
-                    frame = _frame(self._error(reply["cid"], exc))
-            await self._send_frame(frame)
+            assert self._send_lock is not None
+            async with self._send_lock:
+                if self._closed:
+                    return  # the worker was killed or closed while this reply waited its turn
+                if isinstance(reply, bytes):
+                    frame = reply
+                else:
+                    try:
+                        frame = await self._encode(reply, big)
+                    except _wire.WireError as exc:
+                        frame = _frame(self._error(reply["cid"], exc))
+                self._write(frame)
+                await self._drain()
         except _wire.StalledWrite:
             # The worker stopped reading what we send: kill it; the pump reports it.
             self._kill(
@@ -1611,6 +1663,23 @@ class AsyncIsolatedRuntime:
 
     # -- public API --------------------------------------------------------
 
+    async def _gated(self, code: Any, mode: str, specifier: str | None = None) -> Any:
+        """The exact source the gate allowed (`code` itself without a gate)."""
+        if self._gate is None:
+            return code
+        self._check_usable()  # a closed runtime does not pay for a gate
+        return await self._gate.acheck(code, mode, tuple(self._bound_names), specifier)
+
+    def _record_refusal(self, command: int | None, exc: BaseException) -> None:
+        """As `IsolatedRuntime._record_refusal`: only the command that imported raises it."""
+        if command is not None and command == self._current_cmd:
+            self._gate_refusals.setdefault(command, exc)
+
+    def _raise_refusal(self, command: int) -> None:
+        refusal = self._gate_refusals.pop(command, None)
+        if refusal is not None:
+            raise refusal
+
     async def eval(
         self, code: str, *, timeout: float | int | timedelta | None = None
     ) -> Any:
@@ -1619,6 +1688,7 @@ class AsyncIsolatedRuntime:
         soft = _limit_seconds("timeout", timeout)
         if soft is None:
             soft = self._soft_timeout
+        code = await self._gated(code, "eval")
         return await self._request(
             {"t": "eval_async", "code": code, "timeout": soft}, soft_timeout=soft
         )
@@ -1662,6 +1732,7 @@ class AsyncIsolatedRuntime:
             self._kill()
             raise WorkerCrashed("worker returned a malformed capability token")
         self._register_token(token, hid)
+        self._bound_names.append(name)
         return token
 
     async def bind_object(self, name: str, obj: Mapping[str, Any]) -> dict[str, int]:
@@ -1701,6 +1772,7 @@ class AsyncIsolatedRuntime:
             raise WorkerCrashed("worker returned malformed capability tokens")
         for key, token in tokens.items():
             self._register_token(token, hids[key])
+        self._bound_names.append(name)
         return tokens
 
     async def revoke_op(self, op_id: int) -> bool:
@@ -1716,7 +1788,72 @@ class AsyncIsolatedRuntime:
         return bool(await self._request({"t": "revoke", "token": op_id}))
 
     async def add_static_module(self, name: str, source: str) -> None:
+        source = await self._gated(
+            source, "add_static_module", name if isinstance(name, str) else None
+        )
         await self._request({"t": "add_module", "name": name, "source": source})
+
+    async def load_wasm(
+        self,
+        module: Any,
+        /,
+        *,
+        max_bytes: int = _wasm.MAX_WASM_BYTES,
+        timeout: float | int | timedelta | None = None,
+    ) -> _wasm.AsyncWasmModule:
+        """`IsolatedRuntime.load_wasm` for asyncio: returns an `AsyncWasmModule`.
+
+        Needs ``jitless=False``; a path is read by this process (in a thread, so the loop does not
+        block), never by the worker."""
+        if _wasm.flags_disable_wasm(self._options["v8_flags"]):
+            raise RuntimeError(_wasm.JITLESS_MESSAGE)
+        if isinstance(module, (bytes, bytearray, memoryview)):
+            data = _wasm.read_module(module, max_bytes)
+        else:
+            data = await asyncio.to_thread(_wasm.read_module, module, max_bytes)
+        signatures = _wasm.parse_signatures(data)
+        soft = _limit_seconds("timeout", timeout)
+        if soft is None:
+            soft = self._soft_timeout
+        with _wasm.draining(self._wasm_dropped) as drop:
+            wid = await self._request(
+                {
+                    "t": "wasm_load",
+                    "bytes": _wire.Enc(data),
+                    "timeout": soft,
+                    "drop": drop,
+                },
+                soft_timeout=soft,
+            )
+        if not _is_token(wid):
+            self._kill()
+            raise WorkerCrashed("worker returned a malformed module id")
+
+        async def call(
+            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+        ) -> Any:
+            soft = _limit_seconds("timeout", call_timeout)
+            if soft is None:
+                soft = self._soft_timeout
+            with _wasm.draining(self._wasm_dropped) as drop:
+                message = {
+                    "t": "wasm_call",
+                    "wid": wid,
+                    "name": name,
+                    "args": _wire.Enc(values),
+                    "wide": wide,
+                    "timeout": soft,
+                    "drop": drop,
+                }
+                return await self._request(message, soft_timeout=soft)
+
+        async def unload() -> None:
+            if not self._closed:
+                await self._request({"t": "wasm_unload", "wid": wid})
+
+        return _wasm.track_drop(
+            _wasm.AsyncWasmModule(signatures, call, unload), self._wasm_dropped, wid
+        )
 
     async def set_module_resolver(
         self, resolver: Callable[[str, str], str | None]
@@ -1731,7 +1868,16 @@ class AsyncIsolatedRuntime:
             raise
 
     async def set_module_loader(self, loader: Callable[[str], Any]) -> None:
-        """Supply module source with a host function: `(specifier) -> str`, sync or async."""
+        """Supply module source with a host function: `(specifier) -> str`, sync or async.
+        With a ``gate``, every source it returns must pass the gate first."""
+        if self._gate is not None:
+            loader = _gated_loader(
+                self._gate,
+                loader,
+                lambda: tuple(self._bound_names),
+                lambda: self._current_cmd,
+                self._record_refusal,
+            )
         hid = next(self._hids)
         self._handlers[hid] = (
             _checked_specifiers(loader, 1),
