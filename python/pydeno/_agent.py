@@ -1663,7 +1663,7 @@ class _SessionBase:
             "max_tool_calls": self._max_tool_calls,
             "namespace": self._namespace,
             "tools": list(self._tools),
-            "release": _engine_version().decode(errors="replace"),
+            "release": _engine_version().decode("ascii"),
             "redact": self._redact,
         }
         # Only when they differ from what a journal without them means, so a session that
@@ -1687,7 +1687,7 @@ class _SessionBase:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """`load`'s checks, before any worker starts: (tools, constructor keyword arguments)."""
         config = journal["config"]
-        made_by = _engine_version().decode(errors="replace")
+        made_by = _engine_version().decode("ascii")
         if config["release"] != made_by:
             # Before any worker starts: replaying under another engine would only fail later, as
             # a divergence, after running the guest's code.
@@ -2110,7 +2110,7 @@ class AgentSandbox(_SessionBase):
             decide, `GateUnavailable`), and nothing is journaled, charged or sent to the worker.
             The gate sees exactly the code that then runs, and ``context.tools`` lists the
             session's tools. Not consulted when `load` replays a journal (every run in it passed
-            the gate when it first ran). See ``docs/guides/gate.md``.
+            the gate when it first ran) unless `load` gets ``regate_replay=True``. See ``docs/guides/gate.md``.
         gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded.
         **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
             ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
@@ -2543,9 +2543,16 @@ class AgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         associated_data: bytes = b"",
         tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
+        regate_replay: bool = False,
         **options: Any,
     ) -> AgentSandbox:
         """Rebuild a session from `dump()` output by replaying it on a fresh worker.
+
+        Replay does not consult ``gate=``, unless ``regate_replay=True``: then the gate (which
+        must be passed) is run over the source of every recorded run, in mode ``"replay"``, before
+        any worker starts, and a refusal raises `GateDenied` (`GateUnavailable` if it cannot
+        decide). Use it with a deterministic gate such as `static_gate`: a classifier that
+        answers differently now would refuse state that was fine when it ran.
 
         The MAC is checked before anything runs. Recorded tool answers are replayed; the real
         tools are never called. If the session was dumped while paused at a tool call, the
@@ -2557,6 +2564,11 @@ class AgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
+        hook = _regate_hook(options, regate_replay, "AgentSandbox", sync_only=True)
+        if hook is not None:
+            sources, names = _replayed_runs(journal)
+            for source in sources:
+                hook.check(source, "replay", names)
         token = _JOURNAL_TOOLS.set(frozenset(journal["config"]["tools"]))
         try:
             session = cls(entries, **arguments, **options)
@@ -2610,6 +2622,31 @@ class AgentSandbox(_SessionBase):
     def __repr__(self) -> str:
         state = "closed" if self.is_closed() else "paused" if self._paused else "idle"
         return f"AgentSandbox(tools={list(self._tools)!r}, {state}, calls={self.calls_made})"
+
+
+def _regate_hook(
+    options: Mapping[str, Any], regate_replay: bool, who: str, *, sync_only: bool
+) -> Any:
+    """The gate `load(regate_replay=True)` re-runs over the journal's runs (None when off)."""
+    if not regate_replay:
+        return None
+    if options.get("gate") is None:
+        raise ValueError(
+            "regate_replay=True needs a gate= to re-run over the replayed runs"
+        )
+    return _hook(
+        options["gate"],
+        options.get("gate_timeout", DEFAULT_GATE_TIMEOUT),
+        who=who,
+        sync_only=sync_only,
+    )
+
+
+def _replayed_runs(journal: dict[str, Any]) -> tuple[list[str], tuple[str, ...]]:
+    """The source of every run a journal replays, and the tool names the gate is told about."""
+    config = journal["config"]
+    names = tuple(config["tools"]) + tuple(config.get("catalog", ()))
+    return [r[1] for r in journal["records"] if r[0] == "run"], names
 
 
 def _replay_plan(

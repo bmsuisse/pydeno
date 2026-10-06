@@ -17,8 +17,20 @@
   Measured on a loaded machine with a debug build: `import pydeno` plus `IsolatedRuntime` went from
   about 38 ms to about 18 ms.
 
+- **`load(regate_replay=True)`** on `AgentSandbox` and `AsyncAgentSandbox` re-runs the session's
+  gate over every recorded run before any worker starts, so a tightened `static_gate` policy applies
+  to stored sessions (`GateDenied`); off by default, as replay stays deterministic. The gate's
+  identity is not bound into the journal, and `Pydeno` / `PydenoSession` loads do not take it (their
+  journal holds wrapped feeds, not the code the gate saw). See `docs/guides/gate.md` (#134).
+
 ### Fixed
 
+- **The snapshot and journal engine tag no longer falls back to `"unknown"`.** `sign_snapshot`,
+  `verify_snapshot` and the journal `release` field now use an identity compiled into the extension
+  (pydeno version, target triple, V8 version; `_pydeno._build_identity()`) instead of package
+  metadata, so a rebuilt wheel with another V8 is refused, and a build that cannot read it raises
+  instead of accepting every other unknown build's data. Snapshots signed and journals dumped by
+  0.10.0 no longer verify or load: sign and dump them again (#133).
 - **`pydeno.eval()` from a thread that inherited its parent's context** (free-threaded builds,
   and any build with `thread_inherit_context`) panicked with "Runtime is unsendable, but sent to
   another thread": the owner is now checked before the inherited runtime is touched.

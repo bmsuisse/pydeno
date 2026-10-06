@@ -107,7 +107,8 @@ class TestTamperingIsRejected:
     def test_a_payload_cannot_be_moved_under_another_tag(self) -> None:
         a = sign_snapshot(b"payload A", KEY)
         b = sign_snapshot(b"payload B", KEY)
-        spliced = b[:45] + a[45:]  # B's header and tag, A's payload
+        cut = len(b) - len(b"payload B")
+        spliced = b[:cut] + a[cut:]  # B's header and tag, A's payload
         with pytest.raises(SnapshotAuthenticationError):
             verify_snapshot(spliced, KEY)
 
@@ -211,3 +212,53 @@ class TestEngineVersionIsBound:
 
         with pytest.raises(auth.SnapshotAuthenticationError):
             auth.verify_snapshot(b"pydeno-snap1\x00" + b"\x00" * 64, b"k" * 32)
+
+
+class TestBuildIdentity:
+    """The engine tag is compiled into the extension, and never falls back to a constant."""
+
+    def test_the_tag_names_the_v8_build(self) -> None:
+        from pydeno import _pydeno
+        from pydeno import _snapshot_auth as auth
+
+        identity = _pydeno._build_identity()  # noqa: SLF001
+        assert auth._engine_version() == identity.encode()  # noqa: SLF001
+        assert "+v8-" in identity and identity.startswith("pydeno-")
+
+    def test_a_blob_differing_only_in_v8_version_is_refused(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from pydeno import _pydeno
+        from pydeno import _snapshot_auth as auth
+
+        key = b"k" * 32
+        real = _pydeno._build_identity()  # noqa: SLF001
+        head, _, v8 = real.rpartition("+v8-")
+        monkeypatch.setattr(_pydeno, "_build_identity", lambda: f"{head}+v8-{v8}.other")
+        blob = auth.sign_snapshot(b"payload", key)
+        monkeypatch.setattr(_pydeno, "_build_identity", lambda: real)
+        with pytest.raises(auth.SnapshotAuthenticationError, match="made by pydeno"):
+            auth.verify_snapshot(blob, key)
+
+    def test_an_unreadable_identity_fails_closed(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        from pydeno import _pydeno
+        from pydeno import _snapshot_auth as auth
+
+        key = b"k" * 32
+        blob = auth.sign_snapshot(b"payload", key)
+        for broken in (lambda: "", lambda: "x" * 300, lambda: 1 / 0):
+            monkeypatch.setattr(_pydeno, "_build_identity", broken)
+            with pytest.raises(RuntimeError, match="cannot identify"):
+                auth.sign_snapshot(b"payload", key)
+            with pytest.raises(RuntimeError, match="cannot identify"):
+                auth.verify_snapshot(blob, key)
+
+    def test_the_old_unknown_tag_is_refused(self) -> None:
+        import hashlib
+        import hmac
+
+        from pydeno import _snapshot_auth as auth
+
+        key = b"k" * 32
+        head = auth._MAGIC + bytes([len(b"unknown")]) + b"unknown"  # noqa: SLF001
+        mac = hmac.new(key, head + b"payload", hashlib.sha256).digest()
+        with pytest.raises(auth.SnapshotAuthenticationError, match="made by pydeno"):
+            auth.verify_snapshot(head + mac + b"payload", key)

@@ -991,3 +991,76 @@ def test_gate_denies_html_close_comment_import_before_loader_runs() -> None:
         assert "forbidden-dynamic-import" in denied.value.labels
         assert loaded == []
         assert rt.eval("1 + 1") == 2
+
+
+# -- load(regate_replay=True) ---------------------------------------------------
+
+
+def _dump_eval_session() -> bytes:
+    with AgentSandbox({}, sandbox=MODE) as ungated:
+        ungated.run("eval('1+1')")
+        return ungated.dump(KEY)
+
+
+def test_replay_is_not_regated_by_default() -> None:
+    blob = _dump_eval_session()
+    with AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=NO_EVAL) as loaded:
+        assert not loaded.is_closed()
+
+
+def test_regate_replay_refuses_a_run_the_gate_now_forbids() -> None:
+    blob = _dump_eval_session()
+    with pytest.raises(GateDenied):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=NO_EVAL, regate_replay=True)
+
+
+def test_regate_replay_denies_before_any_worker_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pydeno._agent as agent_module
+
+    blob = _dump_eval_session()
+
+    def no_worker(*a: object, **k: object) -> None:
+        raise AssertionError("a worker was started for a refused journal")
+
+    monkeypatch.setattr(agent_module, "IsolatedRuntime", no_worker)
+    with pytest.raises(GateDenied):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=NO_EVAL, regate_replay=True)
+
+
+def test_regate_replay_loads_what_the_gate_allows() -> None:
+    with AgentSandbox({}, sandbox=MODE) as first:
+        first.run("globalThis.x = 41")
+        blob = first.dump(KEY)
+    rec = Recorder()
+    with AgentSandbox.load(
+        blob, KEY, {}, sandbox=MODE, gate=rec, regate_replay=True
+    ) as loaded:
+        assert loaded.run("return x + 1") == 42
+    source, context = rec.calls[0]
+    assert (source, context.mode) == ("globalThis.x = 41", "replay")
+
+
+def test_regate_replay_needs_a_gate() -> None:
+    blob = _dump_eval_session()
+    with pytest.raises(ValueError, match="needs a gate"):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, regate_replay=True)
+
+
+async def test_async_regate_replay_refuses_and_allows() -> None:
+    blob = _dump_eval_session()
+    async with await AsyncAgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=NO_EVAL):
+        pass
+    with pytest.raises(GateDenied):
+        await AsyncAgentSandbox.load(
+            blob, KEY, {}, sandbox=MODE, gate=NO_EVAL, regate_replay=True
+        )
+
+    async def agate(source: str, context: GateContext) -> Verdict:
+        return ALLOW
+
+    async with await AsyncAgentSandbox.load(
+        blob, KEY, {}, sandbox=MODE, gate=agate, regate_replay=True
+    ):
+        pass
