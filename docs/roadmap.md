@@ -72,12 +72,17 @@ Status below is a plan, not a promise of dates.
 
 | Item | Issue / PR |
 |---|---|
-| Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap) | #72 |
 | Seccomp as an allow-list with kill-on-violation, Landlock canary, kernel caps (a sandboxed process for host tools is design-only: `docs/contributing/sandboxed-tool-process.md`) | #45 |
 | Custom V8 build: research ([findings: don't for 0.10](contributing/research-custom-v8-build.md)) | #44 |
 | A deep review run over the whole tree | |
 | Preparation for an outside security review: threat model, scope, reproducible builds, known-issue list | [written](contributing/security-review-prep.md); builds are not yet bit-reproducible, no outside review has happened |
 | Free-threaded CPython (3.14t): support it, or state plainly that it is unsupported | [decided: unsupported for now](contributing/free-threaded.md) (loads and passes a smoke test, GIL re-enabled at import, not audited) |
+
+## 0.11: cold start
+
+| Item | Issue / PR |
+|---|---|
+| Cold start in the same class as Monty. Step one, an opt-in fork-from-template worker start (about 63 ms to about 21 ms on x86_64), is in PR #124 and waits for independent review (shared ASLR layout and stack canary across forked workers, `empty_root` under fork, aarch64 and macOS) | #72 |
 
 ## Before 1.0: external review and soak
 
