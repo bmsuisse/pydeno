@@ -53,6 +53,10 @@ fn _pydeno(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(pyo3::wrap_pyfunction!(runtime::v8_flags::_set_v8_flags, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(
+        runtime::python::_set_terse_guest_errors,
+        m
+    )?)?;
+    m.add_function(pyo3::wrap_pyfunction!(
         runtime::v8_flags::_v8_flags_undone_by_engine,
         m
     )?)?;

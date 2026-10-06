@@ -328,7 +328,10 @@ Monty.
   never-legitimate ones, death by `SIGSYS`; `tests/test_sandbox_violation.py` does the same from a
   real worker and checks that the parent reports `sandbox_violation`;
   `scripts/redteam_syscalls.py` sweeps all ~350 syscalls. Run them only inside a container
-  (`--network none --cap-drop all`).
+  (`--network none --cap-drop all`). The sweep's REACHABLE list includes `uprobe` (answers
+  `ENXIO`) and `uretprobe` (`SIGILL`): they are not in the filter, but Linux 6.11+/6.12+ lets
+  them bypass seccomp, and they do nothing without a registered uprobe. The red-team test pins
+  that no syscall other than the allow-listed, the argument-judged and these two is reachable.
 - **What a worker really calls:** `scripts/trace_worker_syscalls.py` runs workers under `strace`
   and lists every syscall made after the sandbox is up, with the kernel's answers. Run it natively
   on each architecture: under emulation the translator issues the host's syscalls, not the guest's.

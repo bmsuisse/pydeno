@@ -59,6 +59,7 @@ from ._pydeno import (
     RuntimeForceKilled,
     RuntimeTerminated,
     RuntimeTimeout,
+    _set_terse_guest_errors,
     _set_v8_flags,
 )
 
@@ -125,6 +126,34 @@ _STRIP_GLOBALS_JS = (
     " { try { delete globalThis[n]; } catch (_) {} }\n"
 )
 
+# Pins `Error.prepareStackTrace` so guest code can neither install one (and read every `CallSite`,
+# `ext:` frame file names included) nor remove this one. The pinned formatter renders the stack
+# as V8 does, minus frames of pydeno's own `ext:` scripts, which would otherwise name the bridge
+# (`callSync (ext:pydeno/python_bridge.js:300:31)`). Runs after the host's own bootstrap, which
+# may set the hook itself; it must also stay the last thing that touches the property, because the
+# bridge's bind code redefines it temporarily and a non-configurable property would refuse that.
+_PIN_STACK_FORMAT_JS = """
+;(() => {
+  const toStr = Error.prototype.toString;
+  const call = Function.prototype.call;
+  const str = String;
+  const format = function prepareStackTrace(error, sites) {
+    let out;
+    try { out = call.call(toStr, error); } catch (_) { out = 'Error'; }
+    for (let i = 0; i < sites.length; i++) {
+      const site = sites[i];
+      let file;
+      try { file = site.getFileName(); } catch (_) { file = undefined; }
+      if (typeof file === 'string' && file.startsWith('ext:')) continue;
+      out += '\\n    at ' + str(site);
+    }
+    return out;
+  };
+  Object.defineProperty(Error, 'prepareStackTrace',
+    { value: format, writable: false, configurable: false, enumerable: false });
+})();
+"""
+
 _FROZEN_CLOCK_JS = """
 (() => {
   const Native = Date;
@@ -176,6 +205,16 @@ _FROZEN_CLOCK_JS = """
   }
 })();
 """
+
+
+def _encode_error_text(exc: Exception) -> str:
+    """The guest-visible text of a value that could not be encoded. A `WireError` is pydeno's own
+    wording; a `ValueError` is CPython's int-to-str digit limit, which names the host language
+    and an interpreter setting, so the guest gets a plain BigInt message instead."""
+    if isinstance(exc, _wire.WireError):
+        return str(exc)
+    return "BigInt value is too large to transfer"
+
 
 # Exceptions the parent may re-raise by name. Anything else becomes RuntimeError.
 _ERROR_KINDS = {
@@ -367,10 +406,10 @@ class _Worker:
                     "args": [_wire.Enc(a) for a in args],
                 }
             )
-        except _wire.WireError as exc:
+        except (_wire.WireError, ValueError) as exc:
             with self._pending_lock:
                 self._pending.pop(cid, None)
-            raise TypeError(str(exc)) from None
+            raise TypeError(_encode_error_text(exc)) from None
         return future
 
     def _stub(self, hid: int, is_async: bool) -> Any:
@@ -527,7 +566,12 @@ class _Worker:
                 "v": _wire.Enc(result),
             }
         except _wire.WireError as exc:
-            reply = {"t": "error", "id": cmd_id, "kind": "TypeError", "msg": str(exc)}
+            reply = {
+                "t": "error",
+                "id": cmd_id,
+                "kind": "TypeError",
+                "msg": _encode_error_text(exc),
+            }
         except BaseException as exc:  # noqa: BLE001 - every failure is reported, never raised here
             name = type(exc).__name__
             kind = name if name in _ERROR_KINDS else "RuntimeError"
@@ -540,7 +584,12 @@ class _Worker:
             # written, so an error reply is safe, and the guest must not be able to end the
             # session by returning one.
             self._writer.send(
-                {"t": "error", "id": cmd_id, "kind": "TypeError", "msg": str(exc)}
+                {
+                    "t": "error",
+                    "id": cmd_id,
+                    "kind": "TypeError",
+                    "msg": _encode_error_text(exc),
+                }
             )
 
     def _init(self, message: dict[str, Any]) -> None:
@@ -553,6 +602,9 @@ class _Worker:
         if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
             raise ValueError("v8_flags must be a list of strings")
 
+        # Before any guest code: limit and module errors the guest can read must not carry this
+        # host's config field names, docs paths or API hints.
+        _set_terse_guest_errors(True)
         # Order matters. V8 flags freeze at the first isolate; the sandbox has to be up
         # before the isolate exists so every thread V8 and tokio spawn inherits it.
         if flags:
@@ -644,6 +696,7 @@ class _Worker:
             kwargs["bootstrap"] = (_FROZEN_CLOCK_JS % {"ms": clock_ms}) + str(
                 kwargs.get("bootstrap") or ""
             )
+        kwargs["bootstrap"] = str(kwargs.get("bootstrap") or "") + _PIN_STACK_FORMAT_JS
         self._runtime = Runtime(RuntimeConfig(**kwargs))
         if "--jitless" not in flags:
             # Before any guest code: only the host's own bootstrap has run.
