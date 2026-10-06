@@ -81,3 +81,13 @@ so the claim "unshare works in the child because the template is single-threaded
 `tests/test_fork_template.py::test_template_is_single_threaded_and_holds_no_isolate` and on reasoning,
 not on a run of that layer. This feature needs native x86_64 and aarch64 verification and independent review
 before it is called supported.
+
+## What is not done (issue #72)
+
+- **V8 startup snapshot.** Measured on the same host: `Runtime()` takes 6.8 ms plain and 3.8 ms from a
+  snapshot made with `SnapshotBuilder`, so a built-in snapshot is worth about 3 ms. Not implemented: the
+  worker always runs a bootstrap (global stripping, optional frozen clock) and `RuntimeConfig` forbids a
+  snapshot together with a bootstrap, V8 checks a snapshot against its flag set (the worker's flags differ from a
+  builder's), and the template cannot build one because it must stay free of V8. It needs a design of its
+  own.
+- **A native worker without Python** (the 4 to 6 week item in the issue).

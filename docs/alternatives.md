@@ -109,6 +109,8 @@ and, for hosted ones, a network dependency. If your threat model needs a VM boun
 ## What pydeno cannot do
 
 - Start a *cold* sandbox as fast as an in-process interpreter (a pool hides it, at the cost of idle processes).
+  The opt-in [fork template](guides/advanced/fork-template.md) (Linux) takes a cold start from about 57 ms to about
+  21 ms on one x86_64 host; that is still hundreds of times Monty's in-process start.
 - Offer a small, auditable trusted code base.
 - Be isolated on Windows (the in-process runtime only, which does not contain hostile code).
 - Claim an independent security review (not yet).

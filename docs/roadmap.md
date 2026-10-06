@@ -72,7 +72,7 @@ Status below is a plan, not a promise of dates.
 
 | Item | Issue / PR |
 |---|---|
-| Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap) | #72 |
+| Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap). Step one, an opt-in fork-from-template start on Linux, is in; the V8 startup snapshot and a native worker are not | #72 |
 | Seccomp as an allow-list with kill-on-violation, Landlock canary, kernel caps (a sandboxed process for host tools is design-only: `docs/contributing/sandboxed-tool-process.md`) | #45 |
 | Custom V8 build: research ([findings: don't for 0.10](contributing/research-custom-v8-build.md)) | #44 |
 | A deep review run over the whole tree | |
