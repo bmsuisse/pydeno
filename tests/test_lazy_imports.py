@@ -1,7 +1,7 @@
 """PEP 810 lazy imports (Python 3.15): the sync API must not pay for asyncio and friends.
 
-`__lazy_modules__` is a plain list, so on 3.10-3.14 the imports stay eager and these tests are
-skipped; the worker's own imports are never lazy (it applies its sandbox after importing).
+`__lazy_modules__` is a plain list, so on 3.10-3.14 the imports stay eager and the tests expect
+that. The worker's own imports are never lazy (it applies its sandbox after importing).
 """
 
 from __future__ import annotations
@@ -10,11 +10,8 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 15), reason="lazy imports need Python 3.15"
-)
+LAZY = sys.version_info >= (3, 15)
 
 HEAVY = (
     "asyncio",
@@ -37,7 +34,9 @@ def _run(code: str) -> str:
     return done.stdout.strip()
 
 
-def test_importing_the_sync_api_loads_no_heavy_stdlib() -> None:
+def test_importing_the_sync_api_loads_heavy_stdlib_only_where_imports_are_eager() -> (
+    None
+):
     out = _run(
         f"""
         import sys, pydeno
@@ -45,7 +44,8 @@ def test_importing_the_sync_api_loads_no_heavy_stdlib() -> None:
         print([m for m in {HEAVY!r} if m in sys.modules])
         """
     )
-    assert out == "[]"
+    # 3.15 honours `__lazy_modules__`; older versions ignore the plain list and import eagerly.
+    assert out == "[]" if LAZY else out != "[]"
 
 
 def test_lazy_modules_resolve_on_first_use() -> None:

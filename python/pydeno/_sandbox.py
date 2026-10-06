@@ -1438,6 +1438,13 @@ def _creates_sysv_semaphore() -> bool:
     return True
 
 
+def _parent_changed(ppid: int, parent: int) -> bool:
+    """Was this process re-parented (or did `getppid` fail)? A parent that is PID 1, which is
+    what a container's main process looks like to its children, is fine as long as it did not
+    change."""
+    return ppid <= 0 or ppid != parent
+
+
 def attest(parent: int | None = None) -> list[str]:
     """Try, from inside the confined process, the things the sandbox exists to stop, and return
     the ones that worked. Empty means every probe was refused.
@@ -1457,7 +1464,7 @@ def attest(parent: int | None = None) -> list[str]:
     ppid = os.getppid()
     if parent is None:
         parent = ppid if ppid > 1 else 0
-    if ppid <= 0 or ppid != parent:
+    if _parent_changed(ppid, parent):
         # The parent changed under us (we were re-parented), or getppid failed. The "parent"
         # probes below would aim at the wrong process, or at -1 (every process) if a denied
         # getppid returned an error. Refuse to start. A parent that is PID 1 is fine: that is

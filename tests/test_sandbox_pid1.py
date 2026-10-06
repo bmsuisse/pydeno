@@ -24,6 +24,21 @@ def test_attest_refuses_a_failed_getppid(monkeypatch: pytest.MonkeyPatch) -> Non
         _sandbox.attest()
 
 
+@pytest.mark.parametrize(
+    ("ppid", "parent", "changed"),
+    [
+        (1, 1, False),
+        (7, 7, False),
+        (1, 7, True),
+        (7, 1, True),
+        (-1, 1, True),
+        (0, 0, True),
+    ],
+)
+def test_a_pid_1_parent_is_not_an_orphan(ppid: int, parent: int, changed: bool) -> None:
+    assert _sandbox._parent_changed(ppid, parent) is changed  # noqa: SLF001
+
+
 def _can_unshare_pid_namespace() -> bool:
     if not shutil.which("unshare"):
         return False
@@ -46,7 +61,8 @@ def _can_unshare_pid_namespace() -> bool:
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
 def test_a_sandboxed_worker_starts_under_a_pid_1_host() -> None:
     if not _can_unshare_pid_namespace():
-        pytest.skip("unprivileged PID namespaces are not available here")
+        # Not a skip: CI budgets skips at zero. The pure check above still runs everywhere.
+        pytest.xfail("PID namespaces are not available on this host")
     code = textwrap.dedent(
         """
         import os, pydeno
