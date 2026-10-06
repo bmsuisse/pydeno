@@ -1543,6 +1543,14 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     const TypedArrayTag = uncurry(
       GetOwnPropertyDescriptor(GetPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get
     );
+    const TypedArrayProto = GetPrototypeOf(Uint8Array.prototype);
+    const TypedArraySet = uncurry(TypedArrayProto.set);
+    const TypedArrayLength = uncurry(GetOwnPropertyDescriptor(TypedArrayProto, "length").get);
+    const Uint8ArrayCtor = Uint8Array;
+    const MemoryBuffer = uncurry(GetOwnPropertyDescriptor(WebAssembly.Memory.prototype, "buffer").get);
+    const BufferByteLength = uncurry(GetOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get);
+    // Same ceiling as `MAX_BUFFER_BYTES` in python/pydeno/_wasm.py; the host checks it first.
+    const WASM_BUFFER_CEILING = 4 * 1024 * 1024;
 
     const wasmLoad = function (bytes) {
       if (!IsView(bytes) || TypedArrayTag(bytes) !== "Uint8Array") {
@@ -1555,17 +1563,93 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
       const exported = WasmInstanceExports(new WasmInstanceCtor(module));
       let functions = { __proto__: null };
       const names = WasmModuleExports(module);
+      let memory = null;
       for (let index = 0; index < names.length; index++) {
         const entry = names[index];
         if (entry.kind === "function") {
           setOwn(functions, entry.name, exported[entry.name]);
+        } else if (entry.kind === "memory" && entry.name === "memory") {
+          memory = exported.memory;
         }
       }
+      // `call_bytes`: copy `data` into memory the module's own `alloc` handed out, let
+      // `name(in_ptr, in_len, out_ptr, out_cap) -> i32` write at most `cap` bytes to the output
+      // block, copy that many back out into a fresh Uint8Array, and free both blocks. Every
+      // pointer is checked against the live memory size; no view of the memory leaves here.
+      const callBuffer = function (fn, data, cap) {
+        if (
+          memory === null ||
+          !HasOwn(functions, "alloc") ||
+          !HasOwn(functions, "dealloc")
+        ) {
+          throw new TypeErrorCtor(
+            "load_wasm: byte buffers need the module to export memory, alloc and dealloc"
+          );
+        }
+        if (
+          !IsView(data) ||
+          TypedArrayTag(data) !== "Uint8Array" ||
+          typeof cap !== "number" ||
+          !(cap >= 0 && cap <= WASM_BUFFER_CEILING) ||
+          cap % 1 !== 0
+        ) {
+          throw new TypeErrorCtor("load_wasm: invalid call");
+        }
+        const length = TypedArrayLength(data);
+        if (length > WASM_BUFFER_CEILING) {
+          throw new TypeErrorCtor("load_wasm: invalid call");
+        }
+        const alloc = functions.alloc;
+        const dealloc = functions.dealloc;
+        const place = function (pointer, size) {
+          if (typeof pointer !== "number") {
+            throw new TypeErrorCtor("load_wasm: alloc returned a non-number");
+          }
+          const start = pointer >>> 0;
+          if (start + size > BufferByteLength(MemoryBuffer(memory))) {
+            throw new RangeErrorCtor("load_wasm: alloc returned a block outside the memory");
+          }
+          return start;
+        };
+        let inPtr = 0;
+        let outPtr = 0;
+        let haveIn = false;
+        let haveOut = false;
+        try {
+          inPtr = place(ReflectApply(alloc, undefined, [length]), length);
+          haveIn = true;
+          outPtr = place(ReflectApply(alloc, undefined, [cap]), cap);
+          haveOut = true;
+          // The memory may have grown (and its buffer been replaced) during `alloc`: look again.
+          TypedArraySet(new Uint8ArrayCtor(MemoryBuffer(memory), inPtr, length), data);
+          const written = ReflectApply(fn, undefined, [inPtr, length, outPtr, cap]);
+          if (typeof written !== "number" || written % 1 !== 0) {
+            throw new TypeErrorCtor("load_wasm: the function returned a non-integer");
+          }
+          if (written < 0) {
+            throw new RangeErrorCtor("the WebAssembly function failed with code " + written);
+          }
+          if (written > cap) {
+            throw new RangeErrorCtor("the WebAssembly function wrote past max_result_bytes");
+          }
+          const out = new Uint8ArrayCtor(written);
+          TypedArraySet(out, new Uint8ArrayCtor(MemoryBuffer(memory), outPtr, written));
+          return out;
+        } finally {
+          if (haveOut) {
+            ReflectApply(dealloc, undefined, [outPtr, cap]);
+          }
+          if (haveIn) {
+            ReflectApply(dealloc, undefined, [inPtr, length]);
+          }
+        }
+      };
       // `call(name, args, wide)`: `args` are numbers, except where `wide[i] === true` marks an
       // i64 parameter (the host parsed the signatures): that one is a decimal string, because a
       // host integer up to 2^64 would cross as a lossy double, and V8 takes an i64 only as a BigInt.
       // `call(null)` unloads: the instance becomes unreachable and later calls fail.
-      return function (name, args, wide) {
+      // With `buffer` (`[bytes, cap]`) it is a `call_bytes`: `args` and `wide` are ignored.
+      return function (name, args, wide, buffer) {
         if (name === null) {
           functions = null;
           return undefined;
@@ -1575,6 +1659,12 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
         }
         if (typeof name !== "string" || !HasOwn(functions, name)) {
           throw new TypeErrorCtor("the module exports no function of that name");
+        }
+        if (buffer !== undefined && buffer !== null) {
+          if (!ArrayIsArray(buffer) || buffer.length !== 2) {
+            throw new TypeErrorCtor("load_wasm: invalid call");
+          }
+          return callBuffer(functions[name], buffer[0], buffer[1]);
         }
         if (!ArrayIsArray(args) || !ArrayIsArray(wide)) {
           throw new TypeErrorCtor("load_wasm: invalid call");

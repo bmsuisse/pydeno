@@ -1751,7 +1751,11 @@ class IsolatedRuntime:
             raise WorkerCrashed("worker returned a malformed module id")
 
         def call(
-            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+            name: str,
+            values: list[Any],
+            wide: list[bool],
+            call_timeout: Any,
+            buffer: list[Any] | None = None,
         ) -> Any:
             soft = _limit_seconds("timeout", call_timeout)
             if soft is None:
@@ -1763,6 +1767,7 @@ class IsolatedRuntime:
                     "name": name,
                     "args": _wire.Enc(values),
                     "wide": wide,
+                    "buf": _wire.Enc(buffer),
                     "timeout": soft,
                     "drop": drop,
                 }

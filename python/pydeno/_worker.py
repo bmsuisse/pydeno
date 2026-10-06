@@ -507,6 +507,7 @@ class _Worker:
                 message["name"],
                 _wire.decode_value(message["args"]),
                 message["wide"],
+                _wire.decode_value(message["buf"]),
                 timeout=message.get("timeout"),
             )
         if kind == "wasm_unload":

@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 #: one 16 MiB frame.
 MAX_WASM_BYTES = 8 * 1024 * 1024
 
+#: The most bytes `call_bytes` takes in, or lets a module write out (each; a copy each way). Base64
+#: on the isolation wire makes 4 MiB about 5.4 MiB, well inside one 16 MiB frame.
+MAX_BUFFER_BYTES = 4 * 1024 * 1024
+DEFAULT_BUFFER_BYTES = 1024 * 1024
+
 JITLESS_MESSAGE = (
     "load_wasm needs jitless=False: this runtime's V8 has no WebAssembly (--jitless, or a flag "
     "such as --lite-mode that implies it). Turning it off enables V8's JIT compiler and WebAssembly, a larger attack "
@@ -280,6 +285,58 @@ def flags_disable_wasm(flags: Sequence[str]) -> bool:
     )
 
 
+_BYTES_FUNCTION = (("i32", "i32", "i32", "i32"), ("i32",))
+_ALLOC = (("i32",), ("i32",))
+_DEALLOC = (("i32", "i32"), ())
+
+
+def _limit(label: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{label} must be an int")
+    if not 0 <= value <= MAX_BUFFER_BYTES:
+        raise ValueError(f"{label} must be between 0 and {MAX_BUFFER_BYTES}")
+    return value
+
+
+def prepare_buffer(
+    name: str,
+    signatures: Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]],
+    data: Any,
+    max_input_bytes: int,
+    max_result_bytes: int,
+) -> list[Any]:
+    """Check a `call_bytes` request; returns the `[bytes, result cap]` the bridge takes. `data` is
+    copied here, so the caller may change its buffer afterwards."""
+    max_in = _limit("max_input_bytes", max_input_bytes)
+    cap = _limit("max_result_bytes", max_result_bytes)
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"{name}() takes bytes, bytearray or memoryview, not {type(data).__name__}"
+        )
+    view = memoryview(data).cast("B")
+    if view.nbytes > max_in:
+        raise ValueError(
+            f"the input is {view.nbytes} bytes, over max_input_bytes ({max_in})"
+        )
+    if signatures[name] != _BYTES_FUNCTION:
+        raise TypeError(
+            f"{name}() is not a byte-buffer function: it must take "
+            "(in_ptr, in_len, out_ptr, out_cap) as i32 and return an i32"
+        )
+    if signatures.get("alloc") != _ALLOC or signatures.get("dealloc") != _DEALLOC:
+        raise TypeError(
+            "call_bytes needs the module to export alloc(len: i32) -> i32, "
+            "dealloc(ptr: i32, len: i32) and memory"
+        )
+    return [view.tobytes(), cap]
+
+
+def buffer_result(value: Any) -> bytes:
+    if not isinstance(value, (bytes, bytearray)):
+        raise TypeError("the WebAssembly bridge returned a malformed buffer")
+    return bytes(value)
+
+
 class _Base:
     __slots__ = ("_signatures", "_closed", "__weakref__")
 
@@ -304,6 +361,17 @@ class _Base:
             raise KeyError(name)
         return prepare_args(name, self._signatures[name], args)
 
+    def _prepare_bytes(
+        self, name: str, data: Any, max_input_bytes: int, max_result_bytes: int
+    ) -> list[Any]:
+        if self._closed:
+            raise RuntimeError("this WebAssembly module was unloaded")
+        if not isinstance(name, str) or name not in self._signatures:
+            raise KeyError(name)
+        return prepare_buffer(
+            name, self._signatures, data, max_input_bytes, max_result_bytes
+        )
+
 
 class WasmModule(_Base):
     """A trusted WebAssembly module loaded with `load_wasm` (`Runtime`, `IsolatedRuntime`).
@@ -319,7 +387,7 @@ class WasmModule(_Base):
     def __init__(
         self,
         signatures: dict[str, tuple[tuple[str, ...], tuple[str, ...]]],
-        call: Callable[[str, list[Any], list[bool], Any], Any],
+        call: Callable[..., Any],
         unload: Callable[[], None],
     ) -> None:
         super().__init__(signatures)
@@ -339,6 +407,25 @@ class WasmModule(_Base):
         return _result(
             self._signatures[name][1], self._call(name, values, wide, timeout)
         )
+
+    def call_bytes(
+        self,
+        name: str,
+        data: bytes | bytearray | memoryview,
+        *,
+        max_input_bytes: int = DEFAULT_BUFFER_BYTES,
+        max_result_bytes: int = DEFAULT_BUFFER_BYTES,
+        timeout: float | timedelta | None = None,
+    ) -> bytes:
+        """Pass `data` to the exported function `name` and return the bytes it produces.
+
+        Copies both ways; see the WebAssembly guide for the convention the module must follow
+        (exports `memory`, `alloc` and `dealloc`; `name(in_ptr, in_len, out_ptr, out_cap) -> i32`
+        returns the number of bytes written, or a negative error). Input over `max_input_bytes`
+        is a ValueError; the module can write at most `max_result_bytes`. Both default to 1 MiB
+        and are capped at 4 MiB."""
+        buffer = self._prepare_bytes(name, data, max_input_bytes, max_result_bytes)
+        return buffer_result(self._call(name, [], [], timeout, buffer))
 
     def unload(self) -> None:
         """Drop the instance. Idempotent; later calls raise RuntimeError."""
@@ -366,7 +453,7 @@ class AsyncWasmModule(_Base):
     def __init__(
         self,
         signatures: dict[str, tuple[tuple[str, ...], tuple[str, ...]]],
-        call: Callable[[str, list[Any], list[bool], Any], Any],
+        call: Callable[..., Any],
         unload: Callable[[], Any],
     ) -> None:
         super().__init__(signatures)
@@ -385,6 +472,18 @@ class AsyncWasmModule(_Base):
         return _result(
             self._signatures[name][1], await self._call(name, values, wide, timeout)
         )
+
+    async def call_bytes(
+        self,
+        name: str,
+        data: bytes | bytearray | memoryview,
+        *,
+        max_input_bytes: int = DEFAULT_BUFFER_BYTES,
+        max_result_bytes: int = DEFAULT_BUFFER_BYTES,
+        timeout: float | timedelta | None = None,
+    ) -> bytes:
+        buffer = self._prepare_bytes(name, data, max_input_bytes, max_result_bytes)
+        return buffer_result(await self._call(name, [], [], timeout, buffer))
 
     async def unload(self) -> None:
         if not self._closed:
@@ -490,8 +589,14 @@ def runtime_load_wasm(
         raise RuntimeError(JITLESS_MESSAGE)
     handle = loader(data, timeout=timeout)
 
-    def call(name: str, values: list[Any], wide: list[bool], call_timeout: Any) -> Any:
-        return handle(name, values, wide, timeout=call_timeout)
+    def call(
+        name: str,
+        values: list[Any],
+        wide: list[bool],
+        call_timeout: Any,
+        buffer: list[Any] | None = None,
+    ) -> Any:
+        return handle(name, values, wide, buffer, timeout=call_timeout)
 
     def unload() -> None:
         handle(None, [], [])
