@@ -74,8 +74,8 @@ Status below is a plan, not a promise of dates.
 | Seccomp as an allow-list with kill-on-violation | #45 |
 | Custom V8 build: research | #44 |
 | A deep review run over the whole tree | |
-| Preparation for an outside security review: threat model, scope, reproducible builds, known-issue list | |
-| Free-threaded CPython (3.14t): support it, or state plainly that it is unsupported | |
+| Preparation for an outside security review: threat model, scope, reproducible builds, known-issue list | [written](contributing/security-review-prep.md); builds are not yet bit-reproducible, no outside review has happened |
+| Free-threaded CPython (3.14t): support it, or state plainly that it is unsupported | [decided: unsupported for now](contributing/free-threaded.md) (loads and passes a smoke test, GIL re-enabled at import, not audited) |
 
 ## Before 1.0: external review and soak
 

@@ -88,6 +88,8 @@ nav:
       - "Research: engine hardening": contributing/research-engine-hardening.md
       - Autoresearch loops: contributing/autoresearch.md
       - Strix pentest review: contributing/strix.md
+      - Preparing for a security review: contributing/security-review-prep.md
+      - Free-threaded CPython: contributing/free-threaded.md
 
 plugins:
   - search

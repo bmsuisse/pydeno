@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased / 0.10.0
+
+### Documentation
+
+- **Security review preparation** ([`docs/contributing/security-review-prep.md`](docs/contributing/security-review-prep.md)):
+  threat model, in and out of scope, how to build (and what is not yet reproducible), a known-issue list
+  derived from the security report and issues #45, #72 and #37, and a disclosure outline consistent with
+  `SECURITY.md`. No outside review has happened yet.
+- **Free-threaded CPython (3.14t) is documented as unsupported**
+  ([`docs/contributing/free-threaded.md`](docs/contributing/free-threaded.md)). The extension builds and
+  imports on 3.14t, but the module does not declare `gil_used = false`, so CPython re-enables the GIL at
+  import. A smoke test passed; nothing was audited and there is no 3.14t wheel or CI job. No code change.
+
 ## 0.9.0 — 2026-10-05
 
 Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed
