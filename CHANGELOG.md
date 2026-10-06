@@ -22,6 +22,9 @@
 - **Local Linux overlays include Python subpackages.** `OVERLAY_PY=1` now includes integrations
   and tools while preserving the installed native extension. Release artifact gates continue
   to run without overlays.
+### Documentation
+
+- Research note on a custom V8 build (pointer compression, V8 sandbox, build-time jitless, disabled features), against the `deno_core` 0.412.0 / `v8` 150.4.0 pins: recommendation is not to build one for 0.10 (#44). See `docs/contributing/research-custom-v8-build.md`.
 
 ## 0.9.0 — 2026-10-05
 

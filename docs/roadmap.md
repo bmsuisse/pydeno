@@ -72,7 +72,7 @@ Status below is a plan, not a promise of dates.
 |---|---|
 | Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap) | #72 |
 | Seccomp as an allow-list with kill-on-violation | #45 |
-| Custom V8 build: research | #44 |
+| Custom V8 build: research ([findings: don't for 0.10](contributing/research-custom-v8-build.md)) | #44 |
 | A deep review run over the whole tree | |
 | Preparation for an outside security review: threat model, scope, reproducible builds, known-issue list | |
 | Free-threaded CPython (3.14t): support it, or state plainly that it is unsupported | |
