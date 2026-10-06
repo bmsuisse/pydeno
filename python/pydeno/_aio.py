@@ -63,6 +63,12 @@ from ._isolated import (
     _check_wire_limits,
     _DEFAULT,
     _HostCallBudgetExceeded,
+    _Outlasted,
+    _TimedCall,
+    MAX_ABANDONED_TOOL_CALLS,
+    abandoned_message,
+    _call_with_deadline,
+    tool_timeout_error,
     _IDLE_CHECK_SECONDS,
     _IDLE_CPU_LIMIT_SECONDS,
     _MAX_WORKER_THREADS,
@@ -606,6 +612,10 @@ _LIVE: weakref.WeakSet[AsyncIsolatedRuntime] = weakref.WeakSet()
 # ---------------------------------------------------------------------------
 
 
+class _ToolTimedOut(Exception):
+    """Internal: a synchronous host call outlasted `tool_timeout`."""
+
+
 def _sync_call(
     handler: Callable[..., Any], args: list[Any], cid: int, redact: bool, serial: int
 ) -> bytes:
@@ -683,6 +693,7 @@ class AsyncIsolatedRuntime:
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
+        tool_timeout: float | int | None = None,
         sandbox: str = "require",
         empty_root: bool | str = True,
         jitless: bool = True,
@@ -750,6 +761,7 @@ class AsyncIsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            tool_timeout=tool_timeout,
         ).items():
             setattr(self, attr, value)
         self._python = python
@@ -773,6 +785,9 @@ class AsyncIsolatedRuntime:
         self.v8_flags: list[str] = []
 
         self._handlers: dict[int, tuple[Callable[..., Any], bool]] = {}
+        # What `tool_timeout` covers: handlers from `bind_function`/`bind_object`.
+        self._tool_hids: set[int] = set()
+        self._outlasted = _Outlasted()
         self._token_to_hid: dict[int, int] = {}
         self._revoked_hids: dict[int, None] = {}
         # Ids of `load_wasm` instances whose module object was dropped without `unload()`: sent
@@ -1590,6 +1605,13 @@ class AsyncIsolatedRuntime:
                 None,
             )
             return
+        limit = self._tool_timeout
+        if limit is not None and (
+            console
+            or hid not in self._tool_hids
+            or getattr(handler, "_pydeno_untimed", False)
+        ):
+            limit = None  # not a tool: console, a loader hook, or an agent session's own shim
         if console:
             pump.begin_console()
         else:
@@ -1599,17 +1621,19 @@ class AsyncIsolatedRuntime:
             self._async_inflight += 1
             # `create_task` copies the current context, which is the caller's: the handler sees
             # the caller's contextvars.
-            task = loop.create_task(self._async_call(handler, args, cid, pump))
+            task = loop.create_task(self._async_call(handler, args, cid, pump, limit))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             return
         # A synchronous handler runs on a thread, in a copy of the caller's context (as
         # `asyncio.to_thread` does). The worker is blocked on this call meanwhile, so one at a time.
         context = contextvars.copy_context()
+        call = _TimedCall()
         fut = loop.run_in_executor(
             self._handler_executor or _pool("handlers"),
             context.run,
-            _sync_call,
+            _sync_call if limit is None else self._timed_sync_call,
+            *(() if limit is None else (call,)),
             handler,
             args,
             cid,
@@ -1617,19 +1641,86 @@ class AsyncIsolatedRuntime:
             self._serial,
         )
         try:
-            frame = await self._await_or_death(fut)
+            if limit is None:
+                frame = await self._await_or_death(fut)
+            else:
+                frame = await self._await_timed(fut, call, limit, cid)
             await self._send_reply(frame, None if console else pump)
         finally:
             if console:
                 pump.end_console()
 
+    def _timed_sync_call(self, call: _TimedCall, *args: Any) -> bytes | None:
+        """`_sync_call` for a call under `tool_timeout`: not run at all if it was given up on
+        while it waited for a handler thread."""
+        if not self._outlasted.begin(call):
+            return None
+        try:
+            return _sync_call(*args)
+        finally:
+            self._outlasted.finish(call)
+
+    def _too_many_outlasted(self, count: int) -> None:
+        self._kill((WorkerCrashed, abandoned_message(self._tool_timeout or 0.0, count)))
+
+    async def _await_timed(
+        self, fut: asyncio.Future[Any], call: _TimedCall, limit: float, cid: int
+    ) -> bytes:
+        """`_await_or_death(fut)` for at most `limit` seconds. Past it the handler's thread is
+        abandoned (a call still waiting for one never starts) and its late answer dropped; the
+        guest's call fails with `tool_timeout_error()`."""
+        loop = asyncio.get_running_loop()
+        guard: asyncio.Future[Any] = loop.create_future()
+
+        def relay(f: asyncio.Future[Any]) -> None:
+            if f.cancelled():
+                if not guard.done():
+                    guard.cancel()
+                return
+            error = f.exception()  # retrieved either way
+            if guard.done():
+                return
+            if error is not None:
+                guard.set_exception(error)
+            else:
+                guard.set_result(f.result())
+
+        def expire() -> None:
+            if not guard.done():
+                guard.set_exception(_ToolTimedOut())
+
+        fut.add_done_callback(relay)
+        timer = loop.call_later(limit, expire)
+        try:
+            return await self._await_or_death(guard)
+        except _ToolTimedOut:
+            fut.cancel()  # a call still queued for a thread never starts
+            count = self._outlasted.abandon(call)
+            if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+                message = abandoned_message(limit, count)
+                self._kill((WorkerCrashed, message))
+                raise _HostCallBudgetExceeded(message) from None
+            return _frame(self._error(cid, tool_timeout_error()))
+        finally:
+            timer.cancel()
+
     async def _async_call(
-        self, handler: Callable[..., Any], args: list[Any], cid: int, pump: _Pump
+        self,
+        handler: Callable[..., Any],
+        args: list[Any],
+        cid: int,
+        pump: _Pump,
+        limit: float | None = None,
     ) -> None:
         big = False
         try:
             try:
-                value = await _call_guarded(handler, args, self._serial)
+                coro = _call_guarded(handler, args, self._serial)
+                if limit is not None:
+                    coro = _call_with_deadline(
+                        coro, limit, self._outlasted, self._too_many_outlasted
+                    )
+                value = await coro
                 reply: dict[str, Any] = {
                     "t": "reply",
                     "cid": cid,
@@ -1742,6 +1833,7 @@ class AsyncIsolatedRuntime:
         hid = next(self._hids)
         is_async = inspect.iscoroutinefunction(handler)
         self._handlers[hid] = (handler, is_async)
+        self._tool_hids.add(hid)
         try:
             token = await self._request(
                 {"t": "bind_function", "name": name, "hid": hid, "async": is_async}
@@ -1771,6 +1863,7 @@ class AsyncIsolatedRuntime:
                 hid = next(self._hids)
                 is_async = inspect.iscoroutinefunction(value)
                 self._handlers[hid] = (value, is_async)
+                self._tool_hids.add(hid)
                 hids[key] = hid
                 entries[key] = {"hid": hid, "async": is_async}
             else:
@@ -1804,6 +1897,7 @@ class AsyncIsolatedRuntime:
         hid = self._token_to_hid.pop(op_id, None)
         if hid is not None:
             self._handlers.pop(hid, None)
+            self._tool_hids.discard(hid)
             self._revoked_hids[hid] = None
             if len(self._revoked_hids) > _REVOKED_MEMORY:
                 self._revoked_hids.pop(next(iter(self._revoked_hids)))
