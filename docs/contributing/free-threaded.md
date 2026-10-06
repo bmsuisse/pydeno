@@ -17,7 +17,7 @@ with `maturin develop` from this tree (PyO3 0.27.2, unoptimised build).
 | One `Runtime` per thread, 16 threads, 200 evals each with a bound Python function | Correct results, with the GIL re-enabled and also under `PYTHON_GIL=0`. |
 | Using one `Runtime` from a second thread | `PanicException: ... Runtime is unsendable, but sent to another thread`. Same as on a GIL build; it is a thread rule, not a GIL rule. |
 | `tests/test_runtime.py`, `test_function.py`, `test_modules.py`, `test_gil_and_limits.py` (244 tests) | All pass, with and without `PYTHON_GIL=0`. |
-| The rest of the suite | See "Full suite" below. |
+| The rest of the suite (including the isolated runtimes and sandbox tests) | **Not run to completion** on 3.14t. An attempt was abandoned after it ran for a long time on an unoptimised build; no result is claimed. |
 
 That is a smoke test. It is not evidence that the extension is safe without the GIL.
 
