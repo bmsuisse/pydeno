@@ -38,6 +38,10 @@ uuid = { version = "1.16.0", features = ["v4"] }
 
 [build-dependencies]
 pyo3-build-config = "0.25.1"
+# `build.rs` makes the V8 startup snapshot; the same version as the runtime, since a snapshot only
+# loads into the V8 it was made with.
+deno_core = "0.412.0"
+tokio = { version = "1.42.0", features = ["rt"] }
 
 [dev-dependencies]
 criterion = "0.5"

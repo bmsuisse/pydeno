@@ -1,0 +1,10 @@
+/// The V8 flags the built-in startup snapshot is made under, which makes them the only flags it can
+/// be used with: V8 refuses a snapshot under any other set. They are what a default
+/// `IsolatedRuntime` worker starts with (`--jitless` and `_isolated._HARDENING_V8_FLAGS`;
+/// `tests/test_startup_snapshot.py` keeps the two lists equal). A worker with any other flags
+/// starts without the snapshot, as it always did.
+pub const STARTUP_SNAPSHOT_V8_FLAGS: &[&str] = &[
+    "--jitless",
+    "--enable-experimental-regexp-engine-on-excessive-backtracks",
+    "--freeze-flags-after-init",
+];

@@ -278,7 +278,10 @@ impl RuntimeCoreState {
                 .with_owner(RuntimeOwner::fresh());
 
         let mut snapshot_source = snapshot.map(OwnedSnapshot::new);
-        let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
+        let startup_snapshot = match snapshot_source.as_mut() {
+            Some(source) => Some(source.as_static()),
+            None => crate::runtime::startup_snapshot::builtin(),
+        };
 
         #[cfg(not(feature = "inspector"))]
         if inspector.is_some() {

@@ -14,6 +14,7 @@ pub mod python;
 mod registration_id;
 pub mod runner;
 pub mod snapshot;
+pub mod startup_snapshot;
 pub mod stats;
 pub mod stream;
 pub mod v8_flags;

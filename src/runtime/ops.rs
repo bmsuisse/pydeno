@@ -663,7 +663,7 @@ fn op_pydeno_stream_cancel_py(
 
 /// Build the `deno_core::Extension` that wires the Python op registry into the runtime.
 pub fn python_extension(registry: PythonOpRegistry) -> Extension {
-    let bridge_code = ascii_str!(
+    let bridge_code = ascii_str!(concat!(
         r#"(function (globalThis) {
   "use strict";
   const { ops } = Deno.core;
@@ -1122,15 +1122,28 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     }
     return ArrayIsArray(frames) && frames.length > 0 ? GetPrototypeOf(frames[0]) : null;
   }
+  // The two prototypes only an `Intl.Segmenter` instance reaches. Making one starts ICU, about 7 ms,
+  // so a runtime restored from the built-in startup snapshot finds them in it instead (the global
+  // is removed before any other code runs, and believed only if it is an array of objects).
+  // Otherwise they are made here, by the same text the snapshot ran.
+  const SEGMENTER_PROTOTYPES = (function () {
+    const key = "__pydeno_segmenter_prototypes";
+    const snapped = GetOwnPropertyDescriptor(globalThis, key);
+    if (snapped !== undefined) {
+      delete globalThis[key];
+      const value = snapped.value;
+      if (HasOwn(snapped, "value") && ArrayIsArray(value) && value.length <= 2) {
+        return value;
+      }
+    }
+    return ("#,
+        include_str!("js/segmenter_prototypes.js"),
+        r#");
+  })();
   const iteratorHelper = [][Symbol.iterator]();
   for (const hidden of [
     callSitePrototype(),
-    typeof Intl === "object" && typeof Intl.Segmenter === "function"
-      ? GetPrototypeOf(new Intl.Segmenter().segment("a"))
-      : null,
-    typeof Intl === "object" && typeof Intl.Segmenter === "function"
-      ? GetPrototypeOf(new Intl.Segmenter().segment("a")[Symbol.iterator]())
-      : null,
+    ...SEGMENTER_PROTOTYPES,
     typeof iteratorHelper.map === "function" ? GetPrototypeOf(iteratorHelper.map((x) => x)) : null,
     typeof WebAssembly === "object" && typeof WebAssembly.Module === "function"
       ? GetPrototypeOf(WebAssembly.Module.prototype)
@@ -1713,7 +1726,7 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     });
   }
 })(globalThis);"#
-    );
+    ));
 
     Extension {
         name: "pydeno_python",

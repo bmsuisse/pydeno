@@ -6,11 +6,25 @@
 //! one disposable guest". Calling it in a host that already runs guests raises.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 static V8_STARTED: AtomicBool = AtomicBool::new(false);
+static FLAGS_SET: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// Whether the flags this process gave V8 are exactly `wanted`, in any order. No flags at all is a
+/// set too (the empty one). The built-in startup snapshot asks, since V8 refuses a snapshot under
+/// flags other than the ones it was made with.
+pub(crate) fn flags_are(wanted: &[&str]) -> bool {
+    let set = FLAGS_SET.lock().unwrap_or_else(|e| e.into_inner());
+    let mut given: Vec<&str> = set.iter().flatten().map(String::as_str).collect();
+    let mut wanted = wanted.to_vec();
+    given.sort_unstable();
+    wanted.sort_unstable();
+    given == wanted
+}
 
 /// Record that an isolate is being created; flags can no longer change.
 pub(crate) fn mark_v8_started() {
@@ -88,9 +102,14 @@ pub fn _set_v8_flags(flags: Vec<String>) -> PyResult<Vec<String>> {
              afterwards and V8 keeps that value"
         )));
     }
+    FLAGS_SET
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Vec::new)
+        .extend(flags.iter().cloned());
     // V8 ignores argv[0], so give it one and strip it from what comes back.
     let mut argv = vec!["pydeno".to_string()];
-    argv.extend(flags);
+    argv.extend(flags.iter().cloned());
     let mut unknown = deno_core::v8_set_flags(argv);
     unknown.retain(|arg| arg != "pydeno");
     Ok(unknown)
