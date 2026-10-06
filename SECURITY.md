@@ -66,11 +66,14 @@ their limits are in `docs/guides/advanced/isolation.md`.
   (with the exception class name) instead of the text of an exception a host function raised.
   Setting it to `False` hands the guest that text verbatim, so paths, queries, credentials or
   stack details in it reach the guest; do that only when the guest is trusted with them.
-- Do not run the host process as PID 1. Run with an init such as `tini` (`docker run --init`,
-  `podman run --init`) so orphaned and exited workers are reaped; see issue #128.
-- Know the sandbox default. `IsolatedRuntime` and `pydeno.configure_default_runtime(isolated=True)`
-  default to `sandbox="auto"`, which runs with fewer OS layers (and warns) when some cannot be
-  applied. Pass `sandbox="require"` explicitly; see issue #127, which may change this default.
+- A host that is PID 1 (a container's main process) works since 0.11; before that, workers refused
+  to start ("orphaned"). An init such as `tini` (`docker run --init`) is still good practice, so
+  exited workers are reaped promptly.
+- `IsolatedRuntime`, `AsyncIsolatedRuntime` and `configure_default_runtime(isolated=True)` default to
+  `sandbox="require"` since 0.11 (`"auto"` before). `sandbox="auto"` starts with fewer OS layers when
+  some cannot be applied; it warns, logs through the `pydeno` logger and sets `rt.sandbox_degraded`.
+  `sandbox="require"` does not demand the empty-root layer; pass `empty_root="require"` for that, and
+  check `sandbox_status().hardened`.
 - Validate the arguments of every host function and tool you bind.
 - Bind session state to its owner: `AgentSandbox.dump(key, associated_data=...)`, and the same
   `associated_data=` on `PydenoSession.dump` / `load_session` / `load_snapshot`, with a tenant id and
