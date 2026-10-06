@@ -527,20 +527,6 @@ def test_path_truncate_is_not_available(others: dict[str, str]) -> None:
     assert others["truncate_path"] == "EPERM", others
 
 
-def _kernel_at_least(major: int, minor: int) -> bool:
-    release = os.uname().release.split(".")
-    try:
-        return (
-            int(release[0]),
-            int("".join(c for c in release[1] if c.isdigit())),
-        ) >= (
-            major,
-            minor,
-        )
-    except (IndexError, ValueError):
-        return False
-
-
 def test_the_only_reachable_syscalls_are_the_kernel_seccomp_passthrough() -> None:
     """Of the full sweep's REACHABLE list, what the filter does not allow (issue #135).
 
@@ -567,7 +553,6 @@ def test_the_only_reachable_syscalls_are_the_kernel_seccomp_passthrough() -> Non
     assert reachable <= expected, (
         f"new reachable syscalls: {sorted(reachable - expected)}"
     )
-    if _kernel_at_least(6, 12):
-        assert reachable == expected, (
-            f"expected the pass-through to be reachable: {reachable}"
-        )
+    # Only "nothing else is reachable" is pinned. That the pass-through itself is reachable
+    # depends on the kernel, the architecture (`uprobe` is x86-64 only) and the container's own
+    # seccomp profile, so asserting it fails on aarch64 and behind a container filter.

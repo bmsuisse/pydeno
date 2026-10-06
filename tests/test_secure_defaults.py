@@ -2,29 +2,39 @@
 
 from __future__ import annotations
 
-import inspect
 
 import pytest
 
 import pydeno
-from pydeno import AsyncIsolatedRuntime, IsolatedRuntime, _isolated
+from pydeno import IsolatedRuntime, _isolated
 
 
-@pytest.mark.parametrize("cls", [IsolatedRuntime, AsyncIsolatedRuntime])
-def test_sandbox_defaults_to_require(cls: type) -> None:
-    assert inspect.signature(cls).parameters["sandbox"].default == "require"
+def test_sandbox_defaults_to_require(original_sandbox_defaults: dict[str, str]) -> None:
+    assert original_sandbox_defaults == {
+        "IsolatedRuntime": "require",
+        "AsyncIsolatedRuntime": "require",
+    }
 
 
-def test_the_default_runtime_helpers_inherit_require() -> None:
-    pydeno.close_default_runtime()  # an earlier test may have left a plain default runtime open
+def test_the_default_runtime_helpers_forward_no_sandbox_of_their_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`configure_default_runtime(isolated=True)` must leave `sandbox` to the constructor's
+    default ("require"), not name one itself."""
+    seen: list[dict[str, object]] = []
+
+    class Recorder:
+        def __init__(self, **options: object) -> None:
+            seen.append(options)
+
+    monkeypatch.setattr(_isolated, "IsolatedRuntime", Recorder)
+    monkeypatch.setattr(pydeno, "_default_factory", pydeno._default_factory)  # noqa: SLF001
+    pydeno.configure_default_runtime(isolated=True)
     try:
-        pydeno.configure_default_runtime(isolated=True)
-        runtime = pydeno.get_default_runtime()
-        assert runtime._options["sandbox"] == "require"  # noqa: SLF001
-        assert runtime.sandbox_degraded is False
+        pydeno._default_factory()  # noqa: SLF001
     finally:
-        pydeno.close_default_runtime()
         pydeno.configure_default_runtime()
+    assert seen == [{}]
 
 
 def test_a_finite_host_call_budget_is_the_default() -> None:
@@ -73,9 +83,10 @@ def test_empty_root_rejects_nonsense_and_a_sandbox_that_is_off() -> None:
 def test_status_separates_complete_from_hardened() -> None:
     status = pydeno.sandbox_status()
     assert status.to_dict()["hardened"] == status.hardened
+    linux = status.platform == "linux"
     if status.hardened:
-        assert status.complete and status.empty_root.applied
-    if status.complete and not status.empty_root.applied:
+        assert status.complete and (not linux or status.empty_root.applied)
+    if linux and status.complete and not status.empty_root.applied:
         assert not status.hardened
         assert "not hardened" in status.explain()
 

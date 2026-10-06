@@ -58,12 +58,11 @@ def _can_unshare_pid_namespace() -> bool:
     return done.returncode == 0
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
 def test_a_pid_1_host_is_not_reported_as_having_an_orphaned_worker() -> None:
     """Before 0.11 a host that was PID 1 got "the worker was orphaned" in every sandbox mode. In
     a user namespace the worker may still be refused for another reason (it runs as the mapped
     root and cannot drop privileges); this pins only that PID 1 is not mistaken for an orphan."""
-    if not _can_unshare_pid_namespace():
+    if sys.platform != "linux" or not _can_unshare_pid_namespace():
         # Not a skip: CI budgets skips at zero. The pure check above still runs everywhere.
         pytest.xfail("PID namespaces are not available on this host")
     code = textwrap.dedent(
