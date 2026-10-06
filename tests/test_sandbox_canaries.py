@@ -150,11 +150,41 @@ def test_a_worker_with_max_memory_gets_a_kernel_data_cap() -> None:
         pid = rt._proc.pid  # noqa: SLF001
         assert rt.eval("1 + 1") == 2
         assert (
-            int(_limit_of(pid, "Max data size")) == 300 * mib + _sandbox.DATA_HEADROOM
+            int(_limit_of(pid, "Max data size")) >= 300 * mib + _sandbox.DATA_HEADROOM
         )
         # and the long-standing ones are still there
         assert _limit_of(pid, "Max core file size") == "0"
         assert _limit_of(pid, "Max open files") == "256"
+
+
+def test_the_data_cap_counts_from_what_the_interpreter_already_reserved() -> None:
+    """RLIMIT_DATA counts private writable *reservations*, not resident pages. A free-threaded
+    CPython reserves 1 GiB before any script runs, so a fixed `max_memory + headroom` ceiling would
+    sit below the worker's own baseline and V8 could not start (found on 3.14t: a JIT worker died
+    with SIGTRAP, a 900 MiB buffer failed). The ceiling is therefore the baseline at the moment it
+    is set, plus `max_memory`, plus the headroom."""
+    out = _run(
+        """
+        import mmap, resource
+        from pydeno import _sandbox
+
+        def vm_data():
+            with open("/proc/self/status") as fh:
+                for line in fh:
+                    if line.startswith("VmData:"):
+                        return int(line.split()[1]) * 1024
+
+        mib = 1 << 20
+        keep = mmap.mmap(-1, 2048 * mib, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)  # a big private writable reservation, untouched
+        base = vm_data()
+        limit = _sandbox.limit_data(256 * mib)
+        assert limit is not None
+        assert limit >= base + 256 * mib + _sandbox.DATA_HEADROOM - 16 * mib, (limit, base)
+        extra = mmap.mmap(-1, 512 * mib, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)  # still fits: the cap is not under the baseline
+        print("ok")
+        """
+    )
+    assert out == "ok"
 
 
 def test_no_max_memory_means_no_data_cap() -> None:

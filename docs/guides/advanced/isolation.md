@@ -139,7 +139,7 @@ kernel enforces these itself, and code in the worker cannot lift them:
 
 | Limit | Value | Notes |
 |---|---|---|
-| `RLIMIT_DATA` (private writable memory) | `max_memory` + 1 GiB | Only with `max_memory`. A ceiling under the sampled limit for bursts faster than the sampling. A normal workload meets `max_memory` long before it; an allocation past it fails in the worker (a `RangeError` for a buffer; a V8 abort, reported as `memory_limit`, for the heap). |
+| `RLIMIT_DATA` (private writable memory) | what the interpreter has already reserved + `max_memory` + 1 GiB | Only with `max_memory`. A ceiling under the sampled limit for bursts faster than the sampling. A normal workload meets `max_memory` long before it; an allocation past it fails in the worker (a `RangeError` for a buffer; a V8 abort, reported as `memory_limit`, for the heap). |
 | `RLIMIT_NPROC` (tasks) | 128 | Only inside the worker's own user namespace (the empty root) on Linux 5.14+, where the kernel counts tasks per namespace. Elsewhere it would count every process the host user runs, so it is not set, and the parent's sampled cap of 64 threads is what stops a thread bomb. |
 | `RLIMIT_FSIZE`, `RLIMIT_NOFILE`, `RLIMIT_CORE`, `RLIMIT_MEMLOCK`, `RLIMIT_MSGQUEUE`, `RLIMIT_RTPRIO`, `RLIMIT_NICE` | 1 MiB, 256, 0, 0, 0, 0, 0 | As before. |
 

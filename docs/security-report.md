@@ -242,6 +242,13 @@ bound methods, classes, async generators, builtins).
   politely on aarch64. `fork` and `vfork` are `EPERM` now; `execve` is still killed, since it can
   only follow a fork the filter never allows. This is the second x86_64-only difference after
   `uname`, and the reason sandbox changes are verified on native runners.
+- **Verification status of this change (be exact about it).** The traces above were taken in an
+  earlier session on CI runners and are carried over, not repeated here. In this change the full
+  filter was run natively on x86_64 only (kernel 7.0, Landlock ABI 8: `sandbox_status()` complete,
+  kill verified, 1100+ filter, table, canary, violation and isolation tests green on a free-threaded
+  CPython 3.14). The aarch64 numbers are checked only against `tests/data/syscalls.json` and the
+  kernel-free interpreter in `tests/test_seccomp_program.py`; no aarch64 kernel ran them here.
+  Native aarch64 and the container matrix come from CI. No outside review has happened.
 - **Not traced:** the macOS sandbox (unchanged), architectures other than x86_64 and aarch64 (the
   filter is not applied there), and kernels older than the runners' 6.17 and the local 6.15
   (containers share the host kernel; the matrix simulates missing Landlock and seccomp, not older
@@ -251,7 +258,7 @@ bound methods, classes, async generators, builtins).
 
 - `--single-threaded`: no reduction in threads, +79% GC time. Not adopted.
 - `RLIMIT_DATA` *at* the memory ceiling: turns the clean RSS kill into a V8 out-of-memory abort.
-  Adopted in 0.10 with 1 GiB of headroom above `max_memory` instead (measured: private writable
+  Adopted in 0.10 with 1 GiB of headroom above `max_memory` and above what the interpreter already reserved instead (a free-threaded CPython reserves 1 GiB before any script runs; a fixed ceiling killed JIT workers there) (measured: private writable
   memory runs ahead of resident memory by about 45 MiB jitless and 300 MiB with the JIT), so the
   sampled limit fires first in normal use, and the abort, when a burst does reach the ceiling, is
   reported as `memory_limit`.

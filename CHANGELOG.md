@@ -27,8 +27,8 @@
   open a moment earlier, which must now be refused; a kernel that accepts the ruleset and does not
   enforce it is no longer counted as `"landlock"`. `sandbox_status()` reports the Landlock ABI, the
   canary and the kill check.
-- **Kernel-enforced caps.** With `max_memory`, a Linux worker gets `RLIMIT_DATA` at `max_memory` +
-  1 GiB, a ceiling under the sampled memory limit that code in the worker cannot lift; V8 aborting
+- **Kernel-enforced caps.** With `max_memory`, a Linux worker gets `RLIMIT_DATA` at what the
+  interpreter has already reserved (1 GiB on free-threaded CPython) + `max_memory` + 1 GiB, a ceiling under the sampled memory limit that code in the worker cannot lift; V8 aborting
   at it is reported as `memory_limit`. Inside the worker's own user namespace (the empty root) on
   Linux 5.14+, `RLIMIT_NPROC` caps its threads at 128, which the kernel counts per namespace there.
   `RLIMIT_AS`, `RLIMIT_CPU` and cgroups are not used; the isolation guide says why.

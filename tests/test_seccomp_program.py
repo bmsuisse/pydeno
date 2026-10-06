@@ -281,7 +281,11 @@ class TestSignals:
     def test_to_itself_is_allowed(self, arch: str, prog: list, signal_nr: int) -> None:
         assert run(prog, arch, signal_nr, (ME, 0, 0)) == ALLOW
 
-    @pytest.mark.parametrize("victim", [1, 2, 0, ME + 1, ME - 1, 2**31 - 1, 2**32 - 1])
+    # In a container the test process can itself be pid 1 or 2: it is not "someone else" then.
+    @pytest.mark.parametrize(
+        "victim",
+        [v for v in (1, 2, 0, ME + 1, ME - 1, 2**31 - 1, 2**32 - 1) if v != ME],
+    )
     def test_to_anyone_else_is_denied(
         self, arch: str, prog: list, signal_nr: int, victim: int
     ) -> None:

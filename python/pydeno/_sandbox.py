@@ -1683,15 +1683,29 @@ def harden_process() -> dict[str, object]:
 DATA_HEADROOM = 1 << 30
 
 
+def _data_bytes_now() -> int:
+    """Private writable address space already reserved by this process (`VmData`). A free-threaded
+    CPython reserves 1 GiB of it before any script runs, and RLIMIT_DATA counts reservations."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmData:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def limit_data(max_memory: int | None) -> int | None:
-    """Linux: cap this process's private writable memory (RLIMIT_DATA) at
-    `max_memory + DATA_HEADROOM`. Returns the limit set, or None (no `max_memory`, not Linux, or
+    """Linux: cap this process's private writable memory (RLIMIT_DATA) at what it has reserved
+    now plus `max_memory + DATA_HEADROOM`, so the interpreter's own baseline does not eat the
+    budget (`DATA_HEADROOM` is for what V8 and the guest add). Returns the limit set, or None (no `max_memory`, not Linux, or
     refused). Not RLIMIT_AS: V8 reserves tens of GiB of address space it never uses (the
     pointer-compression cage and its guard regions), so an address-space limit would either stop
     V8 from starting or be too large to bound anything."""
     if max_memory is None or not sys.platform.startswith("linux"):
         return None
-    limit = max_memory + DATA_HEADROOM
+    limit = _data_bytes_now() + max_memory + DATA_HEADROOM
     try:
         _, hard = resource.getrlimit(resource.RLIMIT_DATA)
         if hard != resource.RLIM_INFINITY:
