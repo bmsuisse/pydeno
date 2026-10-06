@@ -36,7 +36,7 @@ from pydeno import (
     _sandbox,
     undefined,
 )
-from pydeno import _aio, _compat
+from pydeno import _aio, _compat, _template
 from pydeno._aio import AsyncIsolatedRuntime
 from pydeno._isolated import _HARDENING_V8_FLAGS, _MAX_WORKER_THREADS
 
@@ -901,6 +901,7 @@ class TestScaling:
         guard(subprocess.Popen, "__init__")
         guard(subprocess.Popen, "wait")
         guard(subprocess.Popen, "communicate")
+        guard(_template.MANAGER, "spawn")  # fork-template mode starts workers here, not by Popen
         guard(_sandbox, "usage")
         guard(_aio, "_stderr_tail")
         guard(time, "sleep")
@@ -932,7 +933,7 @@ class TestScaling:
 
         assert not on_loop, f"blocking calls on the event loop thread: {on_loop}"
         # Not vacuous: the guarded operations did happen, on other threads.
-        assert off_loop.count("__init__") >= 12, off_loop
+        assert off_loop.count("__init__") + off_loop.count("spawn") >= 12, off_loop
         assert "usage" in off_loop, off_loop
 
     async def test_fifty_runtimes_add_almost_no_threads(self) -> None:

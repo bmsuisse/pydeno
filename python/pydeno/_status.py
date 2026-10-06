@@ -48,7 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import _sandbox
+from . import _sandbox, _template
 
 __all__ = ["Layer", "SandboxStatus", "sandbox_status"]
 
@@ -95,6 +95,10 @@ class SandboxStatus:
     #: `complete` and, on Linux, the empty-root layer too. `sandbox="require"` does not demand
     #: that layer; `empty_root="require"` does.
     hardened: bool = False
+    #: How new workers are started: "exec" (a fresh interpreter each, the default) or
+    #: "fork-template" (opt-in: `enable_fork_template()`, workers share the template's address-space
+    #: layout and stack canary).
+    worker_start: str = "exec"
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -105,6 +109,7 @@ class SandboxStatus:
             "complete": self.complete,
             "hardened": self.hardened,
             "warnings": list(self.warnings),
+            "worker_start": self.worker_start,
         }
         for name in _LAYER_FIELDS:
             out[name] = getattr(self, name).to_dict()
@@ -645,6 +650,14 @@ def _sandbox_status() -> SandboxStatus:
             )
     if (time.monotonic() - start) > 0.3:
         warns.append("the probe took over 300 ms; this host is slow to fork")
+    worker_start = "fork-template" if _template.MANAGER.enabled else "exec"
+    if worker_start == "fork-template":
+        warns.append(
+            "workers start by forking a template (opt-in): they share its address-space layout "
+            "and stack canary, so an information leak in one session helps against the next from "
+            "the same template; the template is replaced after "
+            f"{_template.MANAGER.max_forks} workers or {_template.MANAGER.max_age_seconds:g} s"
+        )
 
     return SandboxStatus(
         platform=plat,
@@ -663,4 +676,5 @@ def _sandbox_status() -> SandboxStatus:
         complete=complete,
         hardened=complete and (not linux or empty_root.applied),
         warnings=warns,
+        worker_start=worker_start,
     )

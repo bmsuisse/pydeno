@@ -53,7 +53,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import _sandbox, _wasm, _wire
+from . import _sandbox, _template, _wasm, _wire
 from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._limits import limit_int, limit_seconds
 from ._result import (
@@ -848,6 +848,11 @@ class IsolatedRuntime:
             _take_worker()
             if prewarm and python is None
             else _start_worker(self._python)
+        )
+        #: "exec" (a fresh interpreter, the default) or "fork-template" (opt-in, see
+        #: `enable_fork_template`): how this worker was started.
+        self.worker_start = (
+            "fork-template" if isinstance(self._proc, _template.ForkedProc) else "exec"
         )
         stdin_fd = self._proc.stdin.fileno()  # type: ignore[union-attr]
         # Non-blocking, so that a worker which stops reading its input is a timeout we can act on
@@ -1966,11 +1971,8 @@ _PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `-S`: no `site`, so no `.pth` file runs in the worker and its `sys.path` is the standard library
 # plus this package's directory, *appended* so nothing next to `pydeno` can shadow a stdlib module.
 # pydeno has no runtime dependencies, so the worker needs nothing else. Saves the `site` import.
-_WORKER_BOOT = (
-    "import sys; sys.path.append({!r}); from pydeno._worker import main; main()".format(
-        _PACKAGE_PARENT
-    )
-)
+_WORKER_BOOT_PREFIX = "import sys; sys.path.append({!r}); ".format(_PACKAGE_PARENT)
+_WORKER_BOOT = _WORKER_BOOT_PREFIX + "from pydeno._worker import main; main()"
 
 
 def _worker_argv(python: str) -> list[str]:
@@ -1983,6 +1985,13 @@ def _worker_argv(python: str) -> list[str]:
 
 def _start_worker(python: str) -> tuple[subprocess.Popen[bytes], Any]:
     stderr = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close() / finalizer
+    if python == sys.executable and _template.MANAGER.enabled:
+        # Opt-in (`enable_fork_template`): a fork of a prepared template, not a fresh interpreter.
+        # Any failure falls back to the ordinary spawn below, which is the stricter choice.
+        try:
+            return _template.MANAGER.spawn(stderr.fileno()), stderr  # type: ignore[return-value]
+        except OSError:
+            pass
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
             _worker_argv(python),
@@ -2112,4 +2121,6 @@ def _forget_parents_workers() -> None:
 
 
 os.register_at_fork(after_in_child=_forget_parents_workers)
+os.register_at_fork(after_in_child=_template.MANAGER.forget)
 atexit.register(_discard_spare)
+atexit.register(_template.MANAGER.shutdown)
