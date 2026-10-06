@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased / 0.10.0
+
+### Added
+
+- **`WasmModule.call_bytes()` (and the `AsyncWasmModule` coroutine): byte buffers in and out of a
+  trusted WebAssembly module** (the remainder of #37). Opt-in by convention: the module exports
+  `memory`, `alloc(len) -> ptr`, `dealloc(ptr, len)` and a function
+  `(in_ptr, in_len, out_ptr, out_cap) -> i32` that returns the bytes written (negative is an error).
+  The host copies the input in, caps the output at `max_result_bytes`, copies it out as `bytes` and
+  frees both blocks, also on an error. Each side is bounded by `max_input_bytes` /
+  `max_result_bytes` (default 1 MiB, ceiling 4 MiB), checked on the host and again in the bridge.
+  No view of the module's memory ever leaves the bridge, and a pointer from `alloc` outside the live
+  memory, or a claimed length over the cap, is refused. Same `jitless=False` and trusted-module
+  caveats as `load_wasm`.
+
 ## 0.9.0 — 2026-10-05
 
 Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed
