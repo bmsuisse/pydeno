@@ -150,6 +150,37 @@ declare function query_rows(sql: string, params?: Record<string, unknown> | null
 Every tool returns `Promise<...>`. Both helpers also exist as module-level functions that take the
 tools mapping, so you can build a prompt without starting a worker.
 
+### A bounded prompt catalog across namespaces
+
+For tools bound under several namespace objects, `describe_tool_catalog()` renders a
+fair selection of complete descriptions:
+
+```python
+from pydeno import describe_tool_catalog
+
+prompt = describe_tool_catalog(
+    {"orders": order_tools, "weather": weather_tools},
+    max_chars=8000,
+)
+```
+
+Pass only tools that the host actually bound under those names. This helper renders text;
+it does not bind capabilities or make a lazy catalog tool discoverable. For
+`tools_catalog=`, keep using the session's `search_tools` and `describe_tool` workflow.
+
+`max_chars` bounds the characters in complete tool entries, including their types and
+examples. Execution instructions and the per-namespace count summaries are additional.
+Zero is valid. The catalog labels itself `COMPLETE` or `PARTIAL`, and always reports each
+namespace's shown and total counts. Shortest entries are selected round-robin across
+alphabetically sorted namespaces, so a large namespace cannot take every available slot
+when entries from other namespaces fit. No entry is cut in the middle of a schema or
+example. Each entry has a separate block with entry-local types, so two tools may
+use the same schema type name for different shapes without conflicting. Existing
+`describe_tools()` output is unchanged.
+
+This bounds model context; it is not an execution, memory or tool-call limit. Rendering
+still inspects the supplied tools, and no execution-speed improvement is claimed.
+
 ## Tools described by JSON Schema
 
 A host with tools described by JSON Schema (MCP style) rather than Python signatures passes them as

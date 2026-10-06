@@ -33,7 +33,9 @@ A deny-list is only as good as its last review, so the design leans on two furth
 |---|---|---|
 | Behaviour and lifecycle | `test_isolated_runtime`, `_lifecycle`, `_limits`, `_determinism` | Normal use, limits, cancellation, restarts, determinism. |
 | Capability denial | `test_isolated_capability_denial` | A checklist of what untrusted code tries first: files, network, subprocess, environment, `Deno`/Node/browser globals, the runtime's own plumbing; through `eval` and `eval_async`; plus a check that nothing reached the host. |
-| Assume-breach (Linux) | `test_redteam_syscalls`, `scripts/redteam_syscalls.py` | Real dangerous syscalls fired from a sandboxed process; every one must answer `EPERM`. The sweep covers ~350 syscalls. |
+| Assume-breach (Linux) | `test_redteam_syscalls`, `test_sandbox_violation`, `scripts/redteam_syscalls.py` | Real dangerous syscalls fired from a sandboxed process (and from a real worker): each must answer `EPERM`, or, for the never-legitimate ones, kill the process, which the parent reports as `sandbox_violation`. The sweep covers ~350 syscalls. |
+| What a worker calls (Linux) | `scripts/trace_worker_syscalls.py` | Real workers traced with `strace` through the isolation suites, natively on x86_64 and aarch64: the evidence for the allow-list. |
+| Canaries (Linux) | `test_sandbox_canaries` | The filter's kill action and Landlock's enforcement are checked by a forbidden call after they are applied; a kernel that accepts either and does not enforce it is detected. |
 | Filter logic | `test_seccomp_program` | The BPF program run in a small interpreter over every syscall number on x86_64 and aarch64, with no kernel. |
 | Kernel tables | `test_sandbox_syscall_tables` | Every number in the filter checked against the kernel's own tables (`tests/data/syscalls.json`). |
 | Startup self-test | `test_sandbox_attest*`, `test_seatbelt_process_info` | The probes detect a breach when there is no sandbox (negative control) and report none when there is. |
@@ -99,8 +101,9 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Landlock/userns "single-thread" check could not see native threads | **Fixed.** Counts via `/proc/self/task`. |
 | Worker with a thread bomb stays under the memory ceiling | **Fixed.** Parent kills a worker over 64 threads. |
 | `sandbox="auto"` runs with fewer layers silently | **Mitigated.** Warns; `require` refuses. The default stays `auto` (a deliberate compatibility choice). |
-| Denied calls answer `EPERM` (an exploit can probe the filter freely) | **Open.** Killing the process on never-legitimate calls is planned. |
-| Seccomp is a deny-list with a default-deny tail for unreviewed syscalls | **Open.** An allow-list derived from tracing real workers is planned. |
+| Denied calls answer `EPERM` (an exploit can probe the filter freely) | **Fixed** (0.10, #45). About 60 never-legitimate calls (`ptrace`, `execve`, the mount API, `bpf`, `io_uring_*`, `memfd_create`, ...) kill the worker; the parent reports `sandbox_violation`. Others still answer `EPERM`, on purpose: libraries probe some of them and fall back. |
+| Seccomp is a deny-list with a default-deny tail for unreviewed syscalls | **Fixed** (0.10, #45). An allow-list (92 syscalls on x86_64, 79 on aarch64, plus about 20 with checked arguments), derived by tracing real workers natively on both architectures; `fcntl` and `ioctl` commands are allow-lists too. |
+| A kernel (or a stack in front of it) that accepts the seccomp kill action or the Landlock ruleset and does not enforce it would go unnoticed | **Fixed** (0.10, #45). Landlock: a canary on every worker start (a directory readable before the ruleset must be refused after it), or the layer is not counted. Seccomp: a worker asks the kernel whether the kill action is supported; `sandbox_status()` exercises it (a never-legitimate call in its throwaway child must be killed). Not on every start, because the kernel audits each seccomp kill; a filter in front of pydeno's cannot weaken a kill (the most severe action wins). Failures fail the self-test, so `require` refuses. |
 | macOS: `notify_post()` still reaches other processes; `kill(pid, 0)` still distinguishes live pids | **Open, known.** The connection to `notifyd` is made before the profile applies. |
 | Landlock access rights newer than the reviewed ABI are not handled | **Open.** |
 | Worker outliving a dead parent (`PR_SET_PDEATHSIG`) | **Open.** |
@@ -176,7 +179,7 @@ not supported, so its findings are summarised in one line below.
 | Bridge: `null` entries skipped the node count, so a four-billion-entry sparse array looped until the deadline | **Fixed in source; verified after the next build.** |
 | Bridge globals (`__host_op_sync__` and friends) were writable | **Fixed in source; verified after the next build.** |
 | macOS: path existence is observable (`stat` answers EPERM for a path that exists and ENOENT for one that does not); XNU build string and CPU/memory counts are readable | **Open, known.** Seatbelt cannot hide existence; Linux with only Landlock has the same oracle. |
-| Linux: the thread cap is sampled, not kernel-enforced | **Open.** A pids cgroup or `RLIMIT_NPROC` in the new user namespace is planned. |
+| Linux: the thread cap is sampled, not kernel-enforced | **Partly fixed** (0.10, #45). `RLIMIT_NPROC` at 128 inside the worker's own user namespace on Linux 5.14+ (the kernel counts per namespace there). Without the empty root it would count every process of the host user, so it is not set and the sampled cap remains the limit. Cgroups need a delegated subtree and are not used. |
 | Hosts that mount `/proc` with `hidepid` make the worker's usage unreadable | **Open.** `require` refuses to start there (fail closed); `auto` warns. |
 
 ### Round 4: host boundary and state (0.8 red team, slice C)
@@ -218,11 +221,51 @@ journaled); re-entering, closing or dumping a session from its own tool; context
 and other embedded forms, trailing-dot and confusable hosts); weird callables as tools (partials,
 bound methods, classes, async generators, builtins).
 
+### 0.10: the seccomp allow-list (#45), how it was derived and checked
+
+- **Derived by tracing, natively.** `scripts/trace_worker_syscalls.py` ran real workers under
+  `strace` through a built-in workload (both engine modes, WebAssembly, modules, async host calls,
+  a deadline, a memory kill) and ten isolation test files, on GitHub's native x86_64 and aarch64
+  runners, in Debian 13 (Python 3.10 and 3.14), Ubuntu 22.04, AlmaLinux 9 and Fedora images
+  (glibc 2.34 to 2.43). About 520 sandboxed workers per image. A worker made 39 to 44 distinct
+  syscalls after its sandbox was up; the union over every trace is 46 names, all on the allow-list
+  or argument-checked, except the self-test's own probes and `pkey_alloc` (V8 on x86_64 asks for
+  memory protection keys and carries on without them; it stays `EPERM`). `uname` and `pkey_alloc`
+  appear only on x86_64, `epoll_wait` only on x86_64 (`epoll_pwait` on aarch64).
+- **Re-traced under the new filter.** The same traces with the allow-list in force: the only
+  refusals a healthy worker met were the self-test's probes (a non-thread `clone`, `kill` of the
+  parent, `socket`, a datagram `socketpair`), `clone3` (`ENOSYS`, glibc falls back to `clone`) and
+  `pkey_alloc`. Nothing on the default-deny path.
+- **What the native runs caught.** CPython's `subprocess` calls glibc's `vfork()`, which on x86_64
+  is the `vfork` syscall itself (aarch64 has none and goes through `clone`): with `vfork` on the
+  kill list, a library that tried to start a program killed the worker on x86_64 and failed
+  politely on aarch64. `fork` and `vfork` are `EPERM` now; `execve` is still killed, since it can
+  only follow a fork the filter never allows. This is the second x86_64-only difference after
+  `uname`, and the reason sandbox changes are verified on native runners.
+- **Verification status of this change (be exact about it).** The traces above were taken in an
+  earlier session on CI runners and are carried over, not repeated here. In this change the full
+  filter was run natively on x86_64 only (kernel 7.0, Landlock ABI 8: `sandbox_status()` complete,
+  kill verified, 1100+ filter, table, canary, violation and isolation tests green on a free-threaded
+  CPython 3.14). The aarch64 numbers are checked only against `tests/data/syscalls.json` and the
+  kernel-free interpreter in `tests/test_seccomp_program.py`; no aarch64 kernel ran them here.
+  Native aarch64 and the container matrix come from CI. No outside review has happened.
+- **Not traced:** the macOS sandbox (unchanged), architectures other than x86_64 and aarch64 (the
+  filter is not applied there), and kernels older than the runners' 6.17 and the local 6.15
+  (containers share the host kernel; the matrix simulates missing Landlock and seccomp, not older
+  kernels).
+
 ### Rejected after measuring
 
 - `--single-threaded`: no reduction in threads, +79% GC time. Not adopted.
-- `RLIMIT_DATA` at the memory ceiling: turns the clean RSS kill into a V8 out-of-memory abort.
-  Deferred until the abort path is handled.
+- `RLIMIT_DATA` *at* the memory ceiling: turns the clean RSS kill into a V8 out-of-memory abort.
+  Adopted in 0.10 with 1 GiB of headroom above `max_memory` and above what the interpreter already reserved instead (a free-threaded CPython reserves 1 GiB before any script runs; a fixed ceiling killed JIT workers there) (measured: private writable
+  memory runs ahead of resident memory by about 45 MiB jitless and 300 MiB with the JIT), so the
+  sampled limit fires first in normal use, and the abort, when a burst does reach the ceiling, is
+  reported as `memory_limit`.
+- `RLIMIT_AS`: V8 reserves 18 to 50 GiB of address space (the pointer-compression cage and guard
+  regions) and touches a fraction, so an address-space limit either stops V8 or bounds nothing.
+- `RLIMIT_CPU`: it counts the worker's whole life, and a non-root parent cannot raise it again for
+  the next command, so it cannot express a per-command cap. The parent's CPU cap stays.
 - A default `max_heap_size`: with one set, V8 turns an over-cap `ArrayBuffer` into a fatal heap-limit
   termination instead of a catchable `RangeError`. The buffer cap alone behaves better.
 
@@ -234,7 +277,9 @@ bound methods, classes, async generators, builtins).
 - **One architecture is not both.** V8's x86_64 build calls `uname()` while starting and aborts if
   seccomp refuses it; the aarch64 build does not. A change that passed every aarch64 container run
   failed every x86_64 CI cell. Sandbox rules are verified on a native x86_64 runner before they
-  are trusted.
+  are trusted. The 0.10 allow-list was derived from traces taken on native x86_64 and aarch64
+  runners, never under emulation (a translator issues the host's syscalls, not the guest's): the
+  x86_64 traces show `uname` and `pkey_alloc`, which aarch64 never calls.
 - **Verify the verifier.** Each new probe has a negative control (it must report a breach in an
   unsandboxed process), otherwise a green result proves nothing.
 - **Count what the kernel counts.** Threads, memory and CPU are read from outside the process, not
@@ -261,6 +306,7 @@ Most agent-sized work is within a factor of two either way. If you trust the cod
 ```bash
 .venv/bin/python -m pytest tests -q          # the whole suite (macOS or Linux)
 scripts/linux_matrix.sh WHEELS IMAGE         # one Linux image, optionally under a degraded kernel
+scripts/trace_worker_syscalls.py --help      # what a real worker calls (strace, in a container)
 python benches_py/monty_three_bench.py       # the speed numbers above
 ```
 

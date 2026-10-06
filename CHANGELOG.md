@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.10.0 — 2026-10-06
+
+### Added
+
+- **Fair, bounded tool descriptions.** `describe_tool_catalog(namespaces, max_chars=8000)`
+  selects complete tool descriptions round-robin across namespace objects and labels the
+  catalog complete or partial. Types are local to each entry; the entry character budget
+  includes examples and schemas, while instructions and namespace summaries are additional.
+  This description-only helper does not bind or discover capabilities. Existing
+  `describe_tools()` output is unchanged.
+
+### Fixed
+
+- **Late async tool calls after cancellation.** A queued callback entering an already-closed
+  `AsyncAgentSandbox` is refused before allocating an unanswered future or charging the tool
+  budget. This prevents shim tasks from remaining parked after cancellation.
+- **Bounded model previews.** Dictionary previews inspect only the five entries they display,
+  rather than copying the entire dictionary first. Displayed output is unchanged; no
+  wall-clock speed improvement is claimed.
+- **Local Linux overlays include Python subpackages.** `OVERLAY_PY=1` now includes integrations
+  and tools while preserving the installed native extension. Release artifact gates continue
+  to run without overlays.
+- **Intermittent abort or segfault at exit after `eval_async` in an `atexit` handler.** The
+  Tokio worker that delivered the result could still be inside Python when the handler
+  returned and finalization began, so CPython freed its thread state under it (`Fatal Python
+  error: Aborted`, or a segfault, with `unsendable` panics from the deferred drops). The
+  receiving side now waits for that worker to leave Python before it resolves the future.
+
+### Documentation
+
+- Research note on a custom V8 build (pointer compression, V8 sandbox, build-time jitless, disabled features), against the `deno_core` 0.412.0 / `v8` 150.4.0 pins: recommendation is not to build one for 0.10 (#44). See `docs/contributing/research-custom-v8-build.md`.
+- **Security review preparation** ([`docs/contributing/security-review-prep.md`](docs/contributing/security-review-prep.md)):
+  threat model, in and out of scope, how to build (and what is not yet reproducible), a known-issue list
+  derived from the security report and issues #45, #72 and #37, and a disclosure outline consistent with
+  `SECURITY.md`. No outside review has happened yet.
+- **Free-threaded CPython (3.14t) is documented as unsupported**
+  ([`docs/contributing/free-threaded.md`](docs/contributing/free-threaded.md)). The extension builds and
+  imports on 3.14t, but the module does not declare `gil_used = false`, so CPython re-enables the GIL at
+  import. A smoke test passed; nothing was audited and there is no 3.14t wheel or CI job. No code change.
+- **`WasmModule.call_bytes()` (and the `AsyncWasmModule` coroutine): byte buffers in and out of a
+  trusted WebAssembly module** (the remainder of #37). Opt-in by convention: the module exports
+  `memory`, `alloc(len) -> ptr`, `dealloc(ptr, len)` and a function
+  `(in_ptr, in_len, out_ptr, out_cap) -> i32` that returns the bytes written (negative is an error).
+  The host copies the input in, caps the output at `max_result_bytes`, copies it out as `bytes` and
+  frees both blocks, also on an error. Each side is bounded by `max_input_bytes` /
+  `max_result_bytes` (default 1 MiB, ceiling 4 MiB), checked on the host and again in the bridge.
+  No view of the module's memory ever leaves the bridge, and a pointer from `alloc` outside the live
+  memory, or a claimed length over the cap, is refused. Same `jitless=False` and trusted-module
+  caveats as `load_wasm`.
+### Security
+
+- **The Linux seccomp filter is an allow-list, and never-legitimate calls kill the worker** (#45).
+  The worker may make 92 syscalls on x86_64 and 79 on aarch64 with any arguments, and about 20
+  more with checked arguments (a worker in normal use makes about 40 distinct ones), derived by tracing real workers through the isolation suites with `strace`,
+  natively on x86_64 and aarch64 and on several distributions (`scripts/trace_worker_syscalls.py`).
+  `fcntl` and `ioctl` are allow-lists of commands too (`ioctl`: `TCGETS`, `TIOCGWINSZ`, `FIONREAD`,
+  `FIONBIO`, `FIOCLEX`, `FIONCLEX`). Every other syscall is refused with `EPERM` (the unreviewed
+  range keeps `ENOSYS`), except about 60 that no runtime ever makes (`ptrace`, `process_vm_*`,
+  `execve`, the mount API, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`,
+  `io_uring_*`, `memfd_create`, the keyring, kernel modules, `kexec`, `reboot`, the clock and the
+  host name, ...): those end the worker on the spot (`SECCOMP_RET_KILL_PROCESS`), so a probing
+  exploit gets no answer to iterate on. `fork`/`vfork` stay `EPERM`: CPython's `subprocess` calls
+  `vfork`, which on x86_64 is its own syscall (found on a native x86_64 runner).
+- **New error kind `sandbox_violation`** (not retryable). A worker killed by its filter raises
+  `WorkerCrashed("worker process died: sandbox violation: ...")` from `IsolatedRuntime` and
+  `AsyncIsolatedRuntime`.
+- **The kill action is checked, and Landlock is checked by a canary.** A worker asks the kernel
+  whether the kill action is supported; `sandbox_status()` exercises it (its throwaway child makes
+  one never-legitimate call and must be killed; a worker start does not, since the kernel audits
+  every seccomp kill). A missing or unenforced kill fails the self-test (`exec-not-killed`), so
+  `sandbox="require"` refuses it. After Landlock is in force the worker opens a directory it could
+  open a moment earlier, which must now be refused; a kernel that accepts the ruleset and does not
+  enforce it is no longer counted as `"landlock"`. `sandbox_status()` reports the Landlock ABI, the
+  canary and the kill check.
+- **Kernel-enforced caps.** With `max_memory`, a Linux worker gets `RLIMIT_DATA` at what the
+  interpreter has already reserved (1 GiB on free-threaded CPython) + `max_memory` + 1 GiB, a ceiling under the sampled memory limit that code in the worker cannot lift; V8 aborting
+  at it is reported as `memory_limit`. Inside the worker's own user namespace (the empty root) on
+  Linux 5.14+, `RLIMIT_NPROC` caps its threads at 128, which the kernel counts per namespace there.
+  `RLIMIT_AS`, `RLIMIT_CPU` and cgroups are not used; the isolation guide says why.
+- Not in this release: running host tools in a sandboxed process of their own (the fifth item of
+  #45). The evaluation and a design are in `docs/contributing/sandboxed-tool-process.md`.
+
 ## 0.9.0 — 2026-10-05
 
 Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed

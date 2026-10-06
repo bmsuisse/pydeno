@@ -326,6 +326,38 @@ class WorkerCrashed(RuntimeError):
     """The worker process died, was killed, or broke protocol. The runtime is closed."""
 
 
+# V8's own words when an allocation it cannot do without fails (it then aborts the process).
+_V8_OOM = re.compile(r"Fatal (?:process|JavaScript) out of memory")
+
+
+def _v8_out_of_memory(code: int | None, tail: str, max_memory: int | None) -> bool:
+    """A worker under the kernel's memory ceiling (`_sandbox.limit_data`, Linux, only with
+    `max_memory`) that hit it: an allocation failed and V8 aborted. The stderr text is the
+    worker's, but all it can choose is a non-retryable kind, never a more retryable one."""
+    return (
+        max_memory is not None
+        and sys.platform.startswith("linux")
+        and code is not None
+        and code < 0
+        and bool(_V8_OOM.search(tail))
+    )
+
+
+def _memory_ceiling_message(max_memory: int | None) -> str:
+    return (
+        f"worker reached its kernel memory ceiling (max_memory={max_memory} plus headroom) "
+        "and was stopped"
+    )
+
+
+# What a worker killed by its seccomp filter is reported as (after "worker process died: " or
+# the like); `classify_error` gives it the kind `sandbox_violation`.
+SANDBOX_VIOLATION = (
+    "sandbox violation: the worker made a system call its OS sandbox never allows "
+    "and was killed (SIGSYS)"
+)
+
+
 class _HostCallBudgetExceeded(Exception):
     """Internal: the guest asked for more host calls than `max_host_calls` allows."""
 
@@ -947,6 +979,15 @@ class IsolatedRuntime:
             return (
                 f"{prefix}: worker went over max_memory={self._max_memory} and exited"
             )
+        if (
+            hasattr(signal, "SIGSYS")
+            and code == -signal.SIGSYS
+            and "seccomp" in self.sandbox.split("+")
+        ):
+            # The seccomp filter killed it for a call that is never legitimate in a worker
+            # (`_sandbox._KILL`): an escape probing the kernel, not a crash. Nothing the worker
+            # wrote is added: there is nothing a person needs from it, and it is the guest's text.
+            return f"{prefix}: {SANDBOX_VIOLATION}"
         if code is not None and code < 0:
             try:
                 prefix += f" (killed by {signal.Signals(-code).name})"
@@ -961,6 +1002,8 @@ class IsolatedRuntime:
             tail = self._stderr.read().decode("utf-8", "replace").strip()
         except (OSError, ValueError):
             tail = ""
+        if _v8_out_of_memory(code, tail, self._max_memory):
+            return f"{prefix}: {_memory_ceiling_message(self._max_memory)}"
         # The worker wrote this, and a compromised one can write anything: it goes into an
         # exception message, so no control or escape characters.
         last = tail.splitlines()[-1] if tail else ""
@@ -1751,7 +1794,11 @@ class IsolatedRuntime:
             raise WorkerCrashed("worker returned a malformed module id")
 
         def call(
-            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+            name: str,
+            values: list[Any],
+            wide: list[bool],
+            call_timeout: Any,
+            buffer: list[Any] | None = None,
         ) -> Any:
             soft = _limit_seconds("timeout", call_timeout)
             if soft is None:
@@ -1763,6 +1810,7 @@ class IsolatedRuntime:
                     "name": name,
                     "args": _wire.Enc(values),
                     "wide": wide,
+                    "buf": _wire.Enc(buffer),
                     "timeout": soft,
                     "drop": drop,
                 }

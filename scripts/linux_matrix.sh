@@ -20,7 +20,7 @@
 # Environment:
 #   CONTAINER_RUNTIME  podman or docker (default: whichever is on PATH, podman first)
 #   PYTEST_TARGETS     what to run (default: the isolation and escape suites)
-#   OVERLAY_PY=1       copy ./python/pydeno/*.py over the installed wheel, for iterating on
+#   OVERLAY_PY=1       overlay Python files recursively over the installed wheel, for iterating on
 #                      Python-only changes without rebuilding the wheel (local use only)
 #   MIN_TESTS         minimum selected test count (default: 1 for focused local runs)
 #   KEEP_OUT=1         leave the junit/collect logs in OUT_DIR
@@ -39,7 +39,7 @@ OUT=${OUT_DIR:-$(mktemp -d)}
 mkdir -p "$OUT"
 # The monty-parity file is left out by default: its strict xfails run the in-process crash
 # probes for minutes and do not depend on the kernel. One cell runs it (PYTEST_TARGETS=...).
-TARGETS=${PYTEST_TARGETS:-"tests/test_isolated_runtime.py tests/test_isolated_lifecycle.py tests/test_isolated_determinism.py tests/test_isolated_fuzz.py tests/test_snapshot_auth.py tests/test_redteam_syscalls.py tests/test_sandbox_syscall_tables.py tests/test_known_escape_techniques.py tests/test_guest_globals.py tests/test_isolated_libraries.py tests/test_isolated_review_findings.py tests/test_aio_isolated_runtime.py tests/test_isolated_limits.py tests/test_status.py tests/test_sandbox_attest.py tests/test_sandbox_attest_edges.py tests/test_isolated_command_loop.py tests/test_isolated_wasm.py"}
+TARGETS=${PYTEST_TARGETS:-"tests/test_isolated_runtime.py tests/test_isolated_lifecycle.py tests/test_isolated_determinism.py tests/test_isolated_fuzz.py tests/test_snapshot_auth.py tests/test_redteam_syscalls.py tests/test_sandbox_syscall_tables.py tests/test_known_escape_techniques.py tests/test_guest_globals.py tests/test_isolated_libraries.py tests/test_isolated_review_findings.py tests/test_aio_isolated_runtime.py tests/test_isolated_limits.py tests/test_status.py tests/test_sandbox_attest.py tests/test_sandbox_attest_edges.py tests/test_isolated_command_loop.py tests/test_isolated_wasm.py tests/test_sandbox_violation.py tests/test_sandbox_canaries.py tests/test_seccomp_program.py"}
 
 case "$PROFILE" in
   default)     BLOCK=""; EXPECT="landlock+seccomp" ;;
@@ -107,8 +107,19 @@ if ! command -v "$PY" >/dev/null 2>&1; then bootstrap; fi
 /tmp/v/bin/pip install -q "pytest>=8.4.0" "pytest-asyncio>=1.2.0" "hypothesis>=6.100.0" >/dev/null
 
 if [ "${OVERLAY_PY:-0}" = "1" ]; then
-  SITE=$(/tmp/v/bin/python -c "import pydeno,os;print(os.path.dirname(pydeno.__file__))")
-  cp /src/python/pydeno/*.py "$SITE"/
+  /tmp/v/bin/python - <<'OVERLAY_EOF'
+from pathlib import Path
+import shutil
+import pydeno
+
+source_root = Path("/src/python/pydeno")
+installed_root = Path(pydeno.__file__).parent
+# Include integration/tool subpackages, preserving the wheel's native extension.
+for source in source_root.rglob("*.py"):
+    destination = installed_root / source.relative_to(source_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+OVERLAY_EOF
 fi
 
 /tmp/v/bin/python -c "

@@ -2,13 +2,14 @@
 
 Threat model: a V8 escape gives the attacker arbitrary native code in the worker *after*
 `pydeno._sandbox.apply()`. These tests play that attacker: from a freshly sandboxed process
-they issue dangerous syscalls with junk arguments and require the answer to be `EPERM`.
+they issue dangerous syscalls with junk arguments and require the answer to be `EPERM`, or, for
+the calls no runtime ever makes (`NEVER_LEGITIMATE`), the death of the process by SIGSYS.
 
 Why `EPERM` with junk arguments proves something: the seccomp filter decides at syscall
 *entry*, before the kernel validates any argument. A syscall the filter denies therefore
-answers `EPERM` whatever we pass; one it lets through answers `EFAULT`/`EINVAL`/`EBADF`... or
-succeeds. (The full sweep in `scripts/redteam_syscalls.py` enumerates all ~350 calls and was
-how most of this list was found.)
+answers `EPERM` whatever we pass (or kills, before anything happens); one it lets through
+answers `EFAULT`/`EINVAL`/`EBADF`... or succeeds. (The full sweep in
+`scripts/redteam_syscalls.py` enumerates all ~350 calls and was how most of this list was found.)
 
 The list of syscalls that must be blocked is written here by *intent* ("these give host
 access"), not derived from `_sandbox.py`, so deleting an entry from the filter cannot also
@@ -183,13 +184,27 @@ MUST_BLOCK = {
     ],
 }
 ALL_BLOCKED = sorted({name for group in MUST_BLOCK.values() for name in group})
+# Of those, the ones that must end the process (SIGSYS) rather than fail: written by intent too.
+NEVER_LEGITIMATE = {
+    "memfd_create", "execve", "execveat", "ptrace", "process_vm_readv",
+    "process_vm_writev", "kcmp", "pidfd_getfd", "mount", "umount2", "pivot_root", "chroot",
+    "setns", "unshare", "open_tree", "open_tree_attr", "mount_setattr", "fsconfig", "fsopen",
+    "fsmount", "fspick", "move_mount", "swapon", "swapoff", "kexec_load", "kexec_file_load",
+    "init_module", "finit_module", "delete_module", "bpf", "perf_event_open", "userfaultfd",
+    "keyctl", "add_key", "request_key", "open_by_handle_at", "name_to_handle_at",
+    "io_uring_setup", "io_uring_enter", "io_uring_register", "reboot", "acct", "syslog", "iopl",
+    "ioperm", "quotactl", "quotactl_fd", "lookup_dcookie", "nfsservctl", "lsm_set_self_attr",
+    "settimeofday", "clock_settime", "adjtimex", "clock_adjtime", "sethostname", "setdomainname",
+}  # fmt: skip
+SIGSYS = 31
 ARCH = {"aarch64": "aarch64", "arm64": "aarch64", "x86_64": "x86_64"}.get(
     os.uname().machine, os.uname().machine
 )
 PATTERNS = ["0,0,0,0,0,0", "PTR,PTR,PTR,PTR,PTR,PTR", "1,1,1,1,1,1", "-100,PTR,0,0,0,0"]
 
 CHILD = r"""
-import ctypes, importlib.util, json, os, sys
+import ctypes, importlib.util, json, os, resource, sys
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # a SIGSYS kill must not leave a core file
 spec = importlib.util.spec_from_file_location("_sandbox", sys.argv[1])
 sb = importlib.util.module_from_spec(spec); spec.loader.exec_module(sb)
 libc = ctypes.CDLL(None, use_errno=True); libc.syscall.restype = ctypes.c_long
@@ -258,6 +273,11 @@ def test_dangerous_syscall_is_denied_whatever_the_arguments(
             f"seccomp was not applied here ({layers}); the matrix profile that hides it "
             f"must not run the red-team tests"
         )
+    if name in NEVER_LEGITIMATE:
+        # Killed at syscall entry, whatever the arguments: no answer to iterate on.
+        bad = [r for r in results if r.get("died") != -SIGSYS]
+        assert not bad, f"[{group}] {name} did not kill the sandboxed process: {bad}"
+        return
     bad = [r for r in results if r.get("errno") != 1 or r.get("ret") != -1]
     assert not bad, f"[{group}] {name} was reachable from the sandbox: {bad}"
 

@@ -33,6 +33,7 @@ import warnings
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field, replace
 from datetime import date, datetime, time as dt_time, timezone
+from itertools import islice
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, TypeAdapter, ValidationError
@@ -298,7 +299,7 @@ def _preview(value: Any, *, nested: bool = False) -> str:
     if isinstance(value, dict):
         if nested:
             return f"{{{len(value)} items}}"
-        items = list(value.items())[:_PREVIEW_ITEMS]
+        items = list(islice(value.items(), _PREVIEW_ITEMS))
         shown = ", ".join(
             f"{_preview(k, nested=True)}: {_preview(v, nested=True)}" for k, v in items
         )

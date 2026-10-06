@@ -439,8 +439,9 @@ class TestLimits:
             max_memory=300 * MIB,
             request_timeout=30,
         )
+        # 800 MiB: over max_memory, under the kernel's ceiling on Linux (max_memory + 1 GiB)
         with pytest.raises(WorkerCrashed, match="max_memory"):
-            await rt.eval("new Uint8Array(1500 * 1024 * 1024).fill(1).length")
+            await rt.eval("new Uint8Array(800 * 1024 * 1024).fill(1).length")
         assert rt.is_closed()
         await rt.close()
 

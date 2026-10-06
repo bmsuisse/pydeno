@@ -101,6 +101,7 @@ __all__ = [
     "ToolCall",
     "ToolNotDiscoveredError",
     "describe_tools",
+    "describe_tool_catalog",
     "typescript_stubs",
 ]
 
@@ -690,6 +691,73 @@ def describe_tools(
         lines.append(f"    Example: {example}")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def describe_tool_catalog(
+    namespaces: Mapping[str, Mapping[str, Any] | collections.abc.Sequence[Any]],
+    *,
+    max_chars: int = 8000,
+) -> str:
+    """Describe already-bound tools fairly across namespaces within an entry budget.
+
+    ``max_chars`` counts complete entry characters, including types and examples; the
+    execution guide and namespace summaries are outside that budget. Shortest entries
+    are selected round-robin across sorted namespaces. This helper only renders text:
+    it does not bind tools, discover lazy catalog tools, or grant authority.
+    """
+    if max_chars is None:
+        raise TypeError("max_chars must be a non-negative int")
+    budget = _limit_int("max_chars", max_chars, minimum=0)
+    assert budget is not None
+    if not isinstance(namespaces, Mapping):
+        raise TypeError("namespaces must map namespace names to tools")
+    pending: dict[str, collections.deque[str]] = {}
+    counts: dict[str, int] = {}
+    for ns, tools in namespaces.items():
+        ToolBridge._check_name(ns, what="namespace")  # noqa: SLF001
+        entries = _normalize_tools(tools)
+        blocks = [
+            (
+                name,
+                f"### {ns}.{name} (entry-local types)\n```typescript\n"
+                + describe_tools({name: tool}, namespace=ns)[len(_PREAMBLE) :]
+                + "```\n",
+            )
+            for name, tool in entries.items()
+        ]
+        blocks.sort(key=lambda item: (len(item[1]), item[0]))
+        pending[ns] = collections.deque(block for _, block in blocks)
+        counts[ns] = len(blocks)
+    selected: list[str] = []
+    shown = dict.fromkeys(pending, 0)
+    active = sorted(pending)
+    while active:
+        next_round = []
+        for ns in active:
+            queue = pending[ns]
+            if queue and len(queue[0]) <= budget:
+                block = queue.popleft()
+                selected.append(block)
+                budget -= len(block)
+                shown[ns] += 1
+                if queue:
+                    next_round.append(ns)
+            # The shortest remaining block does not fit: nothing else here can fit.
+        active = next_round
+    total = sum(counts.values())
+    used = len(selected)
+    status = "COMPLETE" if used == total else "PARTIAL"
+    lines = [
+        _PREAMBLE.rstrip(),
+        f"{status}: {used} of {total} tools shown.",
+        "Entry budget counts characters; instructions and summaries are additional.",
+        "Only tools already bound by the host are callable; this catalog grants no access.",
+        "Types in each tool entry are local to that entry, not shared declarations.",
+    ]
+    lines.extend(
+        f"{ns}: {shown[ns]} of {counts[ns]} tools shown." for ns in sorted(counts)
+    )
+    return "\n".join(lines) + "\n\n## Tool entries\n" + "".join(selected)
 
 
 def _jsdoc(doc: str, indent: str) -> list[str]:
