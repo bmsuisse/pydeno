@@ -1830,7 +1830,11 @@ class AsyncIsolatedRuntime:
             raise WorkerCrashed("worker returned a malformed module id")
 
         async def call(
-            name: str, values: list[Any], wide: list[bool], call_timeout: Any
+            name: str,
+            values: list[Any],
+            wide: list[bool],
+            call_timeout: Any,
+            buffer: list[Any] | None = None,
         ) -> Any:
             soft = _limit_seconds("timeout", call_timeout)
             if soft is None:
@@ -1842,6 +1846,7 @@ class AsyncIsolatedRuntime:
                     "name": name,
                     "args": _wire.Enc(values),
                     "wide": wide,
+                    "buf": _wire.Enc(buffer),
                     "timeout": soft,
                     "drop": drop,
                 }

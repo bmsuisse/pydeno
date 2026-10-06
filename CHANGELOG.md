@@ -34,6 +34,16 @@
   ([`docs/contributing/free-threaded.md`](docs/contributing/free-threaded.md)). The extension builds and
   imports on 3.14t, but the module does not declare `gil_used = false`, so CPython re-enables the GIL at
   import. A smoke test passed; nothing was audited and there is no 3.14t wheel or CI job. No code change.
+- **`WasmModule.call_bytes()` (and the `AsyncWasmModule` coroutine): byte buffers in and out of a
+  trusted WebAssembly module** (the remainder of #37). Opt-in by convention: the module exports
+  `memory`, `alloc(len) -> ptr`, `dealloc(ptr, len)` and a function
+  `(in_ptr, in_len, out_ptr, out_cap) -> i32` that returns the bytes written (negative is an error).
+  The host copies the input in, caps the output at `max_result_bytes`, copies it out as `bytes` and
+  frees both blocks, also on an error. Each side is bounded by `max_input_bytes` /
+  `max_result_bytes` (default 1 MiB, ceiling 4 MiB), checked on the host and again in the bridge.
+  No view of the module's memory ever leaves the bridge, and a pointer from `alloc` outside the live
+  memory, or a claimed length over the cap, is refused. Same `jitless=False` and trusted-module
+  caveats as `load_wasm`.
 
 ## 0.9.0 — 2026-10-05
 

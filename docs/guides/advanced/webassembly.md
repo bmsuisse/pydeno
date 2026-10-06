@@ -63,6 +63,41 @@ What it does, and refuses:
   is garbage collected without it is forgotten too: the in-process handle is released, and the
   isolated worker drops the instance with the next `load_wasm` or call on that runtime.
 
+### Byte buffers: `call_bytes()`
+
+A module's memory is its own, so passing bytes needs an agreed convention. `call_bytes` defines the
+smallest one. The module exports:
+
+- `memory`, its linear memory;
+- `alloc(len: i32) -> i32` and `dealloc(ptr: i32, len: i32)`, its own allocator;
+- a function `(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32) -> i32` that reads `in_len`
+  bytes at `in_ptr`, writes at most `out_cap` bytes at `out_ptr` and returns how many it wrote (a
+  negative number is an error).
+
+```python
+wasm = rt.load_wasm("codec.wasm")
+packed = wasm.call_bytes("compress", data, max_result_bytes=2 * 1024 * 1024)   # -> bytes
+# AsyncWasmModule: packed = await wasm.call_bytes("compress", data)
+```
+
+What the host guarantees:
+
+- **Copies, no sharing.** The input is copied into a block from the module's `alloc`; the result is
+  copied out into fresh `bytes`. Python never holds a view of the module's memory, and the module
+  never sees a Python buffer, so a later change on either side is invisible to the other.
+- **Bounded.** `max_input_bytes` and `max_result_bytes` default to 1 MiB and cannot exceed 4 MiB
+  (`ValueError` otherwise). The output block is exactly `max_result_bytes` long, so the module
+  cannot produce more; a returned length above it is refused, never truncated.
+- **Checked pointers.** A block `alloc` returns that lies outside the live memory is refused.
+  Both blocks are `dealloc`ed after every call, a failed one included.
+- **Same limits as any call.** The runtime's `timeout`, `timeout=`,
+  traps and `max_memory` apply. A module's memory still grows past `max_buffer_bytes`
+  (see below), and a module that lacks the convention gets a `TypeError` (or a `JavaScriptError`
+  if it has no `memory` export).
+
+The result is bounded, but the module is still trusted: its own `alloc` runs inside the call, and a
+module that leaks in `dealloc` or loops is bounded only by memory limits and the timeout.
+
 ### The cost: `jitless=False`, and memory
 
 Only load modules you trust, as you would a native library.
@@ -129,8 +164,8 @@ Here the guest holds the instance, and the size, import and argument checks abov
 
 - **No file system**: Wasm can't access files directly. Pass data via JavaScript bindings.
 - **No threads**: V8's Wasm doesn't support threads (SharedArrayBuffer-based parallelism). Use multiple runtimes instead.
-- **Numbers only through `load_wasm`**: passing `bytes` into a module's memory needs an allocator
-  convention the helper does not define; do that from JavaScript if you need it.
+- **Numbers, or byte buffers by convention**: `call()` takes and returns numbers only; bytes need
+  `call_bytes()` and the convention below. Strings, structs and shared memory are not supported.
 
 ## Next Steps
 
