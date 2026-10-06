@@ -55,6 +55,27 @@
   metadata, so a rebuilt wheel with another V8 is refused, and a build that cannot read it raises
   instead of accepting every other unknown build's data. Snapshots signed and journals dumped by
   0.10.0 no longer verify or load: sign and dump them again (#133).
+- **Guest-visible error text no longer names the host (#131).** In an isolated worker, a BigInt
+  past CPython's int-to-str digit limit now reads "BigInt value is too large to transfer" (it
+  carried `sys.set_int_max_str_digits()`), serialization size and depth rejections read
+  "Serialization size limit exceeded" / "Serialization depth limit exceeded" (they carried the
+  exact limit, `RuntimeConfig(max_serialization_bytes=...)` and a docs path), and a denied module
+  reads "Module resolution denied for X" (it hinted at `add_static_module()`). An in-process
+  `Runtime` keeps its guiding text. Cost: the host-side exception from an isolated runtime is terse
+  too, so the limit values must be read from your own `RuntimeConfig`.
+- **`Error.prepareStackTrace` is pinned in the isolated worker (#131).** It is non-writable and
+  non-configurable after the host's bootstrap, so a guest can no longer install a hook to read the
+  `ext:` file names of every frame, and the pinned formatter drops pydeno's own `ext:` frames
+  (`callSync (ext:pydeno/python_bridge.js:...)`) from `error.stack`. Guest frames and the error
+  header are unchanged. A plain `Runtime` still shows bridge frames.
+- **Docs and red-team drift (#135).** `docs/contributing/security-review-prep.md` no longer lists
+  the bridge globals as writable (fixed in 0.8.0, now pinned by a test) or a late `bind_function`
+  as silently inert (it fails loudly, now pinned for `IsolatedRuntime`); the syscall sweep reports
+  `uprobe`/`uretprobe` as a kernel seccomp pass-through and a red-team test pins that no other
+  syscall is reachable outside the filter's allow-list; `SECURITY.md` says `redact_host_errors`
+  defaults to `True` and what turning it off exposes, and lists "no PID 1" and the sandbox default
+  under hardening.
+
 - **`pydeno.eval()` from a thread that inherited its parent's context** (free-threaded builds,
   and any build with `thread_inherit_context`) panicked with "Runtime is unsendable, but sent to
   another thread": the owner is now checked before the inherited runtime is touched.

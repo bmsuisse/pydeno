@@ -525,3 +525,49 @@ def test_signalling_its_own_process_group_is_confined_to_itself(
 def test_path_truncate_is_not_available(others: dict[str, str]) -> None:
     """`truncate(2)` by path is denied outright (not even ENOENT leaks through)."""
     assert others["truncate_path"] == "EPERM", others
+
+
+def _kernel_at_least(major: int, minor: int) -> bool:
+    release = os.uname().release.split(".")
+    try:
+        return (
+            int(release[0]),
+            int("".join(c for c in release[1] if c.isdigit())),
+        ) >= (
+            major,
+            minor,
+        )
+    except (IndexError, ValueError):
+        return False
+
+
+def test_the_only_reachable_syscalls_are_the_kernel_seccomp_passthrough() -> None:
+    """Of the full sweep's REACHABLE list, what the filter does not allow (issue #135).
+
+    `uprobe` and `uretprobe` are not in the filter's allow-list, yet the kernel lets them bypass
+    seccomp (Linux 6.11+/6.12+), so they answer `ENXIO` / `SIGILL`. Pin that this set is exactly
+    those two: a new kernel pass-through, or a filter regression, then fails here and gets
+    reviewed instead of scrolling past in the script's output.
+    """
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "redteam_syscalls.py"
+    spec = importlib.util.spec_from_file_location("redteam_syscalls_script", script)
+    assert spec is not None and spec.loader is not None
+    sweep_script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sweep_script)
+
+    results = sweep_script.sweep(ARCH, sorted(int(n) for n in TABLES[ARCH]))
+    assert results, "the sweep returned nothing"
+    reachable = sweep_script.unexpectedly_reachable(
+        results, sweep_script.allowed_names(ARCH)
+    )
+    expected = set(sweep_script.KERNEL_SECCOMP_PASSTHROUGH)
+    assert expected == {"uprobe", "uretprobe"}
+    assert reachable <= expected, (
+        f"new reachable syscalls: {sorted(reachable - expected)}"
+    )
+    if _kernel_at_least(6, 12):
+        assert reachable == expected, (
+            f"expected the pass-through to be reachable: {reachable}"
+        )

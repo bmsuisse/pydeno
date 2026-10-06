@@ -6,7 +6,7 @@ use num_bigint::BigInt;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Default serialization depth / byte limits.
 pub const MAX_JS_DEPTH: usize = 100;
@@ -480,9 +480,28 @@ impl LimitTracker {
     }
 }
 
+/// Whether guest-visible limit and module errors drop host implementation detail (config field
+/// names, docs paths, API hints). Process-wide, and only an isolated worker turns it on: a worker
+/// is a dedicated process whose every error text may reach untrusted guest code, while an
+/// in-process `Runtime` is driven by the host that owns it and keeps the guiding text.
+static TERSE_GUEST_ERRORS: AtomicBool = AtomicBool::new(false);
+
+/// Make this process's guest-visible limit and module errors terse; see [`TERSE_GUEST_ERRORS`].
+pub fn set_terse_guest_errors(terse: bool) {
+    TERSE_GUEST_ERRORS.store(terse, Ordering::Relaxed);
+}
+
+/// Whether guest-visible errors are terse in this process.
+pub fn terse_guest_errors() -> bool {
+    TERSE_GUEST_ERRORS.load(Ordering::Relaxed)
+}
+
 /// User-facing depth rejection (both directions); names the config knob so the
-/// limit reads as tunable.
+/// limit reads as tunable, unless [`terse_guest_errors`] is on.
 pub fn depth_limit_message(max_depth: usize) -> String {
+    if terse_guest_errors() {
+        return "Serialization depth limit exceeded".to_string();
+    }
     format!(
         "Serialization depth exceeded the configured limit of {max_depth} \
          (RuntimeConfig(max_serialization_depth=...))"
@@ -491,6 +510,9 @@ pub fn depth_limit_message(max_depth: usize) -> String {
 
 /// User-facing byte rejection; see [`depth_limit_message`].
 pub fn byte_limit_message(current_bytes: usize, max_bytes: usize) -> String {
+    if terse_guest_errors() {
+        return "Serialization size limit exceeded".to_string();
+    }
     format!(
         "Serialization size ({current_bytes} bytes) exceeded the configured limit of \
          {max_bytes} bytes (RuntimeConfig(max_serialization_bytes=...)); see \

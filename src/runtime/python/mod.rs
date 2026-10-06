@@ -40,6 +40,13 @@ pub fn _debug_active_runtime_threads() -> usize {
     runner::active_runtime_threads()
 }
 
+/// Called once by an isolated worker, before any guest code runs: its guest-visible limit and
+/// module errors then omit host config names, docs paths and API hints.
+#[pyfunction]
+pub fn _set_terse_guest_errors(terse: bool) {
+    crate::runtime::js_value::set_terse_guest_errors(terse);
+}
+
 #[pyclass(module = "_pydeno")]
 pub struct JsUndefined;
 
