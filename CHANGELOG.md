@@ -36,6 +36,13 @@
 - **A host that is PID 1 (a container's main process) could not start a sandboxed worker.** The
   worker reported "orphaned" because its parent's pid was 1. It now records its parent at start-up and
   refuses only when that changes (#128).
+- **Op capability tokens now carry the full 53 bits of entropy** (#130). They were cut from the
+  first 8 bytes of a UUIDv4, whose version nibble pinned bit 52 to 0 (52 bits). They now use the 64
+  random bits of the UUID that the format does not fix. A unit test checks every bit is drawn.
+- **The wire decoder refuses out-of-range number literals and duplicate object keys** (#136).
+  `1e999999` used to decode to `inf` (non-finite values must use `{"$":"f","v":"inf"}`), and
+  `{"t":"result","t":"call",...}` decoded as the last spelling. Both now raise `WireError`, in the
+  native decoder and in `_wire.loads`. A repeated key is refused at any depth.
 - **`pydeno.eval()` from a thread that inherited its parent's context** (free-threaded builds,
   and any build with `thread_inherit_context`) panicked with "Runtime is unsendable, but sent to
   another thread": the owner is now checked before the inherited runtime is touched.
