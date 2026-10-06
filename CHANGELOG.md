@@ -22,6 +22,11 @@
 - **Local Linux overlays include Python subpackages.** `OVERLAY_PY=1` now includes integrations
   and tools while preserving the installed native extension. Release artifact gates continue
   to run without overlays.
+- **Intermittent abort or segfault at exit after `eval_async` in an `atexit` handler.** The
+  Tokio worker that delivered the result could still be inside Python when the handler
+  returned and finalization began, so CPython freed its thread state under it (`Fatal Python
+  error: Aborted`, or a segfault, with `unsendable` panics from the deferred drops). The
+  receiving side now waits for that worker to leave Python before it resolves the future.
 
 ### Documentation
 

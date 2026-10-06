@@ -39,6 +39,33 @@ where
     Some(Python::attach(f))
 }
 
+/// `Python::attach` for work that must run even after the `atexit` hook (a later `atexit`
+/// handler waits on it), still counted so [`wait_for_background_detach`] can tell when the
+/// thread has left Python.
+pub(crate) fn attach_counted<F, R>(f: F) -> R
+where
+    F: for<'py> FnOnce(Python<'py>) -> R,
+{
+    BACKGROUND_ATTACHED.fetch_add(1, Ordering::SeqCst);
+    let _guard = BackgroundAttachGuard;
+    Python::attach(f)
+}
+
+/// Block (GIL released) until every counted background thread has left Python.
+///
+/// A thread that delivered a result to an awaiting handler must not still be inside the
+/// interpreter when that handler returns and finalization starts: CPython frees the thread's
+/// state under it (a crash in the worker), or ends it in the GIL wait (an abort). Call this on the
+/// thread that receives the result, once the exit hook has run.
+pub(crate) fn wait_for_background_detach(py: Python<'_>) {
+    py.detach(|| {
+        let deadline = Instant::now() + EXIT_DRAIN_LIMIT;
+        while BACKGROUND_ATTACHED.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    });
+}
+
 /// Whether the `atexit` hook has run. Work started after it (by a later `atexit` handler, which
 /// keeps the interpreter alive while it waits) is not gated: refusing it would hang that handler.
 pub(crate) fn interpreter_exiting() -> bool {

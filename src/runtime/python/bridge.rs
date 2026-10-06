@@ -10,7 +10,9 @@ use std::future::Future;
 use tokio::sync::oneshot;
 
 use super::error::runtime_error_with_context;
-use super::utils::{attach_unless_exiting, interpreter_exiting};
+use super::utils::{
+    attach_counted, attach_unless_exiting, interpreter_exiting, wait_for_background_detach,
+};
 
 fn python_future_flag(
     future: &Bound<'_, PyAny>,
@@ -69,6 +71,12 @@ impl Drop for JsAsyncResultSetter {
 impl JsAsyncResultSetter {
     /// Execute the deferred conversion and resolve the Python `asyncio.Future`.
     fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
+        if interpreter_exiting() {
+            // The worker that queued this setter may still be inside Python (returning from
+            // `call_soon_threadsafe`); whoever awaits the result can finish and let the
+            // interpreter finalize under it.
+            wait_for_background_detach(py);
+        }
         let future = self.future.bind(py);
         if python_future_done(future)? || python_future_cancelled(future)? {
             return Ok(()); // `Drop` releases the handles in the unread value
@@ -204,7 +212,7 @@ where
             }
         };
         if started_after_exit_hook {
-            Python::attach(deliver);
+            attach_counted(deliver);
         } else {
             attach_unless_exiting(deliver);
         }

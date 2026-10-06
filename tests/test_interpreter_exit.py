@@ -13,8 +13,10 @@ read in flight, a generator whose `finally` raises) is the closer's to ignore, n
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 _TIMEOUT = 30
 
@@ -36,6 +38,27 @@ def late():
         print(asyncio.run(go()), flush=True)
     finally:
         rt.close()
+
+
+atexit.register(late)  # registered first, so it runs after pydeno's hook
+import pydeno  # noqa: E402
+
+state["rt"] = pydeno.Runtime()
+""",
+    "atexit_burst_without_close": r"""
+import asyncio
+import atexit
+
+state = {}
+
+
+def late():
+    rt = state["rt"]
+
+    async def go():
+        return await asyncio.gather(*[rt.eval_async(f"Promise.resolve({i})") for i in range(16)])
+
+    print(sum(asyncio.run(go())), flush=True)
 
 
 atexit.register(late)  # registered first, so it runs after pydeno's hook
@@ -145,6 +168,42 @@ def test_eval_async_in_an_atexit_handler_registered_before_import_completes() ->
 def test_eval_async_after_a_manual_run_of_the_exit_functions_completes() -> None:
     stdout, _ = _run("run_exitfuncs_then_eval_async")
     assert stdout == "7"
+
+
+def test_work_delivered_from_an_atexit_handler_is_never_touched_by_a_worker_during_finalization() -> None:
+    """The Tokio worker that delivers a late result must be out of Python before the handler returns.
+
+    The handler's `asyncio.run` ends as soon as the worker queues the result; the worker is then
+    still returning from `call_soon_threadsafe`, so finalization used to free its thread state under
+    it (a segfault, or `Fatal Python error: Aborted` from CPython ending it in the GIL wait).
+    The window is a few microseconds wide: it shows only when the worker loses the CPU there, so
+    saturate the machine and run many children (about one in ten failed before the fix).
+    """
+    burners = [
+        subprocess.Popen([sys.executable, "-c", "while True: pass"])
+        for _ in range(os.cpu_count() or 4)
+    ]
+
+    def one(_: int) -> tuple[int, str, str]:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CASES["atexit_burst_without_close"]],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT * 4,
+            check=False,
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(one, range(64)))
+    finally:
+        for burner in burners:
+            burner.kill()
+        for burner in burners:
+            burner.wait()
+    failures = [r for r in results if r[0] != 0 or r[1] != "120"]
+    assert not failures, failures[:3]
 
 
 def _assert_no_stray_traceback(stderr: str) -> None:
