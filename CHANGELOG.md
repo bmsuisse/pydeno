@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased / 0.10.0
+
+### Added
+
+- **Fair, bounded tool descriptions.** `describe_tool_catalog(namespaces, max_chars=8000)`
+  selects complete tool descriptions round-robin across namespace objects and labels the
+  catalog complete or partial. Types are local to each entry; the entry character budget
+  includes examples and schemas, while instructions and namespace summaries are additional.
+  This description-only helper does not bind or discover capabilities. Existing
+  `describe_tools()` output is unchanged.
+
+### Fixed
+
+- **Late async tool calls after cancellation.** A queued callback entering an already-closed
+  `AsyncAgentSandbox` is refused before allocating an unanswered future or charging the tool
+  budget. This prevents shim tasks from remaining parked after cancellation.
+- **Bounded model previews.** Dictionary previews inspect only the five entries they display,
+  rather than copying the entire dictionary first. Displayed output is unchanged; no
+  wall-clock speed improvement is claimed.
+- **Local Linux overlays include Python subpackages.** `OVERLAY_PY=1` now includes integrations
+  and tools while preserving the installed native extension. Release artifact gates continue
+  to run without overlays.
+
 ## 0.9.0 — 2026-10-05
 
 Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed
@@ -15,13 +38,6 @@ independent reviews are fixed (listed below, in neutral terms). The gate is defe
 boundary; the sandbox is.
 
 ### Added
-
-- **Fair, bounded tool descriptions.** `describe_tool_catalog(namespaces, max_chars=8000)`
-  selects complete tool descriptions round-robin across namespace objects and labels the
-  catalog complete or partial. Types are local to each entry; the entry character budget
-  includes examples and schemas, while instructions and namespace summaries are additional.
-  This description-only helper does not bind or discover capabilities. Existing
-  `describe_tools()` output is unchanged.
 
 - **Gates: a host-side check of the exact source before it runs.** A gate is a callable
   `(source, GateContext) -> Verdict(allow, reason, labels)`, sync or async.
@@ -137,16 +153,6 @@ boundary; the sandbox is.
   `CheckoutTimeout`) is no longer counted in either.
 
 ### Fixed
-
-- **Late async tool calls after cancellation.** A queued callback entering an already-closed
-  `AsyncAgentSandbox` is refused before allocating an unanswered future or charging the tool
-  budget. This prevents shim tasks from remaining parked after cancellation.
-- **Bounded model previews.** Dictionary previews inspect only the five entries they display,
-  rather than copying the entire dictionary first. Displayed output is unchanged; no
-  wall-clock speed improvement is claimed.
-- **Local Linux overlays include Python subpackages.** `OVERLAY_PY=1` now includes integrations
-  and tools while preserving the installed native extension. Release artifact gates continue
-  to run without overlays.
 
 - Final integration review: gate pools reset their synchronization before child threads run;
   module-loader gates restore control-flow exceptions after completing the worker reply.
