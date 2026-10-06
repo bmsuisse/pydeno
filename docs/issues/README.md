@@ -85,3 +85,11 @@ they were not on `future/0.10` when this index was created. Merge the two indexe
 
 The earlier OpenCode follow-ups (`opencode-*.md`) live on PR #114 (`feat/opencode-takeaways`) and
 are indexed in that branch's version of this file; merge the two tables when both land.
+# Research notes and follow-up issues
+
+Evidence-linked notes comparing pydeno with other projects, each ending in proposed changes with a
+priority and a risk. They are proposals, not commitments.
+
+| Note | Subject |
+| --- | --- |
+| [TrueForge takeaways](trueforge-takeaways.md) | Agent harness (TypeScript, process sandbox): result source, tool annotations, oversized-result preview, per-call tool deadline, backend contract suites. No V8, WASM or Deno content. |
