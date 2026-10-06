@@ -86,6 +86,7 @@ nav:
       - Upstream provenance: contributing/upstream-divergence.md
       - Supply-chain security: contributing/supply-chain.md
       - "Research: engine hardening": contributing/research-engine-hardening.md
+      - "Research: custom V8 build": contributing/research-custom-v8-build.md
       - Autoresearch loops: contributing/autoresearch.md
       - Strix pentest review: contributing/strix.md
 
