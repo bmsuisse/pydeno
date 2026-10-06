@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased / 0.10.0
+
+### Added
+
+- **Opt-in fork-from-template worker start (Linux), issue #72.** `pydeno.enable_fork_template()` (or
+  `PYDENO_FORK_TEMPLATE=1`) starts sandboxed workers as a `fork()` of a prepared, single-threaded template
+  process instead of a fresh interpreter. The OS sandbox, self-test, limits and V8 start-up all run in the
+  forked child exactly as before. Off by default, because workers from one template share an address-space
+  layout and stack canary; the template is replaced after `max_forks` (64) workers or `max_age_seconds`
+  (300). `sandbox_status().worker_start` and `IsolatedRuntime.worker_start` say which mode is in force, and
+  `sandbox_status()` warns while it is on. See "Faster worker start" in the advanced guides.
+  Measured (Linux x86_64, release build, 25 interleaved pairs): new sandboxed worker plus first call
+  57.6 ms (exec) to 21.2 ms (fork template); 50 `SandboxPool` checkouts in a row against a pool of 4:
+  about 1000 ms to about 365 ms. Needs native x86_64 and aarch64 verification and independent review.
+
 ## 0.10.0 — 2026-10-06
 
 ### Added
