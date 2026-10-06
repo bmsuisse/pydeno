@@ -2,7 +2,7 @@
 
 Issue #45 asks, as its fifth item, for host tools to run in a process of their own, with a per-call
 deadline and result caps, "so a tool bug is not in the parent's address space". This note records
-what was evaluated for 0.9, why it was not built in the same change as the seccomp allow-list, and
+what was evaluated for 0.10, why it was not built in the same change as the seccomp allow-list, and
 what a sound version would look like. It is a plan, not a description of shipped behaviour.
 
 ## Where tools run today

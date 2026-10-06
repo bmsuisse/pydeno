@@ -101,9 +101,9 @@ already runs native code, or by the guest alone for the JavaScript-level items.
 | Landlock/userns "single-thread" check could not see native threads | **Fixed.** Counts via `/proc/self/task`. |
 | Worker with a thread bomb stays under the memory ceiling | **Fixed.** Parent kills a worker over 64 threads. |
 | `sandbox="auto"` runs with fewer layers silently | **Mitigated.** Warns; `require` refuses. The default stays `auto` (a deliberate compatibility choice). |
-| Denied calls answer `EPERM` (an exploit can probe the filter freely) | **Fixed** (0.9, #45). About 60 never-legitimate calls (`ptrace`, `execve`, the mount API, `bpf`, `io_uring_*`, `memfd_create`, ...) kill the worker; the parent reports `sandbox_violation`. Others still answer `EPERM`, on purpose: libraries probe some of them and fall back. |
-| Seccomp is a deny-list with a default-deny tail for unreviewed syscalls | **Fixed** (0.9, #45). An allow-list (92 syscalls on x86_64, 79 on aarch64, plus about 20 with checked arguments), derived by tracing real workers natively on both architectures; `fcntl` and `ioctl` commands are allow-lists too. |
-| A kernel (or a stack in front of it) that accepts the seccomp kill action or the Landlock ruleset and does not enforce it would go unnoticed | **Fixed** (0.9, #45). Landlock: a canary on every worker start (a directory readable before the ruleset must be refused after it), or the layer is not counted. Seccomp: a worker asks the kernel whether the kill action is supported; `sandbox_status()` exercises it (a never-legitimate call in its throwaway child must be killed). Not on every start, because the kernel audits each seccomp kill; a filter in front of pydeno's cannot weaken a kill (the most severe action wins). Failures fail the self-test, so `require` refuses. |
+| Denied calls answer `EPERM` (an exploit can probe the filter freely) | **Fixed** (0.10, #45). About 60 never-legitimate calls (`ptrace`, `execve`, the mount API, `bpf`, `io_uring_*`, `memfd_create`, ...) kill the worker; the parent reports `sandbox_violation`. Others still answer `EPERM`, on purpose: libraries probe some of them and fall back. |
+| Seccomp is a deny-list with a default-deny tail for unreviewed syscalls | **Fixed** (0.10, #45). An allow-list (92 syscalls on x86_64, 79 on aarch64, plus about 20 with checked arguments), derived by tracing real workers natively on both architectures; `fcntl` and `ioctl` commands are allow-lists too. |
+| A kernel (or a stack in front of it) that accepts the seccomp kill action or the Landlock ruleset and does not enforce it would go unnoticed | **Fixed** (0.10, #45). Landlock: a canary on every worker start (a directory readable before the ruleset must be refused after it), or the layer is not counted. Seccomp: a worker asks the kernel whether the kill action is supported; `sandbox_status()` exercises it (a never-legitimate call in its throwaway child must be killed). Not on every start, because the kernel audits each seccomp kill; a filter in front of pydeno's cannot weaken a kill (the most severe action wins). Failures fail the self-test, so `require` refuses. |
 | macOS: `notify_post()` still reaches other processes; `kill(pid, 0)` still distinguishes live pids | **Open, known.** The connection to `notifyd` is made before the profile applies. |
 | Landlock access rights newer than the reviewed ABI are not handled | **Open.** |
 | Worker outliving a dead parent (`PR_SET_PDEATHSIG`) | **Open.** |
@@ -179,7 +179,7 @@ not supported, so its findings are summarised in one line below.
 | Bridge: `null` entries skipped the node count, so a four-billion-entry sparse array looped until the deadline | **Fixed in source; verified after the next build.** |
 | Bridge globals (`__host_op_sync__` and friends) were writable | **Fixed in source; verified after the next build.** |
 | macOS: path existence is observable (`stat` answers EPERM for a path that exists and ENOENT for one that does not); XNU build string and CPU/memory counts are readable | **Open, known.** Seatbelt cannot hide existence; Linux with only Landlock has the same oracle. |
-| Linux: the thread cap is sampled, not kernel-enforced | **Partly fixed** (0.9, #45). `RLIMIT_NPROC` at 128 inside the worker's own user namespace on Linux 5.14+ (the kernel counts per namespace there). Without the empty root it would count every process of the host user, so it is not set and the sampled cap remains the limit. Cgroups need a delegated subtree and are not used. |
+| Linux: the thread cap is sampled, not kernel-enforced | **Partly fixed** (0.10, #45). `RLIMIT_NPROC` at 128 inside the worker's own user namespace on Linux 5.14+ (the kernel counts per namespace there). Without the empty root it would count every process of the host user, so it is not set and the sampled cap remains the limit. Cgroups need a delegated subtree and are not used. |
 | Hosts that mount `/proc` with `hidepid` make the worker's usage unreadable | **Open.** `require` refuses to start there (fail closed); `auto` warns. |
 
 ### Round 4: host boundary and state (0.8 red team, slice C)
@@ -221,7 +221,7 @@ journaled); re-entering, closing or dumping a session from its own tool; context
 and other embedded forms, trailing-dot and confusable hosts); weird callables as tools (partials,
 bound methods, classes, async generators, builtins).
 
-### 0.9: the seccomp allow-list (#45), how it was derived and checked
+### 0.10: the seccomp allow-list (#45), how it was derived and checked
 
 - **Derived by tracing, natively.** `scripts/trace_worker_syscalls.py` ran real workers under
   `strace` through a built-in workload (both engine modes, WebAssembly, modules, async host calls,
@@ -251,7 +251,7 @@ bound methods, classes, async generators, builtins).
 
 - `--single-threaded`: no reduction in threads, +79% GC time. Not adopted.
 - `RLIMIT_DATA` *at* the memory ceiling: turns the clean RSS kill into a V8 out-of-memory abort.
-  Adopted in 0.9 with 1 GiB of headroom above `max_memory` instead (measured: private writable
+  Adopted in 0.10 with 1 GiB of headroom above `max_memory` instead (measured: private writable
   memory runs ahead of resident memory by about 45 MiB jitless and 300 MiB with the JIT), so the
   sampled limit fires first in normal use, and the abort, when a burst does reach the ceiling, is
   reported as `memory_limit`.
@@ -270,7 +270,7 @@ bound methods, classes, async generators, builtins).
 - **One architecture is not both.** V8's x86_64 build calls `uname()` while starting and aborts if
   seccomp refuses it; the aarch64 build does not. A change that passed every aarch64 container run
   failed every x86_64 CI cell. Sandbox rules are verified on a native x86_64 runner before they
-  are trusted. The 0.9 allow-list was derived from traces taken on native x86_64 and aarch64
+  are trusted. The 0.10 allow-list was derived from traces taken on native x86_64 and aarch64
   runners, never under emulation (a translator issues the host's syscalls, not the guest's): the
   x86_64 traces show `uname` and `pkey_alloc`, which aarch64 never calls.
 - **Verify the verifier.** Each new probe has a negative control (it must report a breach in an

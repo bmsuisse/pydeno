@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased / 0.10.0
+
+### Security
+
+- **The Linux seccomp filter is an allow-list, and never-legitimate calls kill the worker** (#45).
+  The worker may make 92 syscalls on x86_64 and 79 on aarch64 with any arguments, and about 20
+  more with checked arguments (a worker in normal use makes about 40 distinct ones), derived by tracing real workers through the isolation suites with `strace`,
+  natively on x86_64 and aarch64 and on several distributions (`scripts/trace_worker_syscalls.py`).
+  `fcntl` and `ioctl` are allow-lists of commands too (`ioctl`: `TCGETS`, `TIOCGWINSZ`, `FIONREAD`,
+  `FIONBIO`, `FIOCLEX`, `FIONCLEX`). Every other syscall is refused with `EPERM` (the unreviewed
+  range keeps `ENOSYS`), except about 60 that no runtime ever makes (`ptrace`, `process_vm_*`,
+  `execve`, the mount API, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`,
+  `io_uring_*`, `memfd_create`, the keyring, kernel modules, `kexec`, `reboot`, the clock and the
+  host name, ...): those end the worker on the spot (`SECCOMP_RET_KILL_PROCESS`), so a probing
+  exploit gets no answer to iterate on. `fork`/`vfork` stay `EPERM`: CPython's `subprocess` calls
+  `vfork`, which on x86_64 is its own syscall (found on a native x86_64 runner).
+- **New error kind `sandbox_violation`** (not retryable). A worker killed by its filter raises
+  `WorkerCrashed("worker process died: sandbox violation: ...")` from `IsolatedRuntime` and
+  `AsyncIsolatedRuntime`.
+- **The kill action is checked, and Landlock is checked by a canary.** A worker asks the kernel
+  whether the kill action is supported; `sandbox_status()` exercises it (its throwaway child makes
+  one never-legitimate call and must be killed; a worker start does not, since the kernel audits
+  every seccomp kill). A missing or unenforced kill fails the self-test (`exec-not-killed`), so
+  `sandbox="require"` refuses it. After Landlock is in force the worker opens a directory it could
+  open a moment earlier, which must now be refused; a kernel that accepts the ruleset and does not
+  enforce it is no longer counted as `"landlock"`. `sandbox_status()` reports the Landlock ABI, the
+  canary and the kill check.
+- **Kernel-enforced caps.** With `max_memory`, a Linux worker gets `RLIMIT_DATA` at `max_memory` +
+  1 GiB, a ceiling under the sampled memory limit that code in the worker cannot lift; V8 aborting
+  at it is reported as `memory_limit`. Inside the worker's own user namespace (the empty root) on
+  Linux 5.14+, `RLIMIT_NPROC` caps its threads at 128, which the kernel counts per namespace there.
+  `RLIMIT_AS`, `RLIMIT_CPU` and cgroups are not used; the isolation guide says why.
+- Not in this release: running host tools in a sandboxed process of their own (the fifth item of
+  #45). The evaluation and a design are in `docs/contributing/sandboxed-tool-process.md`.
+
 ## 0.9.0 — 2026-10-05
 
 Highlights: **gates** (a host-side check of the exact source before it runs, with a fail-closed
@@ -99,39 +134,6 @@ boundary; the sandbox is.
   killed worker's slot is handed to the replay, so a checkout already waiting cannot take it in
   between. `stats()` adds `max_workers`, `workers`, `waiting` and `checkout_timeouts`.
   Based on the contribution in #93.
-
-### Security
-
-- **The Linux seccomp filter is an allow-list, and never-legitimate calls kill the worker** (#45).
-  The worker may make 92 syscalls on x86_64 and 79 on aarch64 with any arguments, and about 20
-  more with checked arguments (a worker in normal use makes about 40 distinct ones), derived by tracing real workers through the isolation suites with `strace`,
-  natively on x86_64 and aarch64 and on several distributions (`scripts/trace_worker_syscalls.py`).
-  `fcntl` and `ioctl` are allow-lists of commands too (`ioctl`: `TCGETS`, `TIOCGWINSZ`, `FIONREAD`,
-  `FIONBIO`, `FIOCLEX`, `FIONCLEX`). Every other syscall is refused with `EPERM` (the unreviewed
-  range keeps `ENOSYS`), except about 60 that no runtime ever makes (`ptrace`, `process_vm_*`,
-  `execve`, the mount API, `setns`, `unshare`, `bpf`, `perf_event_open`, `userfaultfd`,
-  `io_uring_*`, `memfd_create`, the keyring, kernel modules, `kexec`, `reboot`, the clock and the
-  host name, ...): those end the worker on the spot (`SECCOMP_RET_KILL_PROCESS`), so a probing
-  exploit gets no answer to iterate on. `fork`/`vfork` stay `EPERM`: CPython's `subprocess` calls
-  `vfork`, which on x86_64 is its own syscall (found on a native x86_64 runner).
-- **New error kind `sandbox_violation`** (not retryable). A worker killed by its filter raises
-  `WorkerCrashed("worker process died: sandbox violation: ...")` from `IsolatedRuntime` and
-  `AsyncIsolatedRuntime`.
-- **The kill action is checked, and Landlock is checked by a canary.** A worker asks the kernel
-  whether the kill action is supported; `sandbox_status()` exercises it (its throwaway child makes
-  one never-legitimate call and must be killed; a worker start does not, since the kernel audits
-  every seccomp kill). A missing or unenforced kill fails the self-test (`exec-not-killed`), so
-  `sandbox="require"` refuses it. After Landlock is in force the worker opens a directory it could
-  open a moment earlier, which must now be refused; a kernel that accepts the ruleset and does not
-  enforce it is no longer counted as `"landlock"`. `sandbox_status()` reports the Landlock ABI, the
-  canary and the kill check.
-- **Kernel-enforced caps.** With `max_memory`, a Linux worker gets `RLIMIT_DATA` at `max_memory` +
-  1 GiB, a ceiling under the sampled memory limit that code in the worker cannot lift; V8 aborting
-  at it is reported as `memory_limit`. Inside the worker's own user namespace (the empty root) on
-  Linux 5.14+, `RLIMIT_NPROC` caps its threads at 128, which the kernel counts per namespace there.
-  `RLIMIT_AS`, `RLIMIT_CPU` and cgroups are not used; the isolation guide says why.
-- Not in this release: running host tools in a sandboxed process of their own (the fifth item of
-  #45). The evaluation and a design are in `docs/contributing/sandboxed-tool-process.md`.
 
 ### Changed
 

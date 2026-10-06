@@ -40,14 +40,14 @@ Status below is a plan, not a promise of dates.
 
 **Hardening** (each needs verification on native x86_64, not only emulation):
 
-- Seccomp as an allow-list with kill-on-violation: done in 0.9 (#45), traced and verified natively
-  on x86_64 and aarch64.
-- Kernel-enforced thread and memory caps: `RLIMIT_DATA` and a per-namespace `RLIMIT_NPROC` in 0.9
+- Seccomp as an allow-list with kill-on-violation: implemented in 0.10 (#45); the aarch64 tables are
+  checked in a kernel-free interpreter, native aarch64 results come from CI.
+- Kernel-enforced thread and memory caps: `RLIMIT_DATA` and a per-namespace `RLIMIT_NPROC` in 0.10
   (#45); cgroups only where a delegated subtree exists (not assumed).
 - Tool boundary: per-tool deadlines, result caps, redacted conversion errors, argument normalisation, a
   sandboxed tool process, safe preset tools (read-only files / SQL / HTTP fetch), call audit hooks.
 - macOS: close the path-existence side channel.
-- Landlock ABI probe plus a canary so a kernel that silently weakens it is noticed: done in 0.9 (#45).
+- Landlock ABI probe plus a canary so a kernel that silently weakens it is noticed: done in 0.10 (#45).
 
 **API**:
 
