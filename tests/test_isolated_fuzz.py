@@ -200,7 +200,7 @@ class TestRegressions:
 
     def test_an_endless_stream_of_host_calls_cannot_dodge_the_deadline(self) -> None:
         # found by reading `_pump`: limits were checked only when the pipe went quiet
-        rt = IsolatedRuntime(RuntimeConfig(), request_timeout=1.5)
+        rt = IsolatedRuntime(RuntimeConfig(), request_timeout=1.5, max_host_calls=None)
         rt.bind_function("host", lambda *a: None)
         start = time.monotonic()
         with pytest.raises(RuntimeTimeout):

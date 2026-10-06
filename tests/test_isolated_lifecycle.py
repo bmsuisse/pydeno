@@ -343,7 +343,7 @@ class TestLimitsHoldUnderConstantTraffic:
         return outcome[0]
 
     def test_the_hard_deadline_fires_under_a_stream_of_cheap_host_calls(self) -> None:
-        rt = IsolatedRuntime(RuntimeConfig(), request_timeout=1.5)
+        rt = IsolatedRuntime(RuntimeConfig(), request_timeout=1.5, max_host_calls=None)
         rt.bind_function("tick", lambda: None)
         start = time.monotonic()
         result = self._run_bounded(rt, "for (;;) tick()")

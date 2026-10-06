@@ -519,7 +519,7 @@ class TestLimits:
         with pytest.raises(WorkerCrashed, match="cannot be enforced"):
             await _rt(sandbox="require")
         with pytest.warns(RuntimeWarning, match="cannot be enforced"):
-            rt = await _rt()
+            rt = await _rt(sandbox="auto")
         await rt.close()
 
 
