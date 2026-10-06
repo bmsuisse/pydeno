@@ -1438,7 +1438,7 @@ def _creates_sysv_semaphore() -> bool:
     return True
 
 
-def attest() -> list[str]:
+def attest(parent: int | None = None) -> list[str]:
     """Try, from inside the confined process, the things the sandbox exists to stop, and return
     the ones that worked. Empty means every probe was refused.
 
@@ -1455,11 +1455,16 @@ def attest() -> list[str]:
     """
     breaches: list[str] = []
     ppid = os.getppid()
-    if ppid <= 1:
-        # Reparented to init (or the parent is gone): the "parent" probes below would aim at pid 1, or,
-        # worse, at -1 (every process) if a denied getppid returned an error. Refuse to start.
+    if parent is None:
+        parent = ppid if ppid > 1 else 0
+    if ppid <= 0 or ppid != parent:
+        # The parent changed under us (we were re-parented), or getppid failed. The "parent"
+        # probes below would aim at the wrong process, or at -1 (every process) if a denied
+        # getppid returned an error. Refuse to start. A parent that is PID 1 is fine: that is
+        # how a container's main process looks to its children.
         raise RuntimeError(
-            "the worker was orphaned before its sandbox self-test could run"
+            "the worker was orphaned before its sandbox self-test could run (its parent "
+            f"process changed from {parent} to {ppid})"
         )
 
     def check(

@@ -92,6 +92,9 @@ class SandboxStatus:
     termination: Layer = field(
         default_factory=lambda: Layer(False, "termination authority was not probed")
     )
+    #: `complete` and, on Linux, the empty-root layer too. `sandbox="require"` does not demand
+    #: that layer; `empty_root="require"` does.
+    hardened: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -100,6 +103,7 @@ class SandboxStatus:
             "applied": self.applied,
             "required": sorted(self.required),
             "complete": self.complete,
+            "hardened": self.hardened,
             "warnings": list(self.warnings),
         }
         for name in _LAYER_FIELDS:
@@ -119,6 +123,11 @@ class SandboxStatus:
             ),
             f"  applied in probe: {self.applied}; required here: {sorted(self.required) or 'nothing known'}",
         ]
+        if self.complete and not self.hardened:
+            lines.append(
+                "  note: complete, but not hardened: the empty-root layer is missing, which "
+                "sandbox='require' does not demand (pass empty_root='require' to)"
+            )
         for name in _LAYER_FIELDS:
             layer: Layer = getattr(self, name)
             tag = (
@@ -238,6 +247,7 @@ def _reap(pid: int, *, killed: bool) -> None:
 def _confinement_probe() -> dict[str, Any]:
     """Runs in the throwaway child, mirroring what the worker does before its isolate exists."""
     out: dict[str, Any] = {}
+    parent = os.getppid()  # before anything else: the caller, which may legitimately be PID 1
     out["hardened"] = {
         k: v
         for k, v in _sandbox.harden_process().items()
@@ -258,7 +268,7 @@ def _confinement_probe() -> dict[str, Any]:
     out["missing"] = sorted(_sandbox.missing_layers(applied))
     if applied != "none" and not out["missing"]:
         try:
-            out["breaches"] = _sandbox.attest()
+            out["breaches"] = _sandbox.attest(parent=parent)
         except BaseException as exc:  # noqa: BLE001
             out["self_test_error"] = f"{type(exc).__name__}: {exc}"[:200]
     return out
@@ -649,5 +659,6 @@ def _sandbox_status() -> SandboxStatus:
         termination=termination,
         self_test=self_test,
         complete=complete,
+        hardened=complete and (not linux or empty_root.applied),
         warnings=warns,
     )

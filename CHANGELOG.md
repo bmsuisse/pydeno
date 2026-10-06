@@ -2,8 +2,22 @@
 
 ## Unreleased (0.11.0)
 
+### Changed (breaking defaults, security review of 0.10.0)
+
+- **`sandbox` now defaults to `"require"`** for `IsolatedRuntime`, `AsyncIsolatedRuntime` and
+  `configure_default_runtime(isolated=True)` (and so `pydeno.eval()`), like `Pydeno`. Before, `"auto"`
+  silently started with no OS sandbox where the kernel or container profile blocked Landlock or
+  seccomp, with only a warning (#127). Pass `sandbox="auto"` to keep the old behaviour; it now also
+  logs through the `pydeno` logger and sets `rt.sandbox_degraded`.
+- **Finite defaults for code you do not trust:** `max_host_calls` defaults to 10,000 per runtime
+  (`None` removes it) and `max_host_wait` to 60 s per command, down from 600 s (#132).
+
 ### Added
 
+- `empty_root` accepts `"auto"`, `"require"` or `"off"` (`True`/`False` still work).
+  `empty_root="require"` refuses to start without the empty-root layer; `sandbox="require"` still
+  does not demand it. `sandbox_status()` gains `hardened` (complete plus the empty-root layer) and
+  says so when a host is complete but not hardened (#129).
 - **Python 3.15 builds.** PyO3 and `pyo3-async-runtimes` are bumped to 0.29 (the 0.27 series stops
   at 3.14), `#[pyclass]` types that are `Clone` keep their by-value `FromPyObject` explicitly
   (`from_py_object`), and the 3.15 classifier and CI cells are added. Verified here: a debug build
@@ -19,6 +33,9 @@
 
 ### Fixed
 
+- **A host that is PID 1 (a container's main process) could not start a sandboxed worker.** The
+  worker reported "orphaned" because its parent's pid was 1. It now records its parent at start-up and
+  refuses only when that changes (#128).
 - **`pydeno.eval()` from a thread that inherited its parent's context** (free-threaded builds,
   and any build with `thread_inherit_context`) panicked with "Runtime is unsendable, but sent to
   another thread": the owner is now checked before the inherited runtime is touched.

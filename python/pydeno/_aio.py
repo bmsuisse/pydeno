@@ -81,6 +81,7 @@ from ._isolated import (
     _limit_int,
     _limit_seconds,
     _revoked_handler,
+    _empty_root_mode,
     _session_options,
     _start_worker,
     _strict_eval_setting,
@@ -677,13 +678,13 @@ class AsyncIsolatedRuntime:
         max_memory: int | None = _DEFAULT,
         request_timeout: float | int | None = _DEFAULT,
         timeout_grace: float | int = 2.0,
-        max_host_calls: int | None = None,
+        max_host_calls: int | None = _DEFAULT,
         max_host_wait: float | int | None = _DEFAULT,
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
-        sandbox: str = "auto",
-        empty_root: bool = True,
+        sandbox: str = "require",
+        empty_root: bool | str = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
         strict_eval: bool = False,
@@ -720,6 +721,7 @@ class AsyncIsolatedRuntime:
         max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
+        empty_root = _empty_root_mode(empty_root, sandbox)
         if os.name != "posix":
             raise NotImplementedError(
                 "AsyncIsolatedRuntime currently supports POSIX only"
@@ -763,6 +765,9 @@ class AsyncIsolatedRuntime:
             self._options["clock_ms"] = clock_ms
         #: The OS layers in force, as the worker reported them ("seatbelt", "landlock+seccomp", ...).
         self.sandbox = "none"
+        #: True when the worker started with fewer OS layers than the platform has (only
+        #: `sandbox="auto"` allows that). Check it instead of relying on the warning.
+        self.sandbox_degraded = False
         #: Bonus layers that also took effect, e.g. ["emptyroot"].
         self.sandbox_extras: list[str] = []
         self.v8_flags: list[str] = []
@@ -943,14 +948,17 @@ class AsyncIsolatedRuntime:
             missing = (
                 _sandbox.missing_layers(applied) if applied != "off" else frozenset()
             )
+            self.sandbox_degraded = bool(missing)
             if missing and self._options["sandbox"] == "auto":
-                warnings.warn(
+                text = (
                     f"AsyncIsolatedRuntime is running with a degraded OS sandbox ({applied!r}; "
                     f"missing {sorted(missing)}). Untrusted code has less containment than "
-                    "intended; pass sandbox='require' to refuse instead.",
-                    RuntimeWarning,
-                    stacklevel=4,
+                    "intended; pass sandbox='require' to refuse instead."
                 )
+                import logging
+
+                logging.getLogger("pydeno").warning(text)
+                warnings.warn(text, RuntimeWarning, stacklevel=4)
             self.v8_flags = list(self._options["v8_flags"])
         except TimeoutError:
             self._kill()

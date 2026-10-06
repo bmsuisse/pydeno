@@ -238,6 +238,10 @@ class _CommandLoop(asyncio.SelectorEventLoop):
 
 class _Worker:
     def __init__(self, in_fd: int, out_fd: int) -> None:
+        # Read before anything runs, in the process that was just started: a host that is PID 1
+        # (a container's main process) is a legitimate parent, so "orphaned" means the parent
+        # changed, not that it is 1.
+        self._parent = os.getppid()
         self._reader = _wire.FrameReader(in_fd)
         self._writer = _wire.FrameWriter(out_fd)
         # Who reads the parent's frames. Between commands the main thread does, itself: a command
@@ -572,11 +576,18 @@ class _Worker:
         ):
             # A kernel ceiling under the sampled one (`_sandbox.DATA_HEADROOM` explains the gap).
             _sandbox.limit_data(max_memory)
+        empty_root = options.get("empty_root", "auto")
+        if empty_root is True:
+            empty_root = "auto"
+        elif empty_root is False:
+            empty_root = "off"
+        if empty_root not in ("auto", "require", "off"):
+            raise ValueError(f"unknown empty_root mode {empty_root!r}")
         applied = (
             "none"
             if mode == "off"
             else _sandbox.apply(
-                empty_root=bool(options.get("empty_root", True)),
+                empty_root=empty_root != "off",
                 # A jitless V8 never maps memory executable, so refuse it: an exploit then has to
                 # work without injecting code.
                 allow_exec="--jitless" not in flags,
@@ -586,12 +597,18 @@ class _Worker:
             # Ask the kernel rather than trust the filter lists: if the platform's full sandbox
             # claims to be on and a forbidden operation still works, no guest code may run in
             # this process. (A degraded one, say a kernel without Landlock, is expected to leak.)
-            breaches = _sandbox.attest()
+            breaches = _sandbox.attest(parent=self._parent)
             if breaches:
                 raise RuntimeError(
                     f"sandbox self-test failed: the worker could still {breaches} "
                     f"(applied: {applied}){_sandbox.layer_notes()}"
                 )
+        if empty_root == "require" and "emptyroot" not in _sandbox.EXTRAS:
+            raise RuntimeError(
+                "empty_root='require' but the empty-root layer could not be applied here "
+                "(it needs unprivileged user namespaces and a single-threaded worker)"
+                f"{_sandbox.layer_notes()}"
+            )
         if mode == "require":
             # "require" means every layer this platform has, not "at least one": a kernel that
             # lacks Landlock must not be allowed to pass for a fully sandboxed one.
@@ -616,7 +633,7 @@ class _Worker:
             args=(
                 max_memory if isinstance(max_memory, int) and max_memory > 0 else None,
                 read_rss,
-                os.getppid(),
+                self._parent,
             ),
             name="pydeno-worker-watch",
             daemon=True,

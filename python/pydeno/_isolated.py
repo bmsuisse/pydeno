@@ -122,7 +122,8 @@ _CPU_BASELINE_MAX_AGE = 2 * _IDLE_CHECK_SECONDS
 # silently has no limits until you remember to set them is not much of a sandbox.
 DEFAULT_MAX_MEMORY = 1024 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 60.0
-DEFAULT_MAX_HOST_WAIT = 600.0
+DEFAULT_MAX_HOST_WAIT = 60.0
+DEFAULT_MAX_HOST_CALLS = 10_000
 DEFAULT_MAX_INFLIGHT_HOST_CALLS = 64
 DEFAULT_WRITE_STALL_TIMEOUT = 10.0
 
@@ -408,11 +409,26 @@ SESSION_OPTIONS = (
 )
 
 
+def _empty_root_mode(value: object, sandbox: str) -> str:
+    """`empty_root` as "auto" | "require" | "off". A bool is the old spelling: True is "auto"."""
+    if value is True:
+        mode = "auto"
+    elif value is False:
+        mode = "off"
+    elif value in ("auto", "require", "off"):
+        mode = str(value)
+    else:
+        raise ValueError("empty_root must be a bool, 'auto', 'require' or 'off'")
+    if mode == "require" and sandbox == "off":
+        raise ValueError("empty_root='require' needs an OS sandbox, but sandbox='off'")
+    return mode
+
+
 def _session_options(
     *,
     request_timeout: float | int | timedelta | None | Any = _DEFAULT,
     timeout_grace: float | int = 2.0,
-    max_host_calls: int | None = None,
+    max_host_calls: int | None | Any = _DEFAULT,
     max_host_wait: float | int | timedelta | None | Any = _DEFAULT,
     max_inflight_host_calls: int | None | Any = _DEFAULT,
     write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
@@ -421,7 +437,11 @@ def _session_options(
     """The parent-side options, validated and normalised, as the runtime attributes that hold
     them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
     an option set at checkout means exactly what it means in the constructor."""
-    max_host_calls = _limit_int("max_host_calls", max_host_calls, minimum=0)
+    max_host_calls = (
+        DEFAULT_MAX_HOST_CALLS
+        if max_host_calls is _DEFAULT
+        else _limit_int("max_host_calls", max_host_calls, minimum=0)
+    )
     max_inflight = (
         DEFAULT_MAX_INFLIGHT_HOST_CALLS
         if max_inflight_host_calls is _DEFAULT
@@ -595,10 +615,10 @@ class IsolatedRuntime:
             no timeout; pass `None` to remove the hard deadline.
         timeout_grace: Seconds the worker gets past a soft `timeout` before it is killed.
         max_host_calls: Total host-function calls the guest may make over this runtime's
-            life, then the worker is killed. The guest's clock is paused while a host
-            callback runs, so an endless stream of quick calls needs its own cap.
+            life, then the worker is killed (default 10,000). The guest's clock is paused while
+            a host callback runs, so an endless stream of quick calls needs its own cap.
             (`None`: unlimited.)
-        max_host_wait: Most time (seconds, default 600) one command may spend waiting on host
+        max_host_wait: Most time (seconds, default 60) one command may spend waiting on host
             callbacks in total. The hard deadline does not run while a callback does, which a
             guest could exploit by always keeping one asynchronous call in flight; this bounds it.
             The worker's CPU use is also capped at twice the hard deadline per command, which
@@ -619,14 +639,16 @@ class IsolatedRuntime:
             generic one before the guest sees it (the exception's class name is kept). Use this
             when your tools' error text can contain paths, queries or secrets.
         sandbox: OS confinement for the worker (macOS Seatbelt; Linux Landlock + seccomp).
-            "auto" applies whatever the platform offers. "require" refuses to start unless
-            *every* layer the platform has is in force (macOS: Seatbelt; Linux: Landlock and
-            seccomp), so a kernel that lacks one cannot silently weaken you. "off" disables it.
-            Read `.sandbox` for what is active.
+            "require" (the default) refuses to start unless *every* layer the platform has is in
+            force (macOS: Seatbelt; Linux: Landlock and seccomp), so a kernel that lacks one
+            cannot silently weaken you. "auto" applies whatever the platform offers and starts
+            without the rest: opt in to it knowingly, and check `.sandbox_degraded`. "off"
+            disables it. Read `.sandbox` for what is active.
         empty_root: On Linux, also give the worker a private mount namespace whose root is
             empty, plus empty network and IPC namespaces, so it cannot even tell which host paths
-            exist. Needs unprivileged user namespaces; silently skipped where they are not
-            allowed (see `.sandbox_extras`).
+            exist. Needs unprivileged user namespaces. `True` / "auto" skips it where they are not
+            allowed (see `.sandbox_extras`; `sandbox="require"` does not demand it). "require"
+            refuses to start without it. `False` / "off" never applies it.
         jitless: Run V8 in the worker with `--jitless`: no JIT compiler and no
             WebAssembly, which removes the largest class of V8 exploits at a modest
             speed cost. Pass `False` to allow WebAssembly and JIT speed.
@@ -674,13 +696,13 @@ class IsolatedRuntime:
         max_memory: int | None = _DEFAULT,
         request_timeout: float | int | None = _DEFAULT,
         timeout_grace: float | int = 2.0,
-        max_host_calls: int | None = None,
+        max_host_calls: int | None = _DEFAULT,
         max_host_wait: float | int | None = _DEFAULT,
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
-        sandbox: str = "auto",
-        empty_root: bool = True,
+        sandbox: str = "require",
+        empty_root: bool | str = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
         strict_eval: bool = False,
@@ -711,6 +733,7 @@ class IsolatedRuntime:
         max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
+        empty_root = _empty_root_mode(empty_root, sandbox)
         if os.name != "posix":
             raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
         config = config or RuntimeConfig()
@@ -768,6 +791,9 @@ class IsolatedRuntime:
         #: What the worker reports after start-up: the OS layers in force
         #: ("seatbelt", "landlock+seccomp", ... or "none") and the V8 flags set.
         self.sandbox = "none"
+        #: True when the worker started with fewer OS layers than the platform has (only
+        #: `sandbox="auto"` allows that). Check it instead of relying on the warning.
+        self.sandbox_degraded = False
         #: Bonus layers that also took effect, e.g. ["emptyroot"] (a private mount namespace
         #: with nothing in it; needs unprivileged user namespaces, so it is not everywhere).
         self.sandbox_extras: list[str] = []
@@ -951,14 +977,17 @@ class IsolatedRuntime:
             missing = (
                 _sandbox.missing_layers(applied) if applied != "off" else frozenset()
             )
+            self.sandbox_degraded = bool(missing)
             if missing and self._options["sandbox"] == "auto":
-                warnings.warn(
+                text = (
                     f"IsolatedRuntime is running with a degraded OS sandbox ({applied!r}; "
                     f"missing {sorted(missing)}). Untrusted code has less containment than "
-                    "intended; pass sandbox='require' to refuse instead.",
-                    RuntimeWarning,
-                    stacklevel=3,
+                    "intended; pass sandbox='require' to refuse instead."
                 )
+                import logging
+
+                logging.getLogger("pydeno").warning(text)
+                warnings.warn(text, RuntimeWarning, stacklevel=3)
             self.v8_flags = list(self._options["v8_flags"])
         except TimeoutError:
             self._kill()
