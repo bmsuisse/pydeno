@@ -371,7 +371,9 @@ def get_default_runtime() -> Runtime | IsolatedRuntime:
     """
     slot = _default_runtime_var.get()
     owner = _current_runtime_owner()
-    if slot is None or slot.runtime.is_closed() or slot.owner is not owner:
+    # Owner first: a thread that inherited the parent's context (free-threaded builds do) sees a
+    # slot whose in-process Runtime is unsendable, and even is_closed() on it panics off-thread.
+    if slot is None or slot.owner is not owner or slot.runtime.is_closed():
         slot = _RuntimeSlot(runtime=_default_factory(), owner=owner)
         _default_runtime_var.set(slot)
         _schedule_owner_cleanup(slot)
