@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased (0.11.0)
+
+### Added
+
+- **Python 3.15 builds.** PyO3 and `pyo3-async-runtimes` are bumped to 0.29 (the 0.27 series stops
+  at 3.14), `#[pyclass]` types that are `Clone` keep their by-value `FromPyObject` explicitly
+  (`from_py_object`), and the 3.15 classifier and CI cells are added. Verified here: a debug build
+  on CPython 3.15.0rc2 on x86_64 Linux and the test suite on it. Not verified: aarch64, macOS,
+  Windows, the Linux sandbox matrix on 3.15, and free-threaded 3.15t (still unsupported).
+- **PEP 810 lazy imports on 3.15.** The parent-side modules declare `__lazy_modules__` for the
+  heavy stdlib they import (`asyncio`, `concurrent.futures`, `inspect`, `subprocess`, `tempfile`,
+  `logging`, `hashlib`, ...), so `import pydeno; pydeno.IsolatedRuntime` no longer loads asyncio,
+  and a synchronous program never does. It is a plain list, so it does nothing on 3.10-3.14. The
+  isolation worker's imports stay eager on purpose: it applies its sandbox after importing.
+  Measured on a loaded machine with a debug build: `import pydeno` plus `IsolatedRuntime` went from
+  about 38 ms to about 18 ms.
+
+### Fixed
+
+- **`pydeno.eval()` from a thread that inherited its parent's context** (free-threaded builds,
+  and any build with `thread_inherit_context`) panicked with "Runtime is unsendable, but sent to
+  another thread": the owner is now checked before the inherited runtime is touched.
+
 ## 0.10.0 — 2026-10-06
 
 ### Added

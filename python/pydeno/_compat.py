@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = ["asyncio"]
+
 import asyncio
 import sys
 from typing import Any
 
 if sys.version_info >= (3, 11):
-    timeout = asyncio.timeout
+
+    def timeout(delay: float | None) -> Any:
+        # A function, not `timeout = asyncio.timeout`: that would load asyncio at import time.
+        return asyncio.timeout(delay)
+
 else:
 
     class _Timeout:

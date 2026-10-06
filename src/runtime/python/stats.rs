@@ -71,7 +71,7 @@ impl RuntimeStats {
 }
 
 mirror_pyclass! {
-    #[pyclass(module = "pydeno")]
+    #[pyclass(module = "pydeno", skip_from_py_object)]
     #[derive(Clone)]
     struct InspectorEndpoints from InspectorMetadata => String {
         id, websocket_url, devtools_frontend_url, title, description, target_url,

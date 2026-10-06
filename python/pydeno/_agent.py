@@ -26,6 +26,12 @@ The tools run with the host's full authority; validate their arguments.
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = ["asyncio", "concurrent.futures", "hashlib", "inspect", "logging", "secrets"]
+
 import asyncio
 import base64
 import collections
