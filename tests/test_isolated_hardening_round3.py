@@ -196,7 +196,7 @@ class TestALimitThatCannotBeMeasuredIsNotSilent:
 
         monkeypatch.setattr(_sandbox, "cpu_seconds", lambda pid: None)
         with pytest.warns(RuntimeWarning, match="cannot be enforced"):
-            rt = IsolatedRuntime()
+            rt = IsolatedRuntime(sandbox="auto")
         rt.close()
 
 
