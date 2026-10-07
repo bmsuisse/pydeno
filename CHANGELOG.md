@@ -39,15 +39,16 @@
   `empty_root="require"` refuses to start without the empty-root layer; `sandbox="require"` still
   does not demand it. `sandbox_status()` gains `hardened` (complete plus the empty-root layer) and
   says so when a host is complete but not hardened (#129).
-- **Dependencies refreshed, V8 15.2.** Rust and Python lockfiles updated (`criterion` 0.8 and
-  higher minimums for `tokio`, `uuid` and `indexmap`). The engine is built against V8 15.2.124.1
-  (`rusty_v8` 152.2.0) instead of the 15.0 that `deno_core` 0.412.0 (Deno 2.9.7) ships: the
-  newest `deno_core` pins `rusty_v8` ^150.4, so `vendor/deno_v8` (the re-export facade) and
-  `vendor/deno_core` are patched in. The only source changes: `Global::open` became `unsafe` in
-  `rusty_v8` 152 (25 call sites wrapped, behaviour unchanged), and the `--no-validate-asm` flag was
-  removed from the start-up list because V8 15.2 rejects it and then ignores every flag after it
-  (that broke `queueMicrotask`). `tests/test_v8_flags_accepted.py` fails if V8 ever rejects a
-  start-up flag again. Drop the patches once a `deno_core` release ships a newer V8.
+- **Dependencies refreshed.** Rust and Python lockfiles updated (`criterion` 0.8 and higher
+  minimums for `tokio`, `uuid` and `indexmap`). The engine stays on V8 15.0 (`rusty_v8` 150.4),
+  which is what `deno_core` 0.412.0 (Deno 2.9.7, the newest release) is built for. A V8 15.2
+  build (`rusty_v8` 152.2) was tried with vendored patches (`Global::open` became `unsafe`, and
+  the `--no-validate-asm` flag was removed) and is **not shipped**: it needed unaudited `unsafe`
+  in `deno_core`, and CI showed intermittent allocator aborts on macOS that the stock build did
+  not (2 in about 24 macOS jobs, none in 18 on `main`). It is kept on the `chore/v8-152` branch
+  until a `deno_core` release supports a newer V8. `tests/test_v8_flags_accepted.py` fails if
+  V8 ever rejects a start-up flag (V8 stops parsing at the first unknown flag and ignores the
+  rest), which is what happened with 15.2.
 - **Python 3.15 builds.** PyO3 and `pyo3-async-runtimes` are bumped to 0.29 (the 0.27 series stops
   at 3.14), `#[pyclass]` types that are `Clone` keep their by-value `FromPyObject` explicitly
   (`from_py_object`), and the 3.15 classifier and CI cells are added. Verified here: a debug build
