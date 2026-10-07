@@ -37,7 +37,25 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SANDBOX_PY = HERE.parent / "python" / "pydeno" / "_sandbox.py"
+
+
+def _find_sandbox_py() -> Path:
+    """The `_sandbox.py` under test: the checkout's, else the installed package's (the container
+    matrix copies tests/ and scripts/ but installs pydeno from a wheel, with no python/ tree).
+    Found by path, not imported: the sweep loads it by file."""
+    checkout = HERE.parent / "python" / "pydeno" / "_sandbox.py"
+    if checkout.exists():
+        return checkout
+    spec = importlib.util.find_spec("pydeno")
+    if spec is not None and spec.submodule_search_locations:
+        for location in spec.submodule_search_locations:
+            candidate = Path(location) / "_sandbox.py"
+            if candidate.exists():
+                return candidate
+    return checkout
+
+
+SANDBOX_PY = _find_sandbox_py()
 TABLES = HERE.parent / "tests" / "data" / "syscalls.json"
 
 # What the child does. It applies the real sandbox, then fires one syscall with junk

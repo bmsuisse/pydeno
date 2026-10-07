@@ -552,12 +552,6 @@ def test_the_only_reachable_syscalls_are_the_kernel_seccomp_passthrough() -> Non
         pytest.fail(f"the sweep failed on {ARCH}: {type(exc).__name__}: {exc!r}")
     assert results, f"the sweep returned nothing on {ARCH}"
     expected = set(sweep_script.KERNEL_SECCOMP_PASSTHROUGH)
-    import platform as _platform  # DEBUG-TEMP
-
-    pytest.skip(  # DEBUG-TEMP: shows in the matrix tail via -rs; revert
-        f"DEBUG {ARCH} kernel={_platform.release()} reachable={sorted(reachable)} "
-        f"n_results={len(results)}"
-    )
     assert expected == {"uprobe", "uretprobe"}
     assert reachable <= expected, (
         f"new reachable syscalls on {ARCH}: {sorted(reachable - expected)}"
