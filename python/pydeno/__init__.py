@@ -5,8 +5,10 @@ from __future__ import annotations
 import atexit
 import contextlib
 import contextvars
+import os
 import sys
 import threading
+import types
 from collections.abc import Callable
 
 from ._pydeno import (
@@ -304,6 +306,29 @@ setattr(Runtime, "bind", _runtime_bind)
 
 
 # Standard library only, so importing it costs next to nothing (the isolation worker needs it too).
+def _reify_lazy_imports() -> None:
+    """Python 3.15 (PEP 810): resolve every lazy import the package declared, right before a fork.
+
+    A lazy import is loaded under its module's import lock the first time it is used. If another
+    thread holds that lock when the process forks, the child inherits it held by a thread that does
+    not exist there and hangs on its first use of the module. Touching each name here waits for any
+    such thread to finish, so the child starts with nothing half-imported. A no-op before 3.15."""
+    lazy = getattr(types, "LazyImportType", None)
+    if lazy is None:
+        return
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "pydeno" or name.startswith("pydeno.")):
+            continue
+        for key, value in list(vars(module).items()):
+            if isinstance(value, lazy):
+                with contextlib.suppress(Exception):
+                    getattr(module, key)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_reify_lazy_imports)
+
+
 from ._wasm import AsyncWasmModule, WasmModule  # noqa: E402
 from ._wasm import runtime_load_wasm as _runtime_load_wasm  # noqa: E402
 

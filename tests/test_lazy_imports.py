@@ -68,3 +68,38 @@ def test_the_worker_imports_stay_eager() -> None:
     for name in ("_worker", "_sandbox", "_wire", "_wasm", "_awaitable"):
         source = (Path(pydeno.__file__).parent / f"{name}.py").read_text()
         assert "__lazy_modules__" not in source, name
+
+
+def test_a_fork_starts_with_no_lazy_import_pending() -> None:
+    """A lazy import another thread is loading at `fork()` would leave its module lock held in the
+    child, which then hangs on first use. The package resolves its own before every fork."""
+    out = _run(
+        """
+        import os, sys, types, pydeno
+
+        pydeno.IsolatedRuntime  # loads the sync API; its lazy imports are still unresolved
+
+        def pending():
+            lazy = getattr(types, "LazyImportType", None)
+            if lazy is None:
+                return 0
+            return sum(
+                isinstance(v, lazy)
+                for name, mod in list(sys.modules.items())
+                if mod is not None and (name == "pydeno" or name.startswith("pydeno."))
+                for v in list(vars(mod).values())
+            )
+
+        before = pending()
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.write(w, str(pending()).encode())
+            os._exit(0)
+        os.waitpid(pid, 0)
+        print(before, os.read(r, 16).decode())
+        """
+    )
+    before, in_child = out.split()
+    assert int(in_child) == 0
+    assert (int(before) > 0) == LAZY, out

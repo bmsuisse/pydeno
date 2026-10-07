@@ -57,7 +57,9 @@
   heavy stdlib they import (`asyncio`, `concurrent.futures`, `inspect`, `subprocess`, `tempfile`,
   `logging`, `hashlib`, ...), so `import pydeno; pydeno.IsolatedRuntime` no longer loads asyncio,
   and a synchronous program never does. It is a plain list, so it does nothing on 3.10-3.14. The
-  isolation worker's imports stay eager on purpose: it applies its sandbox after importing.
+  isolation worker's imports stay eager on purpose: it applies its sandbox after importing. Before
+  every `fork()` the package resolves its own lazy imports, so a child never inherits a module lock
+  held by a thread that is mid-import (found when a fork-in-flight test hung on 3.15).
   Measured on a loaded machine with a debug build: `import pydeno` plus `IsolatedRuntime` went from
   about 38 ms to about 18 ms.
 
