@@ -371,7 +371,7 @@ What to do about it in your own code:
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `max_host_wait` | 600 s | Total time a run may spend waiting on host callbacks; exceeding it raises `RuntimeTimeout` and kills the worker. `None` disables it (the CPU cap still applies) |
+| `max_host_wait` | 60 s | Total time a run may spend waiting on host callbacks; exceeding it raises `RuntimeTimeout` and kills the worker. `None` disables it (the CPU cap still applies) |
 | `tool_timeout` | `None` (off) | Most time one call to a bound host function (`bind_function`, `bind_object`, `ToolBridge`, agent tools) may take; see [Per-call tool deadline](#per-call-tool-deadline) |
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
