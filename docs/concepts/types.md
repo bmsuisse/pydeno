@@ -108,6 +108,12 @@ with Runtime() as runtime:
 
 All datetime values are normalized to UTC during conversion. If you pass a naive (timezone-unaware) Python datetime, it will be treated as UTC.
 
+A JavaScript `Date` converts exactly, to the millisecond. One that Python cannot represent, either invalid
+(`new Date(NaN)`) or outside the years 1 to 9999 (`new Date(8.64e15)`), cannot be returned or passed to a host
+function: the evaluation raises a `RuntimeError` ("Evaluation failed: Date value out of range"), on `Runtime`
+and the isolated runtimes alike; `AgentSandbox` reports it as a `Failed` result with `error_type="RuntimeError"`.
+The runtime stays usable. Check `isNaN(d)` or the year first if the guest might produce such a value.
+
 ## Binary Data
 
 Binary data is represented as `bytes` in Python and `Uint8Array` in JavaScript:

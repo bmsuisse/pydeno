@@ -12,6 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub const MAX_JS_DEPTH: usize = 100;
 pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024;
 
+/// The range of a `Date` the host can hold: `datetime.min` (0001-01-01T00:00:00Z) to
+/// `datetime.max` truncated to milliseconds (9999-12-31T23:59:59.999Z), as epoch milliseconds.
+pub const MIN_DATE_EPOCH_MS: i64 = -62_135_596_800_000;
+pub const MAX_DATE_EPOCH_MS: i64 = 253_402_300_799_999;
+
 /// Stack reserved for every thread that may run V8 or the recursive `JSValue`
 /// converters (Rust's 2 MiB default is too small for unoptimized frames at
 /// [`MAX_JS_DEPTH`]). Only a lazily committed reservation; V8's own ~984 KB
