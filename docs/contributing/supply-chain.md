@@ -59,10 +59,8 @@ osv-scanner scan -L Cargo.lock -L uv.lock
 
 ## State at the time of writing
 
-* Excepted in `deny.toml`: `RUSTSEC-2026-0176` and `RUSTSEC-2026-0177` (both `pyo3` 0.27.2). The
-  fix is `pyo3 >= 0.29`, but `pyo3-async-runtimes` 0.27 pins `pyo3` 0.27. pydeno calls neither
-  `nth`/`nth_back` on list/tuple iterators nor `PyCFunction::new_closure`. Remove both once
-  `pyo3-async-runtimes` releases for `pyo3 >= 0.29`.
+* Excepted in `deny.toml`: nothing. `RUSTSEC-2026-0176` and `-0177` applied to `pyo3` 0.27.2 and were
+  dropped with the upgrade to `pyo3` 0.29 (`Cargo.lock` has 0.29.3).
 * Not excepted, shown as warnings: `paste` is unmaintained (`RUSTSEC-2024-0436`, a build-time proc
   macro pulled in by the `v8` crate), and `yoke-derive` 0.8.3 is yanked
   (`cargo update -p yoke-derive` fixes it).

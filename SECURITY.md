@@ -60,7 +60,7 @@ their limits are in `docs/guides/advanced/isolation.md`.
   start instead of quietly running without it.
 - Keep the default `max_memory` and hard deadline, or set your own.
 - Leave `max_host_wait`, `max_inflight_host_calls` and `write_stall_timeout` at their defaults
-  (600 s, 64, 10 s) unless you have a reason; they stop a guest or compromised worker from
+  (60 s, 64, 10 s) unless you have a reason; they stop a guest or compromised worker from
   holding the deadline paused or freezing the caller.
 - Leave `redact_host_errors` at its default, `True`: the guest then sees `host function failed`
   (with the exception class name) instead of the text of an exception a host function raised.

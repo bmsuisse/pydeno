@@ -216,7 +216,7 @@ agent = Agent(model, capabilities=[JSCodeMode(), HandleDeferredToolCalls(handler
 An approved call returns its value. A denied call throws `ToolDenied` in JavaScript. Without a
 handler, it throws `ApprovalRequired`, and if the snippet doesn't catch it, the model gets a retry
 that says a `HandleDeferredToolCalls` capability is needed. Time spent waiting for the decision
-pauses the snippet's `timeout`, but counts against the worker's `max_host_wait` (600 s by
+pauses the snippet's `timeout`, but counts against the worker's `max_host_wait` (60 s by
 default, settable through `runtime_options`).
 
 `approvals="defer"`, which would end the run with `DeferredToolRequests` and resume it later by
