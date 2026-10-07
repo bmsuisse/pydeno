@@ -163,9 +163,8 @@ fn v8_init(
     v8::icu::set_common_data_77(deno_core_icudata::ICU_DATA).unwrap();
   }
 
-  // `--no-validate-asm` is gone in V8 15.2 (rusty_v8 152): the parser rejects it and ignores every
-  // flag after it, which silently dropped the rest of this list.
   let base_flags = concat!(
+    " --no-validate-asm",
     " --turbo_fast_api_calls",
     " --harmony-temporal",
     " --js-float16array",
