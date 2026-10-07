@@ -55,7 +55,7 @@ class TestDefaults:
             assert rt._max_memory == 512 * _MIB  # noqa: SLF001
             assert rt._config["max_buffer_bytes"] == 128 * _MIB  # noqa: SLF001
             assert rt._request_timeout == 30.0  # noqa: SLF001
-            assert rt._max_host_wait == 600.0  # noqa: SLF001
+            assert rt._max_host_wait == 60.0  # noqa: SLF001
             assert agent.calls_remaining == 1000
             # A frozen clock and a seeded Math.random of the session's own.
             assert session.feed_run("Date.now()") == session.feed_run("Date.now()")

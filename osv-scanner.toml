@@ -2,25 +2,6 @@
 # OSV does not), so one assessment is recorded in one place per tool and CI is red only for NEW findings.
 # Remove each entry when the dependency that blocks it is upgraded.
 
-# pyo3 0.27.2: out-of-bounds read in `nth`/`nth_back` on PyList/PyTuple iterators. pydeno's `src/` never
-# calls `.nth()` or `.nth_back()`. The fix needs pyo3 >= 0.29, which `pyo3-async-runtimes` 0.27 blocks.
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0176"
-reason = "affected API (PyList/PyTuple nth/nth_back) is not called; fix needs pyo3 0.29, blocked by pyo3-async-runtimes"
-
-[[IgnoredVulns]]
-id = "GHSA-36hh-v3qg-5jq4"
-reason = "alias of RUSTSEC-2026-0176 (see above)"
-
-# pyo3 0.27.2: `PyCFunction::new_closure` is missing a `Sync` bound. pydeno's `src/` never calls it.
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0177"
-reason = "affected API (PyCFunction::new_closure) is not called; fix needs pyo3 0.29, blocked by pyo3-async-runtimes"
-
-[[IgnoredVulns]]
-id = "GHSA-chgr-c6px-7xpp"
-reason = "alias of RUSTSEC-2026-0177 (see above)"
-
 # `paste` 1.0.15 is unmaintained (no CVE, no fix). It is a build-time proc-macro pulled in by the `v8` crate,
 # so it never runs in the shipped extension.
 [[IgnoredVulns]]

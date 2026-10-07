@@ -82,6 +82,7 @@ from ._errors import PydenoError
 from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import (
     _CONTROL,
+    DEFAULT_MAX_HOST_WAIT,
     MAX_ABANDONED_TOOL_CALLS,
     IsolatedRuntime,
     WorkerCrashed,
@@ -118,7 +119,7 @@ DEFAULT_LIMITS: dict[str, Any] = {
     "max_feed_duration_secs": 30.0,
     "max_memory": 512 * _MIB,
     "max_suspensions": 1000,
-    "max_host_wait_secs": 600.0,
+    "max_host_wait_secs": DEFAULT_MAX_HOST_WAIT,
 }
 _EXTERNAL = "__pydeno_external"
 _RESERVED_PREFIX = "__pydeno"
@@ -136,7 +137,7 @@ class PydenoLimits(TypedDict, total=False):
 
     Omit a key to keep its default. ``None`` removes a limit where that is allowed (it is an
     explicit choice, never the default). The defaults: 30 s per feed, 512 MiB of worker memory,
-    1000 external calls per session, 600 s of waiting on the host per feed.
+    1000 external calls per session, 60 s of waiting on the host per feed.
     """
 
     max_feed_duration_secs: float | None
@@ -180,7 +181,7 @@ class PydenoLimits(TypedDict, total=False):
 
     max_host_wait_secs: float | None
     """pydeno only: most time one feed may spend suspended, waiting on external calls in total
-    (default 600 s). Enforced while the external call runs: past it the worker is killed and the
+    (default 60 s, like `IsolatedRuntime`'s `max_host_wait`). Enforced while the external call runs: past it the worker is killed and the
     feed raises `PydenoTimeoutError` within about 0.1 s, even if the external function never
     returns (it is left running on its own thread; its answer is discarded). The same holds for
     the CPU cap while the guest computes during an external call."""

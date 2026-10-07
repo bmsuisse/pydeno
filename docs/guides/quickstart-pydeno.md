@@ -38,7 +38,7 @@ Nothing below needs an argument. Relaxing any of it is an explicit argument, doc
 | `max_feed_duration_secs` | 30 s of guest running time per feed (waiting on your functions does not count); the worker's CPU is capped at twice that |
 | `max_memory` | 512 MiB of worker memory; `ArrayBuffer` storage capped at a quarter of it (a catchable `RangeError`) |
 | `max_suspensions` | 1000 external calls per session |
-| `max_host_wait_secs` | 600 s of waiting on external calls per feed |
+| `max_host_wait_secs` | 60 s of waiting on external calls per feed (600 s before 0.11.1) |
 | `tool_timeout_secs` | off: no per-call deadline on external calls (see below) |
 | Workers | Single-use: a worker never serves a second session; it is killed when the `with` block exits |
 | Guest globals | No `Deno`, `process`, `require`, filesystem, network, `SharedArrayBuffer`, `Atomics`, `WeakRef`; a frozen clock and a seeded `Math.random` of the session's own |
@@ -80,7 +80,7 @@ not capped; keep it fast or buffer its output.
 | `max_turn_duration_secs` | the same deadline, `min` with the above | One V8 command runs a whole feed, so it is enforced over the feed: never weaker than Monty's |
 | `max_memory` | the worker's `max_memory` | Fixed when a worker starts: a session asking for another value than its pool's gets a fresh worker (a cold start). Default 512 MiB |
 | `max_suspensions` | the session's tool budget (`max_tool_calls`) | Default 1000; `None` keeps it, as in Monty. The call over budget throws a catchable `ToolBudgetError` in the guest (Monty's is uncatchable) |
-| `max_host_wait_secs` | `max_pause` | pydeno only. Default 600 |
+| `max_host_wait_secs` | `max_pause` | pydeno only. Default 60 |
 | `tool_timeout_secs` | `tool_timeout` | pydeno only. Default off. One external call that takes longer fails in the guest with a catchable `TimeoutError` (`host function timed out`) and the feed goes on; see [Per-call tool deadline](advanced/isolation.md#per-call-tool-deadline) |
 | `max_total_sleep_secs` | nothing | Always satisfied: guest timers run on virtual time, a guest cannot sleep |
 | `max_recursion_depth` | refused (`ValueError`) | V8 bounds recursion by stack size (a catchable `RangeError`); a flag cannot raise that limit safely |

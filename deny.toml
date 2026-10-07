@@ -21,17 +21,9 @@ unmaintained = "workspace"
 # A yanked crate in Cargo.lock is a warning: fixable with `cargo update -p`, but never a
 # reason to block an unrelated PR.
 yanked = "warn"
-ignore = [
-  # pyo3 0.27.2: out-of-bounds read in `nth`/`nth_back` on PyList/PyTuple iterators.
-  # Not reachable: pydeno never calls `.nth()`/`.nth_back()` on a PyList/PyTuple iterator
-  # (grep of src/ is clean). The fix needs pyo3 >= 0.29, but pyo3-async-runtimes 0.27 pins
-  # pyo3 0.27. Remove when pyo3-async-runtimes ships a release for pyo3 >= 0.29 and
-  # Cargo.toml is bumped.
-  { id = "RUSTSEC-2026-0176", reason = "not reachable: no nth/nth_back on PyList/PyTuple iterators in src/; fix needs pyo3 >= 0.29, blocked on pyo3-async-runtimes" },
-  # pyo3 0.27.2: `PyCFunction::new_closure` lacks a `Sync` bound. pydeno does not call
-  # `new_closure` (grep of src/ is clean). Same removal condition as above.
-  { id = "RUSTSEC-2026-0177", reason = "not reachable: pydeno does not use PyCFunction::new_closure; fix needs pyo3 >= 0.29, blocked on pyo3-async-runtimes" },
-]
+# No advisory is excepted: the pyo3 0.27.2 ones (RUSTSEC-2026-0176/-0177) went away with the
+# pyo3 0.29 upgrade. A new exception needs a written reason here and in osv-scanner.toml.
+ignore = []
 
 [licenses]
 # Every licence present in the tree today, nothing speculative. A new one fails the build

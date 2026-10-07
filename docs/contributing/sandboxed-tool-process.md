@@ -17,7 +17,7 @@ A host function bound to an `IsolatedRuntime` (`bind_function`, `bind_object`, `
   closed set of value tags; an unknown host-function id ends the session);
 - what bounds a call today: `max_inflight_host_calls` (64 outstanding, runtime-wide),
   `max_host_calls` (count per runtime), `max_host_wait` (total time a command may wait on host
-  calls, 600 s by default; the worker's CPU cap keeps running meanwhile), the reply frame cap
+  calls, 60 s by default; the worker's CPU cap keeps running meanwhile), the reply frame cap
   (16 MiB) and the decoder budgets on the way back, error redaction (`redact_host_errors=True`);
 - what is *not* bounded per call: how long one call may take (only the per-command total), how much
   memory or CPU the handler itself uses, and what it can do to the parent if it crashes (a segfault
