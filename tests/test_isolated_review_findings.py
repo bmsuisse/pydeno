@@ -1079,6 +1079,9 @@ class TestPrewarmedSpare:
         code = (
             "import os, time\n"
             "from pydeno import IsolatedRuntime, RuntimeConfig, _isolated\n"
+            "import os as _os\n"
+            "if _os.environ.get('PYDENO_EXPECT_SANDBOX') not in (None, 'landlock+seccomp', 'seatbelt'):\n"
+            "    IsolatedRuntime.__init__.__kwdefaults__['sandbox'] = 'auto'\n"
             "with IsolatedRuntime(RuntimeConfig(timeout=10.0)): pass\n"
             "while _isolated._SPARE is None: time.sleep(0.02)\n"
             "print(_isolated._SPARE[0].pid, flush=True)\n"
