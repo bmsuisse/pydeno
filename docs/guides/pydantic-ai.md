@@ -78,7 +78,24 @@ runs this end to end with no API key, using pydantic-ai's `FunctionModel` as a s
 | `max_memory` | `256 MiB` | Resident-memory ceiling of the worker process. |
 | `approvals` | `'inline'` | See [Approvals](#approvals). `'defer'` raises `NotImplementedError`. |
 | `dynamic_catalog` | `False` | Put the declarations in the instructions instead of the tool description, so the tool definitions stay byte-stable (prompt cache) when tools appear mid-run. |
-| `runtime_options` | `{}` | Extra `IsolatedRuntime` arguments: `sandbox="require"`, `max_host_wait`, `max_inflight_host_calls`, `clock`, `random_seed`, `jitless`, ... |
+| `runtime_options` | `{}` | Extra `IsolatedRuntime` arguments: `sandbox="require"`, `max_host_wait`, `tool_timeout`, `max_inflight_host_calls`, `clock`, `random_seed`, `jitless`, ... See [Per-call tool deadline](#per-call-tool-deadline) |
+
+### Per-call tool deadline
+
+`timeout` does not count time spent waiting on tools, and `max_host_wait` (600 s by default) bounds
+the total. To stop one hung tool from using that budget up, pass `tool_timeout` (seconds) through
+`runtime_options`:
+
+```python
+JSCodeMode(runtime_options={"tool_timeout": 20})
+```
+
+A nested tool call that takes longer fails inside the snippet with a catchable
+`TimeoutError: host function timed out`; the snippet can catch it and go on, and if it doesn't, the
+model gets the error as a normal retry. An `async` tool is cancelled; a synchronous one cannot be
+interrupted, so it runs on a thread of its own and its late result is discarded. The time still counts
+toward `max_host_wait`, which stays the hard cap: keep `tool_timeout` well under it (see
+[the isolation guide](advanced/isolation.md#per-call-tool-deadline)).
 
 Some tools always stay native, whatever `tools` says:
 

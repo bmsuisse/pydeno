@@ -22,6 +22,13 @@
   reliably nor recorded without changing the record shape, so this is documented in
   `docs/guides/gate.md` and left.
 
+### Documentation
+
+- `tool_timeout` is documented on the pydantic-ai page (it reaches `JSCodeMode` through
+  `runtime_options`, now pinned by a test), and the isolation guide spells out how it combines with
+  `max_host_wait`: the per-call deadline fails one call, `max_host_wait` kills the command and wins when
+  a single call could outlast what is left of it.
+
 ### Development
 
 - **`make test-rust`** runs the Rust unit tests the way CI does (`cargo test --release --features bench --
