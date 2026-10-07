@@ -17,13 +17,24 @@
 - **Opt-in fork-from-template worker start (Linux), issue #72.** `pydeno.enable_fork_template()` (or
   `PYDENO_FORK_TEMPLATE=1`) starts sandboxed workers as a `fork()` of a prepared, single-threaded template
   process instead of a fresh interpreter. The OS sandbox, self-test, limits and V8 start-up all run in the
-  forked child exactly as before. Off by default, because workers from one template share an address-space
-  layout and stack canary; the template is replaced after `max_forks` (64) workers or `max_age_seconds`
-  (300). `sandbox_status().worker_start` and `IsolatedRuntime.worker_start` say which mode is in force, and
-  `sandbox_status()` warns while it is on. See "Faster worker start" in the advanced guides.
-  Measured (Linux x86_64, release build, 25 interleaved pairs): new sandboxed worker plus first call
+  forked child exactly as before. Off by default, and nothing changes unless you turn it on. **Trade-offs:**
+  workers of one template share an address-space layout (including V8's code, which is statically linked
+  into `_pydeno`, a module the template imports; only V8's heap and seed are per worker), the stack canary,
+  the pointer guard, Python's hash seed and `id()` layout (Python reseeds `random` after a fork). Rotation
+  (`max_forks` 64, `max_age_seconds` 300) bounds how many workers share a layout, not their lifetime nor how
+  many tenants are live on one template at once. The self-test's "parent" probes target the template, not
+  the host. `sandbox_status().worker_start` is the configured mode; `IsolatedRuntime.worker_start` (and the
+  async one) says how a worker really started, and a failed template start falls back to a fresh interpreter
+  (logged, counted in `sandbox_status()` warnings). The host keeps authority over its workers: if the
+  template dies the host kills them, and the template shuts down after every other exit hook; the
+  template holds a finished worker's pid until the host has its status (no recycled-pid kill), relays
+  every worker's real exit status (a seccomp kill still reads as a sandbox violation, the memory-limit exit
+  code still as `max_memory`), answers are matched by sequence number, and no lock is held while waiting.
+  In a host that `fork()`s, each child starts its own template. See "Faster worker start" in the advanced
+  guides. Measured (Linux x86_64, release build, 25 interleaved pairs): new sandboxed worker plus first call
   63.3 ms (exec) to 21.5 ms (fork template); 50 `SandboxPool` checkouts in a row against a pool of 4:
-  about 1120 ms to about 365 ms. Needs native x86_64 and aarch64 verification and independent review.
+  about 1120 ms to about 365 ms. Needs native aarch64 verification (x86_64 Linux and the review findings
+  are covered by `tests/test_fork_template.py`).
 - `empty_root` accepts `"auto"`, `"require"` or `"off"` (`True`/`False` still work).
   `empty_root="require"` refuses to start without the empty-root layer; `sandbox="require"` still
   does not demand it. `sandbox_status()` gains `hardened` (complete plus the empty-root layer) and

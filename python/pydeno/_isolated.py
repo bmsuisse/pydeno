@@ -1987,11 +1987,13 @@ def _start_worker(python: str) -> tuple[subprocess.Popen[bytes], Any]:
     stderr = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close() / finalizer
     if python == sys.executable and _template.MANAGER.enabled:
         # Opt-in (`enable_fork_template`): a fork of a prepared template, not a fresh interpreter.
-        # Any failure falls back to the ordinary spawn below, which is the stricter choice.
+        # Any failure (OSError, but also a ValueError from a descriptor limit, or a bug) falls
+        # back to the ordinary spawn below, which is the stricter choice. Never BaseException:
+        # Ctrl-C must still stop the program.
         try:
             return _template.MANAGER.spawn(stderr.fileno()), stderr  # type: ignore[return-value]
-        except OSError:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _template.MANAGER.note_fallback(exc)
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
             _worker_argv(python),
@@ -2123,4 +2125,5 @@ def _forget_parents_workers() -> None:
 os.register_at_fork(after_in_child=_forget_parents_workers)
 os.register_at_fork(after_in_child=_template.MANAGER.forget)
 atexit.register(_discard_spare)
-atexit.register(_template.MANAGER.shutdown)
+# `_template.MANAGER.shutdown` is registered by `_template` itself, at its import, so that it runs
+# after the hooks above (atexit is last in, first out) and can still kill what they did not.

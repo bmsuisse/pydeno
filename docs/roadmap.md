@@ -72,7 +72,6 @@ Status below is a plan, not a promise of dates.
 
 | Item | Issue / PR |
 |---|---|
-| Cold start in the same class as Monty (already compared in the benchmarks; this closes the remaining gap). Step one, an opt-in fork-from-template start on Linux, is in; the V8 startup snapshot and a native worker are not | #72 |
 | Seccomp as an allow-list with kill-on-violation, Landlock canary, kernel caps (a sandboxed process for host tools is design-only: `docs/contributing/sandboxed-tool-process.md`) | #45 |
 | Custom V8 build: research ([findings: don't for 0.10](contributing/research-custom-v8-build.md)) | #44 |
 | A deep review run over the whole tree | |
@@ -83,7 +82,7 @@ Status below is a plan, not a promise of dates.
 
 | Item | Issue / PR |
 |---|---|
-| Cold start in the same class as Monty. Step one, an opt-in fork-from-template worker start (about 63 ms to about 21 ms on x86_64), is in PR #124 and waits for independent review (shared ASLR layout and stack canary across forked workers, `empty_root` under fork, aarch64 and macOS) | #72 |
+| Cold start in the same class as Monty. Step one, an opt-in fork-from-template worker start (about 63 ms to about 21 ms on x86_64), is in 0.11 with its trade-offs documented (workers of a template share an address-space layout, V8's code image and the stack canary); aarch64 and macOS are not verified. The V8 startup snapshot and a native worker are not done | #72, #124 |
 
 ## Before 1.0: external review and soak
 

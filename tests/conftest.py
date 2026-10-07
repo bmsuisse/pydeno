@@ -28,6 +28,7 @@ _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 collect_ignore = (
     [
         "test_secure_defaults.py",
+        "test_fork_template.py",
         "test_sandbox_pid1.py",
         "test_lazy_imports.py",
         "test_isolated_guest_error_text.py",
