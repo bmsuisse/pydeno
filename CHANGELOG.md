@@ -35,6 +35,29 @@
   --test-threads=1`, with `PYTHON=` choosing the interpreter and libpython put on `LD_LIBRARY_PATH` on
   Linux). A bare `cargo test` fails with "Python interpreter is not initialized" because the tests need pyo3's
   `auto-initialize`, which the `bench` feature enables. Documented in CLAUDE.md; verified on Python 3.15 and 3.12.
+### Added
+
+- **Experimental: `pydeno.ToolProcess`, host tools in a supervised child process (#45, item 5,
+  phase 1).** `tools = ToolProcess(...)`; `rt.bind_function("lookup", tools.tool("myapp.tools:lookup"))`.
+  A tool bug, a segfault in a C extension or a runaway tool is then not in the parent's address
+  space. Tools are importable `'module:function'` names or module-level functions (closures,
+  lambdas and `__main__` functions are refused with a clear error); the handler `tool()` returns is
+  an ordinary async callable, so it works with `bind_function`, `bind_object`, `ToolBridge`,
+  `AgentSandbox` and `AsyncIsolatedRuntime`, and **no existing class or option changes**.
+  Per call: a deadline (`call_timeout`, the guest gets the same `TimeoutError: host function timed
+  out` as `tool_timeout`), a result-size cap checked in the tool host before sending
+  (`ToolResultTooLarge`), a memory ceiling (RSS poll plus `RLIMIT_DATA` on Linux) and a CPU cap; a
+  breach kills the tool host's process group and the next call starts a new one. A tool host that
+  dies (crash, signal, limit, close) fails every call in flight with `ToolProcessDied`, which an
+  agent journal records as a failed call and a replay feeds back without running the tool.
+  Exceptions keep their class name and their message, redacted per `redact_host_errors`; async tools
+  run concurrently. Empty environment unless `env=` is passed; the tool host exits when its parent
+  dies. Every tool is asynchronous for the guest. **Without `sandbox=` this is crash isolation and
+  resource limits, not a sandbox.** `sandbox="auto" | "require"` applies the worker's OS layers
+  to the tool host (no filesystem, no network; `"require"` refuses where a layer is missing). Not
+  done yet: per-tool capability grants, per-call isolation, cgroup caps; macOS and aarch64 are
+  unverified. See "Host tools in a child process" in the isolation guide and
+  `docs/contributing/sandboxed-tool-process.md`.
 
 ## 0.11.0 — 2026-10-07
 

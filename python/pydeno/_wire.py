@@ -200,7 +200,10 @@ class FrameWriter:
             self._fd = -1
 
     def send(self, message: dict[str, Any]) -> None:
-        payload = dumps(message)
+        self.send_encoded(dumps(message))
+
+    def send_encoded(self, payload: bytes) -> None:
+        """Send a payload `dumps` already produced (for a caller that measured it first)."""
         frame = _HEADER.pack(len(payload)) + payload
         with self._lock:
             if self._fd < 0:
