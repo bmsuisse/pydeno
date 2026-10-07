@@ -295,6 +295,29 @@ reference to guest code. (`IsolatedRuntime` refuses snapshots.)
 
 Not supported yet: streams, snapshots, the inspector, function handles, Windows.
 
+### A function in the result: `on_unserializable`
+
+A `JsFunction` (or another handle that cannot be copied) anywhere in a command's result makes the
+whole command fail with `TypeError: JsFunction cannot cross the isolation boundary`. That stays the
+default (`on_unserializable="error"`): nothing leaves the sandbox that you did not ask for. A host
+whose guest returns rich objects can opt in, on `IsolatedRuntime`, `AsyncIsolatedRuntime`,
+`AgentSandbox`, `AsyncAgentSandbox` and per `SandboxPool` checkout:
+
+| Value | A function in the result becomes |
+|---|---|
+| `"error"` (default) | the whole command raises `TypeError` |
+| `"drop"` | nothing: an object member is removed, an array or set item becomes `None` (a result that is itself one is `None`), like `JSON.stringify` |
+| `"stringify"` | the text `"[JsFunction]"` (the type name in brackets: never the function's name or source) |
+
+```python
+with IsolatedRuntime(config, on_unserializable="drop") as rt:
+    rt.eval("({run: () => 1, n: 2, items: [1, () => 2]})")   # {"n": 2, "items": [1, None]}
+```
+
+It applies to the result of `eval`, `eval_async`, `eval_module`, `eval_module_async` and the
+`execute` forms, at any depth, and leaves every serialisable value as it was. It does not apply to
+the arguments a guest passes to your host functions, which still fail the call.
+
 ### One result instead of an exception
 
 `execute(code)` (and `await execute_async(code)`) evaluates like `eval` but returns an
@@ -376,6 +399,7 @@ What to do about it in your own code:
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
 | `redact_host_errors` | `True` | Guest sees the exception class but only `"host function failed"` as message |
+| `on_unserializable` | `"error"` | What happens to a function inside a result: fails the command (default), or is dropped / stringified, see [above](#a-function-in-the-result-on_unserializable) |
 
 A worker CPU-time cap of twice the hard deadline also applies, because wall-clock pauses
 during host calls cannot pause CPU.
@@ -501,7 +525,8 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
   `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`, `max_inflight_host_calls`,
-  `write_stall_timeout`, `redact_host_errors`, `tool_timeout`) can be set per checkout.
+  `write_stall_timeout`, `redact_host_errors`, `on_unserializable`, `tool_timeout`) can be set per
+  checkout.
 
 Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
 a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports

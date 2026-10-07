@@ -465,6 +465,7 @@ SESSION_OPTIONS = (
     "max_inflight_host_calls",
     "write_stall_timeout",
     "redact_host_errors",
+    "on_unserializable",
     "tool_timeout",
 )
 
@@ -484,6 +485,11 @@ def _empty_root_mode(value: object, sandbox: str) -> str:
     return mode
 
 
+ON_UNSERIALIZABLE_MODES = ("error", "drop", "stringify")
+# The commands whose result is a guest value (`on_unserializable` applies to these).
+_RESULT_COMMANDS = frozenset({"eval", "eval_async", "eval_module", "eval_module_async"})
+
+
 def _session_options(
     *,
     request_timeout: float | int | timedelta | None | Any = _DEFAULT,
@@ -493,6 +499,7 @@ def _session_options(
     max_inflight_host_calls: int | None | Any = _DEFAULT,
     write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
     redact_host_errors: bool = True,
+    on_unserializable: str = "error",
     tool_timeout: float | int | timedelta | None = None,
 ) -> dict[str, Any]:
     """The parent-side options, validated and normalised, as the runtime attributes that hold
@@ -511,6 +518,10 @@ def _session_options(
     grace = _limit_seconds("timeout_grace", timeout_grace, allow_zero=True)
     if grace is None:
         raise TypeError("timeout_grace must be a number of seconds")
+    if on_unserializable not in ON_UNSERIALIZABLE_MODES:
+        raise ValueError(
+            f"on_unserializable must be one of {', '.join(map(repr, ON_UNSERIALIZABLE_MODES))}"
+        )
     return {
         "_request_timeout": (
             _DEFAULT
@@ -531,6 +542,7 @@ def _session_options(
             else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
+        "_unserializable": on_unserializable,
         "_tool_timeout": _limit_seconds("tool_timeout", tool_timeout),
     }
 
@@ -700,6 +712,15 @@ class IsolatedRuntime:
         redact_host_errors: Replace the message of an exception raised by a host function with a
             generic one before the guest sees it (the exception's class name is kept). Use this
             when your tools' error text can contain paths, queries or secrets.
+        on_unserializable: What to do when a command's result holds a value that cannot cross
+            the isolation boundary (a `JsFunction`, anywhere in it). ``"error"`` (default): the
+            command fails with ``TypeError``. ``"drop"``: the value is left out (an object member
+            is removed, an array item becomes ``None``, a result that is such a value is
+            ``None``), like ``JSON.stringify``. ``"stringify"``: it is replaced by the text
+            ``"[JsFunction]"`` (its type name in brackets, nothing of its content). Applies to the
+            result of `eval`, `eval_async`, `eval_module` and their ``execute`` forms, not to
+            the arguments the guest passes to host functions. Also settable per `SandboxPool`
+            checkout.
         tool_timeout: Most time (seconds, default `None`: off) one call to a host function you
             bound (`bind_function`, `bind_object`, `ToolBridge` tools; not `console`, module
             loaders or the gate) may take. Past it the guest's call fails with a catchable
@@ -774,6 +795,7 @@ class IsolatedRuntime:
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
+        on_unserializable: str = "error",
         tool_timeout: float | int | None = None,
         sandbox: str = "require",
         empty_root: bool | str = True,
@@ -851,6 +873,7 @@ class IsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            on_unserializable=on_unserializable,
             tool_timeout=tool_timeout,
         ).items():
             setattr(self, attr, value)
@@ -1251,6 +1274,8 @@ class IsolatedRuntime:
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
             message["id"] = cmd_id = next(self._cmd_ids)
+            if self._unserializable != "error" and message["t"] in _RESULT_COMMANDS:
+                message["unser"] = self._unserializable
             cpu_start = self._last_cpu
             if (
                 cpu_start is None

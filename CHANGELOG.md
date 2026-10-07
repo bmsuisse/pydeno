@@ -12,6 +12,15 @@
   journaled only when it is `"script"`, so existing journals and default sessions are byte-for-byte what
   they were. `JSCodeMode` keeps its own snippet contract and is not affected.
 
+- **`on_unserializable="error" | "drop" | "stringify"` for isolated results (#145).** A `JsFunction`
+  anywhere in a result used to fail the whole command with no way round but normalising inside the
+  sandbox. On `IsolatedRuntime`, `AsyncIsolatedRuntime`, `AgentSandbox`, `AsyncAgentSandbox` and per
+  `SandboxPool` checkout, `"drop"` leaves such a value out (object member removed, array item
+  `None`) and `"stringify"` replaces it with `"[JsFunction]"` (the type only, nothing of the function).
+  The default stays `"error"`, so the secure behaviour is unchanged; it applies to results, not to the
+  arguments a guest passes to host functions. The setting travels with each command, so a pre-started
+  pool worker takes it at checkout.
+
 ### Changed
 
 - **The host-side exception from an isolated runtime keeps the detail the guest is denied (#131).** The

@@ -82,6 +82,7 @@ from ._isolated import (
     _checked_specifiers,
     _clean,
     _clock_ms,
+    _RESULT_COMMANDS,
     _error_reply,
     _is_token,
     _limit_int,
@@ -693,6 +694,7 @@ class AsyncIsolatedRuntime:
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
+        on_unserializable: str = "error",
         tool_timeout: float | int | None = None,
         sandbox: str = "require",
         empty_root: bool | str = True,
@@ -761,6 +763,7 @@ class AsyncIsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            on_unserializable=on_unserializable,
             tool_timeout=tool_timeout,
         ).items():
             setattr(self, attr, value)
@@ -1438,6 +1441,8 @@ class AsyncIsolatedRuntime:
             if self._closed:
                 raise WorkerCrashed("runtime is closed")
             message["id"] = cmd_id = next(self._cmd_ids)
+            if self._unserializable != "error" and message["t"] in _RESULT_COMMANDS:
+                message["unser"] = self._unserializable
             try:
                 frame = await self._encode(message, _big_message(message))
             except _wire.WireError as exc:
