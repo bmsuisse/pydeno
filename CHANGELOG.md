@@ -83,6 +83,9 @@
   agent sessions a timed-out call is journaled as a failed call and replays as exactly that failure,
   never re-running the tool. Default `None`: nothing changes. See `docs/guides/advanced/isolation.md`.
 
+- Windows is stated as untested in the README: the sandboxed runtimes are POSIX-only, and the
+  Windows CI cells stay experimental.
+
 ### Fixed
 
 - **A host that is PID 1 (a container's main process) could not start a sandboxed worker.** The
