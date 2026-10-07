@@ -106,6 +106,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
     )
     from ._sandbox_pool import AsyncSandboxPool, CheckoutTimeout, SandboxPool
     from ._status import Layer, SandboxStatus, sandbox_status
+    from ._template import disable_fork_template, enable_fork_template
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
     from .tools.http_fetch import (
         AsyncHttpFetch,
@@ -193,6 +194,8 @@ _LAZY = {
     "Layer": "_status",
     "SandboxStatus": "_status",
     "sandbox_status": "_status",
+    "enable_fork_template": "_template",
+    "disable_fork_template": "_template",
     "http_fetch": "tools.http_fetch",
     "HttpFetch": "tools.http_fetch",
     "AsyncHttpFetch": "tools.http_fetch",
@@ -528,6 +531,8 @@ __all__ = [
     "set_gate_threads",
     "static_gate",
     "sandbox_status",
+    "enable_fork_template",
+    "disable_fork_template",
     "SandboxStatus",
     "Layer",
     "AsyncIsolatedRuntime",

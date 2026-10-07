@@ -51,7 +51,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import _compat, _isolated, _sandbox, _wasm, _wire
+from . import _compat, _isolated, _sandbox, _template, _wasm, _wire
 from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._isolated import (
     DEFAULT_MAX_MEMORY,
@@ -882,6 +882,15 @@ class AsyncIsolatedRuntime:
         self._idle_since = time.monotonic()
         self._last_idle_sample = self._idle_since
         self._sup.add(self)
+
+    @property
+    def worker_start(self) -> str:
+        """How this worker was started: "exec" or "fork-template" (see `enable_fork_template`)."""
+        return (
+            "fork-template"
+            if isinstance(getattr(self, "_proc", None), _template.ForkedProc)
+            else "exec"
+        )
 
     async def _spawn_and_handshake(self, loop: asyncio.AbstractEventLoop) -> None:
         # The blocking part, fork/exec (or taking the spare), happens on the io pool.

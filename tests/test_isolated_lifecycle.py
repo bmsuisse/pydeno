@@ -72,12 +72,41 @@ class TestNoLeaks:
         """
         for _ in range(CYCLES):
             one_cycle()
+        def settle_templates():
+            # Fork-template mode (PYDENO_FORK_TEMPLATE=1): workers are children of the template,
+            # not of this process. Check none is left under it, then reap the template itself so
+            # the child check below only sees what really leaked. No-op in the default mode.
+            import time
+            from pydeno import _template
+
+            def live(pid):
+                try:
+                    kids = ""
+                    for task in os.listdir(f"/proc/{pid}/task"):
+                        with open(f"/proc/{pid}/task/{task}/children") as f:
+                            kids += f.read()
+                    return kids.split()
+                except OSError:
+                    return []
+
+            manager = _template.MANAGER
+            templates = [t for t in (manager._current, *manager._retired) if t is not None]
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and any(live(t.proc.pid) for t in templates):
+                time.sleep(0.05)
+            left = any(live(t.proc.pid) for t in templates)
+            manager.shutdown()
+            return left
+
         after = open_fds()
+        left = settle_templates()
         try:
             os.waitpid(-1, os.WNOHANG)
             children = "a-child-is-still-waiting-to-be-reaped"
         except ChildProcessError:
             children = "none"
+        if left:
+            children = "a-worker-is-still-alive-under-the-template"
         print(after - before, children)
         """
     )

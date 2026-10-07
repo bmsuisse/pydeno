@@ -48,7 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import _sandbox
+from . import _sandbox, _template
 
 __all__ = ["Layer", "SandboxStatus", "sandbox_status"]
 
@@ -95,6 +95,12 @@ class SandboxStatus:
     #: `complete` and, on Linux, the empty-root layer too. `sandbox="require"` does not demand
     #: that layer; `empty_root="require"` does.
     hardened: bool = False
+    #: The *configured* way new workers are started: "exec" (a fresh interpreter each, the
+    #: default) or "fork-template" (opt-in: `enable_fork_template()`; workers of one template share
+    #: its address-space layout, V8's code image and stack canary). A start that falls back to exec
+    #: still reads "fork-template" here, with a warning; `IsolatedRuntime.worker_start` is what
+    #: really happened to one worker.
+    worker_start: str = "exec"
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -105,6 +111,7 @@ class SandboxStatus:
             "complete": self.complete,
             "hardened": self.hardened,
             "warnings": list(self.warnings),
+            "worker_start": self.worker_start,
         }
         for name in _LAYER_FIELDS:
             out[name] = getattr(self, name).to_dict()
@@ -645,6 +652,26 @@ def _sandbox_status() -> SandboxStatus:
             )
     if (time.monotonic() - start) > 0.3:
         warns.append("the probe took over 300 ms; this host is slow to fork")
+    worker_start = "fork-template" if _template.MANAGER.enabled else "exec"
+    if worker_start == "fork-template":
+        warns.append(
+            "workers start by forking a template (opt-in): workers from one template share its "
+            "address-space layout (V8's code image included), stack canary, pointer guard and "
+            "hash seed, so an information leak in one session helps against the next from the "
+            f"same template; at most {_template.MANAGER.max_forks} workers or "
+            f"{_template.MANAGER.max_age_seconds:g} s per template, which bounds how many share "
+            "a layout, not how long they live or how many run at once"
+        )
+        warns.append(
+            "worker_start is the configured mode; IsolatedRuntime.worker_start says how that "
+            "worker really started, and a failed template start silently falls back to a fresh "
+            "interpreter"
+        )
+        if _template.MANAGER.fallbacks:
+            warns.append(
+                f"{_template.MANAGER.fallbacks} worker start(s) fell back to a fresh interpreter "
+                f"(last: {_template.MANAGER.last_fallback})"
+            )
 
     return SandboxStatus(
         platform=plat,
@@ -663,4 +690,5 @@ def _sandbox_status() -> SandboxStatus:
         complete=complete,
         hardened=complete and (not linux or empty_root.applied),
         warnings=warns,
+        worker_start=worker_start,
     )
