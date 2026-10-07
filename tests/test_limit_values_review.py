@@ -345,12 +345,16 @@ def test_console_is_not_refused_by_the_in_flight_cap_sync() -> None:
     assert seen == [["during"]]
 
 
-def test_console_still_counts_toward_max_host_calls() -> None:
+def test_console_does_not_count_toward_max_host_calls() -> None:
+    # Console output is the guest's own, not a tool call (#141): a chatty script must not spend
+    # the budget meant for tools.
+    seen: list[object] = []
     with IsolatedRuntime(
-        RuntimeConfig(on_console=lambda level, args: None), max_host_calls=3
+        RuntimeConfig(on_console=lambda level, args: seen.append(args)),
+        max_host_calls=3,
     ) as rt:
-        with pytest.raises(Exception, match="max_host_calls"):
-            rt.eval("for (let i = 0; i < 10; i++) console.log(i)")
+        assert rt.eval("for (let i = 0; i < 10; i++) console.log(i); 1") == 1
+    assert len(seen) == 10
 
 
 # -- 3. the front door's default printer is capped per feed -----------------------------------------------------

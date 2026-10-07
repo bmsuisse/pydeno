@@ -210,6 +210,13 @@ class OutputCapture:
                 stream.size += len(head.encode("utf-8"))
             stream.cut = True
 
+    def mark_cut(self, level: Any) -> None:
+        """The guest's line for `level` was longer than the worker could send; what `__call__`
+        got is a bounded prefix. End that stream here, like any other overflow."""
+        stream = self._out if level in _STDOUT_LEVELS else self._err
+        with self._lock:
+            stream.cut = True
+
     @staticmethod
     def _text(stream: _Stream) -> str:
         text = "".join(stream.parts)

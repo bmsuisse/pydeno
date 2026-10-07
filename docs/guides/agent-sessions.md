@@ -425,8 +425,9 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
   budget throws a `ToolBudgetError` in the guest and never reaches you.
 - **The catalog is enforced in the host.** A catalog tool is reachable only through one hidden
   host function that refuses names that are not in the catalog or not yet found.
-- **Console output is a host call.** The session routes `console.*` to the parent to capture it,
-  so with `max_host_calls=` set, console calls count against it. Output is capped per run
+- **Console output is a host call, but not a counted one.** The session routes `console.*` to the
+  parent to capture it; those calls do not count against `max_host_calls=` (they did before 0.11.1).
+  A single line too large for one frame (16 MiB) is cut to a bounded prefix and sets `truncated`. Output is capped per run
   (`max_output_bytes`); a `RuntimeConfig(on_console=...)` you pass still sees every call.
 - **One session per trust unit.** Everything in a session can see everything else in it. Do not
   share a session, or a journal, between users.

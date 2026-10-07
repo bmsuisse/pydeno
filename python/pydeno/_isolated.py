@@ -293,21 +293,41 @@ def _console_router(
         if user is not None:
             user(level, args)
 
+    def cut(level: str) -> None:
+        rt = ref()
+        capture = rt._capture if rt is not None else None  # noqa: SLF001
+        if capture is not None:
+            capture.mark_cut(level)
+        user_cut = getattr(user, "cut", None)
+        if user_cut is not None:
+            user_cut(level)
+
+    route.cut = cut  # type: ignore[attr-defined]
     return route
 
 
 def _checked_console(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Only the six console methods, with a list of arguments: `getattr(logger, level)` in a
-    typical `on_console` must not be steerable to `__init__` by the worker."""
+    typical `on_console` must not be steerable to `__init__` by the worker.
+
+    A third argument, `True`, says the worker had to cut a line too long for one frame to the
+    prefix it sent (see `_worker._console_stub`): `fn.cut(level)`, when it has one, ends that
+    stream as an overflow, so `truncated` is set instead of the line silently vanishing."""
 
     def call(*args: Any) -> Any:
         if (
-            len(args) != 2
+            len(args) not in (2, 3)
             or args[0] not in _CONSOLE_LEVELS
             or not isinstance(args[1], list)
+            or (len(args) == 3 and args[2] is not True)
         ):
             raise ValueError("invalid console call")
-        return fn(*args)
+        result = fn(args[0], args[1])
+        if len(args) == 3:
+            cut = getattr(fn, "cut", None)
+            if cut is not None:
+                cut(args[0])
+        return result
 
     return call
 
@@ -648,7 +668,7 @@ class IsolatedRuntime:
     Args:
         config: Limits and bootstrap for the guest. `inspector` and `snapshot` are not
             supported across the boundary yet. `on_console` is: each `console.*` call is a
-            (synchronous) host call, counted by `max_host_calls`. It receives the guest's
+            (synchronous) host call, not counted by `max_host_calls`. It receives the guest's
             arguments as they are, text included: sanitise before printing or logging them
             (`execute()`'s `stdout`/`stderr` are already stripped of control, escape and
             bidirectional characters; a callback is not).
@@ -729,7 +749,7 @@ class IsolatedRuntime:
         random_seed: Seed `Math.random` (V8's `--random-seed`) for reproducible runs.
         capture_console: Route the guest's `console.*` to the parent even without an
             `on_console`, so `execute()` can return it as `stdout`/`stderr`. Off by default:
-            every `console.*` call is then a host call (counted by `max_host_calls`). With an
+            every `console.*` call is then a host call (not counted by `max_host_calls`). With an
             `on_console`, console output is captured either way.
         python: Interpreter for the worker (default: this one).
         gate: A `Gate` (sync) that every source this runtime compiles must pass first: the code
@@ -1488,23 +1508,31 @@ class IsolatedRuntime:
         ):
             # An id the worker was never given is not a capability it holds.
             raise _wire.WireError("call for an unknown host function")
-        self._host_calls += 1
-        if self._max_host_calls is not None and self._host_calls > self._max_host_calls:
-            # Monty's `max_suspensions`: while a host callback runs, the guest's
-            # clock is paused, so an unbounded stream of quick calls needs its own cap.
-            raise _HostCallBudgetExceeded(
-                f"guest made more than max_host_calls={self._max_host_calls} host calls"
-            )
+        # Console output is the guest's own output, not a call into the host's tools: it does not
+        # count against `max_host_calls`, so a chatty script cannot spend the budget meant for
+        # tools (its time is bounded by the console allowance in `_Pump`, its size by the capture).
+        is_console = hid == self._options.get("console_hid")
+        if not is_console:
+            self._host_calls += 1
+            if (
+                self._max_host_calls is not None
+                and self._host_calls > self._max_host_calls
+            ):
+                # Monty's `max_suspensions`: while a host callback runs, the guest's
+                # clock is paused, so an unbounded stream of quick calls needs its own cap.
+                raise _HostCallBudgetExceeded(
+                    f"guest made more than max_host_calls={self._max_host_calls} host calls"
+                )
         handler, is_async = entry
         # All the arguments under one budget: decoding each on its own would multiply the limit
         # by the argument count.
         decoded = args  # `loads_decoded` already decoded them, under one shared budget
-        if hid == self._options.get("console_hid"):
+        if is_console:
             # Console output is the guest's own work, not a tool call: it pauses the deadline
             # only within the command's console allowance (see `_Pump`), not up to
             # `max_host_wait`. It is synchronous (the worker waits for it), so it is never one of
             # the calls in flight, and the in-flight cap does not refuse it; `max_host_calls`
-            # still counts it (above).
+            # does not count it (above).
             pump.begin_console()
             try:
                 self._run_watched(handler, decoded, cid, pump, None)
