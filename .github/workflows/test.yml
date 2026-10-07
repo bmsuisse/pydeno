@@ -27,11 +27,10 @@ env:
   # assertion that makes a mass-skip fail the job -- see
   # `scripts/check_test_report.py` for the full rationale.
   MIN_PYTHON_TESTS: "700"
-  # Skips are unverified tests, so the budget is zero. The suite has exactly
-  # one conditional skip (`tests/test_idle_cpu.py`, skipped above 16 CPUs) and
-  # GitHub's macOS runners are well under that, so zero is correct here. Every
-  # skip is printed with its reason regardless, so a new one is visible before
-  # anyone tolerates it.
+  # Skips are unverified tests, so the budget is zero: the suite has none (the
+  # core-count dependent `tests/test_idle_cpu.py` scales its runtime count to
+  # the machine instead of skipping). Every skip is printed with its reason
+  # regardless, so a new one is visible before anyone tolerates it.
   MAX_SKIPPED: "0"
   # Deliberate expected failures, kept out of the skip budget: the in-process
   # `Runtime` cannot contain these native-builtin crashes and hangs (they are
