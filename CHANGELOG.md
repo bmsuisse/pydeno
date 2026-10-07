@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.11.0)
+## 0.11.0 — 2026-10-07
 
 ### Changed (breaking defaults, security review of 0.10.0)
 
