@@ -1,7 +1,9 @@
 //! V8 value <-> [`JSValue`] conversion, and calls into stored JS functions.
 
 use crate::runtime::error::{RuntimeError, RuntimeResult};
-use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
+use crate::runtime::js_value::{
+    JSValue, LimitTracker, SerializationLimits, MAX_DATE_EPOCH_MS, MIN_DATE_EPOCH_MS,
+};
 use crate::runtime::ops::{indexed_length, proxy_target, MAX_INDEXED_ELEMENTS};
 use crate::runtime::stream::JsStreamRegistry;
 use deno_core::error::JsError;
@@ -405,7 +407,11 @@ impl Converter {
             let date = v8::Local::<v8::Date>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to Date"))?;
             let epoch_ms = date.value_of();
-            if !epoch_ms.is_finite() || epoch_ms < i64::MIN as f64 || epoch_ms > i64::MAX as f64 {
+            // A `Date` the host cannot represent (invalid, or outside the years 1..9999 a Python
+            // `datetime` holds) is one error with pydeno's own wording, not the host language's.
+            if !epoch_ms.is_finite()
+                || !(MIN_DATE_EPOCH_MS as f64..=MAX_DATE_EPOCH_MS as f64).contains(&epoch_ms)
+            {
                 return Err(RuntimeError::internal("Date value out of range"));
             }
             tracker.add_bytes(16)?;

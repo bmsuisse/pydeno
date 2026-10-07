@@ -194,14 +194,23 @@ fn js_value_to_python_inner(
     }
 }
 
+/// Exact: `1970-01-01T00:00:00Z + timedelta(milliseconds=epoch_ms)`, all in integers. (Going through
+/// a float `fromtimestamp` was off by microseconds at the far edge, and its `ValueError` carried
+/// Python's wording.) Outside the years 1..9999 there is no `datetime`: one `RuntimeError`.
 fn epoch_ms_to_datetime(py: Python<'_>, epoch_ms: i64) -> PyResult<Py<PyAny>> {
+    use crate::runtime::js_value::{MAX_DATE_EPOCH_MS, MIN_DATE_EPOCH_MS};
+    if !(MIN_DATE_EPOCH_MS..=MAX_DATE_EPOCH_MS).contains(&epoch_ms) {
+        return Err(PyRuntimeError::new_err("Date value out of range"));
+    }
     let datetime = py.import("datetime")?;
     let utc = datetime.getattr("timezone")?.getattr("utc")?;
-    let seconds = epoch_ms as f64 / 1000.0;
-    Ok(datetime
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("milliseconds", epoch_ms)?;
+    let delta = datetime.getattr("timedelta")?.call((), Some(&kwargs))?;
+    let epoch = datetime
         .getattr("datetime")?
-        .call_method1("fromtimestamp", (seconds, utc))?
-        .unbind())
+        .call1((1970, 1, 1, 0, 0, 0, 0, utc))?;
+    Ok(epoch.add(delta)?.unbind())
 }
 
 fn js_items_to_pyset(
