@@ -83,6 +83,34 @@ _MAX_EXC_CLASSES = 256
 _exc_classes: dict[str, type[Exception]] = {}
 
 
+# What is kept of an oversized `console.*` call (see `_console_stub`): a prefix of the text of its
+# string arguments, at most this many characters in all. Far under the 16 MiB frame, far over any
+# sensible `max_output_bytes` default (64 KiB), and it is the parent's cap that applies after that.
+_CONSOLE_PREFIX_CHARS = 1 << 20
+
+
+def _console_prefix(args: list[Any]) -> list[Any]:
+    """`args` cut to something one frame can carry: string arguments are kept up to a shared
+    budget; anything else (an object or array the parent would format as JSON) is replaced by a
+    short placeholder, since its size is unknown here."""
+    left = _CONSOLE_PREFIX_CHARS
+    out: list[Any] = []
+    for arg in args:
+        if isinstance(arg, str):
+            part = arg[:left]
+            left -= len(part)
+        elif (
+            isinstance(arg, (bool, float))
+            or arg is None
+            or (isinstance(arg, int) and abs(arg) < 2**63)
+        ):
+            part = arg
+        else:
+            part = "[value omitted: too large]"
+        out.append(part)
+    return out
+
+
 class _VerbatimMessage:
     """`str(exc)` returns the message exactly. Without this, rebuilding `KeyError('k')` from
     its already-formatted text `"'k'"` would quote it a second time."""
@@ -497,11 +525,24 @@ class _Worker:
 
     def _console_stub(self, hid: int) -> Any:
         """`console.*` goes to the parent's callback. A broken callback or an argument that
-        cannot cross the boundary must never break the guest, so every failure is dropped."""
+        cannot cross the boundary must never break the guest, so every failure is dropped.
 
-        def console(level: str, args: list[Any]) -> None:
+        One exception to dropping: a call too large to cross (over 10 MiB when the engine converts it,
+        or over a 16 MiB frame when it is sent) arrives as a bounded prefix of its text, flagged as cut
+        (`cut`, sent as a third argument), so the parent ends that stream with `[truncated]` and sets
+        `truncated`. Before, the line vanished and nothing said so."""
+
+        def console(level: str, args: list[Any], cut: bool = False) -> None:
             try:
-                self._call_host(hid, (level, args)).result()
+                try:
+                    future = self._call_host(
+                        hid, (level, args, True) if cut else (level, args)
+                    )
+                except TypeError:
+                    # Not sent: it does not fit a frame (a send that worked, whose callback then
+                    # failed, must not be repeated: the callback would see the line twice).
+                    future = self._call_host(hid, (level, _console_prefix(args), True))
+                future.result()
             except Exception:  # noqa: BLE001, S110
                 pass
 
