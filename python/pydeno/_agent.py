@@ -871,6 +871,16 @@ class _ConsoleSink:
         if self.user is not None:
             self.user(level, args)
 
+    def cut(self, level: str) -> None:
+        """A line too long for one frame arrived as a bounded prefix: end the stream (see
+        `_checked_console`)."""
+        capture = self.capture
+        if capture is not None:
+            capture.mark_cut(level)
+        user_cut = getattr(self.user, "cut", None)
+        if user_cut is not None:
+            user_cut(level)
+
 
 class _Core:
     """Everything the loop thread touches. It never refers to the `AgentSandbox`, so a session
