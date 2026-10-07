@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased (0.12.0)
+
+### Development
+
+- **`make test-rust`** runs the Rust unit tests the way CI does (`cargo test --release --features bench --
+  --test-threads=1`, with `PYTHON=` choosing the interpreter and libpython put on `LD_LIBRARY_PATH` on
+  Linux). A bare `cargo test` fails with "Python interpreter is not initialized" because the tests need pyo3's
+  `auto-initialize`, which the `bench` feature enables. Documented in CLAUDE.md; verified on Python 3.15 and 3.12.
+
 ## 0.11.0 — 2026-10-07
 
 ### Changed (breaking defaults, security review of 0.10.0)
