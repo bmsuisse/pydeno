@@ -2,6 +2,16 @@
 
 ## Unreleased (0.12.0)
 
+### Changed
+
+- **The host-side exception from an isolated runtime keeps the detail the guest is denied (#131).** The
+  guest-visible text stays terse; the `JavaScriptError`/`TypeError` the host receives now carries an
+  exception note (`host detail: ...`, Python 3.11+, shown in tracebacks, `str(exc)` unchanged) naming the
+  `max_serialization_bytes`/`max_serialization_depth` that was hit, the BigInt digit limit, or the
+  `add_static_module()` hint. The note is composed in the parent from its own `RuntimeConfig` and fixed
+  wording, so no new text comes from the worker and the wire format is unchanged. It is matched on the
+  terse wording, so a guest that throws that wording itself gets the same note, holding only host settings.
+
 ### Development
 
 - **`make test-rust`** runs the Rust unit tests the way CI does (`cargo test --release --features bench --
