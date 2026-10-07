@@ -45,6 +45,19 @@
   to stored sessions (`GateDenied`); off by default, as replay stays deterministic. The gate's
   identity is not bound into the journal, and `Pydeno` / `PydenoSession` loads do not take it (their
   journal holds wrapped feeds, not the code the gate saw). See `docs/guides/gate.md` (#134).
+- **`tool_timeout=`: an opt-in per-call deadline for host tools that run in the parent** (the
+  smaller step of #45 item 5). On `IsolatedRuntime`, `AsyncIsolatedRuntime`, `SandboxPool` /
+  `AsyncSandboxPool` (per pool or checkout), `AgentSandbox` / `AsyncAgentSandbox` and, as
+  `limits={"tool_timeout_secs": ...}`, `Pydeno` / `AsyncPydeno`. One call to a bound host function
+  (`bind_function`, `bind_object`, `ToolBridge`, agent tools) that runs longer fails in the guest
+  with a catchable `TimeoutError("host function timed out")` (the same text whatever
+  `redact_host_errors` says) and the command goes on. Async handlers are cancelled; a synchronous
+  one cannot be interrupted, so with the option set it runs on a thread of its own, which is
+  abandoned, and its late result is discarded. More than 8 abandoned calls still running end the
+  session (`WorkerCrashed`: "too many abandoned tool calls in this session"). Time in the tool still
+  counts toward `max_host_wait`; `max_host_calls` and `max_inflight_host_calls` are unchanged. In
+  agent sessions a timed-out call is journaled as a failed call and replays as exactly that failure,
+  never re-running the tool. Default `None`: nothing changes. See `docs/guides/advanced/isolation.md`.
 
 ### Fixed
 

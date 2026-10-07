@@ -51,6 +51,7 @@ import secrets
 import signal
 import sys
 import threading
+import time
 import warnings
 import weakref
 from collections.abc import Callable, Mapping
@@ -79,7 +80,15 @@ from ._agent import (
 )
 from ._errors import PydenoError
 from ._gate import DEFAULT_GATE_TIMEOUT, _hook
-from ._isolated import _CONTROL, IsolatedRuntime, WorkerCrashed
+from ._isolated import (
+    _CONTROL,
+    MAX_ABANDONED_TOOL_CALLS,
+    IsolatedRuntime,
+    WorkerCrashed,
+    _TimedCall,
+    abandoned_message,
+    tool_timeout_error,
+)
 from ._limits import limit_int, limit_seconds
 from ._pydeno import JavaScriptError, JsUndefined, RuntimeConfig, RuntimeTimeout
 from ._result import _STDOUT_LEVELS, ResultTooLarge, format_console_arg
@@ -160,6 +169,15 @@ class PydenoLimits(TypedDict, total=False):
     max_total_sleep_secs: float | None
     """Accepted and always satisfied: a guest cannot sleep (its timers run on virtual time)."""
 
+    tool_timeout_secs: float | None
+    """pydeno only: most time one external call may take (default ``None``: off). Past it the
+    guest's call fails with a catchable ``TimeoutError`` ("host function timed out") and the feed
+    goes on; an async external is cancelled, a plain one cannot be interrupted and is left on its
+    thread, its late answer discarded. The failure is recorded like any failed call, so a replay
+    sends the same error and never runs the external again. With 8 such abandoned externals still
+    running the worker is killed (`PydenoCrashedError`). Time in the external still counts toward
+    ``max_host_wait_secs``."""
+
     max_host_wait_secs: float | None
     """pydeno only: most time one feed may spend suspended, waiting on external calls in total
     (default 600 s). Enforced while the external call runs: past it the worker is killed and the
@@ -175,6 +193,7 @@ _LIMIT_KEYS = frozenset(PydenoLimits.__annotations__)
 class _Limits:
     timeout: float | None
     max_pause: float | None
+    tool_timeout: float | None
     max_memory: int | None
     max_tool_calls: int
 
@@ -213,6 +232,7 @@ def _resolve_limits(*layers: Mapping[str, Any] | None) -> _Limits:
     return _Limits(
         timeout=float(min(caps)) if caps else None,
         max_pause=_positive("max_host_wait_secs", merged.get("max_host_wait_secs")),
+        tool_timeout=_positive("tool_timeout_secs", merged.get("tool_timeout_secs")),
         max_memory=_positive("max_memory", merged.get("max_memory"), int),
         max_tool_calls=suspensions,
     )
@@ -1359,6 +1379,7 @@ class Pydeno:
                 max_tool_calls=limits.max_tool_calls,
                 timeout=limits.timeout,
                 max_pause=limits.max_pause,
+                tool_timeout=limits.tool_timeout,
             )
         except BaseException:
             rt.close()
@@ -1395,6 +1416,7 @@ class Pydeno:
                 runtime=rt,
                 timeout=limits.timeout,
                 max_pause=limits.max_pause,
+                tool_timeout=limits.tool_timeout,
             )
         except BaseException as exc:
             rt.close()
@@ -1838,12 +1860,29 @@ class PydenoSession:
         context = contextvars.copy_context()
         context.run(_TOOL_OF.set, core.session_id)
         # The session's own tool thread: never shared with another session.
+        rt = core.rt
+        limit = rt._tool_timeout  # noqa: SLF001
+        outlasted, timed = core.outlasted, _TimedCall()
+
+        def run() -> Any:
+            if limit is None:
+                return self._call_external(fn, name, args)
+            if not outlasted.begin(timed):
+                return (
+                    _MISSING,
+                    None,
+                )  # given up on while it waited its turn: never runs
+            try:
+                return self._call_external(fn, name, args)
+            finally:
+                outlasted.finish(timed)
+
         try:
-            future = core.tools.submit(context.run, self._call_external, fn, name, args)
+            future = core.tools.submit(context.run, run)
         except _ThreadsExhausted as exc:
             core.note_refusal(exc)  # answered with the generic error, as feed_run does
             return _MISSING, _unavailable()
-        rt = core.rt
+        deadline = None if limit is None else time.monotonic() + limit
         while True:
             try:
                 return future.result(_POLL)
@@ -1852,6 +1891,14 @@ class PydenoSession:
                     return _MISSING, RuntimeError(
                         "the run ended while the external ran"
                     )
+                if deadline is not None and time.monotonic() >= deadline:
+                    count = outlasted.abandon(timed)
+                    future.cancel()  # still queued: it never starts
+                    core.replace_tool_thread()
+                    if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+                        rt._kill_reason = abandoned_message(limit or 0.0, count)  # noqa: SLF001
+                        rt._kill()  # noqa: SLF001
+                    return _MISSING, tool_timeout_error()
 
     @staticmethod
     def _call_external(

@@ -3,7 +3,8 @@
 Issue #45 asks, as its fifth item, for host tools to run in a process of their own, with a per-call
 deadline and result caps, "so a tool bug is not in the parent's address space". This note records
 what was evaluated for 0.10, why it was not built in the same change as the seccomp allow-list, and
-what a sound version would look like. It is a plan, not a description of shipped behaviour.
+what a sound version would look like. It is a plan, not a description of shipped behaviour,
+except for the per-call deadline described at the end, which has shipped.
 
 ## Where tools run today
 
@@ -60,11 +61,13 @@ parent's problem.
 - **The guest-facing boundary does not depend on it.** A guest that escapes V8 is confined by the
   worker's OS sandbox whatever the tools do; this item protects the host from its own tools.
 
-## A smaller step that could ship first
+## The smaller step shipped: `tool_timeout=`
 
-An opt-in **per-call deadline** for tools that already run in the parent (`tool_timeout=`): the
-guest gets an error when the deadline passes, the handler's thread or task is abandoned (async
-tasks are cancelled; a synchronous handler cannot be interrupted, only outlasted), and a counter of
-abandoned calls stops the session past a threshold (the same rule `AgentSandbox` already applies to
-abandoned tool calls). That gives the guest-visible half of item 5 without the process boundary,
-and it is a natural first PR before the tool host.
+The opt-in per-call deadline for tools that run in the parent shipped in 0.11 (see "Per-call tool
+deadline" in `docs/guides/advanced/isolation.md`). The guest gets a catchable `TimeoutError`
+("host function timed out"), async handlers are cancelled, a synchronous handler is abandoned on its
+thread (with the option set it runs on a thread of its own) and its late result is discarded, and
+past 8 abandoned calls still running the session ends. Agent sessions journal a timed-out call as a
+failed call, so a replay sends the same failure and never re-runs the tool. That is the
+guest-visible half of item 5; what remains is the process boundary: crash isolation and memory
+limits for a tool's own bugs, importable tools, and per-tool confinement.

@@ -412,6 +412,7 @@ SESSION_OPTIONS = (
     "max_inflight_host_calls",
     "write_stall_timeout",
     "redact_host_errors",
+    "tool_timeout",
 )
 
 
@@ -439,6 +440,7 @@ def _session_options(
     max_inflight_host_calls: int | None | Any = _DEFAULT,
     write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
     redact_host_errors: bool = True,
+    tool_timeout: float | int | timedelta | None = None,
 ) -> dict[str, Any]:
     """The parent-side options, validated and normalised, as the runtime attributes that hold
     them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
@@ -476,6 +478,7 @@ def _session_options(
             else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
+        "_tool_timeout": _limit_seconds("tool_timeout", tool_timeout),
     }
 
 
@@ -644,6 +647,17 @@ class IsolatedRuntime:
         redact_host_errors: Replace the message of an exception raised by a host function with a
             generic one before the guest sees it (the exception's class name is kept). Use this
             when your tools' error text can contain paths, queries or secrets.
+        tool_timeout: Most time (seconds, default `None`: off) one call to a host function you
+            bound (`bind_function`, `bind_object`, `ToolBridge` tools; not `console`, module
+            loaders or the gate) may take. Past it the guest's call fails with a catchable
+            `TimeoutError` whose message is always ``"host function timed out"`` (it holds nothing
+            of yours, so `redact_host_errors` changes nothing) and the command goes on. An
+            asynchronous handler is cancelled. A synchronous one cannot be interrupted: with this
+            option set it runs on a thread of its own (not the calling thread), which is abandoned
+            when the deadline passes, and its late result is discarded. The time spent still counts
+            toward `max_host_wait`. Past 8 abandoned calls still running, the worker is killed
+            (`WorkerCrashed`: "too many abandoned tool calls in this session"), so a guest cannot
+            pile up stuck threads. Also settable per `SandboxPool` checkout.
         sandbox: OS confinement for the worker (macOS Seatbelt; Linux Landlock + seccomp).
             "require" (the default) refuses to start unless *every* layer the platform has is in
             force (macOS: Seatbelt; Linux: Landlock and seccomp), so a kernel that lacks one
@@ -707,6 +721,7 @@ class IsolatedRuntime:
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
+        tool_timeout: float | int | None = None,
         sandbox: str = "require",
         empty_root: bool | str = True,
         jitless: bool = True,
@@ -783,6 +798,7 @@ class IsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            tool_timeout=tool_timeout,
         ).items():
             setattr(self, attr, value)
         self._python = python or sys.executable
@@ -807,6 +823,10 @@ class IsolatedRuntime:
 
         self._handlers: dict[int, tuple[Callable[..., Any], bool]] = {}
         self._token_to_hid: dict[int, int] = {}
+        # The handlers `bind_function`/`bind_object` registered: the ones `tool_timeout` covers
+        # (not console, module loaders or the gate's hooks).
+        self._tool_hids: set[int] = set()
+        self._outlasted = _Outlasted()
         self._hids = itertools.count(1)
         self._cmd_ids = itertools.count(1)
         self._lock = threading.Lock()
@@ -1465,9 +1485,18 @@ class IsolatedRuntime:
                 None,
             )
             return
+        limit = self._tool_timeout
+        if limit is not None and (
+            hid not in self._tool_hids or getattr(handler, "_pydeno_untimed", False)
+        ):
+            limit = None  # not a tool: a loader hook, or an agent session's own shim
         pump.begin_call()
         if is_async and pump.loop is not None:
             coro = _call_guarded(handler, decoded)
+            if limit is not None:
+                coro = _call_with_deadline(
+                    coro, limit, self._outlasted, self._too_many_outlasted
+                )
             with self._async_inflight_lock:
                 self._async_inflight += 1
             try:
@@ -1482,7 +1511,13 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
-        self._run_watched(handler, decoded, cid, pump, pump)
+        self._run_watched(handler, decoded, cid, pump, pump, limit)
+
+    def _too_many_outlasted(self, count: int) -> None:
+        """Past the cap on calls still running after `tool_timeout`: end the session. The reason
+        is what the pump reports as the worker's death."""
+        self._kill_reason = abandoned_message(self._tool_timeout or 0.0, count)
+        self._kill()
 
     def _run_watched(
         self,
@@ -1491,6 +1526,7 @@ class IsolatedRuntime:
         cid: int,
         pump: _Pump,
         reply_pump: _Pump | None,
+        limit: float | None = None,
     ) -> None:
         """Run a synchronous handler on this (the pump's) thread, with the idle watchdog standing
         in for the pump meanwhile. The handler is never interrupted and never moved to another
@@ -1500,7 +1536,10 @@ class IsolatedRuntime:
         handler has returned. `reply_pump` is the pump to `end_call` on (None for console)."""
         self._handler_pump = pump
         try:
-            self._run_sync_handler(handler, decoded, cid, reply_pump)
+            if limit is None:
+                self._run_sync_handler(handler, decoded, cid, reply_pump)
+            else:
+                self._run_timed_handler(handler, decoded, cid, reply_pump, limit)
         finally:
             # Under the lock: a verdict the watchdog is still reaching is seen here, not lost.
             with self._handler_lock:
@@ -1527,6 +1566,70 @@ class IsolatedRuntime:
                 self._guard.in_host_call = False
         except Exception as exc:  # noqa: BLE001 - the guest sees the failure, the host keeps running
             reply = self._error(cid, exc)
+        self._send_reply(reply, pump)
+
+    def _run_timed_handler(
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump | None,
+        limit: float,
+    ) -> None:
+        """`_run_sync_handler` under `tool_timeout`: the handler runs on a thread of its own, in a
+        copy of this one's context, and this thread waits for it for at most `limit` seconds (the
+        idle watchdog supervises meanwhile, as for any synchronous handler). Past the deadline the
+        guest gets `tool_timeout_error()`, the thread is abandoned, and whatever it returns later
+        is dropped."""
+        outlasted, call = self._outlasted, _TimedCall()
+        ended = threading.Event()
+        box: list[dict[str, Any]] = []
+
+        def work() -> None:
+            try:
+                if not outlasted.begin(call):
+                    return
+                try:
+                    self._guard.in_host_call = True
+                    try:
+                        value = handler(*decoded)
+                        if inspect.isawaitable(value):
+                            value = asyncio.run(_await(value))
+                        box.append({"t": "reply", "cid": cid, "v": _wire.Enc(value)})
+                    finally:
+                        self._guard.in_host_call = False
+                except Exception as exc:  # noqa: BLE001 - the guest sees the failure
+                    box.append(self._error(cid, exc))
+            finally:
+                outlasted.finish(call)
+                ended.set()
+
+        context = contextvars.copy_context()
+        try:
+            threading.Thread(
+                target=context.run, args=(work,), name="pydeno-tool", daemon=True
+            ).start()
+        except RuntimeError as exc:  # no thread to be had: the call fails, nothing ran
+            self._send_reply(self._error(cid, exc), pump)
+            return
+        deadline = time.monotonic() + limit
+        while True:
+            remaining = deadline - time.monotonic()
+            if ended.wait(max(0.0, min(remaining, _POLL_SECONDS))):
+                break
+            if remaining <= 0 or self._closed:
+                break
+        reply = box[0] if box else None
+        if reply is None:
+            count = outlasted.abandon(call)
+            if count is None:  # it ended while we decided
+                reply = box[0]
+            else:
+                if count > MAX_ABANDONED_TOOL_CALLS:
+                    self._too_many_outlasted(count)
+                    self._send_reply(self._error(cid, tool_timeout_error()), pump)
+                    raise WorkerCrashed(abandoned_message(limit, count))
+                reply = self._error(cid, tool_timeout_error())
         self._send_reply(reply, pump)
 
     def _error(self, cid: int, exc: BaseException) -> dict[str, Any]:
@@ -1724,6 +1827,7 @@ class IsolatedRuntime:
         hid = next(self._hids)
         is_async = inspect.iscoroutinefunction(handler)
         self._handlers[hid] = (handler, is_async)
+        self._tool_hids.add(hid)
         try:
             token = self._request(
                 {"t": "bind_function", "name": name, "hid": hid, "async": is_async}
@@ -1753,6 +1857,7 @@ class IsolatedRuntime:
                 hid = next(self._hids)
                 is_async = inspect.iscoroutinefunction(value)
                 self._handlers[hid] = (value, is_async)
+                self._tool_hids.add(hid)
                 hids[key] = hid
                 entries[key] = {"hid": hid, "async": is_async}
             else:
@@ -1786,6 +1891,7 @@ class IsolatedRuntime:
         hid = self._token_to_hid.pop(op_id, None)
         if hid is not None:
             self._handlers.pop(hid, None)
+            self._tool_hids.discard(hid)
             self._revoked_hids[hid] = None
             if len(self._revoked_hids) > _REVOKED_MEMORY:
                 self._revoked_hids.pop(next(iter(self._revoked_hids)))
@@ -1947,6 +2053,108 @@ def _is_token(value: object) -> bool:
 
 async def _await(awaitable: Any) -> Any:
     return await awaitable
+
+
+# `tool_timeout`: what the guest is told, and how many calls that outlasted it may still be running.
+TOOL_TIMEOUT_MESSAGE = "host function timed out"
+MAX_ABANDONED_TOOL_CALLS = 8
+# How long a cancelled asynchronous handler gets to finish before it counts as abandoned.
+_CANCEL_GRACE = 1.0
+
+
+def tool_timeout_error() -> TimeoutError:
+    """What the guest sees for a call that outlasted `tool_timeout`: the same text whatever
+    `redact_host_errors` says (it is pydeno's own, so it holds nothing to redact)."""
+    exc = TimeoutError(TOOL_TIMEOUT_MESSAGE)
+    exc._pydeno_public = True  # type: ignore[attr-defined]
+    return exc
+
+
+def abandoned_message(limit: float, count: int) -> str:
+    return (
+        f"too many abandoned tool calls in this session ({count} calls outlasted "
+        f"tool_timeout={limit:g}s and are still running); worker killed"
+    )
+
+
+class _TimedCall:
+    """One host call under `tool_timeout`: has it begun, ended, been given up on."""
+
+    __slots__ = ("abandoned", "done", "started")
+
+    def __init__(self) -> None:
+        self.started = self.done = self.abandoned = False
+
+
+class _Outlasted:
+    """The calls that outlived `tool_timeout` and still run (threads, or tasks that ignored
+    their cancellation). A call that ends removes itself, so only stuck ones count."""
+
+    __slots__ = ("count", "lock")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def begin(self, call: _TimedCall) -> bool:
+        """False when the call was given up on before it began: it must not run at all."""
+        with self.lock:
+            if call.abandoned:
+                return False
+            call.started = True
+            return True
+
+    def finish(self, call: _TimedCall) -> None:
+        with self.lock:
+            call.done = True
+            if call.abandoned and call.started:
+                self.count -= 1
+
+    def abandon(self, call: _TimedCall) -> int | None:
+        """Give up on a call. None: it had already ended (use its answer). Otherwise how many
+        calls are now outstanding past their deadline (not counting one that never began)."""
+        with self.lock:
+            if call.done:
+                return None
+            call.abandoned = True
+            if call.started:
+                self.count += 1
+            return self.count
+
+
+async def _call_with_deadline(
+    coro: Any,
+    limit: float,
+    outlasted: _Outlasted,
+    on_outlasted: Callable[[int], None],
+) -> Any:
+    """Await an asynchronous host function for at most `limit` seconds. Past it the task is
+    cancelled and the guest's call fails with `tool_timeout_error()`; one that ignores the
+    cancellation is abandoned (counted, and `on_outlasted` told when too many are)."""
+    task = asyncio.ensure_future(coro)
+    call = _TimedCall()
+    call.started = True
+    task.add_done_callback(lambda _t: outlasted.finish(call))
+    expired = False
+    try:
+        done, _ = await asyncio.wait({task}, timeout=limit)
+        if not done:
+            expired = True
+            task.cancel()
+            await asyncio.wait({task}, timeout=_CANCEL_GRACE)
+    except BaseException:
+        task.cancel()
+        raise
+    if not expired:
+        return task.result()
+    if task.done():
+        if not task.cancelled():
+            task.exception()  # retrieved: nobody will read it
+    else:
+        count = outlasted.abandon(call)
+        if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+            on_outlasted(count)
+    raise tool_timeout_error()
 
 
 async def _call_guarded(handler: Callable[..., Any], args: list[Any]) -> Any:

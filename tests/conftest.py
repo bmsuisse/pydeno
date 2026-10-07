@@ -108,6 +108,7 @@ collect_ignore = (
         "test_stream_source_owner.py",
         "test_sandbox_violation.py",
         "test_sandbox_canaries.py",
+        "test_tool_timeout.py",
     ]
     if sys.platform == "win32"
     else []
