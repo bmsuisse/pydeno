@@ -44,6 +44,7 @@ from ._agent import (
     _MAX_ABANDONED_CALLS,
     _MISSING,
     _SESSION_IDS,
+    _check_gate_identity,
     _regate_hook,
     _replayed_runs,
     DEFAULT_MAX_JOURNAL_BYTES,
@@ -763,6 +764,7 @@ class AsyncAgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
+        _check_gate_identity(journal, options, regate_replay)
         hook = _regate_hook(
             options, regate_replay, "AsyncAgentSandbox", sync_only=False
         )

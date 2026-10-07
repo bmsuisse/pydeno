@@ -68,7 +68,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from ._gate import DEFAULT_GATE_TIMEOUT, _hook
+from ._gate import DEFAULT_GATE_TIMEOUT, StaticGate, _hook, _policy_hash
 from ._isolated import (
     _CONFIG_KEYS,
     MAX_ABANDONED_TOOL_CALLS,
@@ -1701,6 +1701,11 @@ class _SessionBase:
         if self._strict_eval:
             # The guest's `eval` / `new Function` throw under it, so replay needs the same.
             config["strict_eval"] = True
+        # Only for a static gate, whose policy is plain data: any other gate (a classifier, a
+        # combinator) has no identity to record, and a session without one writes the old journal.
+        gate = self._gate.gate if self._gate is not None else None
+        if isinstance(gate, StaticGate):
+            config["gate_policy"] = _policy_hash(gate.policy)
         return config
 
     @staticmethod
@@ -2669,7 +2674,9 @@ class AgentSandbox(_SessionBase):
         must be passed) is run over the source of every recorded run, in mode ``"replay"``, before
         any worker starts, and a refusal raises `GateDenied` (`GateUnavailable` if it cannot
         decide). Use it with a deterministic gate such as `static_gate`: a classifier that
-        answers differently now would refuse state that was fine when it ran.
+        answers differently now would refuse state that was fine when it ran. A journal dumped
+        under a `static_gate` records the policy's hash, and a load under a different static
+        gate (or none) raises `JournalError` unless ``regate_replay=True``.
 
         The MAC is checked before anything runs. Recorded tool answers are replayed; the real
         tools are never called. If the session was dumped while paused at a tool call, the
@@ -2681,6 +2688,7 @@ class AgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
+        _check_gate_identity(journal, options, regate_replay)
         hook = _regate_hook(options, regate_replay, "AgentSandbox", sync_only=True)
         if hook is not None:
             sources, names = _replayed_runs(journal)
@@ -2739,6 +2747,33 @@ class AgentSandbox(_SessionBase):
     def __repr__(self) -> str:
         state = "closed" if self.is_closed() else "paused" if self._paused else "idle"
         return f"AgentSandbox(tools={list(self._tools)!r}, {state}, calls={self.calls_made})"
+
+
+def _check_gate_identity(
+    journal: dict[str, Any], options: Mapping[str, Any], regate_replay: bool
+) -> None:
+    """Refuse a load whose gate is not the static gate the journal was dumped under.
+
+    Only a journal that recorded a static gate's policy hash is bound (the others never had an
+    identity, see `_config`). Replay itself does not consult the gate, so without this a stricter or
+    different gate would be paired with state it never saw; ``regate_replay=True`` re-runs the gate
+    over every recorded run instead, which is the stronger check, so it replaces this one."""
+    recorded = journal["config"].get("gate_policy")
+    if recorded is None or regate_replay:
+        return
+    gate = options.get("gate")
+    current = _policy_hash(gate.policy) if isinstance(gate, StaticGate) else None
+    if current != recorded:
+        raise JournalError(
+            f"the journal was dumped under static gate policy {recorded[:12]}, but this load "
+            + (
+                f"uses policy {current[:12]}"
+                if current is not None
+                else "has no static gate"
+            )
+            + "; pass the same static_gate(SourcePolicy(...)), or regate_replay=True to run "
+            "the gate you pass over every recorded run instead"
+        )
 
 
 def _regate_hook(
@@ -3348,6 +3383,13 @@ def _parse(payload: bytes) -> dict[str, Any]:
     catalog = config.get("catalog", [])
     if not isinstance(catalog, list) or not all(isinstance(n, str) for n in catalog):
         raise bad("catalog")
+    recorded_policy = config.get("gate_policy")
+    if recorded_policy is not None and not (
+        isinstance(recorded_policy, str)
+        and len(recorded_policy) == 64
+        and all(c in "0123456789abcdef" for c in recorded_policy)
+    ):
+        raise bad("gate_policy")
     if "strict_eval" in config and config["strict_eval"] is not True:
         # Written only when True, so a journal without it reads exactly as it always did.
         raise bad("strict_eval")

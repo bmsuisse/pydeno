@@ -12,6 +12,16 @@
   wording, so no new text comes from the worker and the wire format is unchanged. It is matched on the
   terse wording, so a guest that throws that wording itself gets the same note, holding only host settings.
 
+- **A static gate's policy is bound to the session journal (#134).** `AgentSandbox` / `AsyncAgentSandbox`
+  sessions made with `gate=static_gate(policy)` record a stable hash of the `SourcePolicy` in the journal
+  config, and `load` refuses (`JournalError`, before any worker starts) a load under a different static
+  gate, or none, unless `regate_replay=True`. Journals of sessions without a static gate are
+  byte-for-byte what they were, and load under any gate. The front-door sessions
+  (`PydenoSession.load_session` / `load_snapshot`) still have no `regate_replay`: their journal holds the
+  generated setup and a rewritten body rather than the text the gate saw, which cannot be recovered
+  reliably nor recorded without changing the record shape, so this is documented in
+  `docs/guides/gate.md` and left.
+
 ### Development
 
 - **`make test-rust`** runs the Rust unit tests the way CI does (`cargo test --release --features bench --
