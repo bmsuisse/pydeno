@@ -681,7 +681,8 @@ def test_host_fork_while_a_spawn_is_in_flight(tmp_path):
                 if pid == 0:
                     code = 1
                     try:
-                        import signal
+                        import faulthandler, signal, traceback
+                        faulthandler.dump_traceback_later(60, exit=True)
                         signal.alarm(90)
                         with IsolatedRuntime(sandbox="auto", prewarm=False) as rt:
                             # A start that fell back to exec (the template was mid-spawn at the
@@ -691,7 +692,10 @@ def test_host_fork_while_a_spawn_is_in_flight(tmp_path):
                                 "exec",
                             ):
                                 code = 0
+                    except BaseException:
+                        traceback.print_exc()
                     finally:
+                        sys.stderr.flush()
                         os._exit(code)
                 _, status = os.waitpid(pid, 0)
                 bad += status != 0
