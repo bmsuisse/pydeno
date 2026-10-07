@@ -684,7 +684,12 @@ def test_host_fork_while_a_spawn_is_in_flight(tmp_path):
                         import signal
                         signal.alarm(90)
                         with IsolatedRuntime(sandbox="auto", prewarm=False) as rt:
-                            if rt.eval("2") == 2 and rt.worker_start == "fork-template":
+                            # A start that fell back to exec (the template was mid-spawn at the
+                            # fork) is correct behaviour; a hang or a wrong answer is not.
+                            if rt.eval("2") == 2 and rt.worker_start in (
+                                "fork-template",
+                                "exec",
+                            ):
                                 code = 0
                     finally:
                         os._exit(code)

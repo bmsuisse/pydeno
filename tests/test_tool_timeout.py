@@ -438,11 +438,15 @@ class TestSyncRuntime:
 
             def brief() -> None:
                 calls["n"] += 1
-                release.wait(0.15)
+                release.wait(30)
 
             rt.bind_function("brief", brief)
             for _ in range(MAX_ABANDONED_TOOL_CALLS * 2):
+                # Blocks until released, so the deadline always fires first however loaded the
+                # machine is; released right after, so the call ends and stops counting.
+                release.clear()
                 assert rt.eval(_guest("brief()")) == TIMED_OUT
+                release.set()
                 assert _settle(lambda: rt._outlasted.count == 0)  # noqa: SLF001
             assert rt.eval("1") == 1
             assert calls["n"] == MAX_ABANDONED_TOOL_CALLS * 2

@@ -2067,12 +2067,22 @@ MAX_ABANDONED_TOOL_CALLS = 8
 _CANCEL_GRACE = 1.0
 
 
+class _ToolTimeout(TimeoutError):
+    """A `TimeoutError` that says it is pydeno's own text. The flag lives on the class, not on the
+    instance: asyncio rebuilds a `TimeoutError` that crosses `run_coroutine_threadsafe` (3.11+),
+    and a rebuilt instance would lose an attribute set on the original and be redacted."""
+
+    _pydeno_public = True
+
+
+# The guest and the journal read the class name; it stays "TimeoutError".
+_ToolTimeout.__name__ = _ToolTimeout.__qualname__ = "TimeoutError"
+
+
 def tool_timeout_error() -> TimeoutError:
     """What the guest sees for a call that outlasted `tool_timeout`: the same text whatever
     `redact_host_errors` says (it is pydeno's own, so it holds nothing to redact)."""
-    exc = TimeoutError(TOOL_TIMEOUT_MESSAGE)
-    exc._pydeno_public = True  # type: ignore[attr-defined]
-    return exc
+    return _ToolTimeout(TOOL_TIMEOUT_MESSAGE)
 
 
 def abandoned_message(limit: float, count: int) -> str:
