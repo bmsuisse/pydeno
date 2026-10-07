@@ -67,6 +67,13 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
     from ._aio import AsyncIsolatedRuntime
     from ._aio_agent import AsyncAgentSandbox
     from ._isolated import IsolatedRuntime, WorkerCrashed
+    from ._toolproc import (
+        ToolProcess,
+        ToolProcessDied,
+        ToolProcessError,
+        ToolProcessStartError,
+        ToolResultTooLarge,
+    )
     from ._result import ExecutionResult, ResultTooLarge
     from ._schema import SchemaTool
     from ._polyfills import WEB_POLYFILLS
@@ -161,6 +168,11 @@ _LAZY = {
     "StaleJournal": "_pool",
     "JournalTooLarge": "_pool",
     "IsolatedRuntime": "_isolated",
+    "ToolProcess": "_toolproc",
+    "ToolProcessError": "_toolproc",
+    "ToolProcessDied": "_toolproc",
+    "ToolProcessStartError": "_toolproc",
+    "ToolResultTooLarge": "_toolproc",
     "WorkerCrashed": "_isolated",
     "CheckoutTimeout": "_sandbox_pool",
     "SandboxPool": "_sandbox_pool",
@@ -578,6 +590,11 @@ __all__ = [
     "bind_object",
     "Runtime",
     "IsolatedRuntime",
+    "ToolProcess",
+    "ToolProcessError",
+    "ToolProcessDied",
+    "ToolProcessStartError",
+    "ToolResultTooLarge",
     "CheckoutTimeout",
     "SandboxPool",
     "AsyncSandboxPool",
