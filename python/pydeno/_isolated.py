@@ -43,6 +43,7 @@ import re
 import signal
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -416,6 +417,42 @@ SESSION_OPTIONS = (
 )
 
 
+#: Environment variable that lets the sandboxed runtimes start on a free-threaded CPython build.
+ALLOW_FREE_THREADED_ENV = "PYDENO_ALLOW_FREE_THREADED"
+
+
+def _is_free_threaded_build() -> bool:
+    """True on a free-threaded CPython build (3.13t and later), whether or not the GIL is on.
+
+    pydeno does not declare the extension GIL-free, so CPython re-enables the GIL when it loads;
+    the build is what matters, since the supervisor was only reviewed under the GIL.
+    """
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
+def _refuse_free_threaded() -> None:
+    """Refuse to build a sandboxed runtime on a free-threaded interpreter unless opted in.
+
+    Free-threaded CPython is unsupported (docs/contributing/free-threaded.md): the sandbox
+    supervisor, fork handling and worker supervision were reviewed on GIL builds only. Set
+    `PYDENO_ALLOW_FREE_THREADED=1` to run anyway, at your own risk.
+    """
+    if not _is_free_threaded_build():
+        return
+    if os.environ.get(ALLOW_FREE_THREADED_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    raise RuntimeError(
+        "free-threaded CPython is not supported by pydeno's sandboxed runtimes: the sandbox "
+        "supervisor was only reviewed with the GIL. Use a GIL build, or set "
+        f"{ALLOW_FREE_THREADED_ENV}=1 to run without that guarantee"
+    )
+
+
 def _empty_root_mode(value: object, sandbox: str) -> str:
     """`empty_root` as "auto" | "require" | "off". A bool is the old spelling: True is "auto"."""
     if value is True:
@@ -757,6 +794,7 @@ class IsolatedRuntime:
         empty_root = _empty_root_mode(empty_root, sandbox)
         if os.name != "posix":
             raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
+        _refuse_free_threaded()
         config = config or RuntimeConfig()
         for attr in _UNSUPPORTED_CONFIG:
             if getattr(config, attr, None) is not None:
