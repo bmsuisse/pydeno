@@ -901,7 +901,9 @@ class TestScaling:
         guard(subprocess.Popen, "__init__")
         guard(subprocess.Popen, "wait")
         guard(subprocess.Popen, "communicate")
-        guard(_template.MANAGER, "spawn")  # fork-template mode starts workers here, not by Popen
+        guard(
+            _template.MANAGER, "spawn"
+        )  # fork-template mode starts workers here, not by Popen
         guard(_sandbox, "usage")
         guard(_aio, "_stderr_tail")
         guard(time, "sleep")
