@@ -634,6 +634,29 @@ fails throws an Error whose `name` is the failure's type.
 """
 
 
+_SCRIPT_PREAMBLE = """\
+You can run JavaScript in a sandbox. Write the code as a script: the value of its last
+expression is the result (a Promise is awaited, so `(async () => { ... })()` works), and
+`return` is not allowed at the top level. Call tools with `await` inside an async function.
+`var` and `function` declarations are kept for later runs; `const`, `let` and `class` are
+not (they are local to the run); to keep anything, store it on `globalThis`. There is no
+network, filesystem, `require` or `import`. `Date.now()` is frozen and `Math.random()` is
+seeded. A tool that fails throws an Error whose `name` is the failure's type.
+"""
+
+RUN_MODES = ("function", "script")
+
+
+def _check_mode(mode: str) -> str:
+    if mode not in RUN_MODES:
+        raise ValueError(f"mode must be one of {', '.join(map(repr, RUN_MODES))}")
+    return mode
+
+
+def _preamble(mode: str) -> str:
+    return _SCRIPT_PREAMBLE if mode == "script" else _PREAMBLE
+
+
 def _schema_placeholder(schema: Any, name: str) -> str:
     if not isinstance(schema, Mapping):
         return "null"
@@ -680,17 +703,22 @@ def describe_tools(
     tools: Mapping[str, Any] | collections.abc.Sequence[Any],
     *,
     namespace: str | None = None,
+    mode: str = "function",
 ) -> str:
     """A block for an LLM's system prompt: how code runs, then each tool's signature, docstring
     and an example call. The signatures are the ones `typescript_stubs` declares.
 
     `tools` maps names to callables (described from their signatures) or to `SchemaTool`s
-    (described from their JSON Schemas); a sequence of `SchemaTool`s works too."""
+    (described from their JSON Schemas); a sequence of `SchemaTool`s works too.
+
+    `mode` is how the session runs code (see `AgentSandbox(mode=...)`); the block tells the model
+    to write an async function body (``"function"``, the default) or a script (``"script"``)."""
     entries = _normalize_tools(tools)
+    _check_mode(mode)
     prefix = f"{namespace}." if namespace else ""
     where = f"on the `{namespace}` object" if namespace else "as global functions"
     lines = [
-        _PREAMBLE,
+        _preamble(mode),
         f"These tools are available {where}; each returns a Promise.",
         "",
     ]
@@ -908,6 +936,8 @@ class _Core:
         # During a run driven on the caller's thread (`AgentSandbox._drive`): answers a tool call
         # at once, there. None otherwise (calls then go through the loop, as `start` needs).
         self.inline: Callable[[str, list[Any]], Any] | None = None
+        # How a run's code is evaluated ("function" or "script"); set by the session.
+        self.mode = "function"
         # JavaScript run before the next run's code (not journaled): see `_SessionBase._install`.
         self.pending_js = ""
         # The loop thread is started on first use: a session driven only by `run`/`execute` (and
@@ -1062,7 +1092,7 @@ class _Core:
             if self.pending_js:
                 await self.rt.eval_async(self.pending_js)
                 self.pending_js = ""
-            value = await self.rt.eval_async(_wrap(code))
+            value = await self.rt.eval_async(_wrap(code, self.mode))
             # Over the cap, the run fails but the session goes on (the value is dropped here).
             bounded_result(value, self.max_result_bytes)
             final: Step = Done(value)
@@ -1217,6 +1247,7 @@ class _SessionBase:
         max_result_bytes: int,
         runtime_options: dict[str, Any],
         adopted: bool = False,
+        mode: str = "function",
     ) -> tuple[RuntimeConfig | None, _ConsoleSink]:
         """Validate the arguments and set up the session's state. Pops ``config`` from
         `runtime_options`; returns the runtime config to start the worker with (its console goes
@@ -1287,6 +1318,11 @@ class _SessionBase:
         self._max_tool_calls = max_tool_calls
         self._redact = bool(runtime_options.get("redact_host_errors", True))
         self._strict_eval = _strict_eval_requested(runtime_options)
+        self._mode = _check_mode(mode)
+        if self._mode == "script" and self._strict_eval:
+            raise ValueError(
+                'mode="script" runs the code with `eval`, which strict_eval turns off'
+            )
         self._clock_ms = clock_ms
         self._random_seed = random_seed
         self._max_journal_bytes = max_journal_bytes
@@ -1511,7 +1547,7 @@ class _SessionBase:
     def describe_tools(self) -> str:
         """See the module-level `describe_tools`. With a catalog, the declared part is the same
         whatever the catalog's size: its tools are not listed."""
-        text = describe_tools(self._tools, namespace=self._namespace)
+        text = describe_tools(self._tools, namespace=self._namespace, mode=self._mode)
         if self._catalog:
             text += "\n" + _CATALOG_GUIDE.format(ns=self._catalog_ns) + "\n"
         return text
@@ -1701,6 +1737,8 @@ class _SessionBase:
         if self._strict_eval:
             # The guest's `eval` / `new Function` throw under it, so replay needs the same.
             config["strict_eval"] = True
+        if self._mode != "function":
+            config["mode"] = self._mode
         # Only for a static gate, whose policy is plain data: any other gate (a classifier, a
         # combinator) has no identity to record, and a session without one writes the old journal.
         gate = self._gate.gate if self._gate is not None else None
@@ -1765,6 +1803,7 @@ class _SessionBase:
             "max_tool_calls",
             "namespace",
             "max_result_bytes",
+            "mode",
         ):
             if owned in options:
                 raise TypeError(f"{owned} comes from the journal")
@@ -1778,6 +1817,7 @@ class _SessionBase:
             "max_result_bytes": config.get(
                 "max_result_bytes", DEFAULT_MAX_RESULT_BYTES
             ),
+            "mode": config.get("mode", "function"),
         }
 
 
@@ -2140,6 +2180,14 @@ class AgentSandbox(_SessionBase):
             is killed and the run fails with `WorkerCrashed`. Not applied to calls you answer
             yourself with `start`/`resume` or `call()`. Time in the tool counts toward
             ``max_pause``.
+        mode: How a run's code is evaluated. ``"function"`` (default): the body of an async
+            function (``await`` tools, ``return`` the result; top-level declarations at the start
+            of a line are kept for later runs). ``"script"``: a script, whose result is the value
+            of its last expression, awaited if it is a Promise (so ``(async () => ...)()``
+            works; ``return`` at the top level is a SyntaxError). It is evaluated with a global
+            `eval`, so `var` and `function` declarations persist as globals and `let`, `const`
+            and `class` do not; it cannot be combined with ``strict_eval``. Recorded in the
+            journal, which `load` takes it from.
         max_journal_bytes: Cap on the recorded journal. Past it the session keeps working, but
             `dump()` raises `JournalError`.
         max_output_bytes: Cap on each of a run's `stdout` and `stderr` (console output, carried
@@ -2189,6 +2237,7 @@ class AgentSandbox(_SessionBase):
         runtime: IsolatedRuntime | None = None,
         gate: Any = None,
         gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
+        mode: str = "function",
         **runtime_options: Any,
     ) -> None:
         self._gate = _hook(gate, gate_timeout, who="AgentSandbox", sync_only=True)
@@ -2216,6 +2265,7 @@ class AgentSandbox(_SessionBase):
             max_result_bytes=max_result_bytes,
             runtime_options=runtime_options,
             adopted=runtime is not None,
+            mode=mode,
         )
         self._lock = threading.Lock()
         if runtime is None:
@@ -2250,6 +2300,7 @@ class AgentSandbox(_SessionBase):
             rt.close()
             raise
         self._core.pending_js = self._clock_pending
+        self._core.mode = self._mode
         self._finalizer = weakref.finalize(self, self._core.shutdown)
         try:
             self._bind()
@@ -2398,7 +2449,7 @@ class AgentSandbox(_SessionBase):
                 value = rt._request(  # noqa: SLF001 - `eval_async`, pumped on this thread
                     {
                         "t": "eval_async",
-                        "code": _wrap(code),
+                        "code": _wrap(code, self._mode),
                         "timeout": rt._soft_timeout,  # noqa: SLF001
                     },
                     soft_timeout=rt._soft_timeout,  # noqa: SLF001
@@ -3027,13 +3078,22 @@ def _prelude(
 }})();"""
 
 
-def _wrap(code: str) -> str:
+def _wrap(code: str, mode: str = "function") -> str:
     """A run as the body of an async function, which keeps its top-level declarations and does
     not end while one of its tool calls is in flight.
+
+    ``mode="script"`` evaluates the code as a script instead (global indirect `eval`): the result
+    is the value of its last expression, awaited when it is a Promise. `var` and `function`
+    declarations become globals, as in any script; `let`, `const` and `class` stay local to it.
 
     The declarations are copied by a closure defined in the same block as the code, so it sees
     their bindings; one not yet initialised (or not a declaration at all: the pattern has no
     parser behind it) is skipped. The code starts on line 1, so error line numbers match it."""
+    if mode == "script":
+        return (
+            f"(async () => {{ try {{ return await (0, eval)({json.dumps(code)}); }} "
+            f"finally {{ await {_SETTLE}(); }} }})()"
+        )
     names = dict.fromkeys(
         n for n in _DECLARATION.findall(code) if n not in _JS_RESERVED
     )
@@ -3393,6 +3453,8 @@ def _parse(payload: bytes) -> dict[str, Any]:
     if "strict_eval" in config and config["strict_eval"] is not True:
         # Written only when True, so a journal without it reads exactly as it always did.
         raise bad("strict_eval")
+    if config.get("mode", "function") not in RUN_MODES:
+        raise bad("mode")
     for record in records:
         ok = (
             isinstance(record, list)

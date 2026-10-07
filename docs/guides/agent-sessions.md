@@ -113,6 +113,29 @@ fails throws an Error whose `name` is the failure's type.
   breaking the session or being unreachable. Under a namespace (`namespace="tools"`) any such name
   is fine (`tools.JSON(...)`); the namespace itself must not be one of them.
 
+### Script mode: the last expression is the result
+
+Some models write plain scripts rather than function bodies (the value of the last expression is the
+result, often an `(async () => ...)()`). Pass `mode="script"` (also on `AsyncAgentSandbox`) and the
+code is evaluated as a script instead:
+
+```python
+with AgentSandbox({"add": add}, mode="script") as s:
+    s.run("1 + 2")                                # 3
+    s.run("(async () => await add(1, 2))()")      # 3: a Promise result is awaited
+    s.run("add(1, 2)")                            # 3: so is a bare tool call
+```
+
+- `return` at the top level is a `SyntaxError`; the result is the last expression's value.
+- The script is run with a global (indirect) `eval`, so, as in any script, `var` and `function`
+  declarations become globals and persist for later runs, while `let`, `const` and `class` are local
+  to the run. The line-start declaration scan of the default mode is not used. The run still does not
+  end while one of its tool calls is unanswered.
+- It needs `eval`, so it cannot be combined with `strict_eval=True` (`ValueError`).
+- `describe_tools()` tells the model to write a script. The default stays `mode="function"`.
+- The mode is recorded in the journal (only when it is `"script"`, so a default session's journal is
+  unchanged) and `load` takes it from there; passing `mode=` to `load` is a `TypeError`.
+
 ## Telling the model about the tools
 
 `describe_tools()` is a block for the system prompt: the rules above, then for each tool its
@@ -439,7 +462,8 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
 ```python
 AgentSandbox(tools, *, max_tool_calls=None, namespace=None, tools_catalog=None, clock=None,
              random_seed=None, timeout=30.0, max_pause=600.0, max_journal_bytes=8 MiB,
-             max_output_bytes=64 KiB, max_result_bytes=1 MiB, **isolated_runtime_options)
+             max_output_bytes=64 KiB, max_result_bytes=1 MiB, mode="function" | "script",
+             **isolated_runtime_options)
 
 session.run(code) -> Any
 session.execute(code) -> ExecutionResult

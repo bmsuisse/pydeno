@@ -145,6 +145,8 @@ class _Core:
         self.task: asyncio.Task[None] | None = None
         # JavaScript run before the next run's code (not journaled): see `_SessionBase._install`.
         self.pending_js = ""
+        # How a run's code is evaluated ("function" or "script"); set by the session.
+        self.mode = "function"
 
     async def on_tool_call(self, name: str, args: list[Any]) -> Any:
         """A bound tool, as the guest sees it (see `_agent._Core.on_tool_call`)."""
@@ -196,7 +198,7 @@ class _Core:
                 # Before the first run, as a command of its own (see `_agent._Core.freeze_first`).
                 await self.rt.eval(self.pending_js)
                 self.pending_js = ""
-            value = await self.rt.eval(_wrap(code))
+            value = await self.rt.eval(_wrap(code, self.mode))
             # Over the cap, the run fails but the session goes on (the value is dropped here).
             bounded_result(value, self.max_result_bytes)
             final: Step = Done(value)
@@ -327,6 +329,7 @@ class AsyncAgentSandbox(_SessionBase):
         runtime: AsyncIsolatedRuntime | None = None,
         gate: Any = None,
         gate_timeout: float | None = DEFAULT_GATE_TIMEOUT,
+        mode: str = "function",
         **runtime_options: Any,
     ) -> None:
         self._gate = _hook(gate, gate_timeout, who="AsyncAgentSandbox", sync_only=False)
@@ -354,6 +357,7 @@ class AsyncAgentSandbox(_SessionBase):
             max_result_bytes=max_result_bytes,
             runtime_options=runtime_options,
             adopted=runtime is not None,
+            mode=mode,
         )
         self._executor = runtime_options.get("handler_executor")
         self._busy = False
@@ -384,6 +388,7 @@ class AsyncAgentSandbox(_SessionBase):
             catalog=frozenset(self._catalog),
         )
         self._core.pending_js = self._clock_pending
+        self._core.mode = self._mode
 
     # -- lifecycle -----------------------------------------------------------
 

@@ -2,6 +2,16 @@
 
 ## Unreleased (0.12.0)
 
+### Added
+
+- **`AgentSandbox(mode="script")` (#144).** The code can now be run as a script, whose last expression
+  is the result (a Promise is awaited, so `(async () => ...)()` works), instead of the body of an async
+  function. Also on `AsyncAgentSandbox`; `describe_tools()` (and `describe_tools(mode=...)`) tell the model
+  which one to write. `var`/`function` declarations persist, `let`/`const`/`class` stay local to the run;
+  not combinable with `strict_eval`. The default (`mode="function"`) is unchanged, and the mode is
+  journaled only when it is `"script"`, so existing journals and default sessions are byte-for-byte what
+  they were. `JSCodeMode` keeps its own snippet contract and is not affected.
+
 ### Changed
 
 - **The host-side exception from an isolated runtime keeps the detail the guest is denied (#131).** The
