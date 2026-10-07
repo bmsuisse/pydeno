@@ -253,8 +253,13 @@ _OTHER_RUNTIME = re.compile(
 )
 # The worker reports why it would not start (its text, but only ever a refusal: no retry helps).
 _SANDBOX_REFUSED = re.compile(
-    r"worker failed to start: (?:an OS sandbox is required but|sandbox self-test failed|"
+    r"worker failed to start: (?:init failed: )?(?:an OS sandbox is required but|sandbox self-test failed|"
+    r"empty_root='require' but the empty-root layer could not be applied|"
     r"supervisor termination authority is unavailable)"
+)
+# A sandboxed runtime refused to be built on a free-threaded CPython (`_isolated._refuse_free_threaded`).
+_FREE_THREADED = re.compile(
+    r"free-threaded CPython is not supported by pydeno's sandboxed runtimes"
 )
 # The seccomp filter killed the worker for a never-legitimate call (`_isolated.SANDBOX_VIOLATION`,
 # written by the host from the exit status, after the host's death prefix).
@@ -352,6 +357,10 @@ _ROWS: list[Row] = [
     ("host_call_budget", lambda e, t, a: _crash(e, t, _HOST_CALLS)),
     ("protocol_violation", lambda e, t, a: _crash(e, t, _PROTOCOL)),
     ("sandbox_unavailable", lambda e, t, a: _crash(e, t, _SANDBOX_REFUSED)),
+    (
+        "sandbox_unavailable",
+        lambda e, t, a: isinstance(e, RuntimeError) and bool(_FREE_THREADED.match(t)),
+    ),
     (
         "sandbox_violation",
         lambda e, t, a: (
