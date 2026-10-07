@@ -83,6 +83,7 @@ from ._isolated import (
     _clean,
     _clock_ms,
     _RESULT_COMMANDS,
+    _redaction_of,
     _error_reply,
     _is_token,
     _limit_int,
@@ -694,6 +695,7 @@ class AsyncIsolatedRuntime:
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
+        expose_host_errors: Any = None,
         on_unserializable: str = "error",
         tool_timeout: float | int | None = None,
         sandbox: str = "require",
@@ -763,6 +765,7 @@ class AsyncIsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            expose_host_errors=expose_host_errors,
             on_unserializable=on_unserializable,
             tool_timeout=tool_timeout,
         ).items():
@@ -1574,7 +1577,7 @@ class AsyncIsolatedRuntime:
     # -- host callbacks ----------------------------------------------------
 
     def _error(self, cid: int, exc: BaseException) -> dict[str, Any]:
-        return _error_reply(cid, exc, redact=self._redact)
+        return _error_reply(cid, exc, redact=_redaction_of(self))
 
     async def _on_call(self, message: dict[str, Any], pump: _Pump) -> None:
         cid, hid, args = message.get("cid"), message.get("hid"), message.get("args")
@@ -1651,7 +1654,7 @@ class AsyncIsolatedRuntime:
             handler,
             args,
             cid,
-            self._redact,
+            _redaction_of(self),
             self._serial,
         )
         try:

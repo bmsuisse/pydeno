@@ -465,6 +465,7 @@ SESSION_OPTIONS = (
     "max_inflight_host_calls",
     "write_stall_timeout",
     "redact_host_errors",
+    "expose_host_errors",
     "on_unserializable",
     "tool_timeout",
 )
@@ -490,6 +491,65 @@ ON_UNSERIALIZABLE_MODES = ("error", "drop", "stringify")
 _RESULT_COMMANDS = frozenset({"eval", "eval_async", "eval_module", "eval_module_async"})
 
 
+class _Redaction:
+    """What `redact_host_errors` / `expose_host_errors` came to. Truthy when messages are
+    redacted, so every place that only needs the flag keeps working with ``bool(...)``.
+
+    `exposes` decides per exception, and fails closed: a predicate that raises, or a message that
+    cannot be read, keeps the message redacted. Only the exception's own class and its own
+    ``str()`` take part: nothing is read from ``__cause__``, ``__context__``, notes or the
+    traceback, and none of them is ever sent to the guest (only a class name and a message are)."""
+
+    __slots__ = ("enabled", "_expose")
+
+    def __init__(
+        self, enabled: bool, expose: Callable[[BaseException], bool] | None
+    ) -> None:
+        self.enabled = enabled
+        self._expose = expose
+
+    def __bool__(self) -> bool:
+        return self.enabled
+
+    def exposes(self, exc: BaseException) -> bool:
+        if self._expose is None:
+            return False
+        try:
+            return self._expose(exc) is True
+        except Exception:  # noqa: BLE001 - a broken hook must not widen what the guest sees
+            return False
+
+
+def _redaction_of(runtime: Any) -> _Redaction:
+    """The redaction policy a runtime (or session) was configured with."""
+    return _Redaction(bool(runtime._redact), runtime._expose)  # noqa: SLF001
+
+
+def _exposure(value: Any) -> Callable[[BaseException], bool] | None:
+    """`expose_host_errors` as a predicate: None (nothing exposed), one exception class, a
+    collection of them (matched with ``isinstance``, so subclasses are included), or a callable
+    taking the exception and returning True to show its message."""
+    if value is None:
+        return None
+    if isinstance(value, type):
+        value = (value,)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        classes = tuple(value)
+        if not all(
+            isinstance(c, type) and issubclass(c, BaseException) for c in classes
+        ):
+            raise TypeError(
+                "expose_host_errors must hold exception classes (or be a callable)"
+            )
+        return (lambda exc: isinstance(exc, classes)) if classes else None
+    if callable(value):
+        return value  # type: ignore[no-any-return]
+    raise TypeError(
+        "expose_host_errors must be an exception class, a collection of them, or a callable "
+        "taking the exception and returning a bool"
+    )
+
+
 def _session_options(
     *,
     request_timeout: float | int | timedelta | None | Any = _DEFAULT,
@@ -499,6 +559,7 @@ def _session_options(
     max_inflight_host_calls: int | None | Any = _DEFAULT,
     write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
     redact_host_errors: bool = True,
+    expose_host_errors: Any = None,
     on_unserializable: str = "error",
     tool_timeout: float | int | timedelta | None = None,
 ) -> dict[str, Any]:
@@ -518,6 +579,12 @@ def _session_options(
     grace = _limit_seconds("timeout_grace", timeout_grace, allow_zero=True)
     if grace is None:
         raise TypeError("timeout_grace must be a number of seconds")
+    expose = _exposure(expose_host_errors)
+    if expose is not None and not redact_host_errors:
+        raise ValueError(
+            "expose_host_errors has no effect with redact_host_errors=False (every message "
+            "is shown already)"
+        )
     if on_unserializable not in ON_UNSERIALIZABLE_MODES:
         raise ValueError(
             f"on_unserializable must be one of {', '.join(map(repr, ON_UNSERIALIZABLE_MODES))}"
@@ -542,6 +609,7 @@ def _session_options(
             else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
+        "_expose": expose,
         "_unserializable": on_unserializable,
         "_tool_timeout": _limit_seconds("tool_timeout", tool_timeout),
     }
@@ -712,6 +780,14 @@ class IsolatedRuntime:
         redact_host_errors: Replace the message of an exception raised by a host function with a
             generic one before the guest sees it (the exception's class name is kept). Use this
             when your tools' error text can contain paths, queries or secrets.
+        expose_host_errors: With ``redact_host_errors=True`` (the default), the exceptions whose
+            message the guest may still see: an exception class, a collection of classes (matched
+            with ``isinstance``, so subclasses count too: list the classes whose text you wrote),
+            or a callable taking the exception and returning ``True`` to show it. Everything else
+            stays redacted. Only the matched exception's own class name and ``str()`` are sent:
+            its ``__cause__``, ``__context__``, notes and traceback never reach the guest, and an
+            exception that merely wraps an allowed one is not itself allowed. A callable that
+            raises, or returns anything but ``True``, leaves the message redacted. Default: none.
         on_unserializable: What to do when a command's result holds a value that cannot cross
             the isolation boundary (a `JsFunction`, anywhere in it). ``"error"`` (default): the
             command fails with ``TypeError``. ``"drop"``: the value is left out (an object member
@@ -795,6 +871,7 @@ class IsolatedRuntime:
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
+        expose_host_errors: Any = None,
         on_unserializable: str = "error",
         tool_timeout: float | int | None = None,
         sandbox: str = "require",
@@ -873,6 +950,7 @@ class IsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            expose_host_errors=expose_host_errors,
             on_unserializable=on_unserializable,
             tool_timeout=tool_timeout,
         ).items():
@@ -1720,7 +1798,7 @@ class IsolatedRuntime:
         self._send_reply(reply, pump)
 
     def _error(self, cid: int, exc: BaseException) -> dict[str, Any]:
-        return _error_reply(cid, exc, redact=self._redact)
+        return _error_reply(cid, exc, redact=_redaction_of(self))
 
     def _finish_async_call(self, cid: int, pump: _Pump, future: Any) -> None:
         with self._async_inflight_lock:
@@ -2117,7 +2195,7 @@ class IsolatedRuntime:
 
 
 def _error_reply(
-    cid: int, exc: BaseException, *, redact: bool = False
+    cid: int, exc: BaseException, *, redact: bool | _Redaction = False
 ) -> dict[str, Any]:
     """Tell the worker what a host function raised: its class name and its message, separately,
     exactly what an in-process `Runtime` would hand to guest JS as `e.name` and `e.message`.
@@ -2129,7 +2207,14 @@ def _error_reply(
     # pydeno's own guidance to the guest ("search for the tool first") is written by pydeno, not
     # by the host's tools, so it holds nothing to redact and is the whole point of the error.
     public = getattr(exc, "_pydeno_public", False) is True
-    text = "host function failed" if redact and not public else str(exc)
+    if (
+        redact
+        and not public
+        and not (isinstance(redact, _Redaction) and redact.exposes(exc))
+    ):
+        text = "host function failed"
+    else:
+        text = str(exc)
     return {"t": "reply", "cid": cid, "err": text, "etype": etype}
 
 

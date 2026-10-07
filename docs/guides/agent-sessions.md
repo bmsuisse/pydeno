@@ -417,7 +417,11 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
   metadata addresses (also through redirects and DNS rebinding) and caps size and time:
   `AgentSandbox({"fetch_url": http_fetch(["api.example.com/v1/"])})`.
 - **Errors are redacted** by default: the guest learns a failing tool's exception class, not its
-  message. Use `redact_host_errors=False` only for tools whose errors carry nothing sensitive.
+  message. Use `redact_host_errors=False` only for tools whose errors carry nothing sensitive, or
+  keep redaction and list the exceptions whose text is safe to show with
+  `expose_host_errors=ValidationError` (a class, a collection of classes, or a hook; see
+  [Showing selected host errors](advanced/isolation.md#showing-selected-host-errors-expose_host_errors)).
+  Nothing but the matched exception's own message is shown: causes, notes and tracebacks are not.
   Messages pydeno writes itself for the guest (catalog guidance, `http_fetch` refusals, "takes one
   object argument") are shown; they hold nothing of yours.
 - **A tool that raises something that is not an `Exception`** (`SystemExit`, `KeyboardInterrupt`,

@@ -74,7 +74,9 @@ from ._isolated import (
     MAX_ABANDONED_TOOL_CALLS,
     IsolatedRuntime,
     _Outlasted,
+    _redaction_of,
     _TimedCall,
+    _exposure,
     _await,
     _call_with_deadline,
     abandoned_message,
@@ -1317,6 +1319,7 @@ class _SessionBase:
         self._namespace = namespace
         self._max_tool_calls = max_tool_calls
         self._redact = bool(runtime_options.get("redact_host_errors", True))
+        self._expose = _exposure(runtime_options.get("expose_host_errors"))
         self._strict_eval = _strict_eval_requested(runtime_options)
         self._mode = _check_mode(mode)
         if self._mode == "script" and self._strict_eval:
@@ -1476,6 +1479,7 @@ class _SessionBase:
             }
         )
         self._redact = bool(runtime._redact)  # noqa: SLF001
+        self._expose = runtime._expose  # noqa: SLF001
         self._strict_eval = bool(runtime.strict_eval)
         prepared = getattr(runtime, "_pydeno_prepared", None)
         if "clock_ms" not in runtime._options:  # noqa: SLF001
@@ -1624,7 +1628,11 @@ class _SessionBase:
             name = type(error).__name__
             public = getattr(error, "_pydeno_public", False) is True
             message = (
-                "host function failed" if self._redact and not public else str(error)
+                "host function failed"
+                if self._redact
+                and not public
+                and not _redaction_of(self).exposes(error)
+                else str(error)
             )
             record = ["ans", "e", name, message]
             sent = _error_class(name)(message)

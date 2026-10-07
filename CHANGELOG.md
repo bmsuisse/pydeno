@@ -21,6 +21,16 @@
   arguments a guest passes to host functions. The setting travels with each command, so a pre-started
   pool worker takes it at checkout.
 
+- **`expose_host_errors` allowlists exception types whose message the guest may see (#146).**
+  `redact_host_errors` was all-or-nothing. On `IsolatedRuntime`, `AsyncIsolatedRuntime`, `AgentSandbox`,
+  `AsyncAgentSandbox` and per `SandboxPool` checkout, `expose_host_errors=` takes an exception class, a
+  collection of classes (`isinstance`, so subclasses count) or a callable returning `True`; every other
+  message stays `host function failed`. It fails closed (a hook that raises, or answers anything but
+  `True`, redacts) and only the matched exception's own class name and `str()` are sent: its cause,
+  context, notes and traceback never reach the guest, and an exception wrapping an allowed one is not
+  allowed. Default behaviour is unchanged, and journals record the text the guest saw, so a replay does
+  not depend on the setting.
+
 ### Changed
 
 - **The host-side exception from an isolated runtime keeps the detail the guest is denied (#131).** The

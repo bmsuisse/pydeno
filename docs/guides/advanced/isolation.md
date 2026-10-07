@@ -399,6 +399,7 @@ What to do about it in your own code:
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
 | `redact_host_errors` | `True` | Guest sees the exception class but only `"host function failed"` as message |
+| `expose_host_errors` | none | Exception classes (or a hook) whose message is shown anyway; see [Showing selected host errors](#showing-selected-host-errors-expose_host_errors) |
 | `on_unserializable` | `"error"` | What happens to a function inside a result: fails the command (default), or is dropped / stringified, see [above](#a-function-in-the-result-on_unserializable) |
 
 A worker CPU-time cap of twice the hard deadline also applies, because wall-clock pauses
@@ -525,8 +526,8 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
   `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`, `max_inflight_host_calls`,
-  `write_stall_timeout`, `redact_host_errors`, `on_unserializable`, `tool_timeout`) can be set per
-  checkout.
+  `write_stall_timeout`, `redact_host_errors`, `expose_host_errors`, `on_unserializable`,
+  `tool_timeout`) can be set per checkout.
 
 Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
 a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports
@@ -606,6 +607,40 @@ during the bridge’s type checks.
 
 A Proxy around a function crosses as the underlying function; invoking its Python wrapper
 skips the Proxy’s `apply` trap.
+
+## Showing selected host errors: `expose_host_errors`
+
+`redact_host_errors=True` (the default) replaces the message of every exception a host function
+raises with `host function failed`; the guest keeps the class name. A host that wants the model to
+read the messages of a short list of exceptions (its own validation errors, say) no longer has to
+turn redaction off and filter by hand:
+
+```python
+class ValidationError(Exception): ...
+
+with IsolatedRuntime(expose_host_errors=ValidationError) as rt:      # a class
+    ...
+IsolatedRuntime(expose_host_errors=(ValidationError, KeyError))      # or several
+IsolatedRuntime(expose_host_errors=lambda exc: getattr(exc, "public", False))  # or a hook
+```
+
+- Classes are matched with `isinstance`, so a subclass of a listed class is shown too: list the
+  classes whose text you wrote, never a broad base such as `Exception` or `OSError`. A callable gets
+  the exception and must return exactly `True` to show it.
+- **Fails closed.** A hook that raises, or returns anything but `True`, leaves the message redacted.
+  Everything not matched stays `host function failed`. Passing it with `redact_host_errors=False` is a
+  `ValueError` (everything is shown already).
+- **Nothing else crosses.** Only the matched exception's own class name and `str()` are sent to the
+  worker. Its `__cause__`, `__context__`, `add_note()` notes and traceback never leave the parent, and
+  the decision looks at the raised exception alone: an exception that merely wraps an allowed one
+  (`raise RuntimeError(...) from validation_error`) is not itself allowed. What the guest reads is
+  exactly that `str()`, so keep a listed exception's message free of what you would not show.
+- **Tools in a `ToolProcess`** raise a plain class of the same *name* as the tool's exception, not
+  the original (`isinstance` against your class does not match); use a hook that compares
+  `type(exc).__name__`.
+- Also settable per `SandboxPool` checkout, and on `AgentSandbox` / `AsyncAgentSandbox` (it applies
+  to the errors a session's tools raise and to `resume(step, error=...)`). The journal records the
+  text the guest saw, so a replay sends the same text whatever the setting at load time.
 
 ## Per-call tool deadline
 
