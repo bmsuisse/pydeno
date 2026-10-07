@@ -81,6 +81,7 @@ collect_ignore = (
         "test_linux_resource_probes.py",
         "test_worker_signal_authority.py",
         "test_errors_taxonomy.py",
+        "test_free_threaded_refusal.py",
         "test_classify_empty_root.py",
         "test_preflight.py",
         "test_seatbelt_profile.py",

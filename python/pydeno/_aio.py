@@ -63,6 +63,7 @@ from ._isolated import (
     _check_wire_limits,
     _DEFAULT,
     _HostCallBudgetExceeded,
+    _refuse_free_threaded,
     _Outlasted,
     _TimedCall,
     MAX_ABANDONED_TOOL_CALLS,
@@ -741,6 +742,7 @@ class AsyncIsolatedRuntime:
             raise NotImplementedError(
                 "AsyncIsolatedRuntime currently supports POSIX only"
             )
+        _refuse_free_threaded()
         config = config or RuntimeConfig()
         for attr in _UNSUPPORTED_CONFIG:
             if getattr(config, attr, None) is not None:
