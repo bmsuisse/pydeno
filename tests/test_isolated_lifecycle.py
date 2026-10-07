@@ -45,6 +45,12 @@ class TestNoLeaks:
         from pydeno import IsolatedRuntime, RuntimeConfig, WorkerCrashed, RuntimeTimeout
         import pydeno._isolated as _impl
 
+        # Degraded matrix cells (PYDENO_EXPECT_SANDBOX names fewer layers): "require" refuses there,
+        # and this fresh interpreter has not run the suite's conftest, so say "auto" the same way.
+        import os as _os
+        if _os.environ.get("PYDENO_EXPECT_SANDBOX") not in (None, "landlock+seccomp", "seatbelt"):
+            IsolatedRuntime.__init__.__kwdefaults__["sandbox"] = "auto"
+
         # The pre-started spare worker is a deliberate extra child; leak accounting is about
         # the workers a run creates, so keep the spare out of it (it has its own tests).
         _impl._refill_spare = lambda: None
@@ -167,6 +173,12 @@ class TestOrphans:
         """
         import sys, threading, time
         from pydeno import IsolatedRuntime, RuntimeConfig
+
+        # Degraded matrix cells (PYDENO_EXPECT_SANDBOX names fewer layers): "require" refuses there,
+        # and this fresh interpreter has not run the suite's conftest, so say "auto" the same way.
+        import os as _os
+        if _os.environ.get("PYDENO_EXPECT_SANDBOX") not in (None, "landlock+seccomp", "seatbelt"):
+            IsolatedRuntime.__init__.__kwdefaults__["sandbox"] = "auto"
 
         rt = IsolatedRuntime(RuntimeConfig(), request_timeout=None, max_memory=None)
         print(rt._proc.pid, flush=True)
