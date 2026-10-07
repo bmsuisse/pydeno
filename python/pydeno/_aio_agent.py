@@ -20,6 +20,12 @@ other way round. Everything the guest sends is untrusted data, exactly as for `A
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = ["asyncio", "inspect"]
+
 import asyncio
 import collections
 import collections.abc
@@ -38,6 +44,8 @@ from ._agent import (
     _MAX_ABANDONED_CALLS,
     _MISSING,
     _SESSION_IDS,
+    _regate_hook,
+    _replayed_runs,
     DEFAULT_MAX_JOURNAL_BYTES,
     DEFAULT_MAX_PAUSE,
     DEFAULT_TIMEOUT,
@@ -63,7 +71,16 @@ from ._agent import (
 )
 from ._aio import AsyncIsolatedRuntime
 from ._gate import DEFAULT_GATE_TIMEOUT, _hook
-from ._isolated import WorkerCrashed
+from ._isolated import (
+    MAX_ABANDONED_TOOL_CALLS,
+    WorkerCrashed,
+    _Outlasted,
+    _TimedCall,
+    _await,
+    _call_with_deadline,
+    abandoned_message,
+    tool_timeout_error,
+)
 from ._limits import limit_seconds as _limit_seconds
 from ._result import (
     DEFAULT_MAX_OUTPUT_BYTES,
@@ -121,6 +138,8 @@ class _Core:
         self.ids = itertools.count(1)
         self.run: _AsyncRun | None = None
         self.abandoned: list[asyncio.Future[Any]] = []
+        # Tools that outlasted `tool_timeout` and still run (see `AsyncAgentSandbox._call_tool`).
+        self.outlasted = _Outlasted()
         self.closed = False
         self.task: asyncio.Task[None] | None = None
         # JavaScript run before the next run's code (not journaled): see `_SessionBase._install`.
@@ -300,6 +319,7 @@ class AsyncAgentSandbox(_SessionBase):
         random_seed: int | None = None,
         timeout: float | None = DEFAULT_TIMEOUT,
         max_pause: float | None = DEFAULT_MAX_PAUSE,
+        tool_timeout: float | None = None,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
@@ -311,6 +331,7 @@ class AsyncAgentSandbox(_SessionBase):
         self._gate = _hook(gate, gate_timeout, who="AsyncAgentSandbox", sync_only=False)
         timeout = _limit_seconds("timeout", timeout)
         max_pause = _limit_seconds("max_pause", max_pause)
+        tool_timeout = _limit_seconds("tool_timeout", tool_timeout)
         if runtime is not None:
             clock, random_seed = self._adopt_arguments(
                 "AsyncAgentSandbox",
@@ -343,6 +364,7 @@ class AsyncAgentSandbox(_SessionBase):
                 random_seed=self._random_seed,
                 request_timeout=timeout,
                 max_host_wait=max_pause,
+                tool_timeout=tool_timeout,
                 **runtime_options,
             )
         else:
@@ -350,7 +372,7 @@ class AsyncAgentSandbox(_SessionBase):
             rt = runtime
             self._executor = runtime._handler_executor  # noqa: SLF001
             self._check_prepared(rt)
-            self._install(rt, sink, timeout, max_pause)
+            self._install(rt, sink, timeout, max_pause, tool_timeout)
         self._core = _Core(
             rt,
             next(_SESSION_IDS),
@@ -400,6 +422,7 @@ class AsyncAgentSandbox(_SessionBase):
                     return await core.on_tool_call(name, list(args))
 
                 shim.__name__ = name
+                shim._pydeno_untimed = True  # type: ignore[attr-defined] # see `_agent._Shim`
                 return shim
 
             shims = {name: shim_for(name) for name in self._tools}
@@ -413,6 +436,7 @@ class AsyncAgentSandbox(_SessionBase):
                 async def catalog_call(name: Any = None, *args: Any) -> Any:
                     return await core.on_catalog_call(name, list(args))
 
+                catalog_call._pydeno_untimed = True  # type: ignore[attr-defined]
                 await core.rt.bind_function(_CATALOG_CALL, catalog_call)
             await core.rt.eval(
                 self._clock_js
@@ -596,6 +620,10 @@ class AsyncAgentSandbox(_SessionBase):
             # task noticed the death. Its tool was never part of the recorded run: do not run it.
             raise WorkerCrashed("the worker died while the run was in progress")
         fn, args = self._check_call(call)
+        core = self._core
+        limit = core.rt._tool_timeout  # noqa: SLF001
+        if limit is not None:
+            return self._check_result(call, await self._call_timed(fn, args, limit))
         if inspect.iscoroutinefunction(fn):
             result = await fn(*args)
         else:
@@ -611,6 +639,53 @@ class AsyncAgentSandbox(_SessionBase):
             if inspect.isawaitable(result):
                 result = await result
         return self._check_result(call, result)
+
+    async def _call_timed(
+        self, fn: Callable[..., Any], args: tuple[Any, ...], limit: float
+    ) -> Any:
+        """`_call_tool`'s call under `tool_timeout`: an async tool is cancelled at the deadline, a
+        plain one is abandoned on its thread (its late result dropped). With too many abandoned
+        and still running, the worker is killed and the run ends with `WorkerCrashed`."""
+        core = self._core
+        outlasted = core.outlasted
+
+        def too_many(count: int) -> None:
+            core.rt._kill((WorkerCrashed, abandoned_message(limit, count)))  # noqa: SLF001
+
+        if inspect.iscoroutinefunction(fn):
+            return await _call_with_deadline(fn(*args), limit, outlasted, too_many)
+        loop = asyncio.get_running_loop()
+        call = _TimedCall()
+        context = contextvars.copy_context()
+
+        def tracked() -> Any:
+            if not outlasted.begin(call):
+                return None  # given up on while it waited for a thread: never runs
+            try:
+                return context.run(fn, *args)
+            finally:
+                outlasted.finish(call)
+
+        started = loop.time()
+        fut = loop.run_in_executor(
+            self._executor or _aio._pool("handlers"),  # noqa: SLF001
+            tracked,
+        )
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+        done, _ = await asyncio.wait({fut}, timeout=limit)
+        if not done:
+            count = outlasted.abandon(call)
+            fut.cancel()  # still queued for a thread: it never starts
+            if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+                too_many(count)
+            raise tool_timeout_error()
+        result = fut.result()
+        if inspect.isawaitable(result):
+            left = max(limit - (loop.time() - started), 0.001)
+            result = await _call_with_deadline(
+                _await(result), left, outlasted, too_many
+            )
+        return result
 
     async def _start(self, code: str) -> Step:
         if not isinstance(code, str):
@@ -668,10 +743,12 @@ class AsyncAgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         associated_data: bytes = b"",
         tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
+        regate_replay: bool = False,
         **options: Any,
     ) -> AsyncAgentSandbox:
         """Rebuild a session from a journal (`dump()` output of this class or of `AgentSandbox`)
-        by replaying it on a fresh worker. See `AgentSandbox.load`."""
+        by replaying it on a fresh worker. See `AgentSandbox.load`, including ``regate_replay``
+        (the gate may be async here; it is awaited)."""
         if isinstance(blob, (bytes, bytearray)) and len(blob) > _OFFLOAD_BYTES:
             journal = await asyncio.get_running_loop().run_in_executor(
                 _aio._pool("codec"),  # noqa: SLF001
@@ -686,6 +763,13 @@ class AsyncAgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
+        hook = _regate_hook(
+            options, regate_replay, "AsyncAgentSandbox", sync_only=False
+        )
+        if hook is not None:
+            sources, names = _replayed_runs(journal)
+            for source in sources:
+                await hook.acheck(source, "replay", names)
         token = _JOURNAL_TOOLS.set(frozenset(journal["config"]["tools"]))
         try:
             session = cls(entries, **arguments, **options)
@@ -750,6 +834,7 @@ async def apreinstall(
             return await core.on_tool_call(name, list(args))
 
         shim.__name__ = name
+        shim._pydeno_untimed = True  # type: ignore[attr-defined] # see `_agent._Shim`
         return shim
 
     shims = {name: shim_for(name) for name in names}

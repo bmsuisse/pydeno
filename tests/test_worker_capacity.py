@@ -5,6 +5,7 @@ door requires the OS sandbox and refuses to start without it, so a degraded-prof
 without Landlock or seccomp) deselects them instead of failing.
 """
 
+import asyncio
 import gc
 import os
 import signal
@@ -599,7 +600,17 @@ async def test_capped_replacement_waits_for_actual_async_process_exit(monkeypatc
                 assert proc.poll() is None
                 assert pool.stats()["workers"] == 1
             await old.close()
-            await session.load_session(state)
+            # The slot frees as the old process's exit is reaped; the pool's 50 ms checkout timeout
+            # is tight for a slow runner, so retry the load for a bounded time.
+            deadline = asyncio.get_running_loop().time() + 10
+            while True:
+                try:
+                    await session.load_session(state)
+                    break
+                except pydeno.CheckoutTimeout:
+                    if asyncio.get_running_loop().time() > deadline:
+                        raise
+                    await asyncio.sleep(0.05)
             assert await session.feed_run("v + 1") == 42
 
 

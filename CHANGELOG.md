@@ -1,5 +1,134 @@
 # Changelog
 
+## 0.11.0 — 2026-10-07
+
+### Changed (breaking defaults, security review of 0.10.0)
+
+- **`sandbox` now defaults to `"require"`** for `IsolatedRuntime`, `AsyncIsolatedRuntime` and
+  `configure_default_runtime(isolated=True)` (and so `pydeno.eval()`), like `Pydeno`. Before, `"auto"`
+  silently started with no OS sandbox where the kernel or container profile blocked Landlock or
+  seccomp, with only a warning (#127). Pass `sandbox="auto"` to keep the old behaviour; it now also
+  logs through the `pydeno` logger and sets `rt.sandbox_degraded`.
+- **Finite defaults for code you do not trust:** `max_host_calls` defaults to 10,000 per runtime
+  (`None` removes it) and `max_host_wait` to 60 s per command, down from 600 s (#132).
+
+### Added
+
+- **Opt-in fork-from-template worker start (Linux), issue #72.** `pydeno.enable_fork_template()` (or
+  `PYDENO_FORK_TEMPLATE=1`) starts sandboxed workers as a `fork()` of a prepared, single-threaded template
+  process instead of a fresh interpreter. The OS sandbox, self-test, limits and V8 start-up all run in the
+  forked child exactly as before. Off by default, and nothing changes unless you turn it on. **Trade-offs:**
+  workers of one template share an address-space layout (including V8's code, which is statically linked
+  into `_pydeno`, a module the template imports; only V8's heap and seed are per worker), the stack canary,
+  the pointer guard, Python's hash seed and `id()` layout (Python reseeds `random` after a fork). Rotation
+  (`max_forks` 64, `max_age_seconds` 300) bounds how many workers share a layout, not their lifetime nor how
+  many tenants are live on one template at once. The self-test's "parent" probes target the template, not
+  the host. `sandbox_status().worker_start` is the configured mode; `IsolatedRuntime.worker_start` (and the
+  async one) says how a worker really started, and a failed template start falls back to a fresh interpreter
+  (logged, counted in `sandbox_status()` warnings). The host keeps authority over its workers: if the
+  template dies the host kills them, and the template shuts down after every other exit hook; the
+  template holds a finished worker's pid until the host has its status (no recycled-pid kill), relays
+  every worker's real exit status (a seccomp kill still reads as a sandbox violation, the memory-limit exit
+  code still as `max_memory`), answers are matched by sequence number, and no lock is held while waiting.
+  In a host that `fork()`s, each child starts its own template. See "Faster worker start" in the advanced
+  guides. Measured (Linux x86_64, release build, 25 interleaved pairs): new sandboxed worker plus first call
+  63.3 ms (exec) to 21.5 ms (fork template); 50 `SandboxPool` checkouts in a row against a pool of 4:
+  about 1120 ms to about 365 ms. Needs native aarch64 verification (x86_64 Linux and the review findings
+  are covered by `tests/test_fork_template.py`).
+- `empty_root` accepts `"auto"`, `"require"` or `"off"` (`True`/`False` still work).
+  `empty_root="require"` refuses to start without the empty-root layer; `sandbox="require"` still
+  does not demand it. `sandbox_status()` gains `hardened` (complete plus the empty-root layer) and
+  says so when a host is complete but not hardened (#129).
+- **Dependencies refreshed.** Rust and Python lockfiles updated (`criterion` 0.8 and higher
+  minimums for `tokio`, `uuid` and `indexmap`). The engine stays on V8 15.0 (`rusty_v8` 150.4),
+  which is what `deno_core` 0.412.0 (Deno 2.9.7, the newest release) is built for. A V8 15.2
+  build (`rusty_v8` 152.2) was tried with vendored patches (`Global::open` became `unsafe`, and
+  the `--no-validate-asm` flag was removed) and is **not shipped**: it needed unaudited `unsafe`
+  in `deno_core`, and CI showed intermittent allocator aborts on macOS that the stock build did
+  not (2 in about 24 macOS jobs, none in 18 on `main`). It is kept on the `chore/v8-152` branch
+  until a `deno_core` release supports a newer V8. `tests/test_v8_flags_accepted.py` fails if
+  V8 ever rejects a start-up flag (V8 stops parsing at the first unknown flag and ignores the
+  rest), which is what happened with 15.2.
+- **Python 3.15 builds.** PyO3 and `pyo3-async-runtimes` are bumped to 0.29 (the 0.27 series stops
+  at 3.14), `#[pyclass]` types that are `Clone` keep their by-value `FromPyObject` explicitly
+  (`from_py_object`), and the 3.15 classifier and CI cells are added. Verified here: a debug build
+  on CPython 3.15.0rc2 on x86_64 Linux and the test suite on it. Not verified: aarch64, macOS,
+  Windows, the Linux sandbox matrix on 3.15, and free-threaded 3.15t (still unsupported).
+- **PEP 810 lazy imports on 3.15.** The parent-side modules declare `__lazy_modules__` for the
+  heavy stdlib they import (`asyncio`, `concurrent.futures`, `inspect`, `subprocess`, `tempfile`,
+  `logging`, `hashlib`, ...), so `import pydeno; pydeno.IsolatedRuntime` no longer loads asyncio,
+  and a synchronous program never does. It is a plain list, so it does nothing on 3.10-3.14. The
+  isolation worker's imports stay eager on purpose: it applies its sandbox after importing. Before
+  every `fork()` the package resolves its own lazy imports, so a child never inherits a module lock
+  held by a thread that is mid-import (found when a fork-in-flight test hung on 3.15).
+  Measured on a loaded machine with a debug build: `import pydeno` plus `IsolatedRuntime` went from
+  about 38 ms to about 18 ms.
+
+- **`load(regate_replay=True)`** on `AgentSandbox` and `AsyncAgentSandbox` re-runs the session's
+  gate over every recorded run before any worker starts, so a tightened `static_gate` policy applies
+  to stored sessions (`GateDenied`); off by default, as replay stays deterministic. The gate's
+  identity is not bound into the journal, and `Pydeno` / `PydenoSession` loads do not take it (their
+  journal holds wrapped feeds, not the code the gate saw). See `docs/guides/gate.md` (#134).
+- **`tool_timeout=`: an opt-in per-call deadline for host tools that run in the parent** (the
+  smaller step of #45 item 5). On `IsolatedRuntime`, `AsyncIsolatedRuntime`, `SandboxPool` /
+  `AsyncSandboxPool` (per pool or checkout), `AgentSandbox` / `AsyncAgentSandbox` and, as
+  `limits={"tool_timeout_secs": ...}`, `Pydeno` / `AsyncPydeno`. One call to a bound host function
+  (`bind_function`, `bind_object`, `ToolBridge`, agent tools) that runs longer fails in the guest
+  with a catchable `TimeoutError("host function timed out")` (the same text whatever
+  `redact_host_errors` says) and the command goes on. Async handlers are cancelled; a synchronous
+  one cannot be interrupted, so with the option set it runs on a thread of its own, which is
+  abandoned, and its late result is discarded. More than 8 abandoned calls still running end the
+  session (`WorkerCrashed`: "too many abandoned tool calls in this session"). Time in the tool still
+  counts toward `max_host_wait`; `max_host_calls` and `max_inflight_host_calls` are unchanged. In
+  agent sessions a timed-out call is journaled as a failed call and replays as exactly that failure,
+  never re-running the tool. Default `None`: nothing changes. See `docs/guides/advanced/isolation.md`.
+
+- Windows is stated as untested in the README: the sandboxed runtimes are POSIX-only, and the
+  Windows CI cells stay experimental.
+
+### Fixed
+
+- **A host that is PID 1 (a container's main process) could not start a sandboxed worker.** The
+  worker reported "orphaned" because its parent's pid was 1. It now records its parent at start-up and
+  refuses only when that changes (#128).
+- **Op capability tokens now carry the full 53 bits of entropy** (#130). They were cut from the
+  first 8 bytes of a UUIDv4, whose version nibble pinned bit 52 to 0 (52 bits). They now use the 64
+  random bits of the UUID that the format does not fix. A unit test checks every bit is drawn.
+- **The wire decoder refuses out-of-range number literals and duplicate object keys** (#136).
+  `1e999999` used to decode to `inf` (non-finite values must use `{"$":"f","v":"inf"}`), and
+  `{"t":"result","t":"call",...}` decoded as the last spelling. Both now raise `WireError`, in the
+  native decoder and in `_wire.loads`. A repeated key is refused at any depth.
+- **The snapshot and journal engine tag no longer falls back to `"unknown"`.** `sign_snapshot`,
+  `verify_snapshot` and the journal `release` field now use an identity compiled into the extension
+  (pydeno version, target triple, V8 version; `_pydeno._build_identity()`) instead of package
+  metadata, so a rebuilt wheel with another V8 is refused, and a build that cannot read it raises
+  instead of accepting every other unknown build's data. Snapshots signed and journals dumped by
+  0.10.0 no longer verify or load: sign and dump them again (#133).
+- **Guest-visible error text no longer names the host (#131).** In an isolated worker, a BigInt
+  past CPython's int-to-str digit limit now reads "BigInt value is too large to transfer" (it
+  carried `sys.set_int_max_str_digits()`), serialization size and depth rejections read
+  "Serialization size limit exceeded" / "Serialization depth limit exceeded" (they carried the
+  exact limit, `RuntimeConfig(max_serialization_bytes=...)` and a docs path), and a denied module
+  reads "Module resolution denied for X" (it hinted at `add_static_module()`). An in-process
+  `Runtime` keeps its guiding text. Cost: the host-side exception from an isolated runtime is terse
+  too, so the limit values must be read from your own `RuntimeConfig`.
+- **`Error.prepareStackTrace` is pinned in the isolated worker (#131).** It is non-writable and
+  non-configurable after the host's bootstrap, so a guest can no longer install a hook to read the
+  `ext:` file names of every frame, and the pinned formatter drops pydeno's own `ext:` frames
+  (`callSync (ext:pydeno/python_bridge.js:...)`) from `error.stack`. Guest frames and the error
+  header are unchanged. A plain `Runtime` still shows bridge frames.
+- **Docs and red-team drift (#135).** `docs/contributing/security-review-prep.md` no longer lists
+  the bridge globals as writable (fixed in 0.8.0, now pinned by a test) or a late `bind_function`
+  as silently inert (it fails loudly, now pinned for `IsolatedRuntime`); the syscall sweep reports
+  `uprobe`/`uretprobe` as a kernel seccomp pass-through and a red-team test pins that no other
+  syscall is reachable outside the filter's allow-list; `SECURITY.md` says `redact_host_errors`
+  defaults to `True` and what turning it off exposes, and lists "no PID 1" and the sandbox default
+  under hardening.
+
+- **`pydeno.eval()` from a thread that inherited its parent's context** (free-threaded builds,
+  and any build with `thread_inherit_context`) panicked with "Runtime is unsendable, but sent to
+  another thread": the owner is now checked before the inherited runtime is touched.
+
 ## 0.10.0 — 2026-10-06
 
 ### Added

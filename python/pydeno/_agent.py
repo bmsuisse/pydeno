@@ -26,6 +26,19 @@ The tools run with the host's full authority; validate their arguments.
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = [
+    "asyncio",
+    "concurrent.futures",
+    "hashlib",
+    "inspect",
+    "logging",
+    "secrets",
+]
+
 import asyncio
 import base64
 import collections
@@ -46,6 +59,7 @@ import queue
 import re
 import secrets
 import threading
+import time
 import types
 import typing
 import weakref
@@ -57,7 +71,14 @@ from typing import Any
 from ._gate import DEFAULT_GATE_TIMEOUT, _hook
 from ._isolated import (
     _CONFIG_KEYS,
+    MAX_ABANDONED_TOOL_CALLS,
     IsolatedRuntime,
+    _Outlasted,
+    _TimedCall,
+    _await,
+    _call_with_deadline,
+    abandoned_message,
+    tool_timeout_error,
     _checked_console,
     _clock_ms,
     _limit_int,
@@ -896,6 +917,8 @@ class _Core:
         self._loop_lock = threading.Lock()
         # The session's own thread for plain tools in runs driven by `_drive` (started lazily).
         self.tools = _ToolThread(f"pydeno-agent-tool-{session_id}")
+        # Tools that outlasted `tool_timeout` and still run (see `AgentSandbox._run_tool`).
+        self.outlasted = _Outlasted()
         # A tool of this session is running (on its loop or its tool thread): closing then must
         # not wait for either, since the tool may never return.
         self.tool_busy = False
@@ -925,6 +948,13 @@ class _Core:
                     self.loop = None
                     raise
             return self.loop
+
+    def replace_tool_thread(self) -> None:
+        """A tool is stuck on the tool thread (it outlasted `tool_timeout`): let that thread
+        finish on its own and give later plain tools a new one, on the same budget."""
+        old = self.tools
+        self.tools = _ToolThread(f"pydeno-agent-tool-{self.session_id}", old.budget)
+        old.close()
 
     def count_loop(self) -> None:
         """On the loop thread, before its first tool: charge the loop thread to the session's
@@ -1394,6 +1424,7 @@ class _SessionBase:
         sink: _ConsoleSink,
         timeout: float | None,
         max_pause: float | None,
+        tool_timeout: float | None = None,
     ) -> None:
         """Make an adopted runtime this session's: its console feeds the session's capture, the
         session's deadlines replace the ones it was handed out with, and, if the worker was
@@ -1405,6 +1436,7 @@ class _SessionBase:
             {
                 "_request_timeout": _limit_seconds("timeout", timeout),
                 "_max_host_wait": _limit_seconds("max_pause", max_pause),
+                "_tool_timeout": _limit_seconds("tool_timeout", tool_timeout),
             }
         )
         self._redact = bool(runtime._redact)  # noqa: SLF001
@@ -1657,7 +1689,7 @@ class _SessionBase:
             "max_tool_calls": self._max_tool_calls,
             "namespace": self._namespace,
             "tools": list(self._tools),
-            "release": _engine_version().decode(errors="replace"),
+            "release": _engine_version().decode("ascii"),
             "redact": self._redact,
         }
         # Only when they differ from what a journal without them means, so a session that
@@ -1681,7 +1713,7 @@ class _SessionBase:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """`load`'s checks, before any worker starts: (tools, constructor keyword arguments)."""
         config = journal["config"]
-        made_by = _engine_version().decode(errors="replace")
+        made_by = _engine_version().decode("ascii")
         if config["release"] != made_by:
             # Before any worker starts: replaying under another engine would only fail later, as
             # a divergence, after running the guest's code.
@@ -1742,6 +1774,15 @@ class _SessionBase:
                 "max_result_bytes", DEFAULT_MAX_RESULT_BYTES
             ),
         }
+
+
+class _StopRun(BaseException):
+    """Internal: end the run in progress, as lost, for `reason` (too many tools that outlasted
+    `tool_timeout` are still running). Not an `Exception`, so no tool answer is made of it."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class _InlineRun:
@@ -1946,6 +1987,9 @@ class _Shim:
     answers it), the session's loop otherwise (which hands it to `start`/`resume`)."""
 
     __slots__ = ("catalog", "name", "slot")
+    # The runtime's `tool_timeout` must not apply to the shim itself, which in `start`/`resume`
+    # waits for the caller's answer: the session applies it to the tool it runs (`_run_tool`).
+    _pydeno_untimed = True
 
     def __init__(self, slot: _Slot, name: str, catalog: bool = False) -> None:
         self.slot = slot
@@ -2081,6 +2125,16 @@ class AgentSandbox(_SessionBase):
             a tool call does not count. Exceeding it kills the worker and closes the session.
         max_pause: Most time (seconds) one run may spend waiting on tool answers in total, so a
             session nobody resumes does not hold a worker forever. Exceeding it closes the session.
+        tool_timeout: Most time (seconds, default None: off) one tool the session runs itself
+            (`run`, `execute`) may take. Past it the guest's call fails with a `TimeoutError`
+            ("host function timed out", whatever ``redact_host_errors`` says), the run goes on,
+            an async tool is cancelled, and a plain tool, which cannot be interrupted, is
+            abandoned on its thread (its late result is dropped; later plain tools get a new
+            thread). The failure is journaled like any failed call, so a replay sends the same
+            error and never runs the tool again. With 8 abandoned tools still running the worker
+            is killed and the run fails with `WorkerCrashed`. Not applied to calls you answer
+            yourself with `start`/`resume` or `call()`. Time in the tool counts toward
+            ``max_pause``.
         max_journal_bytes: Cap on the recorded journal. Past it the session keeps working, but
             `dump()` raises `JournalError`.
         max_output_bytes: Cap on each of a run's `stdout` and `stderr` (console output, carried
@@ -2104,7 +2158,7 @@ class AgentSandbox(_SessionBase):
             decide, `GateUnavailable`), and nothing is journaled, charged or sent to the worker.
             The gate sees exactly the code that then runs, and ``context.tools`` lists the
             session's tools. Not consulted when `load` replays a journal (every run in it passed
-            the gate when it first ran). See ``docs/guides/gate.md``.
+            the gate when it first ran) unless `load` gets ``regate_replay=True``. See ``docs/guides/gate.md``.
         gate_timeout: Seconds the gate may take (default 10); a later verdict is discarded.
         **runtime_options: Passed to `IsolatedRuntime` (``config``, ``max_memory``, ``sandbox``,
             ``redact_host_errors``, ...). ``config.timeout`` is refused: a soft timeout would also
@@ -2123,6 +2177,7 @@ class AgentSandbox(_SessionBase):
         random_seed: int | None = None,
         timeout: float | None = DEFAULT_TIMEOUT,
         max_pause: float | None = DEFAULT_MAX_PAUSE,
+        tool_timeout: float | None = None,
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES,
@@ -2134,6 +2189,7 @@ class AgentSandbox(_SessionBase):
         self._gate = _hook(gate, gate_timeout, who="AgentSandbox", sync_only=True)
         timeout = _limit_seconds("timeout", timeout)
         max_pause = _limit_seconds("max_pause", max_pause)
+        tool_timeout = _limit_seconds("tool_timeout", tool_timeout)
         if runtime is not None:
             clock, random_seed = self._adopt_arguments(
                 "AgentSandbox",
@@ -2164,13 +2220,14 @@ class AgentSandbox(_SessionBase):
                 random_seed=self._random_seed,
                 request_timeout=timeout,
                 max_host_wait=max_pause,
+                tool_timeout=tool_timeout,
                 **runtime_options,
             )
         else:
             rt = runtime
             self._check_prepared(rt)  # a refusal leaves it with the caller
             try:
-                self._install(rt, sink, timeout, max_pause)
+                self._install(rt, sink, timeout, max_pause, tool_timeout)
             except BaseException:
                 rt.close()
                 raise
@@ -2414,11 +2471,15 @@ class AgentSandbox(_SessionBase):
                 return
             run.active = False
         rt = self._core.rt
-        name = type(exc).__name__
-        rt._kill_reason = (  # noqa: SLF001 - reported by the pump as the worker's death
-            f"a tool raised {name if _SAFE_ERROR_NAME.fullmatch(name) else 'BaseException'}, "
-            "which is not an answer; the run was stopped"
-        )
+        if isinstance(exc, _StopRun):
+            reason = exc.reason
+        else:
+            name = type(exc).__name__
+            reason = (
+                f"a tool raised {name if _SAFE_ERROR_NAME.fullmatch(name) else 'BaseException'}, "
+                "which is not an answer; the run was stopped"
+            )
+        rt._kill_reason = reason  # noqa: SLF001 - reported by the pump as the worker's death
         rt._kill()  # noqa: SLF001
 
     async def _run_tool(self, run: _InlineRun, call: ToolCall) -> Any:
@@ -2436,11 +2497,19 @@ class AgentSandbox(_SessionBase):
         except _ThreadsExhausted as exc:
             core.note_refusal(exc)
             raise _unavailable() from None
+        limit = core.rt._tool_timeout  # noqa: SLF001
         core.tool_busy = True
         try:
             if inspect.iscoroutinefunction(fn):
                 # A task made inside the context runs in (a copy of) it.
-                return await context.run(loop.create_task, fn(*args))
+                task = context.run(loop.create_task, fn(*args))
+                if limit is None:
+                    return await task
+                return await _call_with_deadline(
+                    task, limit, core.outlasted, self._stop_when_over(limit)
+                )
+            if limit is not None:
+                return await self._run_timed_plain(fn, args, context, limit)
             try:
                 submitted = core.tools.submit(context.run, fn, *args)
             except _ThreadsExhausted as exc:
@@ -2452,6 +2521,60 @@ class AgentSandbox(_SessionBase):
             return result
         finally:
             core.tool_busy = False
+
+    @staticmethod
+    def _stop_when_over(limit: float) -> Callable[[int], None]:
+        """What to do when too many tools that outlasted `tool_timeout` are still running: stop
+        the run the way a tool raising a non-`Exception` does (see `_inline_call`)."""
+
+        def stop(count: int) -> None:
+            raise _StopRun(abandoned_message(limit, count))
+
+        return stop
+
+    async def _run_timed_plain(
+        self,
+        fn: Callable[..., Any],
+        args: tuple[Any, ...],
+        context: contextvars.Context,
+        limit: float,
+    ) -> Any:
+        """A plain tool under `tool_timeout`: on the session's tool thread, which is abandoned
+        (and replaced) when the deadline passes."""
+        core = self._core
+        outlasted, call = core.outlasted, _TimedCall()
+
+        def tracked() -> Any:
+            if not outlasted.begin(call):
+                return None  # given up on while it waited its turn: never runs
+            try:
+                return context.run(fn, *args)
+            finally:
+                outlasted.finish(call)
+
+        try:
+            submitted = core.tools.submit(tracked)
+        except _ThreadsExhausted as exc:
+            core.note_refusal(exc)
+            raise _unavailable() from None
+        started = time.monotonic()
+        wrapped = asyncio.wrap_future(submitted)
+        wrapped.add_done_callback(lambda f: f.cancelled() or f.exception())
+        done, _ = await asyncio.wait({wrapped}, timeout=limit)
+        if not done:
+            count = outlasted.abandon(call)
+            submitted.cancel()  # still queued: it never starts
+            core.replace_tool_thread()
+            if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+                raise _StopRun(abandoned_message(limit, count))
+            raise tool_timeout_error()
+        result = wrapped.result()
+        if inspect.isawaitable(result):
+            left = max(limit - (time.monotonic() - started), 0.001)
+            result = await _call_with_deadline(
+                _await(result), left, outlasted, self._stop_when_over(limit)
+            )
+        return result
 
     def call(self, step: ToolCall) -> Any:
         """Run the real tool for a `ToolCall` (what `run` does for each one) and return its
@@ -2537,9 +2660,16 @@ class AgentSandbox(_SessionBase):
         max_journal_bytes: int = DEFAULT_MAX_JOURNAL_BYTES,
         associated_data: bytes = b"",
         tools_catalog: Mapping[str, Any] | collections.abc.Sequence[Any] | None = None,
+        regate_replay: bool = False,
         **options: Any,
     ) -> AgentSandbox:
         """Rebuild a session from `dump()` output by replaying it on a fresh worker.
+
+        Replay does not consult ``gate=``, unless ``regate_replay=True``: then the gate (which
+        must be passed) is run over the source of every recorded run, in mode ``"replay"``, before
+        any worker starts, and a refusal raises `GateDenied` (`GateUnavailable` if it cannot
+        decide). Use it with a deterministic gate such as `static_gate`: a classifier that
+        answers differently now would refuse state that was fine when it ran.
 
         The MAC is checked before anything runs. Recorded tool answers are replayed; the real
         tools are never called. If the session was dumped while paused at a tool call, the
@@ -2551,6 +2681,11 @@ class AgentSandbox(_SessionBase):
         entries, arguments = cls._load_arguments(
             journal, tools, tools_catalog, max_journal_bytes, options
         )
+        hook = _regate_hook(options, regate_replay, "AgentSandbox", sync_only=True)
+        if hook is not None:
+            sources, names = _replayed_runs(journal)
+            for source in sources:
+                hook.check(source, "replay", names)
         token = _JOURNAL_TOOLS.set(frozenset(journal["config"]["tools"]))
         try:
             session = cls(entries, **arguments, **options)
@@ -2604,6 +2739,31 @@ class AgentSandbox(_SessionBase):
     def __repr__(self) -> str:
         state = "closed" if self.is_closed() else "paused" if self._paused else "idle"
         return f"AgentSandbox(tools={list(self._tools)!r}, {state}, calls={self.calls_made})"
+
+
+def _regate_hook(
+    options: Mapping[str, Any], regate_replay: bool, who: str, *, sync_only: bool
+) -> Any:
+    """The gate `load(regate_replay=True)` re-runs over the journal's runs (None when off)."""
+    if not regate_replay:
+        return None
+    if options.get("gate") is None:
+        raise ValueError(
+            "regate_replay=True needs a gate= to re-run over the replayed runs"
+        )
+    return _hook(
+        options["gate"],
+        options.get("gate_timeout", DEFAULT_GATE_TIMEOUT),
+        who=who,
+        sync_only=sync_only,
+    )
+
+
+def _replayed_runs(journal: dict[str, Any]) -> tuple[list[str], tuple[str, ...]]:
+    """The source of every run a journal replays, and the tool names the gate is told about."""
+    config = journal["config"]
+    names = tuple(config["tools"]) + tuple(config.get("catalog", ()))
+    return [r[1] for r in journal["records"] if r[0] == "run"], names
 
 
 def _replay_plan(

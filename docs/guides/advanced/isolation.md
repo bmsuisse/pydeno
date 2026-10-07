@@ -328,7 +328,10 @@ Monty.
   never-legitimate ones, death by `SIGSYS`; `tests/test_sandbox_violation.py` does the same from a
   real worker and checks that the parent reports `sandbox_violation`;
   `scripts/redteam_syscalls.py` sweeps all ~350 syscalls. Run them only inside a container
-  (`--network none --cap-drop all`).
+  (`--network none --cap-drop all`). The sweep's REACHABLE list includes `uprobe` (answers
+  `ENXIO`) and `uretprobe` (`SIGILL`): they are not in the filter, but Linux 6.11+/6.12+ lets
+  them bypass seccomp, and they do nothing without a registered uprobe. The red-team test pins
+  that no syscall other than the allow-listed, the argument-judged and these two is reachable.
 - **What a worker really calls:** `scripts/trace_worker_syscalls.py` runs workers under `strace`
   and lists every syscall made after the sandbox is up, with the kernel's answers. Run it natively
   on each architecture: under emulation the translator issues the host's syscalls, not the guest's.
@@ -369,6 +372,7 @@ What to do about it in your own code:
 | Parameter | Default | Effect |
 |---|---|---|
 | `max_host_wait` | 600 s | Total time a run may spend waiting on host callbacks; exceeding it raises `RuntimeTimeout` and kills the worker. `None` disables it (the CPU cap still applies) |
+| `tool_timeout` | `None` (off) | Most time one call to a bound host function (`bind_function`, `bind_object`, `ToolBridge`, agent tools) may take; see [Per-call tool deadline](#per-call-tool-deadline) |
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
 | `redact_host_errors` | `True` | Guest sees the exception class but only `"host function failed"` as message |
@@ -497,7 +501,7 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
   `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`, `max_inflight_host_calls`,
-  `write_stall_timeout`, `redact_host_errors`) can be set per checkout.
+  `write_stall_timeout`, `redact_host_errors`, `tool_timeout`) can be set per checkout.
 
 Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
 a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports
@@ -577,6 +581,48 @@ during the bridge’s type checks.
 
 A Proxy around a function crosses as the underlying function; invoking its Python wrapper
 skips the Proxy’s `apply` trap.
+
+## Per-call tool deadline
+
+`max_host_wait` bounds the *total* time a command spends in host calls. `tool_timeout=` (seconds,
+default `None`: off, nothing changes) bounds *one* call to a host function you bound, which is what
+you want when a single hung tool (a stuck database, a slow HTTP call) must not use up the whole
+budget:
+
+```python
+with IsolatedRuntime(tool_timeout=5) as rt:
+    rt.bind_function("lookup", slow_lookup)
+    rt.eval("try { lookup('x') } catch (e) { e.name + ': ' + e.message }")
+    # "TimeoutError: host function timed out" if slow_lookup took longer than 5 s
+```
+
+- **What the guest sees.** A catchable `TimeoutError` whose message is always
+  `host function timed out`. It is pydeno's own text and holds nothing of yours, so it is the same
+  with `redact_host_errors=True` and `False`. The command goes on.
+- **What happens to the handler.** An `async` handler is cancelled (a handler that swallows the
+  cancellation is abandoned after one second). A synchronous handler cannot be interrupted: with
+  `tool_timeout` set it runs on a thread of its own, in a copy of the caller's context, instead of
+  the thread that drives the command, so that thread can be abandoned; whatever it returns later is
+  discarded and nothing is sent for it.
+- **A cap on stuck threads.** Calls that outlasted the deadline and are still running are counted
+  (one that ends stops counting). With more than 8 of them the worker is killed and the command
+  raises `WorkerCrashed("too many abandoned tool calls in this session ...")`, so a guest cannot
+  pile up unbounded stuck threads by calling a hanging tool in a loop.
+- **Existing limits are unchanged.** Time in the tool still counts toward `max_host_wait` (and its
+  CPU cap), a timed-out call counts toward `max_host_calls` and `max_inflight_host_calls` like any
+  other, and `console` output, module loaders and the gate are not tool calls and are not covered.
+- **Where to set it.** `IsolatedRuntime` and `AsyncIsolatedRuntime`; per checkout or per pool on
+  `SandboxPool` / `AsyncSandboxPool` (it is one of `SESSION_OPTIONS`); `AgentSandbox` and
+  `AsyncAgentSandbox`; and `Pydeno` / `AsyncPydeno` as `limits={"tool_timeout_secs": ...}`.
+- **Agent sessions and replay.** A session applies the deadline to the tools it runs itself (`run`,
+  `execute`, `feed_run`, `resume_auto`), not to a call you answer with `start`/`resume`. A timed-out
+  call is journaled as a failed call (`TimeoutError`, `host function timed out`), so a replay sends
+  the guest exactly that failure and never runs the tool again. A plain tool still stuck on the
+  session's tool thread is left there and later plain tools get a fresh thread.
+
+This is the guest-visible half of running tools in a process of their own; the tool still runs in
+the parent, so it bounds a hung tool, not a tool that crashes or misuses the parent's memory (see
+[the design note](../../contributing/sandboxed-tool-process.md)).
 
 ## Console callback deadlines
 

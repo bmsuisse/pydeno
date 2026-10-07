@@ -141,6 +141,7 @@ pub(crate) fn normalize_timeout_to_ms(timeout: Option<&Bound<PyAny>>) -> PyResul
 /// Register `finalizer` to run via `weakref.finalize` when `target` is collected.
 pub(crate) fn attach_finalizer<T, F>(py: Python<'_>, target: &Py<T>, finalizer: F) -> PyResult<()>
 where
+    T: pyo3::PyTypeInfo,
     F: pyo3::PyClass + Into<pyo3::PyClassInitializer<F>>,
 {
     let finalize = py

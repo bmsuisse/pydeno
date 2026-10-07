@@ -138,8 +138,16 @@ disagree, the report wins and this page has a bug.
 | Item | Source |
 |---|---|
 | Decoder amplification: a 6 MB frame can become about 200 MB of Python objects. | Report |
-| Op tokens visible through `Function.prototype.toString`; bridge globals writable in older builds (round 3 notes "verified after the next build"); a guest that pre-defines a non-writable global makes a later `bind_function` silently inert. | Report |
-| Bridge frames and `ext:` paths visible in stack traces (path filtering open). | Report |
+| Op tokens visible through `Function.prototype.toString`. | Report |
+| Bridge frames and `ext:` paths in stack traces: `IsolatedRuntime` workers pin `Error.prepareStackTrace` (non-writable) and drop `ext:` frames from `error.stack` (#131); a plain `Runtime` still shows them. | Report; #131 |
+
+Closed since the reviews, kept so a reviewer does not re-report them:
+
+| Item | Status |
+|---|---|
+| Bridge globals (`__pydenoCallSync`, `__pydenoCallAsync`, `__host_op_sync__`, `__host_op_async__`, `__pydeno_bind_object`, `__pydeno_bind_function`, `__pydeno_from_py_stream`) writable. | Fixed in 0.8.0 (commit 5beee8f): `writable: false, configurable: false, enumerable: false`; assignment, `delete` and `defineProperty` fail. Pinned by `tests/test_isolated_guest_error_text.py`. |
+| A guest that pre-defines a non-writable global made a later `bind_function` silently inert. | It fails loudly: `bind_function` raises `JavaScriptError` ("Cannot bind 'x': ... read-only property") and the guest's value stays. Pinned for `Runtime` (`tests/test_bridge_poisoning.py`) and `IsolatedRuntime`. |
+
 | A huge source ignores `timeout=` while V8 parses it (plain `Runtime`; bounded by the frame cap in `IsolatedRuntime`). | Report |
 | Sparse-array natives on length `2**32-1` ignore V8 termination; unbounded in plain `Runtime`, killed by the hard deadline in `IsolatedRuntime`. | Report |
 | Journal rollback by someone who can write both the journal and its counter. | Report |

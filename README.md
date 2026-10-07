@@ -196,7 +196,7 @@ real libraries such as three.js, Vega and ECharts need much of the language, so 
 default only when those libraries still run (`strict_eval` stays opt-in for that reason). The containment is
 the process and the OS sandbox, not a minimal engine; there has been no independent outside security review
 yet (it is planned before 1.0, see the [roadmap](docs/roadmap.md)). The in-process `Runtime` is **not** safe for
-hostile code: use `Pydeno` / `IsolatedRuntime`. Windows has no isolated worker. For multi-tenant use, put the
+hostile code: use `Pydeno` / `IsolatedRuntime`. Windows has no isolated worker (and is not tested; see [How it was tested](#how-it-was-tested)). For multi-tenant use, put the
 whole process in a locked-down container or microVM ([deployment guidance](SECURITY.md)).
 Found a way out? Please report it privately, as described in [`SECURITY.md`](SECURITY.md).
 
@@ -403,6 +403,11 @@ and call budgets from outside and treats everything the worker sends as untruste
 ## How it was tested
 
 The sandbox is tested the way an attacker would try it: from inside, and against the real kernel.
+
+**Not tested on Windows.** The sandboxed runtimes (`IsolatedRuntime`, `Pydeno`, agent sandboxes) are
+POSIX-only (Linux and macOS) and are not supported on Windows, so their tests do not run there and
+CI reports the Windows cells as experimental. Only the in-process `Runtime` loads on Windows, it is
+not safe for hostile code, and it is not covered by the test suite described below.
 
 - **Assume-breach syscall sweeps.** A sandboxed process fires *every* syscall in the kernel's table
   with garbage arguments, from a fresh process each time, and records what is still reachable.

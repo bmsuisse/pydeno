@@ -29,6 +29,12 @@ either not root or can drop root.
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = ["ctypes", "platform"]
+
 import ctypes
 import json
 import os
@@ -42,7 +48,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import _sandbox
+from . import _sandbox, _template
 
 __all__ = ["Layer", "SandboxStatus", "sandbox_status"]
 
@@ -86,6 +92,15 @@ class SandboxStatus:
     termination: Layer = field(
         default_factory=lambda: Layer(False, "termination authority was not probed")
     )
+    #: `complete` and, on Linux, the empty-root layer too. `sandbox="require"` does not demand
+    #: that layer; `empty_root="require"` does.
+    hardened: bool = False
+    #: The *configured* way new workers are started: "exec" (a fresh interpreter each, the
+    #: default) or "fork-template" (opt-in: `enable_fork_template()`; workers of one template share
+    #: its address-space layout, V8's code image and stack canary). A start that falls back to exec
+    #: still reads "fork-template" here, with a warning; `IsolatedRuntime.worker_start` is what
+    #: really happened to one worker.
+    worker_start: str = "exec"
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -94,7 +109,9 @@ class SandboxStatus:
             "applied": self.applied,
             "required": sorted(self.required),
             "complete": self.complete,
+            "hardened": self.hardened,
             "warnings": list(self.warnings),
+            "worker_start": self.worker_start,
         }
         for name in _LAYER_FIELDS:
             out[name] = getattr(self, name).to_dict()
@@ -113,6 +130,11 @@ class SandboxStatus:
             ),
             f"  applied in probe: {self.applied}; required here: {sorted(self.required) or 'nothing known'}",
         ]
+        if self.complete and not self.hardened:
+            lines.append(
+                "  note: complete, but not hardened: the empty-root layer is missing, which "
+                "sandbox='require' does not demand (pass empty_root='require' to)"
+            )
         for name in _LAYER_FIELDS:
             layer: Layer = getattr(self, name)
             tag = (
@@ -232,6 +254,9 @@ def _reap(pid: int, *, killed: bool) -> None:
 def _confinement_probe() -> dict[str, Any]:
     """Runs in the throwaway child, mirroring what the worker does before its isolate exists."""
     out: dict[str, Any] = {}
+    parent = (
+        os.getppid()
+    )  # before anything else: the caller, which may legitimately be PID 1
     out["hardened"] = {
         k: v
         for k, v in _sandbox.harden_process().items()
@@ -252,7 +277,7 @@ def _confinement_probe() -> dict[str, Any]:
     out["missing"] = sorted(_sandbox.missing_layers(applied))
     if applied != "none" and not out["missing"]:
         try:
-            out["breaches"] = _sandbox.attest()
+            out["breaches"] = _sandbox.attest(parent=parent)
         except BaseException as exc:  # noqa: BLE001
             out["self_test_error"] = f"{type(exc).__name__}: {exc}"[:200]
     return out
@@ -627,6 +652,26 @@ def _sandbox_status() -> SandboxStatus:
             )
     if (time.monotonic() - start) > 0.3:
         warns.append("the probe took over 300 ms; this host is slow to fork")
+    worker_start = "fork-template" if _template.MANAGER.enabled else "exec"
+    if worker_start == "fork-template":
+        warns.append(
+            "workers start by forking a template (opt-in): workers from one template share its "
+            "address-space layout (V8's code image included), stack canary, pointer guard and "
+            "hash seed, so an information leak in one session helps against the next from the "
+            f"same template; at most {_template.MANAGER.max_forks} workers or "
+            f"{_template.MANAGER.max_age_seconds:g} s per template, which bounds how many share "
+            "a layout, not how long they live or how many run at once"
+        )
+        warns.append(
+            "worker_start is the configured mode; IsolatedRuntime.worker_start says how that "
+            "worker really started, and a failed template start silently falls back to a fresh "
+            "interpreter"
+        )
+        if _template.MANAGER.fallbacks:
+            warns.append(
+                f"{_template.MANAGER.fallbacks} worker start(s) fell back to a fresh interpreter "
+                f"(last: {_template.MANAGER.last_fallback})"
+            )
 
     return SandboxStatus(
         platform=plat,
@@ -643,5 +688,7 @@ def _sandbox_status() -> SandboxStatus:
         termination=termination,
         self_test=self_test,
         complete=complete,
+        hardened=complete and (not linux or empty_root.applied),
         warnings=warns,
+        worker_start=worker_start,
     )

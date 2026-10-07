@@ -27,6 +27,11 @@ _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 # Not collected there, which is the "deselected, never skipped" rule applied at file level.
 collect_ignore = (
     [
+        "test_secure_defaults.py",
+        "test_fork_template.py",
+        "test_sandbox_pid1.py",
+        "test_lazy_imports.py",
+        "test_isolated_guest_error_text.py",
         "test_agent_sandbox.py",
         "test_agent_async_lifecycle.py",
         "test_tool_catalog_budget.py",
@@ -104,10 +109,38 @@ collect_ignore = (
         "test_stream_source_owner.py",
         "test_sandbox_violation.py",
         "test_sandbox_canaries.py",
+        "test_tool_timeout.py",
     ]
     if sys.platform == "win32"
     else []
 )
+
+# `sandbox="require"` is the constructors' default. The matrix's degraded cells (a kernel that
+# denies Landlock or seccomp) run the whole suite, and "require" correctly refuses there, so on
+# those hosts only, the tests that do not pass `sandbox=` get "auto". `original_sandbox_defaults`
+# keeps what the signatures really say.
+_ORIGINAL_SANDBOX_DEFAULTS: dict[str, str] = {}
+
+
+def _degraded_hosts_default_to_auto() -> None:
+    if sys.platform == "win32":
+        return
+    from pydeno import AsyncIsolatedRuntime, IsolatedRuntime
+
+    for cls in (IsolatedRuntime, AsyncIsolatedRuntime):
+        kwdefaults = cls.__init__.__kwdefaults__
+        _ORIGINAL_SANDBOX_DEFAULTS[cls.__name__] = kwdefaults["sandbox"]
+        if _EXPECTED_SANDBOX is not None and _EXPECTED_SANDBOX not in _FULL_SANDBOXES:
+            kwdefaults["sandbox"] = "auto"
+
+
+_degraded_hosts_default_to_auto()
+
+
+@pytest.fixture(scope="session")
+def original_sandbox_defaults() -> dict[str, str]:
+    return dict(_ORIGINAL_SANDBOX_DEFAULTS)
+
 
 _PLATFORM_MARKERS = {
     "release_performance": os.environ.get("PYDENO_TEST_PROFILE") != "debug",

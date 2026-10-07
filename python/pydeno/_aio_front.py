@@ -14,6 +14,12 @@ is then over). A pool, and every session from it, belongs to the event loop it w
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = ["asyncio", "inspect"]
+
 import asyncio
 import contextvars
 import functools
@@ -76,7 +82,16 @@ from ._front import (
     _unpack,
 )
 from ._gate import DEFAULT_GATE_TIMEOUT, _hook
-from ._isolated import WorkerCrashed
+from ._isolated import (
+    MAX_ABANDONED_TOOL_CALLS,
+    WorkerCrashed,
+    _Outlasted,
+    _TimedCall,
+    _await,
+    _call_with_deadline,
+    abandoned_message,
+    tool_timeout_error,
+)
 from ._sandbox_pool import AsyncSandboxPool
 
 __all__ = ["AsyncPydeno", "AsyncPydenoSession", "AsyncPydenoSnapshot"]
@@ -236,6 +251,7 @@ class AsyncPydeno:
                 max_tool_calls=limits.max_tool_calls,
                 timeout=limits.timeout,
                 max_pause=limits.max_pause,
+                tool_timeout=limits.tool_timeout,
             )
         except BaseException:
             await rt.close()
@@ -269,6 +285,7 @@ class AsyncPydeno:
                 runtime=rt,
                 timeout=limits.timeout,
                 max_pause=limits.max_pause,
+                tool_timeout=limits.tool_timeout,
             )
         except asyncio.CancelledError:
             await rt.close()
@@ -409,6 +426,26 @@ class AsyncPydenoSession:
         )
         weakref.finalize(self, self._tools.close)
         weakref.finalize(self, self._console.close)
+        # Externals that outlasted `tool_timeout` and still run (see `_call_external`).
+        self._outlasted = _Outlasted()
+
+    def _replace_tools(self) -> None:
+        """A plain external is stuck on the tool thread (it outlasted `tool_timeout`): let that
+        thread finish on its own and give later ones a new one, on the same budget."""
+        old = self._tools
+        self._tools = _ToolThread(f"pydeno-front-tool-{self._sid}", old.budget)
+        weakref.finalize(self, self._tools.close)
+        old.close()
+
+    def _too_many_outlasted(self, limit: float) -> Callable[[int], None]:
+        def stop(count: int) -> None:
+            agent = self._agent
+            if agent is not None:
+                agent._core.rt._kill(  # noqa: SLF001
+                    (WorkerCrashed, abandoned_message(limit, count))
+                )
+
+        return stop
 
     async def __aenter__(self) -> AsyncPydenoSession:
         if self._entered:
@@ -694,10 +731,17 @@ class AsyncPydenoSession:
             # Each call in a fresh copy of the caller's context, marked as this session's tool.
             context = contextvars.copy_context()
             context.run(_TOOL_OF.set, self._sid)
+            limit = self._limits.tool_timeout
             if inspect.iscoroutinefunction(fn):
-                result = await context.run(
-                    asyncio.get_running_loop().create_task, fn(*args)
-                )
+                task = context.run(asyncio.get_running_loop().create_task, fn(*args))
+                if limit is None:
+                    result = await task
+                else:
+                    result = await _call_with_deadline(
+                        task, limit, self._outlasted, self._too_many_outlasted(limit)
+                    )
+            elif limit is not None:
+                result = await self._call_plain_timed(fn, args, context, limit)
             else:
                 # A plain function may block: never on the loop, and never on a thread another
                 # session uses (its thread-locals, or a wedged call, stay this session's).
@@ -721,6 +765,55 @@ class AsyncPydenoSession:
         except Exception as exc:  # noqa: BLE001 - the guest sees the failure
             return _MISSING, exc
         return result, None
+
+    async def _call_plain_timed(
+        self,
+        fn: Any,
+        args: tuple[Any, ...],
+        context: contextvars.Context,
+        limit: float,
+    ) -> Any:
+        """A plain external under `tool_timeout`: on the session's tool thread, which is
+        abandoned (and replaced) when the deadline passes."""
+        loop = asyncio.get_running_loop()
+        outlasted, call = self._outlasted, _TimedCall()
+
+        def tracked() -> Any:
+            if not outlasted.begin(call):
+                return None  # given up on while it waited its turn: never runs
+            try:
+                return context.run(fn, *args)
+            finally:
+                outlasted.finish(call)
+
+        try:
+            submitted = self._tools.submit(tracked)
+        except _ThreadsExhausted as exc:
+            self._refused = exc
+            self._refusals += 1
+            if self._refusals == 1:  # once per session; the rest are counted
+                _log.warning(
+                    "pydeno: session %d: a tool call was refused: %s", self._sid, exc
+                )
+            raise _unavailable() from None
+        started = loop.time()
+        wrapped = asyncio.wrap_future(submitted)
+        wrapped.add_done_callback(lambda f: f.cancelled() or f.exception())
+        done, _ = await asyncio.wait({wrapped}, timeout=limit)
+        if not done:
+            count = outlasted.abandon(call)
+            submitted.cancel()  # still queued: it never starts
+            self._replace_tools()
+            if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+                self._too_many_outlasted(limit)(count)
+            raise tool_timeout_error()
+        result = wrapped.result()
+        if inspect.isawaitable(result):
+            left = max(limit - (loop.time() - started), 0.001)
+            result = await _call_with_deadline(
+                _await(result), left, outlasted, self._too_many_outlasted(limit)
+            )
+        return result
 
     def _finish(self, step: Any) -> Any:
         if isinstance(step, Done):

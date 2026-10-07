@@ -1,5 +1,6 @@
 //! Module loader that delegates resolution and loading to Python callables.
 
+use crate::runtime::js_value::terse_guest_errors;
 use deno_core::{
     ModuleLoadOptions, ModuleLoadReferrer, ModuleLoader, ModuleSource, ModuleSourceCode,
     ModuleSpecifier, ModuleType, RequestedModuleType,
@@ -142,9 +143,13 @@ impl ModuleLoader for PythonModuleLoader {
             .unwrap_or(specifier);
         let static_or_deny = |why: &str| {
             self.resolve_static(specifier).unwrap_or_else(|| {
-                Err(JsErrorBox::generic(format!(
-                    "Module resolution denied for {specifier}. {why}"
-                )))
+                // The hint names the host API; an isolated worker's guest must not read it.
+                let message = if terse_guest_errors() {
+                    format!("Module resolution denied for {specifier}")
+                } else {
+                    format!("Module resolution denied for {specifier}. {why}")
+                };
+                Err(JsErrorBox::generic(message))
             })
         };
 

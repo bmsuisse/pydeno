@@ -37,7 +37,25 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SANDBOX_PY = HERE.parent / "python" / "pydeno" / "_sandbox.py"
+
+
+def _find_sandbox_py() -> Path:
+    """The `_sandbox.py` under test: the checkout's, else the installed package's (the container
+    matrix copies tests/ and scripts/ but installs pydeno from a wheel, with no python/ tree).
+    Found by path, not imported: the sweep loads it by file."""
+    checkout = HERE.parent / "python" / "pydeno" / "_sandbox.py"
+    if checkout.exists():
+        return checkout
+    spec = importlib.util.find_spec("pydeno")
+    if spec is not None and spec.submodule_search_locations:
+        for location in spec.submodule_search_locations:
+            candidate = Path(location) / "_sandbox.py"
+            if candidate.exists():
+                return candidate
+    return checkout
+
+
+SANDBOX_PY = _find_sandbox_py()
 TABLES = HERE.parent / "tests" / "data" / "syscalls.json"
 
 # What the child does. It applies the real sandbox, then fires one syscall with junk
@@ -81,6 +99,56 @@ SKIP = {
 
 
 REFUSED = {"EPERM", "signal 31"}
+
+
+# The only syscalls expected to stay REACHABLE. They are not in the filter's allow-list: since
+# Linux 6.11 (`uretprobe`) and 6.12 (`uprobe`) the kernel lets them bypass seccomp filters, so
+# they answer ENXIO / SIGILL instead of EPERM. Harmless without a registered uprobe, but the
+# REACHABLE list is the attacker's inventory, so a new name here (a new kernel pass-through, or a
+# filter regression) must show up in review: `tests/test_redteam_syscalls.py` pins this set.
+KERNEL_SECCOMP_PASSTHROUGH = frozenset({"uprobe", "uretprobe"})
+
+
+# Calls the filter does not allow outright but judges on their arguments (threads only, scheduling
+# and signals on ourselves, a list of fcntl commands, `socketpair` of one type), or answers
+# `ENOSYS` for (`clone3`). Some sweep patterns pass those checks, so they show up as reachable
+# too. Mirrors the argument-checked section of `_seccomp_program`; a new name there needs one here.
+ARGUMENT_JUDGED = frozenset(
+    {
+        "clone",
+        "clone3",
+        "fcntl",
+        "get_robust_list",
+        "getpgid",
+        "getsid",
+        "prlimit64",
+        "sched_setaffinity",
+        "sched_setattr",
+        "sched_setparam",
+        "sched_setscheduler",
+        "setpriority",
+        "socketpair",
+    }
+)
+
+
+def allowed_names(arch: str) -> set[str]:
+    """Names the filter lets through on purpose: the sandbox's allow-list on this architecture."""
+    idx = 0 if arch == "x86_64" else 1
+    return {n for n, p in load_sandbox()._ALLOWED.items() if p[idx] is not None}
+
+
+def unexpectedly_reachable(results: dict[int, dict], allowed: set[str]) -> set[str]:
+    """Reachable names the filter neither allows nor judges on arguments: the kernel's own
+    seccomp bypasses, and bugs."""
+    allowed = allowed | ARGUMENT_JUDGED
+    return {
+        r["name"]
+        for r in results.values()
+        if r["blocked"] is False
+        and not r.get("cap_dependent")
+        and r["name"] not in allowed
+    }
 
 
 def load_sandbox():
@@ -175,10 +243,8 @@ def main() -> int:
     out.write_text(json.dumps({str(k): v for k, v in results.items()}, indent=1))
 
     skipped = [r for r in results.values() if r["blocked"] is None]
-    sb = load_sandbox()
-    idx = 0 if arch == "x86_64" else 1
     # The filter is an allow-list: it refuses every name it does not allow outright.
-    allowed = {n for n, p in sb._ALLOWED.items() if p[idx] is not None}  # noqa: SLF001
+    allowed = allowed_names(arch)
     in_filter = set(names.values()) - allowed
     killed = sorted(r["name"] for r in results.values() if r.get("killed"))
     # EPERM both with and without the sandbox: whoever is denying it, if it is a name our
@@ -209,7 +275,15 @@ def main() -> int:
         print(f"  {r['name']}")
     print("\nREACHABLE (the sandboxed process gets something other than a refusal):")
     for r in sorted(reachable, key=lambda r: r["name"]):
-        print(f"  {r['name']:28} {' '.join(r['outcomes'])}")
+        note = (
+            "  (kernel bypasses seccomp)"
+            if r["name"] in KERNEL_SECCOMP_PASSTHROUGH
+            else ""
+        )
+        print(f"  {r['name']:28} {' '.join(r['outcomes'])}{note}")
+    unexpected = unexpectedly_reachable(results, allowed) - KERNEL_SECCOMP_PASSTHROUGH
+    if unexpected:
+        print(f"\nUNEXPECTED reachable syscalls: {sorted(unexpected)}")
     print(f"\nfull report: {out}")
     return 0
 

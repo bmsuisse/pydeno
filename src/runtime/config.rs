@@ -69,7 +69,7 @@ fn positive(value: usize, name: &str) -> PyResult<usize> {
 /// Configures the WebSocket server that enables debugging via Chrome DevTools
 /// or compatible debuggers. The inspector runs on a separate thread from the
 /// runtime thread.
-#[pyclass(module = "pydeno")]
+#[pyclass(module = "pydeno", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectorConfig {
     /// Socket address (IP and port) for the inspector server.
@@ -214,7 +214,7 @@ impl Clone for ConsoleCallback {
 ///
 /// Defines heap limits, optional bootstrap code, inspector settings, and
 /// serialization constraints for a V8 runtime instance.
-#[pyclass(module = "pydeno")]
+#[pyclass(module = "pydeno", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Maximum heap size in bytes (None = V8 default ~1.4 GB).

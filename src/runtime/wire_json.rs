@@ -35,6 +35,7 @@ const PARSE_DEPTH_SLACK: usize = 16;
 
 /// A JSON string. `Units` is only used when the text holds an unpaired surrogate, which UTF-8
 /// cannot represent; it keeps the UTF-16 code units so Python can rebuild the exact `str`.
+#[derive(PartialEq, Eq, Hash)]
 enum Str {
     Plain(String),
     Units(Vec<u16>),
@@ -56,6 +57,8 @@ enum ParseError {
     Json,
     TooMany,
     Deep,
+    NonFinite,
+    DuplicateKey,
 }
 
 impl ParseError {
@@ -64,6 +67,8 @@ impl ParseError {
             ParseError::Json => "frame is not valid JSON",
             ParseError::TooMany => "value has too many nodes",
             ParseError::Deep => "value nested too deeply",
+            ParseError::NonFinite => "non-finite JSON number must use the tagged form",
+            ParseError::DuplicateKey => "frame has a duplicate object key",
         }
     }
 }
@@ -167,12 +172,14 @@ impl<'a> Parser<'a> {
             let key = self.string()?;
             self.skip_ws();
             self.expect(b':')?;
-            entries.push((key, self.value(depth + 1)?));
+            let value = self.value(depth + 1)?;
+            entries.push((key, value));
             self.skip_ws();
             match self.bytes.get(self.at) {
                 Some(b',') => self.at += 1,
                 Some(b'}') => {
                     self.at += 1;
+                    reject_duplicate_keys(&entries)?;
                     return Ok(Node::Obj(entries));
                 }
                 _ => return Err(ParseError::Json),
@@ -212,10 +219,12 @@ impl<'a> Parser<'a> {
         }
         let text = &self.text[start..self.at];
         if is_float {
-            // Rust and Python agree on the grammar above; `1e400` is `inf` in both.
-            text.parse::<f64>()
-                .map(Node::Float)
-                .map_err(|_| ParseError::Json)
+            // A literal that overflows a double parses to `inf`; non-finite values are tagged.
+            match text.parse::<f64>() {
+                Ok(f) if f.is_finite() => Ok(Node::Float(f)),
+                Ok(_) => Err(ParseError::NonFinite),
+                Err(_) => Err(ParseError::Json),
+            }
         } else if int_digits <= 18 {
             text.parse::<i64>()
                 .map(Node::Int)
@@ -353,6 +362,24 @@ fn push_unit(out: &str, units: &mut Option<Vec<u16>>, unit: u16) {
     units
         .get_or_insert_with(|| out.encode_utf16().collect())
         .push(unit);
+}
+
+/// Last-wins duplicates let a peer show a byte-level inspector one spelling and the dispatcher
+/// another, so a repeated key is refused rather than resolved.
+fn reject_duplicate_keys(entries: &[(Str, Node)]) -> PResult<()> {
+    let duplicate = if entries.len() <= 8 {
+        entries
+            .iter()
+            .enumerate()
+            .any(|(i, (k, _))| entries[..i].iter().any(|(earlier, _)| earlier == k))
+    } else {
+        let mut seen = std::collections::HashSet::with_capacity(entries.len());
+        entries.iter().any(|(k, _)| !seen.insert(k))
+    };
+    if duplicate {
+        return Err(ParseError::DuplicateKey);
+    }
+    Ok(())
 }
 
 fn parse(data: &[u8], max_nodes: usize, max_depth: usize) -> PResult<Node> {

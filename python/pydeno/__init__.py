@@ -5,8 +5,10 @@ from __future__ import annotations
 import atexit
 import contextlib
 import contextvars
+import os
 import sys
 import threading
+import types
 from collections.abc import Callable
 
 from ._pydeno import (
@@ -106,6 +108,7 @@ if TYPE_CHECKING:  # the real imports are lazy, see `__getattr__`
     )
     from ._sandbox_pool import AsyncSandboxPool, CheckoutTimeout, SandboxPool
     from ._status import Layer, SandboxStatus, sandbox_status
+    from ._template import disable_fork_template, enable_fork_template
     from ._tools import ToolBridge, ToolBudgetError, ToolError, ToolNotFoundError
     from .tools.http_fetch import (
         AsyncHttpFetch,
@@ -193,6 +196,8 @@ _LAZY = {
     "Layer": "_status",
     "SandboxStatus": "_status",
     "sandbox_status": "_status",
+    "enable_fork_template": "_template",
+    "disable_fork_template": "_template",
     "http_fetch": "tools.http_fetch",
     "HttpFetch": "tools.http_fetch",
     "AsyncHttpFetch": "tools.http_fetch",
@@ -301,6 +306,29 @@ setattr(Runtime, "bind", _runtime_bind)
 
 
 # Standard library only, so importing it costs next to nothing (the isolation worker needs it too).
+def _reify_lazy_imports() -> None:
+    """Python 3.15 (PEP 810): resolve every lazy import the package declared, right before a fork.
+
+    A lazy import is loaded under its module's import lock the first time it is used. If another
+    thread holds that lock when the process forks, the child inherits it held by a thread that does
+    not exist there and hangs on its first use of the module. Touching each name here waits for any
+    such thread to finish, so the child starts with nothing half-imported. A no-op before 3.15."""
+    lazy = getattr(types, "LazyImportType", None)
+    if lazy is None:
+        return
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "pydeno" or name.startswith("pydeno.")):
+            continue
+        for key, value in list(vars(module).items()):
+            if isinstance(value, lazy):
+                with contextlib.suppress(Exception):
+                    getattr(module, key)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(before=_reify_lazy_imports)
+
+
 from ._wasm import AsyncWasmModule, WasmModule  # noqa: E402
 from ._wasm import runtime_load_wasm as _runtime_load_wasm  # noqa: E402
 
@@ -368,7 +396,9 @@ def get_default_runtime() -> Runtime | IsolatedRuntime:
     """
     slot = _default_runtime_var.get()
     owner = _current_runtime_owner()
-    if slot is None or slot.runtime.is_closed() or slot.owner is not owner:
+    # Owner first: a thread that inherited the parent's context (free-threaded builds do) sees a
+    # slot whose in-process Runtime is unsendable, and even is_closed() on it panics off-thread.
+    if slot is None or slot.owner is not owner or slot.runtime.is_closed():
         slot = _RuntimeSlot(runtime=_default_factory(), owner=owner)
         _default_runtime_var.set(slot)
         _schedule_owner_cleanup(slot)
@@ -526,6 +556,8 @@ __all__ = [
     "set_gate_threads",
     "static_gate",
     "sandbox_status",
+    "enable_fork_template",
+    "disable_fork_template",
     "SandboxStatus",
     "Layer",
     "AsyncIsolatedRuntime",

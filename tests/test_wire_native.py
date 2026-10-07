@@ -487,6 +487,11 @@ RAW_VALUES = [
     "[1,2,3]",
     '{"a":1}',
     '{"a":1,"a":2}',
+    '{"a":{"b":1,"b":1}}',
+    "1e999999",
+    "-1e999999",
+    "[1e999999]",
+    '{"$":"f","v":"inf"}',
     '{"$":"int","v":"5"}',
     '{"$":"u"}',
     '{"$":"f","v":"nan"}',
@@ -612,12 +617,51 @@ def test_a_flood_frame_is_refused_before_it_is_built() -> None:
     assert time.monotonic() - start < 1.5
 
 
-def test_duplicate_keys_resolve_like_json_loads() -> None:
-    for value in ('{"a":1,"a":2}', '{"a":1,"b":2,"a":3}', '{"t":"x","t":"y"}'):
-        raw = f'{{"t":"result","id":1,"v":{value}}}'.encode()
-        assert _wire.loads_decoded(raw) == ref.py_loads_decoded(raw)
-    raw = b'{"t":"result","t":"error","id":1,"v":{"$":"zz"}}'
-    assert _wire.loads_decoded(raw) == ref.py_loads_decoded(raw)
+def test_duplicate_keys_are_refused_everywhere() -> None:
+    for value in ('{"a":1,"a":2}', '{"a":1,"b":2,"a":3}', '[{"x":{"k":1,"k":1}}]'):
+        for raw in _frames(value):
+            _frame_both(raw)
+            with pytest.raises(_wire.WireError, match="duplicate object key"):
+                _wire.loads_decoded(raw)
+    for raw in (
+        b'{"t":"result","t":"call","id":1,"v":1}',
+        b'{"t":"result","id":1,"v":1,"t":"call"}',
+        b'{"t":"result","id":1,"v":{"$":"int","v":"1","v":"2"}}',
+        b'{"t":"result","id":1,"v":{"\\u0061":1,"a":2}}',
+        b'{"t":"error","id":1,"extra":{"a":1,"a":2}}',
+        b'{"t":"result","id":1,"v":{"\\ud800":1,"\\ud800":2}}',
+        # more keys than the linear-scan cut-off
+        b'{"t":"result","id":1,"v":{'
+        + b",".join(b'"k%d":0' % i for i in range(40))
+        + b',"k7":1}}',
+    ):
+        _frame_both(raw)
+        with pytest.raises(_wire.WireError):
+            _wire.loads_decoded(raw)
+    # distinct keys that merely look alike are fine
+    ok = b'{"t":"result","id":1,"v":{"a":1,"A":2,"a ":3,"\\ud800":4,"\\ud801":5}}'
+    _frame_both(ok)
+    assert len(_wire.loads_decoded(ok)["v"]) == 5
+
+
+def test_out_of_range_number_literals_are_refused() -> None:
+    for literal in ("1e999999", "-1e999999", "1e400", "1.8e308", "123456789e301"):
+        raw = ('{"t":"result","id":1,"v":%s}' % literal).encode()
+        _frame_both(raw)
+        with pytest.raises(_wire.WireError, match="non-finite"):
+            _wire.loads_decoded(raw)
+        raw = ('{"t":"call","cid":1,"hid":2,"args":[[%s]]}' % literal).encode()
+        with pytest.raises(_wire.WireError, match="non-finite"):
+            _wire.loads_decoded(raw)
+    # underflow and the largest finite double are still numbers, and the tagged form still works
+    for literal in ("1e-400", "1.7976931348623157e308", "5e-324"):
+        _frame_both(('{"t":"result","id":1,"v":%s}' % literal).encode())
+    for tag, expected in (("inf", math.inf), ("-inf", -math.inf)):
+        raw = ('{"t":"result","id":1,"v":{"$":"f","v":"%s"}}' % tag).encode()
+        assert _wire.loads_decoded(raw)["v"] == expected
+    assert math.isnan(
+        _wire.loads_decoded(b'{"t":"result","id":1,"v":{"$":"f","v":"nan"}}')["v"]
+    )
 
 
 _json_leaf = st.one_of(

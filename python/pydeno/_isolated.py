@@ -19,6 +19,18 @@ in a disposable, secret-free process; confining what that process may do (seccom
 
 from __future__ import annotations
 
+# PEP 810 (Python 3.15): these stdlib modules are loaded on first use, not at import. A plain
+# list, so it is inert on 3.10-3.14. Never list what the isolation worker imports before it
+# applies its sandbox (`_worker`, `_sandbox`, `_wire`, `_wasm`, `_awaitable`): a lazy import
+# there would run after the sandbox closed the filesystem.
+__lazy_modules__ = [
+    "asyncio",
+    "concurrent.futures",
+    "inspect",
+    "subprocess",
+    "tempfile",
+]
+
 import asyncio
 import atexit
 import functools
@@ -41,7 +53,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import _sandbox, _wasm, _wire
+from . import _sandbox, _template, _wasm, _wire
 from ._gate import DEFAULT_GATE_TIMEOUT, _gated_loader, _hook
 from ._limits import limit_int, limit_seconds
 from ._result import (
@@ -116,7 +128,8 @@ _CPU_BASELINE_MAX_AGE = 2 * _IDLE_CHECK_SECONDS
 # silently has no limits until you remember to set them is not much of a sandbox.
 DEFAULT_MAX_MEMORY = 1024 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 60.0
-DEFAULT_MAX_HOST_WAIT = 600.0
+DEFAULT_MAX_HOST_WAIT = 60.0
+DEFAULT_MAX_HOST_CALLS = 10_000
 DEFAULT_MAX_INFLIGHT_HOST_CALLS = 64
 DEFAULT_WRITE_STALL_TIMEOUT = 10.0
 
@@ -399,23 +412,44 @@ SESSION_OPTIONS = (
     "max_inflight_host_calls",
     "write_stall_timeout",
     "redact_host_errors",
+    "tool_timeout",
 )
+
+
+def _empty_root_mode(value: object, sandbox: str) -> str:
+    """`empty_root` as "auto" | "require" | "off". A bool is the old spelling: True is "auto"."""
+    if value is True:
+        mode = "auto"
+    elif value is False:
+        mode = "off"
+    elif value in ("auto", "require", "off"):
+        mode = str(value)
+    else:
+        raise ValueError("empty_root must be a bool, 'auto', 'require' or 'off'")
+    if mode == "require" and sandbox == "off":
+        raise ValueError("empty_root='require' needs an OS sandbox, but sandbox='off'")
+    return mode
 
 
 def _session_options(
     *,
     request_timeout: float | int | timedelta | None | Any = _DEFAULT,
     timeout_grace: float | int = 2.0,
-    max_host_calls: int | None = None,
+    max_host_calls: int | None | Any = _DEFAULT,
     max_host_wait: float | int | timedelta | None | Any = _DEFAULT,
     max_inflight_host_calls: int | None | Any = _DEFAULT,
     write_stall_timeout: float | int | timedelta | None | Any = _DEFAULT,
     redact_host_errors: bool = True,
+    tool_timeout: float | int | timedelta | None = None,
 ) -> dict[str, Any]:
     """The parent-side options, validated and normalised, as the runtime attributes that hold
     them. One function for `IsolatedRuntime`, `AsyncIsolatedRuntime` and the pools' checkout, so
     an option set at checkout means exactly what it means in the constructor."""
-    max_host_calls = _limit_int("max_host_calls", max_host_calls, minimum=0)
+    max_host_calls = (
+        DEFAULT_MAX_HOST_CALLS
+        if max_host_calls is _DEFAULT
+        else _limit_int("max_host_calls", max_host_calls, minimum=0)
+    )
     max_inflight = (
         DEFAULT_MAX_INFLIGHT_HOST_CALLS
         if max_inflight_host_calls is _DEFAULT
@@ -444,6 +478,7 @@ def _session_options(
             else _limit_seconds("write_stall_timeout", write_stall_timeout)
         ),
         "_redact": bool(redact_host_errors),
+        "_tool_timeout": _limit_seconds("tool_timeout", tool_timeout),
     }
 
 
@@ -589,10 +624,10 @@ class IsolatedRuntime:
             no timeout; pass `None` to remove the hard deadline.
         timeout_grace: Seconds the worker gets past a soft `timeout` before it is killed.
         max_host_calls: Total host-function calls the guest may make over this runtime's
-            life, then the worker is killed. The guest's clock is paused while a host
-            callback runs, so an endless stream of quick calls needs its own cap.
+            life, then the worker is killed (default 10,000). The guest's clock is paused while
+            a host callback runs, so an endless stream of quick calls needs its own cap.
             (`None`: unlimited.)
-        max_host_wait: Most time (seconds, default 600) one command may spend waiting on host
+        max_host_wait: Most time (seconds, default 60) one command may spend waiting on host
             callbacks in total. The hard deadline does not run while a callback does, which a
             guest could exploit by always keeping one asynchronous call in flight; this bounds it.
             The worker's CPU use is also capped at twice the hard deadline per command, which
@@ -612,15 +647,28 @@ class IsolatedRuntime:
         redact_host_errors: Replace the message of an exception raised by a host function with a
             generic one before the guest sees it (the exception's class name is kept). Use this
             when your tools' error text can contain paths, queries or secrets.
+        tool_timeout: Most time (seconds, default `None`: off) one call to a host function you
+            bound (`bind_function`, `bind_object`, `ToolBridge` tools; not `console`, module
+            loaders or the gate) may take. Past it the guest's call fails with a catchable
+            `TimeoutError` whose message is always ``"host function timed out"`` (it holds nothing
+            of yours, so `redact_host_errors` changes nothing) and the command goes on. An
+            asynchronous handler is cancelled. A synchronous one cannot be interrupted: with this
+            option set it runs on a thread of its own (not the calling thread), which is abandoned
+            when the deadline passes, and its late result is discarded. The time spent still counts
+            toward `max_host_wait`. Past 8 abandoned calls still running, the worker is killed
+            (`WorkerCrashed`: "too many abandoned tool calls in this session"), so a guest cannot
+            pile up stuck threads. Also settable per `SandboxPool` checkout.
         sandbox: OS confinement for the worker (macOS Seatbelt; Linux Landlock + seccomp).
-            "auto" applies whatever the platform offers. "require" refuses to start unless
-            *every* layer the platform has is in force (macOS: Seatbelt; Linux: Landlock and
-            seccomp), so a kernel that lacks one cannot silently weaken you. "off" disables it.
-            Read `.sandbox` for what is active.
+            "require" (the default) refuses to start unless *every* layer the platform has is in
+            force (macOS: Seatbelt; Linux: Landlock and seccomp), so a kernel that lacks one
+            cannot silently weaken you. "auto" applies whatever the platform offers and starts
+            without the rest: opt in to it knowingly, and check `.sandbox_degraded`. "off"
+            disables it. Read `.sandbox` for what is active.
         empty_root: On Linux, also give the worker a private mount namespace whose root is
             empty, plus empty network and IPC namespaces, so it cannot even tell which host paths
-            exist. Needs unprivileged user namespaces; silently skipped where they are not
-            allowed (see `.sandbox_extras`).
+            exist. Needs unprivileged user namespaces. `True` / "auto" skips it where they are not
+            allowed (see `.sandbox_extras`; `sandbox="require"` does not demand it). "require"
+            refuses to start without it. `False` / "off" never applies it.
         jitless: Run V8 in the worker with `--jitless`: no JIT compiler and no
             WebAssembly, which removes the largest class of V8 exploits at a modest
             speed cost. Pass `False` to allow WebAssembly and JIT speed.
@@ -668,13 +716,14 @@ class IsolatedRuntime:
         max_memory: int | None = _DEFAULT,
         request_timeout: float | int | None = _DEFAULT,
         timeout_grace: float | int = 2.0,
-        max_host_calls: int | None = None,
+        max_host_calls: int | None = _DEFAULT,
         max_host_wait: float | int | None = _DEFAULT,
         max_inflight_host_calls: int | None = _DEFAULT,
         write_stall_timeout: float | int | None = _DEFAULT,
         redact_host_errors: bool = True,
-        sandbox: str = "auto",
-        empty_root: bool = True,
+        tool_timeout: float | int | None = None,
+        sandbox: str = "require",
+        empty_root: bool | str = True,
         jitless: bool = True,
         v8_flags: Sequence[str] = (),
         strict_eval: bool = False,
@@ -705,6 +754,7 @@ class IsolatedRuntime:
         max_memory = _limit_int("max_memory", max_memory, minimum=1)
         if sandbox not in ("auto", "require", "off"):
             raise ValueError("sandbox must be 'auto', 'require' or 'off'")
+        empty_root = _empty_root_mode(empty_root, sandbox)
         if os.name != "posix":
             raise NotImplementedError("IsolatedRuntime currently supports POSIX only")
         config = config or RuntimeConfig()
@@ -748,6 +798,7 @@ class IsolatedRuntime:
             max_inflight_host_calls=max_inflight_host_calls,
             write_stall_timeout=write_stall_timeout,
             redact_host_errors=redact_host_errors,
+            tool_timeout=tool_timeout,
         ).items():
             setattr(self, attr, value)
         self._python = python or sys.executable
@@ -762,6 +813,9 @@ class IsolatedRuntime:
         #: What the worker reports after start-up: the OS layers in force
         #: ("seatbelt", "landlock+seccomp", ... or "none") and the V8 flags set.
         self.sandbox = "none"
+        #: True when the worker started with fewer OS layers than the platform has (only
+        #: `sandbox="auto"` allows that). Check it instead of relying on the warning.
+        self.sandbox_degraded = False
         #: Bonus layers that also took effect, e.g. ["emptyroot"] (a private mount namespace
         #: with nothing in it; needs unprivileged user namespaces, so it is not everywhere).
         self.sandbox_extras: list[str] = []
@@ -769,6 +823,10 @@ class IsolatedRuntime:
 
         self._handlers: dict[int, tuple[Callable[..., Any], bool]] = {}
         self._token_to_hid: dict[int, int] = {}
+        # The handlers `bind_function`/`bind_object` registered: the ones `tool_timeout` covers
+        # (not console, module loaders or the gate's hooks).
+        self._tool_hids: set[int] = set()
+        self._outlasted = _Outlasted()
         self._hids = itertools.count(1)
         self._cmd_ids = itertools.count(1)
         self._lock = threading.Lock()
@@ -810,6 +868,11 @@ class IsolatedRuntime:
             _take_worker()
             if prewarm and python is None
             else _start_worker(self._python)
+        )
+        #: "exec" (a fresh interpreter, the default) or "fork-template" (opt-in, see
+        #: `enable_fork_template`): how this worker was started.
+        self.worker_start = (
+            "fork-template" if isinstance(self._proc, _template.ForkedProc) else "exec"
         )
         stdin_fd = self._proc.stdin.fileno()  # type: ignore[union-attr]
         # Non-blocking, so that a worker which stops reading its input is a timeout we can act on
@@ -945,14 +1008,17 @@ class IsolatedRuntime:
             missing = (
                 _sandbox.missing_layers(applied) if applied != "off" else frozenset()
             )
+            self.sandbox_degraded = bool(missing)
             if missing and self._options["sandbox"] == "auto":
-                warnings.warn(
+                text = (
                     f"IsolatedRuntime is running with a degraded OS sandbox ({applied!r}; "
                     f"missing {sorted(missing)}). Untrusted code has less containment than "
-                    "intended; pass sandbox='require' to refuse instead.",
-                    RuntimeWarning,
-                    stacklevel=3,
+                    "intended; pass sandbox='require' to refuse instead."
                 )
+                import logging
+
+                logging.getLogger("pydeno").warning(text)
+                warnings.warn(text, RuntimeWarning, stacklevel=3)
             self.v8_flags = list(self._options["v8_flags"])
         except TimeoutError:
             self._kill()
@@ -1424,9 +1490,18 @@ class IsolatedRuntime:
                 None,
             )
             return
+        limit = self._tool_timeout
+        if limit is not None and (
+            hid not in self._tool_hids or getattr(handler, "_pydeno_untimed", False)
+        ):
+            limit = None  # not a tool: a loader hook, or an agent session's own shim
         pump.begin_call()
         if is_async and pump.loop is not None:
             coro = _call_guarded(handler, decoded)
+            if limit is not None:
+                coro = _call_with_deadline(
+                    coro, limit, self._outlasted, self._too_many_outlasted
+                )
             with self._async_inflight_lock:
                 self._async_inflight += 1
             try:
@@ -1441,7 +1516,13 @@ class IsolatedRuntime:
                 lambda fut: self._finish_async_call(cid, pump, fut)
             )
             return
-        self._run_watched(handler, decoded, cid, pump, pump)
+        self._run_watched(handler, decoded, cid, pump, pump, limit)
+
+    def _too_many_outlasted(self, count: int) -> None:
+        """Past the cap on calls still running after `tool_timeout`: end the session. The reason
+        is what the pump reports as the worker's death."""
+        self._kill_reason = abandoned_message(self._tool_timeout or 0.0, count)
+        self._kill()
 
     def _run_watched(
         self,
@@ -1450,6 +1531,7 @@ class IsolatedRuntime:
         cid: int,
         pump: _Pump,
         reply_pump: _Pump | None,
+        limit: float | None = None,
     ) -> None:
         """Run a synchronous handler on this (the pump's) thread, with the idle watchdog standing
         in for the pump meanwhile. The handler is never interrupted and never moved to another
@@ -1459,7 +1541,10 @@ class IsolatedRuntime:
         handler has returned. `reply_pump` is the pump to `end_call` on (None for console)."""
         self._handler_pump = pump
         try:
-            self._run_sync_handler(handler, decoded, cid, reply_pump)
+            if limit is None:
+                self._run_sync_handler(handler, decoded, cid, reply_pump)
+            else:
+                self._run_timed_handler(handler, decoded, cid, reply_pump, limit)
         finally:
             # Under the lock: a verdict the watchdog is still reaching is seen here, not lost.
             with self._handler_lock:
@@ -1486,6 +1571,70 @@ class IsolatedRuntime:
                 self._guard.in_host_call = False
         except Exception as exc:  # noqa: BLE001 - the guest sees the failure, the host keeps running
             reply = self._error(cid, exc)
+        self._send_reply(reply, pump)
+
+    def _run_timed_handler(
+        self,
+        handler: Callable[..., Any],
+        decoded: list[Any],
+        cid: int,
+        pump: _Pump | None,
+        limit: float,
+    ) -> None:
+        """`_run_sync_handler` under `tool_timeout`: the handler runs on a thread of its own, in a
+        copy of this one's context, and this thread waits for it for at most `limit` seconds (the
+        idle watchdog supervises meanwhile, as for any synchronous handler). Past the deadline the
+        guest gets `tool_timeout_error()`, the thread is abandoned, and whatever it returns later
+        is dropped."""
+        outlasted, call = self._outlasted, _TimedCall()
+        ended = threading.Event()
+        box: list[dict[str, Any]] = []
+
+        def work() -> None:
+            try:
+                if not outlasted.begin(call):
+                    return
+                try:
+                    self._guard.in_host_call = True
+                    try:
+                        value = handler(*decoded)
+                        if inspect.isawaitable(value):
+                            value = asyncio.run(_await(value))
+                        box.append({"t": "reply", "cid": cid, "v": _wire.Enc(value)})
+                    finally:
+                        self._guard.in_host_call = False
+                except Exception as exc:  # noqa: BLE001 - the guest sees the failure
+                    box.append(self._error(cid, exc))
+            finally:
+                outlasted.finish(call)
+                ended.set()
+
+        context = contextvars.copy_context()
+        try:
+            threading.Thread(
+                target=context.run, args=(work,), name="pydeno-tool", daemon=True
+            ).start()
+        except RuntimeError as exc:  # no thread to be had: the call fails, nothing ran
+            self._send_reply(self._error(cid, exc), pump)
+            return
+        deadline = time.monotonic() + limit
+        while True:
+            remaining = deadline - time.monotonic()
+            if ended.wait(max(0.0, min(remaining, _POLL_SECONDS))):
+                break
+            if remaining <= 0 or self._closed:
+                break
+        reply = box[0] if box else None
+        if reply is None:
+            count = outlasted.abandon(call)
+            if count is None:  # it ended while we decided
+                reply = box[0]
+            else:
+                if count > MAX_ABANDONED_TOOL_CALLS:
+                    self._too_many_outlasted(count)
+                    self._send_reply(self._error(cid, tool_timeout_error()), pump)
+                    raise WorkerCrashed(abandoned_message(limit, count))
+                reply = self._error(cid, tool_timeout_error())
         self._send_reply(reply, pump)
 
     def _error(self, cid: int, exc: BaseException) -> dict[str, Any]:
@@ -1683,6 +1832,7 @@ class IsolatedRuntime:
         hid = next(self._hids)
         is_async = inspect.iscoroutinefunction(handler)
         self._handlers[hid] = (handler, is_async)
+        self._tool_hids.add(hid)
         try:
             token = self._request(
                 {"t": "bind_function", "name": name, "hid": hid, "async": is_async}
@@ -1712,6 +1862,7 @@ class IsolatedRuntime:
                 hid = next(self._hids)
                 is_async = inspect.iscoroutinefunction(value)
                 self._handlers[hid] = (value, is_async)
+                self._tool_hids.add(hid)
                 hids[key] = hid
                 entries[key] = {"hid": hid, "async": is_async}
             else:
@@ -1745,6 +1896,7 @@ class IsolatedRuntime:
         hid = self._token_to_hid.pop(op_id, None)
         if hid is not None:
             self._handlers.pop(hid, None)
+            self._tool_hids.discard(hid)
             self._revoked_hids[hid] = None
             if len(self._revoked_hids) > _REVOKED_MEMORY:
                 self._revoked_hids.pop(next(iter(self._revoked_hids)))
@@ -1908,6 +2060,118 @@ async def _await(awaitable: Any) -> Any:
     return await awaitable
 
 
+# `tool_timeout`: what the guest is told, and how many calls that outlasted it may still be running.
+TOOL_TIMEOUT_MESSAGE = "host function timed out"
+MAX_ABANDONED_TOOL_CALLS = 8
+# How long a cancelled asynchronous handler gets to finish before it counts as abandoned.
+_CANCEL_GRACE = 1.0
+
+
+class _ToolTimeout(TimeoutError):
+    """A `TimeoutError` that says it is pydeno's own text. The flag lives on the class, not on the
+    instance: asyncio rebuilds a `TimeoutError` that crosses `run_coroutine_threadsafe` (3.11+),
+    and a rebuilt instance would lose an attribute set on the original and be redacted."""
+
+    _pydeno_public = True
+
+
+# The guest and the journal read the class name; it stays "TimeoutError".
+_ToolTimeout.__name__ = _ToolTimeout.__qualname__ = "TimeoutError"
+
+
+def tool_timeout_error() -> TimeoutError:
+    """What the guest sees for a call that outlasted `tool_timeout`: the same text whatever
+    `redact_host_errors` says (it is pydeno's own, so it holds nothing to redact)."""
+    return _ToolTimeout(TOOL_TIMEOUT_MESSAGE)
+
+
+def abandoned_message(limit: float, count: int) -> str:
+    return (
+        f"too many abandoned tool calls in this session ({count} calls outlasted "
+        f"tool_timeout={limit:g}s and are still running); worker killed"
+    )
+
+
+class _TimedCall:
+    """One host call under `tool_timeout`: has it begun, ended, been given up on."""
+
+    __slots__ = ("abandoned", "done", "started")
+
+    def __init__(self) -> None:
+        self.started = self.done = self.abandoned = False
+
+
+class _Outlasted:
+    """The calls that outlived `tool_timeout` and still run (threads, or tasks that ignored
+    their cancellation). A call that ends removes itself, so only stuck ones count."""
+
+    __slots__ = ("count", "lock")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.lock = threading.Lock()
+
+    def begin(self, call: _TimedCall) -> bool:
+        """False when the call was given up on before it began: it must not run at all."""
+        with self.lock:
+            if call.abandoned:
+                return False
+            call.started = True
+            return True
+
+    def finish(self, call: _TimedCall) -> None:
+        with self.lock:
+            call.done = True
+            if call.abandoned and call.started:
+                self.count -= 1
+
+    def abandon(self, call: _TimedCall) -> int | None:
+        """Give up on a call. None: it had already ended (use its answer). Otherwise how many
+        calls are now outstanding past their deadline (not counting one that never began)."""
+        with self.lock:
+            if call.done:
+                return None
+            call.abandoned = True
+            if call.started:
+                self.count += 1
+            return self.count
+
+
+async def _call_with_deadline(
+    coro: Any,
+    limit: float,
+    outlasted: _Outlasted,
+    on_outlasted: Callable[[int], None],
+) -> Any:
+    """Await an asynchronous host function for at most `limit` seconds. Past it the task is
+    cancelled and the guest's call fails with `tool_timeout_error()`; one that ignores the
+    cancellation is abandoned (counted, and `on_outlasted` told when too many are)."""
+    task = asyncio.ensure_future(coro)
+    call = _TimedCall()
+    call.started = True
+    task.add_done_callback(lambda _t: outlasted.finish(call))
+    expired = False
+    try:
+        done, _ = await asyncio.wait({task}, timeout=limit)
+        if not done:
+            expired = True
+            task.cancel()
+            await asyncio.wait({task}, timeout=_CANCEL_GRACE)
+    except BaseException:
+        task.cancel()
+        raise
+    if not expired:
+        return task.result()
+    if task.done():
+        if not task.cancelled():
+            task.exception()  # retrieved: nobody will read it
+    else:
+        count = outlasted.abandon(call)
+        if count is not None and count > MAX_ABANDONED_TOOL_CALLS:
+            on_outlasted(count)
+    raise tool_timeout_error()
+
+
 async def _call_guarded(handler: Callable[..., Any], args: list[Any]) -> Any:
     """Run an asynchronous host function with the re-entrancy flag set in *its* context, so that
     a handler calling back into the runtime that is waiting on it fails instead of deadlocking."""
@@ -1925,11 +2189,8 @@ _PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `-S`: no `site`, so no `.pth` file runs in the worker and its `sys.path` is the standard library
 # plus this package's directory, *appended* so nothing next to `pydeno` can shadow a stdlib module.
 # pydeno has no runtime dependencies, so the worker needs nothing else. Saves the `site` import.
-_WORKER_BOOT = (
-    "import sys; sys.path.append({!r}); from pydeno._worker import main; main()".format(
-        _PACKAGE_PARENT
-    )
-)
+_WORKER_BOOT_PREFIX = "import sys; sys.path.append({!r}); ".format(_PACKAGE_PARENT)
+_WORKER_BOOT = _WORKER_BOOT_PREFIX + "from pydeno._worker import main; main()"
 
 
 def _worker_argv(python: str) -> list[str]:
@@ -1942,6 +2203,15 @@ def _worker_argv(python: str) -> list[str]:
 
 def _start_worker(python: str) -> tuple[subprocess.Popen[bytes], Any]:
     stderr = tempfile.TemporaryFile()  # noqa: SIM115 - closed by close() / finalizer
+    if python == sys.executable and _template.MANAGER.enabled:
+        # Opt-in (`enable_fork_template`): a fork of a prepared template, not a fresh interpreter.
+        # Any failure (OSError, but also a ValueError from a descriptor limit, or a bug) falls
+        # back to the ordinary spawn below, which is the stricter choice. Never BaseException:
+        # Ctrl-C must still stop the program.
+        try:
+            return _template.MANAGER.spawn(stderr.fileno()), stderr  # type: ignore[return-value]
+        except Exception as exc:  # noqa: BLE001
+            _template.MANAGER.note_fallback(exc)
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
             _worker_argv(python),
@@ -2071,4 +2341,7 @@ def _forget_parents_workers() -> None:
 
 
 os.register_at_fork(after_in_child=_forget_parents_workers)
+os.register_at_fork(after_in_child=_template.MANAGER.forget)
 atexit.register(_discard_spare)
+# `_template.MANAGER.shutdown` is registered by `_template` itself, at its import, so that it runs
+# after the hooks above (atexit is last in, first out) and can still kill what they did not.
