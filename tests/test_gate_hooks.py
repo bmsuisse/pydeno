@@ -1064,3 +1064,134 @@ async def test_async_regate_replay_refuses_and_allows() -> None:
         blob, KEY, {}, sandbox=MODE, gate=agate, regate_replay=True
     ):
         pass
+
+
+# -- a static gate's policy is bound into the journal -------------------------------------------
+
+EASY = static_gate(SourcePolicy(forbid_eval=True))
+TIGHT = static_gate(SourcePolicy(forbid_eval=True, forbid_webassembly=True))
+
+
+def _dump_under(gate: object, code: str = "globalThis.x = 1") -> bytes:
+    with AgentSandbox({}, sandbox=MODE, gate=gate) as session:
+        session.run(code)
+        return session.dump(KEY)
+
+
+def test_a_journal_loads_under_the_static_gate_it_was_made_under() -> None:
+    blob = _dump_under(EASY)
+    same = static_gate(SourcePolicy(forbid_eval=True))  # equal policy, another instance
+    with AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=same) as loaded:
+        assert loaded.run("return x") == 1
+
+
+def test_a_journal_is_refused_under_a_different_static_gate() -> None:
+    from pydeno import JournalError
+
+    blob = _dump_under(EASY)
+    with pytest.raises(JournalError, match="static gate"):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=TIGHT)
+
+
+def test_a_journal_is_refused_without_the_gate_it_was_made_under() -> None:
+    from pydeno import JournalError
+
+    blob = _dump_under(EASY)
+    with pytest.raises(JournalError, match="static gate"):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE)
+    with pytest.raises(JournalError, match="static gate"):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=Recorder())
+
+
+def test_the_policy_check_runs_before_any_worker_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pydeno._agent as agent_module
+    from pydeno import JournalError
+
+    blob = _dump_under(EASY)
+
+    def no_worker(*a: object, **k: object) -> None:
+        raise AssertionError("a worker was started for a refused journal")
+
+    monkeypatch.setattr(agent_module, "IsolatedRuntime", no_worker)
+    with pytest.raises(JournalError, match="static gate"):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=TIGHT)
+
+
+def test_regate_replay_accepts_a_changed_static_gate_that_still_allows_the_runs() -> (
+    None
+):
+    blob = _dump_under(EASY)
+    with AgentSandbox.load(
+        blob, KEY, {}, sandbox=MODE, gate=TIGHT, regate_replay=True
+    ) as loaded:
+        assert loaded.run("return x") == 1
+
+
+def test_regate_replay_still_refuses_a_run_the_changed_gate_forbids() -> None:
+    blob = _dump_under(EASY, "globalThis.y = typeof WebAssembly")
+    with pytest.raises(GateDenied):
+        AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=TIGHT, regate_replay=True)
+
+
+def test_journals_without_a_static_gate_are_unchanged_and_load_anywhere() -> None:
+    from pydeno import _agent
+
+    for gate in (None, Recorder()):
+        blob = _dump_under(gate)
+        journal = _agent._open_journal(blob, KEY, b"", 1 << 20)  # noqa: SLF001
+        assert "gate_policy" not in journal["config"]
+        with AgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=TIGHT) as loaded:
+            assert loaded.run("return x") == 1
+
+
+def test_a_static_gate_journal_records_only_the_policy_hash() -> None:
+    from pydeno import _agent
+
+    journal = _agent._open_journal(_dump_under(EASY), KEY, b"", 1 << 20)  # noqa: SLF001
+    recorded = journal["config"]["gate_policy"]
+    assert isinstance(recorded, str) and len(recorded) == 64
+    assert (
+        recorded
+        != _agent._open_journal(  # noqa: SLF001
+            _dump_under(TIGHT), KEY, b"", 1 << 20
+        )["config"]["gate_policy"]
+    )
+
+
+def test_the_policy_hash_ignores_set_order_and_tells_policies_apart() -> None:
+    from pydeno._gate import _policy_hash
+
+    a = SourcePolicy(forbidden_identifiers=frozenset({"a", "b", "c"}))
+    b = SourcePolicy(forbidden_identifiers=frozenset({"c", "b", "a"}))
+    assert _policy_hash(a) == _policy_hash(b)
+    assert _policy_hash(a) != _policy_hash(SourcePolicy(forbidden_identifiers={"a"}))
+    assert _policy_hash(a) != _policy_hash(SourcePolicy())
+    assert _policy_hash(SourcePolicy(max_source_bytes=None)) != _policy_hash(
+        SourcePolicy()
+    )
+
+
+async def test_the_async_session_binds_and_checks_the_policy_too() -> None:
+    from pydeno import JournalError
+
+    async with AsyncAgentSandbox({}, sandbox=MODE, gate=EASY) as session:
+        await session.run("globalThis.x = 1")
+        blob = await session.dump(KEY)
+    with pytest.raises(JournalError, match="static gate"):
+        await AsyncAgentSandbox.load(blob, KEY, {}, sandbox=MODE, gate=TIGHT)
+    async with await AsyncAgentSandbox.load(
+        blob, KEY, {}, sandbox=MODE, gate=TIGHT, regate_replay=True
+    ) as loaded:
+        assert await loaded.run("return x") == 1
+    async with await AsyncAgentSandbox.load(
+        blob, KEY, {}, sandbox=MODE, gate=EASY
+    ) as loaded:
+        assert await loaded.run("return x") == 1
+    # a sync AgentSandbox journal made under the same policy is the same journal
+    with AgentSandbox({}, sandbox=MODE, gate=EASY) as sync_session:
+        sync_session.run("globalThis.x = 1")
+        sync_blob = sync_session.dump(KEY)
+    with pytest.raises(JournalError, match="static gate"):
+        await AsyncAgentSandbox.load(sync_blob, KEY, {}, sandbox=MODE, gate=TIGHT)

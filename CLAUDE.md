@@ -42,11 +42,14 @@ uv run pytest tests/test_runtime.py
 # Run tests with asyncio support
 uv run pytest tests/test_runtime.py::TestRuntimeAsync -v
 
-# Run Rust tests
-cargo test
+# Run Rust tests the way CI does (plain `cargo test` fails: the tests need pyo3's
+# auto-initialize, which the `bench` feature enables; Linux also needs libpython on
+# LD_LIBRARY_PATH). Pick the interpreter with PYTHON=.venv312/bin/python.
+make test-rust PYTHON=$PWD/.venv/bin/python
 
-# Run a single Rust test
-cargo test test_runtime_lifecycle
+# Run a single Rust test (same env as test-rust)
+PYO3_PYTHON=$PWD/.venv/bin/python LD_LIBRARY_PATH=$(.venv/bin/python -c "import sysconfig;print(sysconfig.get_config_var('LIBDIR'))") \
+  cargo test --release --features bench -- --test-threads=1 test_runtime_lifecycle
 ```
 
 ### Linting and formatting

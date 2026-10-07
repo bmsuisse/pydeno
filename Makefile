@@ -68,6 +68,21 @@ test-quiet:
 	uv sync --frozen --group testing
 	uv run python -m pytest tests/ -q
 
+# The Rust unit tests embed a Python interpreter, so they need the `bench` feature
+# (it enables pyo3's auto-initialize; plain `cargo test` fails with "Python interpreter
+# is not initialized"). CI runs exactly this, with --test-threads=1 because the tests share
+# process-global V8 platform state. PYTHON picks the interpreter (e.g. make test-rust
+# PYTHON=.venv312/bin/python); on Linux the test binary also needs libpython on the loader
+# path (macOS finds it via rpath). Use a separate CARGO_TARGET_DIR per interpreter, since
+# pyo3 rebuilds when the interpreter changes.
+PYTHON ?= $(shell which python3)
+PY_LIBDIR = $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+
+.PHONY: test-rust  ## Run the Rust unit tests the way CI does
+test-rust:
+	PYO3_PYTHON=$(PYTHON) LD_LIBRARY_PATH="$(PY_LIBDIR):$$LD_LIBRARY_PATH" \
+		cargo test --release --features bench -- --test-threads=1
+
 .PHONY: docs  ## Build the documentation
 docs:
 	uv run mkdocs build

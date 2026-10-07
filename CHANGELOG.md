@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased (0.12.0)
+
+### Changed
+
+- **The host-side exception from an isolated runtime keeps the detail the guest is denied (#131).** The
+  guest-visible text stays terse; the `JavaScriptError`/`TypeError` the host receives now carries an
+  exception note (`host detail: ...`, Python 3.11+, shown in tracebacks, `str(exc)` unchanged) naming the
+  `max_serialization_bytes`/`max_serialization_depth` that was hit, the BigInt digit limit, or the
+  `add_static_module()` hint. The note is composed in the parent from its own `RuntimeConfig` and fixed
+  wording, so no new text comes from the worker and the wire format is unchanged. It is matched on the
+  terse wording, so a guest that throws that wording itself gets the same note, holding only host settings.
+
+- **A static gate's policy is bound to the session journal (#134).** `AgentSandbox` / `AsyncAgentSandbox`
+  sessions made with `gate=static_gate(policy)` record a stable hash of the `SourcePolicy` in the journal
+  config, and `load` refuses (`JournalError`, before any worker starts) a load under a different static
+  gate, or none, unless `regate_replay=True`. Journals of sessions without a static gate are
+  byte-for-byte what they were, and load under any gate. The front-door sessions
+  (`PydenoSession.load_session` / `load_snapshot`) still have no `regate_replay`: their journal holds the
+  generated setup and a rewritten body rather than the text the gate saw, which cannot be recovered
+  reliably nor recorded without changing the record shape, so this is documented in
+  `docs/guides/gate.md` and left.
+
+### Documentation
+
+- `tool_timeout` is documented on the pydantic-ai page (it reaches `JSCodeMode` through
+  `runtime_options`, now pinned by a test), and the isolation guide spells out how it combines with
+  `max_host_wait`: the per-call deadline fails one call, `max_host_wait` kills the command and wins when
+  a single call could outlast what is left of it.
+
+### Development
+
+- **`make test-rust`** runs the Rust unit tests the way CI does (`cargo test --release --features bench --
+  --test-threads=1`, with `PYTHON=` choosing the interpreter and libpython put on `LD_LIBRARY_PATH` on
+  Linux). A bare `cargo test` fails with "Python interpreter is not initialized" because the tests need pyo3's
+  `auto-initialize`, which the `bench` feature enables. Documented in CLAUDE.md; verified on Python 3.15 and 3.12.
+
 ## 0.11.0 — 2026-10-07
 
 ### Changed (breaking defaults, security review of 0.10.0)

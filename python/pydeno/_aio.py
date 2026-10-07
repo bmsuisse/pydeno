@@ -1539,7 +1539,7 @@ class AsyncIsolatedRuntime:
                     if kind == "result":
                         return message.get("v")  # already decoded by `loads_decoded`
                     # A guest's own JavaScriptError is an answer, not a fault.
-                    remote = IsolatedRuntime._remote_error(message)  # noqa: SLF001
+                    remote = IsolatedRuntime._remote_error(message, self._config)  # noqa: SLF001
                     break
                 else:
                     raise _wire.WireError(f"unexpected {_clean(str(kind), 32)!r} frame")

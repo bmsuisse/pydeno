@@ -611,6 +611,15 @@ with IsolatedRuntime(tool_timeout=5) as rt:
 - **Existing limits are unchanged.** Time in the tool still counts toward `max_host_wait` (and its
   CPU cap), a timed-out call counts toward `max_host_calls` and `max_inflight_host_calls` like any
   other, and `console` output, module loaders and the gate are not tool calls and are not covered.
+- **`tool_timeout` and `max_host_wait` together.** They are two different budgets: `tool_timeout`
+  fails *one* call (the guest gets a catchable `TimeoutError` and carries on), `max_host_wait`
+  fails the *command* (the worker is killed and the command raises `RuntimeTimeout`, which the
+  guest cannot catch). A call that hits its `tool_timeout` still spends that time against
+  `max_host_wait`, so a guest that retries a hanging tool in a loop is bounded by `max_host_wait` in
+  the end. Keep `tool_timeout` well under `max_host_wait` (the default is 600 s). If a single call
+  could outlast what is left of `max_host_wait`, the worker is killed first and the guest never sees
+  the `TimeoutError`: `IsolatedRuntime(tool_timeout=10, max_host_wait=0.5)` and a tool that hangs
+  raises `RuntimeTimeout` after 0.5 s.
 - **Where to set it.** `IsolatedRuntime` and `AsyncIsolatedRuntime`; per checkout or per pool on
   `SandboxPool` / `AsyncSandboxPool` (it is one of `SESSION_OPTIONS`); `AgentSandbox` and
   `AsyncAgentSandbox`; and `Pydeno` / `AsyncPydeno` as `limits={"tool_timeout_secs": ...}`.

@@ -239,6 +239,41 @@ class TestCatalog:
             pai.integration.JSCodeMode(runtime_options={"request_timeout": 5})
 
 
+class TestToolTimeout:
+    """`tool_timeout` is forwarded through `runtime_options` to the worker's runtime."""
+
+    def test_a_hung_tool_times_out_in_the_snippet_and_the_snippet_goes_on(
+        self, pai: SimpleNamespace
+    ) -> None:
+        agent = pai.Agent(
+            scripted(
+                pai,
+                "let msg; try { await tools.hang({}); msg = 'no error' }"
+                " catch (e) { msg = e.name + ': ' + e.message }"
+                "\nreturn [msg, await tools.quick({})]",
+            ),
+            capabilities=[
+                pai.integration.JSCodeMode(runtime_options={"tool_timeout": 0.3})
+            ],
+        )
+
+        @agent.tool_plain
+        async def hang() -> str:
+            await asyncio.sleep(30)
+            return "never"
+
+        @agent.tool_plain
+        async def quick() -> str:
+            return "fast"
+
+        start = time.monotonic()
+        result = agent.run_sync("hi")
+        assert time.monotonic() - start < 20
+        assert returns(pai, result) == [
+            ["TimeoutError: host function timed out", "fast"]
+        ]
+
+
 # ---------------------------------------------------------------------------
 # 2. parallel calls, ids, usage
 # ---------------------------------------------------------------------------

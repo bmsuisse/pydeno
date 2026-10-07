@@ -153,6 +153,59 @@ def _clean(text: str, limit: int = 500) -> str:
     return _CONTROL.sub("?", text)[:limit]
 
 
+# What the worker withholds from its guest (see `_worker._set_terse_guest_errors`), keyed by the
+# terse text, for the exception the HOST gets. It is composed here, from the host's own config and
+# fixed wording, never read from the worker: a worker is not trusted to choose text that lands in
+# the host's logs, and nothing about this is the guest's to learn.
+_HOST_DETAIL = (
+    (
+        "Serialization size limit exceeded",
+        lambda c: (
+            f"max_serialization_bytes={c['max_serialization_bytes']} was exceeded "
+            "(RuntimeConfig(max_serialization_bytes=...)); see "
+            "docs/guides/advanced/arrow-ipc-dataframes.md for transferring large payloads"
+        ),
+    ),
+    (
+        "Serialization depth limit exceeded",
+        lambda c: (
+            f"max_serialization_depth={c['max_serialization_depth']} was exceeded "
+            "(RuntimeConfig(max_serialization_depth=...))"
+        ),
+    ),
+    (
+        "BigInt value is too large to transfer",
+        lambda c: (
+            "the worker's CPython refused the BigInt: it is past the int-to-str digit limit "
+            "(sys.set_int_max_str_digits())"
+        ),
+    ),
+    (
+        "Module resolution denied for ",
+        lambda c: (
+            "the module is not an add_static_module() module, and the runtime has no "
+            "set_module_resolver()/set_module_loader() that returns it"
+        ),
+    ),
+)
+
+
+def _add_host_detail(exc: Exception, text: str, config: dict[str, Any] | None) -> None:
+    """Attach the detail the guest was denied to an exception raised on the host, as a note
+    (Python 3.11+; older versions keep the terse text). Matched on the terse wording, so a guest
+    that throws that wording itself gets the same note: it holds only the host's own settings."""
+    add_note = getattr(exc, "add_note", None)
+    if add_note is None or config is None:
+        return
+    for needle, detail in _HOST_DETAIL:
+        if needle in text:
+            try:
+                add_note("host detail: " + detail(config))
+            except KeyError:
+                pass
+            return
+
+
 _REVOKED_MEMORY = 4096
 # V8 flags every worker gets besides `--jitless` (each checked against dagre, three.js with the glTF
 # exporter and vega-lite under the sandbox, and against the benchmark suite):
@@ -1284,7 +1337,7 @@ class IsolatedRuntime:
                         return message.get("v")  # already decoded by `loads_decoded`
                     # Built here, raised after the guard below: a guest's own JavaScriptError is
                     # an answer, not a fault, and must reach the caller unchanged.
-                    remote = self._remote_error(message)
+                    remote = self._remote_error(message, self._config)
                     break
                 else:
                     raise _wire.WireError(f"unexpected {_clean(str(kind), 32)!r} frame")
@@ -1408,7 +1461,9 @@ class IsolatedRuntime:
         return cpu
 
     @staticmethod
-    def _remote_error(message: dict[str, Any]) -> Exception:
+    def _remote_error(
+        message: dict[str, Any], config: dict[str, Any] | None = None
+    ) -> Exception:
         kind = message.get("kind")
         # `kind` is the worker's field: only a string can name one of our classes.
         cls = (
@@ -1428,7 +1483,9 @@ class IsolatedRuntime:
             )
         # Escape sequences in a message that lands in a terminal or a log are an injection channel.
         # Newlines and tabs stay: a JavaScript stack trace is made of them.
-        return cls(_CONTROL.sub("?", text))
+        exc = cls(_CONTROL.sub("?", text))
+        _add_host_detail(exc, text, config)
+        return exc
 
     # -- host callbacks ----------------------------------------------------
 
