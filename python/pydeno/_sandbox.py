@@ -1067,7 +1067,7 @@ def _readable_dir() -> str | None:
     for path in _CANARY_DIRS:
         try:
             os.close(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
             continue
         return path
     return None
@@ -1079,9 +1079,13 @@ def _landlock_canary(path: str | None) -> bool:
     accepts the ruleset and then does not enforce it is otherwise invisible: the syscall said 0."""
     global LANDLOCK_NOTE  # noqa: PLW0603
     if path is None:
-        # Nothing was readable even before (an unusual root): no canary is possible, and the
-        # filesystem is closed to this process either way.
-        return True
+        # Nothing was readable even before (an unusual root): no canary is possible, so the
+        # ruleset is not proven to do anything. Reported as not applied, like any other failure.
+        LANDLOCK_NOTE = (
+            "no probe directory could be opened before the restriction, "
+            "so Landlock is not proven"
+        )
+        return False
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except PermissionError:

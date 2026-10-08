@@ -119,6 +119,23 @@ def test_a_landlock_that_accepts_and_does_not_enforce_is_not_counted() -> None:
     assert missing == ["landlock"], out
 
 
+def test_no_probe_directory_means_landlock_is_not_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If no canary directory can be opened at all, the layer is reported as not applied."""
+    import errno
+
+    from pydeno import _sandbox
+
+    def refuse(path: str, flags: int, *args: object, **kwargs: object) -> int:
+        raise PermissionError(errno.EACCES, "denied", path)
+
+    monkeypatch.setattr(_sandbox.os, "open", refuse)
+    assert _sandbox._readable_dir() is None
+    assert _sandbox._landlock_canary(None) is False
+    assert "not proven" in _sandbox.LANDLOCK_NOTE
+
+
 @pytest.mark.full_sandbox
 def test_sandbox_status_reports_both_canaries() -> None:
     from pydeno import sandbox_status
