@@ -383,7 +383,10 @@ class TestExceptions:
 
     def test_pydeno_own_failures_are_not_redacted(self, tp: Any) -> None:
         with IsolatedRuntime(redact_host_errors=True) as rt:
-            _bind(rt, tp(call_timeout=0.3), nap="sleep", seg="segfault")
+            _bind(rt, tp(call_timeout=0.3), nap="sleep")
+            # A separate process with a roomy timeout: restarting the first one after its
+            # timeout must not have to fit inside 0.3 s on a loaded runner.
+            _bind(rt, tp(call_timeout=30), seg="segfault")
             assert _run(rt, _guest("nap(30)")) == TIMED_OUT
             out = _run(rt, _guest("seg()"))
         assert out.startswith("ToolProcessDied:the tool process died (killed by signal")
