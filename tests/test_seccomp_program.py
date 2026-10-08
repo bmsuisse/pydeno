@@ -267,6 +267,16 @@ class TestClone:
         assert flags & CLONE_THREAD == 0
         assert run(prog, arch, nr, (flags,)) == ERRNO | EPERM
 
+    @pytest.mark.parametrize(
+        "namespace",
+        [0x00020000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000],
+    )
+    def test_a_new_namespace_is_denied_even_in_a_thread(
+        self, arch: str, prog: list, namespace: int
+    ) -> None:
+        nr = sb._CLONE[_idx(arch)]  # noqa: SLF001
+        assert run(prog, arch, nr, (CLONE_THREAD | namespace,)) == ERRNO | EPERM
+
     def test_clone3_falls_back_to_clone(self, arch: str, prog: list) -> None:
         """glibc retries with clone() when clone3 says ENOSYS, which is how threads still start."""
         nr = sb._CLONE3[_idx(arch)]  # noqa: SLF001

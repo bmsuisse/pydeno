@@ -781,6 +781,9 @@ _SECCOMP_RET_KILL_PROCESS = 0x80000000
 _SECCOMP_RET_ERRNO = 0x00050000
 _EPERM, _ENOSYS = 1, 38
 _CLONE_THREAD = 0x10000
+# CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
+# CLONE_NEWNET: any namespace the sandbox must not create, all in the low 32 bits of arg0.
+_CLONE_NEW_MASK = 0x7E020000
 
 
 def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
@@ -853,8 +856,9 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))  # the default
     stubs(enosys=True)
 
-    label("clone")  # only thread creation: flags must contain CLONE_THREAD
+    label("clone")  # only threads: CLONE_THREAD set, no new namespace
     ins.append((_BPF_LD_W_ABS, None, None, 16))
+    ins.append((_BPF_JSET_K, "eperm", None, _CLONE_NEW_MASK))
     ins.append((_BPF_JSET_K, "allow", "eperm", _CLONE_THREAD))
     stubs()
     label("signal")  # only to ourselves (low 32 bits of the pid argument)
