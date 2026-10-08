@@ -1,6 +1,20 @@
 # Changelog
 
-## 0.12.1 — unreleased
+## 0.13.0 — unreleased
+
+### Fixed
+
+- **The `pydeno` CLI caps total console output (#150).** A guest looping on `console.log` could make the
+  CLI print without limit until the deadline (up to 24 h with `--timeout 86400`). The CLI now prints at
+  most 1 MiB of `console.*` output in total, then one `[truncated]` line, and drops the rest.
+  `--max-output SIZE` changes the cap.
+
+### Housekeeping
+
+- Issues #139 to #146 were filed against 0.11.0 and are fixed in 0.12.1; they are closed with this release.
+- #138 (V8 15.2) waits on a `deno_core` release that uses it; 0.412.0 is still the newest and uses V8 150.
+
+## 0.12.1 — 2026-10-08
 
 The 0.11.1 hotfixes (five issues found in an independent review of 0.11.0), applied to the 0.12 line.
 0.11.0 and 0.12.0 are both affected.

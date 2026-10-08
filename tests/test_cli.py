@@ -511,3 +511,27 @@ def test_frame_cap_refusal_from_the_encoder_is_also_exit_2(
     newlines.write_bytes(b"1" + b"\n" * (9 * 1024 * 1024))
     assert _cli.main(["--no-sandbox", "-f", str(newlines)]) == _cli.EXIT_USAGE
     assert "too large" in capsys.readouterr().err
+
+
+def test_console_printer_caps_total_output(capsys: pytest.CaptureFixture[str]) -> None:
+    printer = _cli._console_printer(100)
+    for _ in range(50):
+        printer("log", ["x" * 30])
+    printer("error", ["after the cut"])
+    out = capsys.readouterr()
+    assert out.out.count("x" * 30) == 3
+    assert out.out.endswith("[truncated]\n")
+    assert out.out.count("[truncated]") == 1
+    assert out.err == ""
+
+
+def test_no_sandbox_console_flood_is_capped() -> None:
+    proc = run(
+        "--no-sandbox",
+        "--max-output",
+        "4K",
+        "for (let i = 0; i < 5000; i++) console.log('A'.repeat(100)); 1",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert len(proc.stdout) < 8192
+    assert "[truncated]" in proc.stdout

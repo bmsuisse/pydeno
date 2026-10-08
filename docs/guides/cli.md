@@ -42,6 +42,7 @@ or an endless pipe stops at the cap instead of filling memory.
 | Option | Default | Meaning |
 |---|---|---|
 | `--timeout SECONDS` | 30 | Deadline for the evaluation; above 0 and at most 86400 |
+| `--max-output SIZE` | 1M | Print at most this much `console.*` output in total, then one `[truncated]` line; the rest is dropped |
 | `--max-memory SIZE` | 1G | Kill the worker above this resident memory: bytes, or a `K`/`M`/`G`/`T` suffix, optionally with `B` or `iB` (binary units); at most `1T` |
 | `--sandbox require\|auto` | `require` | `require` refuses to run without every OS sandbox layer this platform has; `auto` applies what is available |
 | `--no-sandbox` | off | Run the worker without the OS sandbox; prints a warning on stderr. Still a separate process with the same limits |
