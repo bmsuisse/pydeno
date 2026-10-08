@@ -1560,10 +1560,8 @@ def attest(parent: int | None = None) -> list[str]:
                 continue  # absent on this image is not a refusal: probe the next one
             except PermissionError:
                 raise  # the sandbox's refusal, counted by check()
-            except OSError as exc:
-                raise RuntimeError(
-                    f"read probe of {path} failed unexpectedly: {exc}"
-                ) from exc
+            except OSError:
+                continue  # not a refusal and not a read (ENOTDIR, ELOOP, ...): try the next file
             return  # read succeeded: a breach
         raise _NoProbeTarget
 

@@ -9,6 +9,16 @@
   most 1 MiB of `console.*` output in total, then one `[truncated]` line, and drops the rest.
   `--max-output SIZE` changes the cap.
 
+### Changed (sandbox hardening)
+
+- **`clone` that creates a namespace is refused (seccomp).** The filter let a `clone` carrying
+  `CLONE_THREAD` through whatever else was in its flags; any `CLONE_NEW*` bit now gets `EPERM`. Thread
+  creation is unchanged. (`unshare` was already denied and `clone3` already returns `ENOSYS`.)
+- **The Landlock canary fails closed.** If no probe directory could be opened before the restriction, the
+  layer is now reported as not proven instead of applied.
+- **The start-up read probe cannot pass vacuously.** A missing `/etc/hosts` no longer counts as a refusal;
+  the probe tries `/etc/passwd` and `/bin/sh` and is skipped (not passed) if none exists.
+
 ### Housekeeping
 
 - Issues #139 to #146 were filed against 0.11.0 and are fixed in 0.12.1; they are closed with this release.
