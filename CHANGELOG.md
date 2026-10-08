@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.11.1 — 2026-10-07
+
+Hotfix for five issues found in an independent review of 0.11.0.
+
+### Fixed
+
+- **Free-threaded wheels are no longer published (#140).** 0.11.0 shipped `cp314t` and `cp315t`
+  wheels (maturin's `--find-interpreter` picked up the free-threaded interpreters in the manylinux
+  image) although pydeno does not support free-threaded CPython. The release job now deletes any
+  `cp3NNt` wheel and fails if one is left. Those 0.11.0 wheels stay on PyPI (a release's files are
+  immutable to a hotfix); `IsolatedRuntime`, `AsyncIsolatedRuntime` (so `AgentSandbox`, `Pydeno`)
+  now refuse to start on a free-threaded build with a `RuntimeError` (error kind
+  `sandbox_unavailable`) unless `PYDENO_ALLOW_FREE_THREADED=1` is set, at your own risk.
+- **`console.log` of 10 MiB or more no longer vanishes silently (#141).** One `console.*` call over the
+  engine's 10 MiB conversion limit (and so every line of 16 MiB or more) was dropped with `status`
+  `Succeeded`, empty `stdout` and `truncated=False`. It now arrives as a bounded prefix (1 Mi
+  UTF-16 units in all), the stream ends with `[truncated]` and `truncated` is `True`, like any
+  other overflow. A callback that takes a third argument receives `True` there; one that does not
+  gets the prefix only.
+- **Console calls no longer count against `max_host_calls` (#141).** `console.*` is the guest's own
+  output, not a tool call, so a chatty script cannot spend the budget meant for tools
+  (`IsolatedRuntime`, `AsyncIsolatedRuntime`, `AgentSandbox`). Its time and size stay bounded by the
+  console allowance of the deadline and `max_output_bytes`.
+- **A `Date` outside the years 1 to 9999 is one catchable error, and the edge is exact (#142).** It raised
+  a bare `ValueError` with Python's wording (`year 275760 is out of range`), also into the guest through
+  host function arguments, and `253402300799999` ms came back 7 microseconds off because the
+  conversion went through a float. It is now the same `RuntimeError` ("Date value out of range") an
+  invalid `Date` already gave, and the conversion uses integer milliseconds.
+- **`empty_root="require"` that cannot be met is `sandbox_unavailable` (#143).** `classify_error` called it
+  `worker_crashed`, which is retryable, although no retry can succeed (user namespaces blocked, e.g.
+  Ubuntu's `apparmor_restrict_userns`). It is now `sandbox_unavailable` and not retryable.
+
+### Documentation
+
+- `SECURITY.md`, the isolation, pydantic-ai and tool-process guides now state the shipped defaults
+  (`IsolatedRuntime` / `AsyncIsolatedRuntime` `max_host_wait` 60 s; the `Pydeno` / `AsyncPydeno` front
+  door's `max_host_wait_secs` stays 600 s, as documented in the quickstart); the security review prep
+  no longer calls `sandbox="auto"` the default (it is `"require"` since 0.11); the stale `pyo3` 0.27.2 exceptions (`RUSTSEC-2026-0176`/`-0177`) are removed
+  from `deny.toml`, `osv-scanner.toml` and the cargo-audit step (#139).
+
 ## 0.11.0 — 2026-10-07
 
 ### Changed (breaking defaults, security review of 0.10.0)
