@@ -269,7 +269,15 @@ class TestClone:
 
     @pytest.mark.parametrize(
         "namespace",
-        [0x00020000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000],
+        [
+            0x00020000,
+            0x02000000,
+            0x04000000,
+            0x08000000,
+            0x10000000,
+            0x20000000,
+            0x40000000,
+        ],
     )
     def test_a_new_namespace_is_denied_even_in_a_thread(
         self, arch: str, prog: list, namespace: int
