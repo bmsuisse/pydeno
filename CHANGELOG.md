@@ -1,5 +1,93 @@
 # Changelog
 
+## 0.12.0 — 2026-10-08
+
+### Added
+
+- **`AgentSandbox(mode="script")` (#144).** The code can now be run as a script, whose last expression
+  is the result (a Promise is awaited, so `(async () => ...)()` works), instead of the body of an async
+  function. Also on `AsyncAgentSandbox`; `describe_tools()` (and `describe_tools(mode=...)`) tell the model
+  which one to write. `var`/`function` declarations persist, `let`/`const`/`class` stay local to the run;
+  not combinable with `strict_eval`. The default (`mode="function"`) is unchanged, and the mode is
+  journaled only when it is `"script"`, so existing journals and default sessions are byte-for-byte what
+  they were. `JSCodeMode` keeps its own snippet contract and is not affected.
+
+- **`on_unserializable="error" | "drop" | "stringify"` for isolated results (#145).** A `JsFunction`
+  anywhere in a result used to fail the whole command with no way round but normalising inside the
+  sandbox. On `IsolatedRuntime`, `AsyncIsolatedRuntime`, `AgentSandbox`, `AsyncAgentSandbox` and per
+  `SandboxPool` checkout, `"drop"` leaves such a value out (object member removed, array item
+  `None`) and `"stringify"` replaces it with `"[JsFunction]"` (the type only, nothing of the function).
+  The default stays `"error"`, so the secure behaviour is unchanged; it applies to results, not to the
+  arguments a guest passes to host functions. The setting travels with each command, so a pre-started
+  pool worker takes it at checkout.
+
+- **`expose_host_errors` allowlists exception types whose message the guest may see (#146).**
+  `redact_host_errors` was all-or-nothing. On `IsolatedRuntime`, `AsyncIsolatedRuntime`, `AgentSandbox`,
+  `AsyncAgentSandbox` and per `SandboxPool` checkout, `expose_host_errors=` takes an exception class, a
+  collection of classes (`isinstance`, so subclasses count) or a callable returning `True`; every other
+  message stays `host function failed`. It fails closed (a hook that raises, or answers anything but
+  `True`, redacts) and only the matched exception's own class name and `str()` are sent: its cause,
+  context, notes and traceback never reach the guest, and an exception wrapping an allowed one is not
+  allowed. Default behaviour is unchanged, and journals record the text the guest saw, so a replay does
+  not depend on the setting.
+
+### Changed
+
+- **The host-side exception from an isolated runtime keeps the detail the guest is denied (#131).** The
+  guest-visible text stays terse; the `JavaScriptError`/`TypeError` the host receives now carries an
+  exception note (`host detail: ...`, Python 3.11+, shown in tracebacks, `str(exc)` unchanged) naming the
+  `max_serialization_bytes`/`max_serialization_depth` that was hit, the BigInt digit limit, or the
+  `add_static_module()` hint. The note is composed in the parent from its own `RuntimeConfig` and fixed
+  wording, so no new text comes from the worker and the wire format is unchanged. It is matched on the
+  terse wording, so a guest that throws that wording itself gets the same note, holding only host settings.
+
+- **A static gate's policy is bound to the session journal (#134).** `AgentSandbox` / `AsyncAgentSandbox`
+  sessions made with `gate=static_gate(policy)` record a stable hash of the `SourcePolicy` in the journal
+  config, and `load` refuses (`JournalError`, before any worker starts) a load under a different static
+  gate, or none, unless `regate_replay=True`. Journals of sessions without a static gate are
+  byte-for-byte what they were, and load under any gate. The front-door sessions
+  (`PydenoSession.load_session` / `load_snapshot`) still have no `regate_replay`: their journal holds the
+  generated setup and a rewritten body rather than the text the gate saw, which cannot be recovered
+  reliably nor recorded without changing the record shape, so this is documented in
+  `docs/guides/gate.md` and left.
+
+### Documentation
+
+- `tool_timeout` is documented on the pydantic-ai page (it reaches `JSCodeMode` through
+  `runtime_options`, now pinned by a test), and the isolation guide spells out how it combines with
+  `max_host_wait`: the per-call deadline fails one call, `max_host_wait` kills the command and wins when
+  a single call could outlast what is left of it.
+
+### Development
+
+- **`make test-rust`** runs the Rust unit tests the way CI does (`cargo test --release --features bench --
+  --test-threads=1`, with `PYTHON=` choosing the interpreter and libpython put on `LD_LIBRARY_PATH` on
+  Linux). A bare `cargo test` fails with "Python interpreter is not initialized" because the tests need pyo3's
+  `auto-initialize`, which the `bench` feature enables. Documented in CLAUDE.md; verified on Python 3.15 and 3.12.
+### Added
+
+- **Experimental: `pydeno.ToolProcess`, host tools in a supervised child process (#45, item 5,
+  phase 1).** `tools = ToolProcess(...)`; `rt.bind_function("lookup", tools.tool("myapp.tools:lookup"))`.
+  A tool bug, a segfault in a C extension or a runaway tool is then not in the parent's address
+  space. Tools are importable `'module:function'` names or module-level functions (closures,
+  lambdas and `__main__` functions are refused with a clear error); the handler `tool()` returns is
+  an ordinary async callable, so it works with `bind_function`, `bind_object`, `ToolBridge`,
+  `AgentSandbox` and `AsyncIsolatedRuntime`, and **no existing class or option changes**.
+  Per call: a deadline (`call_timeout`, the guest gets the same `TimeoutError: host function timed
+  out` as `tool_timeout`), a result-size cap checked in the tool host before sending
+  (`ToolResultTooLarge`), a memory ceiling (RSS poll plus `RLIMIT_DATA` on Linux) and a CPU cap; a
+  breach kills the tool host's process group and the next call starts a new one. A tool host that
+  dies (crash, signal, limit, close) fails every call in flight with `ToolProcessDied`, which an
+  agent journal records as a failed call and a replay feeds back without running the tool.
+  Exceptions keep their class name and their message, redacted per `redact_host_errors`; async tools
+  run concurrently. Empty environment unless `env=` is passed; the tool host exits when its parent
+  dies. Every tool is asynchronous for the guest. **Without `sandbox=` this is crash isolation and
+  resource limits, not a sandbox.** `sandbox="auto" | "require"` applies the worker's OS layers
+  to the tool host (no filesystem, no network; `"require"` refuses where a layer is missing). Not
+  done yet: per-tool capability grants, per-call isolation, cgroup caps; macOS and aarch64 are
+  unverified. See "Host tools in a child process" in the isolation guide and
+  `docs/contributing/sandboxed-tool-process.md`.
+
 ## 0.11.0 — 2026-10-07
 
 ### Changed (breaking defaults, security review of 0.10.0)

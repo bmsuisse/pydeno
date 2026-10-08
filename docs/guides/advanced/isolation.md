@@ -295,6 +295,29 @@ reference to guest code. (`IsolatedRuntime` refuses snapshots.)
 
 Not supported yet: streams, snapshots, the inspector, function handles, Windows.
 
+### A function in the result: `on_unserializable`
+
+A `JsFunction` (or another handle that cannot be copied) anywhere in a command's result makes the
+whole command fail with `TypeError: JsFunction cannot cross the isolation boundary`. That stays the
+default (`on_unserializable="error"`): nothing leaves the sandbox that you did not ask for. A host
+whose guest returns rich objects can opt in, on `IsolatedRuntime`, `AsyncIsolatedRuntime`,
+`AgentSandbox`, `AsyncAgentSandbox` and per `SandboxPool` checkout:
+
+| Value | A function in the result becomes |
+|---|---|
+| `"error"` (default) | the whole command raises `TypeError` |
+| `"drop"` | nothing: an object member is removed, an array or set item becomes `None` (a result that is itself one is `None`), like `JSON.stringify` |
+| `"stringify"` | the text `"[JsFunction]"` (the type name in brackets: never the function's name or source) |
+
+```python
+with IsolatedRuntime(config, on_unserializable="drop") as rt:
+    rt.eval("({run: () => 1, n: 2, items: [1, () => 2]})")   # {"n": 2, "items": [1, None]}
+```
+
+It applies to the result of `eval`, `eval_async`, `eval_module`, `eval_module_async` and the
+`execute` forms, at any depth, and leaves every serialisable value as it was. It does not apply to
+the arguments a guest passes to your host functions, which still fail the call.
+
 ### One result instead of an exception
 
 `execute(code)` (and `await execute_async(code)`) evaluates like `eval` but returns an
@@ -376,6 +399,8 @@ What to do about it in your own code:
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
 | `redact_host_errors` | `True` | Guest sees the exception class but only `"host function failed"` as message |
+| `expose_host_errors` | none | Exception classes (or a hook) whose message is shown anyway; see [Showing selected host errors](#showing-selected-host-errors-expose_host_errors) |
+| `on_unserializable` | `"error"` | What happens to a function inside a result: fails the command (default), or is dropped / stringified, see [above](#a-function-in-the-result-on_unserializable) |
 
 A worker CPU-time cap of twice the hard deadline also applies, because wall-clock pauses
 during host calls cannot pause CPU.
@@ -501,7 +526,8 @@ The rules, which are what keep a pool as safe as a fresh runtime:
   `jitless`, `v8_flags`, `strict_eval`, `clock`, `random_seed`, `max_memory`, console routing) is fixed per pool;
   use one pool per such configuration. What only the parent enforces (`SandboxPool.SESSION_OPTIONS`:
   `request_timeout`, `timeout_grace`, `max_host_calls`, `max_host_wait`, `max_inflight_host_calls`,
-  `write_stall_timeout`, `redact_host_errors`, `tool_timeout`) can be set per checkout.
+  `write_stall_timeout`, `redact_host_errors`, `expose_host_errors`, `on_unserializable`,
+  `tool_timeout`) can be set per checkout.
 
 Each pooled worker is a live process (tens of MB), so size the pool for your burst, not your peak:
 a burst larger than the pool degrades to cold starts until the refill catches up. `stats()` reports
@@ -582,6 +608,40 @@ during the bridge’s type checks.
 A Proxy around a function crosses as the underlying function; invoking its Python wrapper
 skips the Proxy’s `apply` trap.
 
+## Showing selected host errors: `expose_host_errors`
+
+`redact_host_errors=True` (the default) replaces the message of every exception a host function
+raises with `host function failed`; the guest keeps the class name. A host that wants the model to
+read the messages of a short list of exceptions (its own validation errors, say) no longer has to
+turn redaction off and filter by hand:
+
+```python
+class ValidationError(Exception): ...
+
+with IsolatedRuntime(expose_host_errors=ValidationError) as rt:      # a class
+    ...
+IsolatedRuntime(expose_host_errors=(ValidationError, KeyError))      # or several
+IsolatedRuntime(expose_host_errors=lambda exc: getattr(exc, "public", False))  # or a hook
+```
+
+- Classes are matched with `isinstance`, so a subclass of a listed class is shown too: list the
+  classes whose text you wrote, never a broad base such as `Exception` or `OSError`. A callable gets
+  the exception and must return exactly `True` to show it.
+- **Fails closed.** A hook that raises, or returns anything but `True`, leaves the message redacted.
+  Everything not matched stays `host function failed`. Passing it with `redact_host_errors=False` is a
+  `ValueError` (everything is shown already).
+- **Nothing else crosses.** Only the matched exception's own class name and `str()` are sent to the
+  worker. Its `__cause__`, `__context__`, `add_note()` notes and traceback never leave the parent, and
+  the decision looks at the raised exception alone: an exception that merely wraps an allowed one
+  (`raise RuntimeError(...) from validation_error`) is not itself allowed. What the guest reads is
+  exactly that `str()`, so keep a listed exception's message free of what you would not show.
+- **Tools in a `ToolProcess`** raise a plain class of the same *name* as the tool's exception, not
+  the original (`isinstance` against your class does not match); use a hook that compares
+  `type(exc).__name__`.
+- Also settable per `SandboxPool` checkout, and on `AgentSandbox` / `AsyncAgentSandbox` (it applies
+  to the errors a session's tools raise and to `resume(step, error=...)`). The journal records the
+  text the guest saw, so a replay sends the same text whatever the setting at load time.
+
 ## Per-call tool deadline
 
 `max_host_wait` bounds the *total* time a command spends in host calls. `tool_timeout=` (seconds,
@@ -611,6 +671,15 @@ with IsolatedRuntime(tool_timeout=5) as rt:
 - **Existing limits are unchanged.** Time in the tool still counts toward `max_host_wait` (and its
   CPU cap), a timed-out call counts toward `max_host_calls` and `max_inflight_host_calls` like any
   other, and `console` output, module loaders and the gate are not tool calls and are not covered.
+- **`tool_timeout` and `max_host_wait` together.** They are two different budgets: `tool_timeout`
+  fails *one* call (the guest gets a catchable `TimeoutError` and carries on), `max_host_wait`
+  fails the *command* (the worker is killed and the command raises `RuntimeTimeout`, which the
+  guest cannot catch). A call that hits its `tool_timeout` still spends that time against
+  `max_host_wait`, so a guest that retries a hanging tool in a loop is bounded by `max_host_wait` in
+  the end. Keep `tool_timeout` well under `max_host_wait` (the default is 600 s). If a single call
+  could outlast what is left of `max_host_wait`, the worker is killed first and the guest never sees
+  the `TimeoutError`: `IsolatedRuntime(tool_timeout=10, max_host_wait=0.5)` and a tool that hangs
+  raises `RuntimeTimeout` after 0.5 s.
 - **Where to set it.** `IsolatedRuntime` and `AsyncIsolatedRuntime`; per checkout or per pool on
   `SandboxPool` / `AsyncSandboxPool` (it is one of `SESSION_OPTIONS`); `AgentSandbox` and
   `AsyncAgentSandbox`; and `Pydeno` / `AsyncPydeno` as `limits={"tool_timeout_secs": ...}`.
@@ -620,9 +689,105 @@ with IsolatedRuntime(tool_timeout=5) as rt:
   the guest exactly that failure and never runs the tool again. A plain tool still stuck on the
   session's tool thread is left there and later plain tools get a fresh thread.
 
-This is the guest-visible half of running tools in a process of their own; the tool still runs in
-the parent, so it bounds a hung tool, not a tool that crashes or misuses the parent's memory (see
-[the design note](../../contributing/sandboxed-tool-process.md)).
+`tool_timeout` is the guest-visible half of running tools in a process of their own; the tool
+still runs in the parent, so it bounds a hung tool, not one that crashes or misuses the parent's
+memory. The next section is the process boundary.
+
+## Host tools in a child process: `ToolProcess` (experimental)
+
+!!! warning "Experimental, off by default"
+    `ToolProcess` is new in 0.12 and its API may change before it is declared stable. Nothing
+    changes for tools you bind as before. **Without `sandbox=` it is crash isolation and resource
+    limits, not a sandbox**: the tool host runs with your user's authority (files, network).
+
+A tool that segfaults in a C extension, leaks memory or spins takes the parent with it when it runs
+in the parent. A `ToolProcess` runs tools in a supervised child process (a *tool host*, not the
+JavaScript worker) and gives the parent a handler to bind like any other:
+
+```python
+from pydeno import IsolatedRuntime, ToolProcess
+
+tools = ToolProcess(call_timeout=10, max_memory=256 * 2**20, cpu_seconds=5)
+
+with IsolatedRuntime() as rt:
+    rt.bind_function("lookup", tools.tool("myapp.tools:lookup"))   # 'module:function'
+    rt.bind_function("render", tools.tool(render_report))          # an importable function
+    result = await rt.eval_async("await lookup('x')")
+tools.close()   # or `with ToolProcess(...) as tools:`
+```
+
+`tools.tool(...)` returns an ordinary async callable, so it works wherever a host tool does:
+`bind_function`, `bind_object`, `ToolBridge` (on a `Runtime`), `AgentSandbox(tools=...)`,
+`AsyncIsolatedRuntime` (pools and the `Pydeno` front door take any tool callable too, but are not
+tested with this yet). Budgets, `tool_timeout`, `redact_host_errors` and
+the agent journal see an ordinary tool that returns or raises.
+
+- **Tools must be importable.** Name a tool `"module:function"` (dotted attribute paths work) or pass
+  a module-level function. A lambda, a closure, a function from `__main__`, a bound method or any
+  callable object is refused with an error that says why: another process cannot receive them. The
+  tool host gets the parent's `sys.path` (override with `path=`) and imports a tool on its first
+  call. A function you pass keeps its name, docstring and signature, so tool catalogs describe it.
+- **State lives in the tool host.** Module globals persist between calls and are lost when the host
+  restarts. Nothing is shared with the parent's copy of the module.
+- **Always asynchronous for the guest.** The parent never blocks on the child, so every tool of a
+  `ToolProcess` is a Promise in JavaScript (`await lookup('x')`), sync Python function or not.
+  Calls run concurrently: `async def` tools on one event loop in the tool host, plain functions on
+  up to 32 threads.
+- **Limits, per tool host.** Each one kills the tool host's whole process group (it is started with
+  `start_new_session`), then the next call starts a fresh one:
+
+    | option | default | when it is exceeded |
+    |---|---|---|
+    | `call_timeout` | 60 s (`None` = off) | the call fails with `TimeoutError: host function timed out`, exactly what `tool_timeout` gives |
+    | `max_result_bytes` | 1 MiB | the tool host refuses to send it: `ToolResultTooLarge`, the host lives on |
+    | `max_memory` | off | resident memory sampled every 25 ms: killed, `ToolProcessDied`; on Linux a kernel `RLIMIT_DATA` sits just above it |
+    | `cpu_seconds` | off | CPU used while one call runs (all threads): killed, `ToolProcessDied` |
+
+  A deadline is enforced by a supervisor thread, so it holds even if nobody awaits the call any more.
+- **A dead tool host is a failed call, never "did not happen".** A crash (`ToolProcessDied: the tool
+  process died (killed by signal SIGSEGV)`), a limit kill, a close: every call in flight fails with
+  `ToolProcessDied`, because a call may have had side effects before it died. Other calls in flight
+  when one overruns its deadline die with it (they get `ToolProcessDied`; the call that overran gets
+  the timeout). The text is pydeno's own, with nothing from the tool, so `redact_host_errors` leaves
+  it alone.
+- **Exceptions keep their class name and message.** A tool's `ValueError("x")` reaches the guest as
+  `ValueError` with the message `x`, redacted to `host function failed` under
+  `redact_host_errors=True` (the default), exactly as for a tool in the parent. An exception that
+  cannot be encoded (a result that cannot cross) is the guest's `TypeError`, as in the parent.
+- **Agent journals.** An `AgentSandbox` records a died tool host (and a timeout) as a failed call
+  (`["ans", "e", "ToolProcessDied", "<message>"]`), and a replay sends the guest that same failure
+  without starting a tool host or running the tool, like any recorded failure.
+- **Empty environment.** The tool host sees no environment variable unless you pass `env={...}`
+  (CPython itself may add `LC_CTYPE`).
+- **Cleanup.** `close()` (or the `with` block) kills the tool host and releases its pipes and
+  threads; a `ToolProcess` that is garbage-collected or outlives the interpreter has its host
+  killed, and a tool host exits by itself when its parent dies (stdin EOF plus a parent-pid check).
+  Closing an `IsolatedRuntime` does not close a `ToolProcess` you made: it is yours, and can serve
+  several runtimes. A `fork()`ed child cannot use its parent's `ToolProcess` (it raises).
+
+### Optional confinement: `sandbox="auto" | "require"`
+
+With `sandbox=` the tool host applies the *same* OS layers as a worker (Landlock and seccomp on
+Linux, Seatbelt on macOS, the empty root, dropped privileges) and then serves calls, so a
+compromised tool has no filesystem and no network: a tool that opens a file fails with
+`PermissionError`. `"require"` refuses to start (`ToolProcessStartError`, naming the missing
+layer) where the platform cannot apply all of them, as for `IsolatedRuntime`; `tools.start()`
+raises that error eagerly, and `tools.sandbox` reports what was applied. Consequences: every tool
+must be registered (`tools.tool(...)`) before the first call, because the tool host imports them
+before it is confined; a tool must import what it needs at module level, since nothing can be
+imported afterwards; and there is no per-tool capability grant (a tool that needs a file or a
+network address cannot use `sandbox=` yet; run it in an unconfined `ToolProcess`).
+
+### What it does not do
+
+- It is not a sandbox unless you pass `sandbox=`, and then it is all-or-nothing, not per tool.
+- The tool host is a Python process: a tool that spawns threads or processes, or reads the
+  parent's files, can do so (unconfined). Descendants are killed with the process group, unless a
+  tool puts them in a session of their own.
+- Windows: not supported (nothing in `IsolatedRuntime` is).
+- `max_memory` is sampled; a burst between samples is caught by the kernel ceiling on Linux only.
+- Only Linux x86_64 was verified; see [the design note](../../contributing/sandboxed-tool-process.md)
+  for what is still open.
 
 ## Console callback deadlines
 

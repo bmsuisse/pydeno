@@ -33,8 +33,10 @@ import asyncio
 import concurrent.futures
 import contextvars
 import functools
+import dataclasses
 import hashlib
 import inspect
+import json
 import os
 import queue
 import threading
@@ -763,6 +765,19 @@ class StaticGate:
 
     def __repr__(self) -> str:
         return f"static_gate({self.policy!r})"
+
+
+def _policy_hash(policy: SourcePolicy) -> str:
+    """A stable identity for a `SourcePolicy`: SHA-256 over its fields (sets sorted), so equal
+    policies hash equal in every process and under any set ordering. A session journal records
+    it so a load under another static gate is noticed (see `_agent._check_gate_identity`). It
+    identifies the *configuration*; the scanner's behaviour is pinned by the journal's release."""
+    fields = {
+        f.name: sorted(v) if isinstance(v := getattr(policy, f.name), frozenset) else v
+        for f in dataclasses.fields(policy)
+    }
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(b"pydeno-static-gate-v1\0" + canonical.encode()).hexdigest()
 
 
 def static_gate(policy: SourcePolicy) -> StaticGate:

@@ -37,7 +37,7 @@ import builtins
 import binascii  # noqa: F401
 import concurrent.futures
 import contextvars  # noqa: F401
-import datetime  # noqa: F401
+import datetime
 import inspect  # noqa: F401
 import itertools
 import json  # noqa: F401
@@ -54,6 +54,7 @@ from . import _wasm
 from . import _wire
 from ._pydeno import (
     JavaScriptError,
+    JsUndefined,
     Runtime,
     RuntimeConfig,
     RuntimeForceKilled,
@@ -214,6 +215,54 @@ def _encode_error_text(exc: Exception) -> str:
     if isinstance(exc, _wire.WireError):
         return str(exc)
     return "BigInt value is too large to transfer"
+
+
+_PLAIN_LEAVES = (
+    type(None),
+    bool,
+    int,
+    float,
+    str,
+    bytes,
+    bytearray,
+    memoryview,
+    datetime.datetime,
+    JsUndefined,
+)
+_DROPPED = object()
+
+
+def _scrub(value: Any, mode: str, depth: int) -> Any:
+    """`value` with every leaf the wire cannot carry (a `JsFunction`, a stream handle, ...)
+    dropped or replaced by its type name in brackets, for `on_unserializable`. Containers are
+    rebuilt, so the guest's own structure is never mutated; past the wire's depth limit the value
+    is returned as it is, and the encoder reports the depth the way it always did."""
+    if isinstance(value, _PLAIN_LEAVES):
+        return value
+    if depth > _wire.MAX_DEPTH:
+        return value
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            kept = _scrub(item, mode, depth + 1)
+            if kept is not _DROPPED:
+                out[key] = kept
+        return out
+    if isinstance(value, (list, tuple)):
+        items = [_scrub(item, mode, depth + 1) for item in value]
+        return [None if item is _DROPPED else item for item in items]
+    if isinstance(value, (set, frozenset)):
+        kept = [_scrub(item, mode, depth + 1) for item in value]
+        return {item for item in kept if item is not _DROPPED and _hashable(item)}
+    return _DROPPED if mode == "drop" else f"[{type(value).__name__}]"
+
+
+def _hashable(value: Any) -> bool:
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
 
 
 # Exceptions the parent may re-raise by name. Anything else becomes RuntimeError.
@@ -564,6 +613,11 @@ class _Worker:
         cmd_id = message.get("id")
         try:
             result = self._handle(message)
+            mode = message.get("unser")
+            if mode in ("drop", "stringify"):
+                result = _scrub(result, mode, 0)
+                if result is _DROPPED:
+                    result = None
             reply: dict[str, Any] = {
                 "t": "result",
                 "id": cmd_id,

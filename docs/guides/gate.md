@@ -214,12 +214,26 @@ AgentSandbox.load(blob, key, tools, gate=g, regate_replay=True)  # GateDenied if
 ```
 
 A gate that is not deterministic (a model classifier) can refuse state that was fine when it ran, so
-leave `regate_replay` off for it. The gate's identity is not recorded in the journal: no policy hash
-is checked, so a changed gate is only noticed by `regate_replay` refusing code, not by a mismatch.
+leave `regate_replay` off for it.
 
-`PydenoSession.load_session` / `load_snapshot` (and the async ones) have no `regate_replay`: their
-journal holds each feed wrapped with the inputs and external-function setup, not the code the gate
-saw, so the gate cannot be re-run over the original text. For them, check the code yourself before
+**A static gate's policy is bound to the journal.** A session made with `gate=static_gate(policy)`
+records a SHA-256 of the `SourcePolicy` (its fields, sets sorted, so equal policies hash equal in any
+process) in the journal's config. `AgentSandbox.load` and `AsyncAgentSandbox.load` then refuse
+(`JournalError`, before any worker starts) a journal whose recorded policy is not the one of the
+`static_gate` you load with, including a load with no gate or with a gate of another kind. Pass the
+same policy, or `regate_replay=True`, which instead runs the gate you pass over every recorded run
+and so replaces the identity check. Journals of sessions without a static gate (no gate, a classifier,
+`all_of(...)`, a plain function) record nothing, are unchanged, and load under any gate: only a static
+gate has an identity that can be compared. The hash identifies the policy's configuration; the
+scanner's behaviour is pinned by the journal's pydeno release, which `load` already requires to match.
+
+`PydenoSession.load_session` / `load_snapshot` (and the async ones) have no `regate_replay` and do
+not bind the gate's identity. Their journal holds each feed as the setup the session generated (your
+`inputs` and `external_lookup` stubs, as JSON-in-JavaScript) followed by the code, and for a feed whose
+last statement is an expression the code is rewritten to return it. The text the gate saw is not a
+delimited part of that record, so it cannot be recovered reliably, and recording it beside the feed
+would change the journal's record shape and roughly double the size of every gated feed's record. So
+the gate cannot be re-run over the original text. For these sessions, check the code yourself before
 loading, or start a fresh session.
 
 **Use one `dump_key` per gate configuration.** Replay trusts whatever the key signed. A dump from a

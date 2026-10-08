@@ -128,10 +128,6 @@ def test_idle_cpu_does_not_scale_with_runtime_count() -> None:
     )
 
 
-@pytest.mark.skipif(
-    (os.cpu_count() or 1) > 16,
-    reason="needs a machine where 24 runtimes comfortably outnumber the cores",
-)
 def test_call_latency_survives_more_runtimes_than_cores() -> None:
     """Per-call latency must not collapse once K exceeds the core count.
 
@@ -151,7 +147,9 @@ def test_call_latency_survives_more_runtimes_than_cores() -> None:
             baseline_rt.close()
             gc.collect()
 
-        count = 3 * (os.cpu_count() or 4)
+        # Scales with the core count so K always exceeds the cores; capped so a very large
+        # machine does not spawn hundreds of runtimes (there it only exceeds them up to the cap).
+        count = min(3 * (os.cpu_count() or 4), 96)
         runtimes = [_make_runtime() for _ in range(count)]
         try:
             loaded_us = _median_call_us(runtimes[0])

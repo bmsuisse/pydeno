@@ -205,3 +205,77 @@ def test_a_late_bind_over_a_guest_made_read_only_global_fails_loudly() -> None:
         with pytest.raises(JavaScriptError, match=r"Cannot bind 'late'"):
             runtime.bind_function("late", lambda: "host")
         assert runtime.eval("late") == 1
+
+
+# -- the host side of an isolated runtime keeps the detail (issue #131 residual) -------------------
+
+
+def _notes(exc: BaseException) -> str:
+    if not hasattr(exc, "add_note"):  # Python 3.10 has no exception notes
+        pytest.xfail("exception notes need Python 3.11+")
+    return "\n".join(getattr(exc, "__notes__", []))
+
+
+def test_the_host_exception_for_a_size_limit_names_the_limit_the_guest_does_not_see() -> (
+    None
+):
+    config = RuntimeConfig(timeout=10, max_serialization_bytes=1000)
+    with IsolatedRuntime(config) as runtime:
+        runtime.bind_function("host", lambda *args: 1)
+        with pytest.raises(JavaScriptError) as excinfo:
+            runtime.eval("host('x'.repeat(5000))")
+        guest = runtime.eval(GUEST_CATCH % "host('x'.repeat(5000))")
+    _assert_no_host_detail(guest)
+    assert "Serialization size limit exceeded" in str(excinfo.value)
+    _assert_no_host_detail(str(excinfo.value))
+    notes = _notes(excinfo.value)
+    assert "max_serialization_bytes=1000" in notes
+    assert "arrow-ipc-dataframes.md" in notes
+
+
+def test_the_host_exception_for_a_depth_limit_names_the_limit() -> None:
+    config = RuntimeConfig(timeout=10, max_serialization_depth=8)
+    with IsolatedRuntime(config) as runtime:
+        runtime.bind_function("host", lambda *args: 1)
+        with pytest.raises(JavaScriptError) as excinfo:
+            runtime.eval("let o = 0; for (let i = 0; i < 50; i++) o = [o]; host(o)")
+    assert "max_serialization_depth=8" in _notes(excinfo.value)
+
+
+def test_the_host_exception_for_a_denied_module_carries_the_hint() -> None:
+    with IsolatedRuntime(RuntimeConfig(timeout=10)) as runtime:
+        with pytest.raises(JavaScriptError) as excinfo:
+            asyncio.run(runtime.eval_async("import('nonexistent')"))
+    assert "Module resolution denied for nonexistent" in str(excinfo.value)
+    assert "add_static_module" in _notes(excinfo.value)
+
+
+def test_the_host_exception_for_a_bigint_result_names_the_interpreter_setting(
+    rt,
+) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(TypeError) as excinfo:
+        rt.eval("10n ** 5000n")
+    assert "set_int_max_str_digits" in _notes(excinfo.value)
+
+
+def test_an_unrelated_error_gets_no_note(rt) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(JavaScriptError) as excinfo:
+        rt.eval("throw new Error('plain')")
+    if hasattr(excinfo.value, "add_note"):
+        assert not getattr(excinfo.value, "__notes__", [])
+
+
+def test_the_async_runtime_attaches_the_same_notes() -> None:
+    from pydeno import AsyncIsolatedRuntime
+
+    async def go() -> BaseException:
+        config = RuntimeConfig(timeout=10, max_serialization_bytes=1000)
+        async with AsyncIsolatedRuntime(config) as runtime:
+            await runtime.bind_function("host", lambda *args: 1)
+            try:
+                await runtime.eval("host('x'.repeat(5000))")
+            except JavaScriptError as exc:
+                return exc
+        raise AssertionError("no error")
+
+    assert "max_serialization_bytes=1000" in _notes(asyncio.run(go()))
