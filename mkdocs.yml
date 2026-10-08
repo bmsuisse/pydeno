@@ -48,6 +48,7 @@ nav:
           - Network access (http_fetch): guides/http-fetch.md
           - "Pydeno: the front door": guides/quickstart-pydeno.md
           - pydantic-ai code mode: guides/pydantic-ai.md
+          - Monty + pydeno gallery: guides/monty-examples.md
           - A gate in front of the sandbox: guides/gate.md
           - Upgrading: guides/upgrading.md
           - Advanced:
