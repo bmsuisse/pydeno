@@ -82,7 +82,7 @@ runs this end to end with no API key, using pydantic-ai's `FunctionModel` as a s
 
 ### Per-call tool deadline
 
-`timeout` does not count time spent waiting on tools, and `max_host_wait` (600 s by default) bounds
+`timeout` does not count time spent waiting on tools, and `max_host_wait` (60 s by default) bounds
 the total. To stop one hung tool from using that budget up, pass `tool_timeout` (seconds) through
 `runtime_options`:
 

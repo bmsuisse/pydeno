@@ -56,6 +56,9 @@ def test_no_guide_states_600_s_for_the_isolated_wait() -> None:
     assert re.search(r"max_host_wait`\s+\(60 s", text)
     assert "600 s" not in text
     assert "600 s" not in _read("docs/contributing/sandboxed-tool-process.md")
+    assert "`max_host_wait` (the default is 600 s)" not in _read(
+        "docs/guides/advanced/isolation.md"
+    )
 
 
 def test_front_door_docs_say_600() -> None:
