@@ -173,3 +173,37 @@ def test_a_worker_that_was_orphaned_refuses_to_run_its_self_test(monkeypatch) ->
     monkeypatch.setattr(os, "getppid", lambda: 1)
     with pytest.raises(RuntimeError, match="orphaned"):
         _sandbox.attest()
+
+
+def _attest_with_missing_files(missing: list[str]) -> set[str]:
+    # Unconfined child: `open` of the named paths raises ENOENT, as on an image without them.
+    code = textwrap.dedent(
+        f"""
+        import builtins, errno
+        from pydeno import _sandbox
+        real_open = builtins.open
+        missing = {missing!r}
+        def fake_open(file, *args, **kwargs):
+            if file in missing:
+                raise FileNotFoundError(errno.ENOENT, "No such file or directory", file)
+            return real_open(file, *args, **kwargs)
+        builtins.open = fake_open
+        print(",".join(_sandbox.attest()))
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60
+    ).stdout.strip()
+    return set(out.split(",")) if out else set()
+
+
+def test_a_missing_probe_file_moves_on_to_the_next_one() -> None:
+    # /etc/hosts is absent, but the unconfined child can read /etc/passwd: that is a breach.
+    assert "read-file" in _attest_with_missing_files(["/etc/hosts"])
+
+
+def test_a_read_probe_with_no_file_present_is_skipped_not_passed_or_breached() -> None:
+    # None of the probe files exist: the probe is skipped, so it is not reported as a breach.
+    assert "read-file" not in _attest_with_missing_files(
+        ["/etc/hosts", "/etc/passwd", "/bin/sh"]
+    )

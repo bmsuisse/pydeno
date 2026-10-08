@@ -1449,6 +1449,10 @@ def _parent_changed(ppid: int, parent: int) -> bool:
     return ppid <= 0 or ppid != parent
 
 
+class _NoProbeTarget(Exception):
+    """Raised by a probe that found none of its target files on this image (see `attest`)."""
+
+
 def attest(parent: int | None = None) -> list[str]:
     """Try, from inside the confined process, the things the sandbox exists to stop, and return
     the ones that worked. Empty means every probe was refused.
@@ -1487,6 +1491,8 @@ def attest(parent: int | None = None) -> list[str]:
             call()
         except OSError:
             return  # refused: the answer we want
+        except _NoProbeTarget:
+            return  # nothing to probe on this image: skipped, neither a pass nor a breach
         breaches.append(name)
         if cleanup is not None:
             try:
@@ -1542,7 +1548,22 @@ def attest(parent: int | None = None) -> list[str]:
             a.close()
             b.close()
 
-    check("read-file", lambda: read("/etc/hosts"))
+    def read_file() -> None:
+        for path in ("/etc/hosts", "/etc/passwd", "/bin/sh"):
+            try:
+                read(path)
+            except FileNotFoundError:
+                continue  # absent on this image is not a refusal: probe the next one
+            except PermissionError:
+                raise  # the sandbox's refusal, counted by check()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"read probe of {path} failed unexpectedly: {exc}"
+                ) from exc
+            return  # read succeeded: a breach
+        raise _NoProbeTarget
+
+    check("read-file", read_file)
     check("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
     check("write-file", write, cleanup_files)
     check("spawn-process", spawn, cleanup_children)
