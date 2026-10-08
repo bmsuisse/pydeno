@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import sys
 
 import pytest
 
 # The container matrix (`scripts/linux_matrix.sh`) states which sandbox layers the kernel
 # it hands the tests is supposed to allow. Unset means "an ordinary machine".
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _EXPECTED_SANDBOX = os.environ.get("PYDENO_EXPECT_SANDBOX")
 _FULL_SANDBOXES = ("landlock+seccomp", "seatbelt")
 
@@ -167,6 +169,9 @@ _PLATFORM_MARKERS = {
     "needs_monty": importlib.util.find_spec("pydantic_monty") is not None,
     # Exercises the pydantic-ai integration (the optional `pydantic-ai-slim` package).
     "needs_pydantic_ai": importlib.util.find_spec("pydantic_ai") is not None,
+    # Reads the repository's docs, manifests and workflows. The container matrix copies only
+    # part of the tree next to the installed wheel, so these run in the native jobs instead.
+    "source_tree": (_REPO_ROOT / "SECURITY.md").is_file(),
 }
 
 
