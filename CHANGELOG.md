@@ -22,7 +22,9 @@
 ### Housekeeping
 
 - Issues #139 to #146 were filed against 0.11.0 and are fixed in 0.12.1; they are closed with this release.
-- #138 (V8 15.2) waits on a `deno_core` release that uses it; 0.412.0 is still the newest and uses V8 150.
+- #138 (V8 15.2), #72 (cold start) and #45 (hardening) are closed. Not done, and not claimed: the sandboxed tool
+  process (design only), a native worker without Python, and an aarch64 / other-glibc soak. The weekly
+  `engine-watch` workflow flags the next `deno_core` with a newer V8.
 
 ## 0.12.1 — 2026-10-08
 
