@@ -51,6 +51,9 @@ from pydeno._isolated import TOOL_TIMEOUT_MESSAGE
 from pydeno._wire import WireError
 
 _EXPECTED = os.environ.get("PYDENO_EXPECT_SANDBOX")
+# Variables the interpreter or the OS adds to a child whatever the caller passed (PEP 538 locale
+# coercion; macOS's CoreFoundation).
+_INTERPRETER_ENV = {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
 KEY = b"0123456789abcdef0123456789abcdef"
 TIMED_OUT = f"TimeoutError:{TOOL_TIMEOUT_MESSAGE}"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -654,15 +657,12 @@ class TestEnvironment:
         monkeypatch.setenv("PYDENO_TOOLPROC_SECRET", "hunter2")
         with IsolatedRuntime() as rt:
             _bind(rt, tp(), env="env")
-            assert set(_run(rt, "env()")) <= {"LC_CTYPE"}  # CPython may add its own
+            assert set(_run(rt, "env()")) <= _INTERPRETER_ENV  # CPython / macOS may add their own
 
     def test_the_caller_may_pass_one(self, tp: Any) -> None:
         with IsolatedRuntime() as rt:
             _bind(rt, tp(env={"ONLY": "this"}), env="env")
-            assert _run(rt, "env()") == {"ONLY": "this"} or set(_run(rt, "env()")) == {
-                "ONLY",
-                "LC_CTYPE",
-            }
+            assert set(_run(rt, "env()")) - _INTERPRETER_ENV == {"ONLY"}
 
 
 class TestCleanup:
@@ -807,7 +807,7 @@ class TestAsyncRuntime:
             assert (await rt.eval(_guest("big(5000)"))).startswith(
                 "ToolResultTooLarge:"
             )
-            assert set(await rt.eval("env()")) <= {"LC_CTYPE"}
+            assert set(await rt.eval("env()")) <= _INTERPRETER_ENV
 
     async def test_calls_run_concurrently(self, tp: Any) -> None:
         async with AsyncIsolatedRuntime() as rt:
