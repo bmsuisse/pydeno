@@ -781,6 +781,9 @@ _SECCOMP_RET_KILL_PROCESS = 0x80000000
 _SECCOMP_RET_ERRNO = 0x00050000
 _EPERM, _ENOSYS = 1, 38
 _CLONE_THREAD = 0x10000
+# CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
+# CLONE_NEWNET: any namespace the sandbox must not create, all in the low 32 bits of arg0.
+_CLONE_NEW_MASK = 0x7E020000
 
 
 def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
@@ -853,8 +856,9 @@ def _seccomp_program(arch: str, *, allow_exec: bool = True) -> bytes | None:
     ins.append((_BPF_RET_K, None, None, _SECCOMP_RET_ERRNO | _EPERM))  # the default
     stubs(enosys=True)
 
-    label("clone")  # only thread creation: flags must contain CLONE_THREAD
+    label("clone")  # only threads: CLONE_THREAD set, no new namespace
     ins.append((_BPF_LD_W_ABS, None, None, 16))
+    ins.append((_BPF_JSET_K, "eperm", None, _CLONE_NEW_MASK))
     ins.append((_BPF_JSET_K, "allow", "eperm", _CLONE_THREAD))
     stubs()
     label("signal")  # only to ourselves (low 32 bits of the pid argument)
@@ -1067,7 +1071,7 @@ def _readable_dir() -> str | None:
     for path in _CANARY_DIRS:
         try:
             os.close(os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
             continue
         return path
     return None
@@ -1079,9 +1083,13 @@ def _landlock_canary(path: str | None) -> bool:
     accepts the ruleset and then does not enforce it is otherwise invisible: the syscall said 0."""
     global LANDLOCK_NOTE  # noqa: PLW0603
     if path is None:
-        # Nothing was readable even before (an unusual root): no canary is possible, and the
-        # filesystem is closed to this process either way.
-        return True
+        # Nothing was readable even before (an unusual root): no canary is possible, so the
+        # ruleset is not proven to do anything. Reported as not applied, like any other failure.
+        LANDLOCK_NOTE = (
+            "no probe directory could be opened before the restriction, "
+            "so Landlock is not proven"
+        )
+        return False
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except PermissionError:
@@ -1445,6 +1453,10 @@ def _parent_changed(ppid: int, parent: int) -> bool:
     return ppid <= 0 or ppid != parent
 
 
+class _NoProbeTarget(Exception):
+    """Raised by a probe that found none of its target files on this image (see `attest`)."""
+
+
 def attest(parent: int | None = None) -> list[str]:
     """Try, from inside the confined process, the things the sandbox exists to stop, and return
     the ones that worked. Empty means every probe was refused.
@@ -1483,6 +1495,8 @@ def attest(parent: int | None = None) -> list[str]:
             call()
         except OSError:
             return  # refused: the answer we want
+        except _NoProbeTarget:
+            return  # nothing to probe on this image: skipped, neither a pass nor a breach
         breaches.append(name)
         if cleanup is not None:
             try:
@@ -1538,7 +1552,20 @@ def attest(parent: int | None = None) -> list[str]:
             a.close()
             b.close()
 
-    check("read-file", lambda: read("/etc/hosts"))
+    def read_file() -> None:
+        for path in ("/etc/hosts", "/etc/passwd", "/bin/sh"):
+            try:
+                read(path)
+            except FileNotFoundError:
+                continue  # absent on this image is not a refusal: probe the next one
+            except PermissionError:
+                raise  # the sandbox's refusal, counted by check()
+            except OSError:
+                continue  # not a refusal and not a read (ENOTDIR, ELOOP, ...): try the next file
+            return  # read succeeded: a breach
+        raise _NoProbeTarget
+
+    check("read-file", read_file)
     check("read-parent-environ", lambda: read(f"/proc/{ppid}/environ"))
     check("write-file", write, cleanup_files)
     check("spawn-process", spawn, cleanup_children)

@@ -64,6 +64,8 @@ _KIND_EXIT = {
 }
 
 DEFAULT_TIMEOUT = 30.0
+# Console bytes printed in total, like the front-door printer.
+DEFAULT_MAX_OUTPUT = 1 << 20
 MAX_TIMEOUT = 24 * 3600.0
 MAX_MEMORY = 1024**4  # 1 TiB: anything above is a typo, not a limit
 # The most code the worker accepts: one wire frame (`pydeno._wire.MAX_FRAME_BYTES`, kept equal by a
@@ -210,6 +212,13 @@ def _parser() -> argparse.ArgumentParser:
         metavar="SIZE",
         help="kill the worker above this resident memory, e.g. 256M (default 1G, at most 1T)",
     )
+    parser.add_argument(
+        "--max-output",
+        type=parse_size,
+        default=DEFAULT_MAX_OUTPUT,
+        metavar="SIZE",
+        help="print at most this much console output, then drop the rest (default 1M)",
+    )
     sandbox = parser.add_mutually_exclusive_group()
     sandbox.add_argument(
         "--sandbox",
@@ -312,12 +321,27 @@ def _too_large() -> None:
     )
 
 
-def _print_console(level: str, values: list[Any]) -> None:
+def _console_printer(limit: int) -> Any:
+    """A console callback that prints at most ``limit`` bytes in total, then one ``[truncated]`` line."""
     from ._result import format_console_arg
 
-    line = inert_text(" ".join(format_console_arg(v) for v in values))
-    stream = sys.stdout if level in ("log", "info", "debug") else sys.stderr
-    print(line, file=stream, flush=True)
+    written = 0
+    cut = False
+
+    def _print_console(level: str, values: list[Any]) -> None:
+        nonlocal written, cut
+        if cut:
+            return
+        line = inert_text(" ".join(format_console_arg(v) for v in values))
+        stream = sys.stdout if level in ("log", "info", "debug") else sys.stderr
+        written += len(line.encode("utf-8", "replace")) + 1
+        if written > limit:
+            cut = True
+            print("[truncated]", file=stream, flush=True)
+            return
+        print(line, file=stream, flush=True)
+
+    return _print_console
 
 
 def _render(value: Any, raw: bool) -> str | None:
@@ -365,7 +389,9 @@ def main(argv: list[str] | None = None) -> int:
         options["max_memory"] = args.max_memory
 
     async def run() -> Any:
-        rt = IsolatedRuntime(RuntimeConfig(on_console=_print_console), **options)
+        rt = IsolatedRuntime(
+            RuntimeConfig(on_console=_console_printer(args.max_output)), **options
+        )
         try:
             return await rt.eval_async(code, timeout=args.timeout)
         finally:

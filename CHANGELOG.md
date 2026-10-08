@@ -1,6 +1,32 @@
 # Changelog
 
-## 0.12.1 — unreleased
+## 0.13.0 — unreleased
+
+### Fixed
+
+- **The `pydeno` CLI caps total console output (#150).** A guest looping on `console.log` could make the
+  CLI print without limit until the deadline (up to 24 h with `--timeout 86400`). The CLI now prints at
+  most 1 MiB of `console.*` output in total, then one `[truncated]` line, and drops the rest.
+  `--max-output SIZE` changes the cap.
+
+### Changed (sandbox hardening)
+
+- **`clone` that creates a namespace is refused (seccomp).** The filter let a `clone` carrying
+  `CLONE_THREAD` through whatever else was in its flags; any `CLONE_NEW*` bit now gets `EPERM`. Thread
+  creation is unchanged. (`unshare` was already denied and `clone3` already returns `ENOSYS`.)
+- **The Landlock canary fails closed.** If no probe directory could be opened before the restriction, the
+  layer is now reported as not proven instead of applied.
+- **The start-up read probe cannot pass vacuously.** A missing `/etc/hosts` no longer counts as a refusal;
+  the probe tries `/etc/passwd` and `/bin/sh` and is skipped (not passed) if none exists.
+
+### Housekeeping
+
+- Issues #139 to #146 were filed against 0.11.0 and are fixed in 0.12.1; they are closed with this release.
+- #138 (V8 15.2), #72 (cold start) and #45 (hardening) are closed. Not done, and not claimed: the sandboxed tool
+  process (design only), a native worker without Python, and an aarch64 / other-glibc soak. The weekly
+  `engine-watch` workflow flags the next `deno_core` with a newer V8.
+
+## 0.12.1 — 2026-10-08
 
 The 0.11.1 hotfixes (five issues found in an independent review of 0.11.0), applied to the 0.12 line.
 0.11.0 and 0.12.0 are both affected.
