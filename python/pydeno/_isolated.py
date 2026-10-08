@@ -496,13 +496,19 @@ SESSION_OPTIONS = (
 ALLOW_FREE_THREADED_ENV = "PYDENO_ALLOW_FREE_THREADED"
 
 
+# Read once, at import, before any thread exists. A first `sysconfig.get_config_var` call made
+# while another thread is running can leave a forked child waiting on a lock the parent held,
+# and `IsolatedRuntime()` forks its worker (`test_host_fork_while_a_spawn_is_in_flight`).
+_FREE_THREADED_BUILD = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
 def _is_free_threaded_build() -> bool:
     """True on a free-threaded CPython build (3.13t and later), whether or not the GIL is on.
 
     pydeno does not declare the extension GIL-free, so CPython re-enables the GIL when it loads;
     the build is what matters, since the supervisor was only reviewed under the GIL.
     """
-    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    return _FREE_THREADED_BUILD
 
 
 def _refuse_free_threaded() -> None:

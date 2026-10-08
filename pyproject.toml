@@ -85,6 +85,7 @@ markers = [
     "redteam: fires real privileged syscalls from a sandboxed process; deselected unless PYDENO_REDTEAM_CONTAINER=1 and seccomp is expected",
     "as_root: only meaningful when the tests run as root (a container); deselected otherwise",
     "exception_notes: asserts PEP 678 notes on host exceptions; deselected before Python 3.11",
+    "source_tree: reads the repository checkout (docs, manifests, workflows); deselected where only the installed wheel is present",
     "needs_monty: pairs pydeno with pydantic-monty; deselected where it is not installed",
     "needs_pydantic_ai: exercises the pydantic-ai integration; deselected where pydantic-ai is not installed",
 ]
