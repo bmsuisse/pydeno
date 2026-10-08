@@ -453,7 +453,7 @@ top, so every `IsolatedRuntime` limit still applies (and its keyword arguments, 
 - **The catalog is enforced in the host.** A catalog tool is reachable only through one hidden
   host function that refuses names that are not in the catalog or not yet found.
 - **Console output is a host call, but not a counted one.** The session routes `console.*` to the
-  parent to capture it; those calls do not count against `max_host_calls=` (they did before 0.11.1).
+  parent to capture it; those calls do not count against `max_host_calls=` (they did in 0.11.0 and 0.12.0).
   A single line too large for one frame (16 MiB) is cut to a bounded prefix and sets `truncated`. Output is capped per run
   (`max_output_bytes`); a `RuntimeConfig(on_console=...)` you pass still sees every call.
 - **One session per trust unit.** Everything in a session can see everything else in it. Do not
