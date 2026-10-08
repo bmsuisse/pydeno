@@ -6,11 +6,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from pydeno import IsolatedRuntime
 from pydeno._front import DEFAULT_LIMITS
 from pydeno._isolated import DEFAULT_MAX_HOST_WAIT
 
 ROOT = Path(__file__).resolve().parent.parent
+
+pytestmark = pytest.mark.source_tree
 
 
 def _read(rel: str) -> str:
