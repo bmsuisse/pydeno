@@ -657,7 +657,9 @@ class TestEnvironment:
         monkeypatch.setenv("PYDENO_TOOLPROC_SECRET", "hunter2")
         with IsolatedRuntime() as rt:
             _bind(rt, tp(), env="env")
-            assert set(_run(rt, "env()")) <= _INTERPRETER_ENV  # CPython / macOS may add their own
+            assert (
+                set(_run(rt, "env()")) <= _INTERPRETER_ENV
+            )  # CPython / macOS may add their own
 
     def test_the_caller_may_pass_one(self, tp: Any) -> None:
         with IsolatedRuntime() as rt:
