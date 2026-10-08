@@ -163,6 +163,8 @@ _PLATFORM_MARKERS = {
     "needs_monty": importlib.util.find_spec("pydantic_monty") is not None,
     # Exercises the pydantic-ai integration (the optional `pydantic-ai-slim` package).
     "needs_pydantic_ai": importlib.util.find_spec("pydantic_ai") is not None,
+    # Exception notes (`add_note`, PEP 678) exist from Python 3.11; the host side attaches them.
+    "exception_notes": hasattr(BaseException, "add_note"),
 }
 
 
