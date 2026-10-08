@@ -456,12 +456,14 @@ class TestDeadline:
                 + _guest("nap(60)")
                 + "])",
             )
-        assert out[0] == TIMED_OUT and out[2] == TIMED_OUT
-        assert out[1] in (
-            "returned",
-            "ToolProcessDied:the tool process was killed: a call "
-            "outlasted its deadline",
+        died = (
+            "ToolProcessDied:the tool process was killed: a call outlasted its deadline"
         )
+        # Whichever 60 s call's deadline fires first gets the timeout; the kill that follows takes the
+        # other (and the short call, if it is still running) with it, and says so.
+        assert TIMED_OUT in (out[0], out[2])
+        assert out[0] in (TIMED_OUT, died) and out[2] in (TIMED_OUT, died)
+        assert out[1] in ("returned", died)
 
     def test_off_with_none(self, tp: Any) -> None:
         with IsolatedRuntime() as rt:
