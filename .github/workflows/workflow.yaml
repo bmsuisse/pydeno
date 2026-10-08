@@ -49,6 +49,18 @@ jobs:
           # wheel failed to import: "undefined symbol: memfd_create").
           # manylinux_2_28 ships glibc 2.28.
           manylinux: 2_28
+      # `--find-interpreter` also finds the free-threaded interpreters (cp314t, cp315t) that the
+      # manylinux image ships. Free-threaded CPython is unsupported (docs/contributing/free-threaded.md),
+      # so no `t` wheel may reach PyPI: a prebuilt one would install there without any warning.
+      - name: Drop free-threaded wheels
+        shell: bash
+        run: |
+          rm -f dist/*-cp3[0-9][0-9]t-*.whl
+          if ls dist/*-cp3[0-9][0-9]t-*.whl >/dev/null 2>&1; then
+            echo "free-threaded wheels must not be published" >&2
+            exit 1
+          fi
+          ls dist
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
@@ -62,6 +74,18 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           args: --release --locked --out dist --find-interpreter
+      # `--find-interpreter` also finds the free-threaded interpreters (cp314t, cp315t) that the
+      # manylinux image ships. Free-threaded CPython is unsupported (docs/contributing/free-threaded.md),
+      # so no `t` wheel may reach PyPI: a prebuilt one would install there without any warning.
+      - name: Drop free-threaded wheels
+        shell: bash
+        run: |
+          rm -f dist/*-cp3[0-9][0-9]t-*.whl
+          if ls dist/*-cp3[0-9][0-9]t-*.whl >/dev/null 2>&1; then
+            echo "free-threaded wheels must not be published" >&2
+            exit 1
+          fi
+          ls dist
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos
@@ -75,6 +99,18 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           args: --release --locked --out dist --find-interpreter
+      # `--find-interpreter` also finds the free-threaded interpreters (cp314t, cp315t) that the
+      # manylinux image ships. Free-threaded CPython is unsupported (docs/contributing/free-threaded.md),
+      # so no `t` wheel may reach PyPI: a prebuilt one would install there without any warning.
+      - name: Drop free-threaded wheels
+        shell: bash
+        run: |
+          rm -f dist/*-cp3[0-9][0-9]t-*.whl
+          if ls dist/*-cp3[0-9][0-9]t-*.whl >/dev/null 2>&1; then
+            echo "free-threaded wheels must not be published" >&2
+            exit 1
+          fi
+          ls dist
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows

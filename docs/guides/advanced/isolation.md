@@ -394,7 +394,7 @@ What to do about it in your own code:
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `max_host_wait` | 600 s | Total time a run may spend waiting on host callbacks; exceeding it raises `RuntimeTimeout` and kills the worker. `None` disables it (the CPU cap still applies) |
+| `max_host_wait` | 60 s | Total time a run may spend waiting on host callbacks; exceeding it raises `RuntimeTimeout` and kills the worker. `None` disables it (the CPU cap still applies) |
 | `tool_timeout` | `None` (off) | Most time one call to a bound host function (`bind_function`, `bind_object`, `ToolBridge`, agent tools) may take; see [Per-call tool deadline](#per-call-tool-deadline) |
 | `max_inflight_host_calls` | 64 | Concurrent async host calls; extra calls get an error reply and never reach your function |
 | `write_stall_timeout` | 10 s | A worker that stops reading its pipe is killed after this long (`None` disables) |
@@ -676,7 +676,7 @@ with IsolatedRuntime(tool_timeout=5) as rt:
   fails the *command* (the worker is killed and the command raises `RuntimeTimeout`, which the
   guest cannot catch). A call that hits its `tool_timeout` still spends that time against
   `max_host_wait`, so a guest that retries a hanging tool in a loop is bounded by `max_host_wait` in
-  the end. Keep `tool_timeout` well under `max_host_wait` (the default is 600 s). If a single call
+  the end. Keep `tool_timeout` well under `max_host_wait` (the default is 60 s). If a single call
   could outlast what is left of `max_host_wait`, the worker is killed first and the guest never sees
   the `TimeoutError`: `IsolatedRuntime(tool_timeout=10, max_host_wait=0.5)` and a tool that hangs
   raises `RuntimeTimeout` after 0.5 s.

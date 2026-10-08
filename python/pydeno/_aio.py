@@ -63,6 +63,7 @@ from ._isolated import (
     _check_wire_limits,
     _DEFAULT,
     _HostCallBudgetExceeded,
+    _refuse_free_threaded,
     _Outlasted,
     _TimedCall,
     MAX_ABANDONED_TOOL_CALLS,
@@ -741,6 +742,7 @@ class AsyncIsolatedRuntime:
             raise NotImplementedError(
                 "AsyncIsolatedRuntime currently supports POSIX only"
             )
+        _refuse_free_threaded()
         config = config or RuntimeConfig()
         for attr in _UNSUPPORTED_CONFIG:
             if getattr(config, attr, None) is not None:
@@ -1593,17 +1595,21 @@ class AsyncIsolatedRuntime:
             or not isinstance(args, list)
         ):
             raise _wire.WireError("call for an unknown host function")
-        self._host_calls += 1
-        if self._max_host_calls is not None and self._host_calls > self._max_host_calls:
-            raise _HostCallBudgetExceeded(
-                f"guest made more than max_host_calls={self._max_host_calls} host calls"
-            )
-        handler, is_async = entry
         # Console output is the guest's own work, not a tool call: it pauses the deadline only
         # within the command's console allowance (see `_Pump`). It is synchronous (the worker waits
         # for it), so it is never one of the calls in flight and the in-flight cap does not refuse
-        # it; `max_host_calls` still counts it (above).
+        # it; `max_host_calls` does not count it either.
         console = hid == self._options.get("console_hid")
+        if not console:
+            self._host_calls += 1
+            if (
+                self._max_host_calls is not None
+                and self._host_calls > self._max_host_calls
+            ):
+                raise _HostCallBudgetExceeded(
+                    f"guest made more than max_host_calls={self._max_host_calls} host calls"
+                )
+        handler, is_async = entry
         if (
             not console
             and self._max_inflight is not None

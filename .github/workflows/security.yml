@@ -56,8 +56,7 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # Keep in step with [advisories].ignore in deny.toml (reasons are there).
-          ignore: RUSTSEC-2026-0176,RUSTSEC-2026-0177
+          # Keep in step with [advisories].ignore in deny.toml (reasons are there): none today.
 
   pip-audit:
     name: pip-audit (uv.lock)

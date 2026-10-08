@@ -62,6 +62,8 @@ const CONSOLE_CAPTURE_JS: &str = r#"
 (() => {
   const OP_ID = __OP_ID__;
   const PASSTHROUGH = __PASSTHROUGH__;
+  // UTF-16 units kept, in all, of a console call too large to forward whole.
+  const PREFIX_UNITS = 1 << 20;
   const forward = globalThis.__host_op_sync__;
   const previous = globalThis.console;
   const target = {};
@@ -78,19 +80,38 @@ const CONSOLE_CAPTURE_JS: &str = r#"
         forward(OP_ID, level, args);
       } catch (_) {
         // Unrepresentable arguments degrade to strings; a console call must
-        // never throw into (or break) the script that made it.
+        // never throw into (or break) the script that made it. A call too
+        // large to cross (over `max_serialization_bytes`) degrades to a
+        // bounded prefix of its text, and says so with a third argument
+        // (`true`), so a capture can end that stream as truncated instead of
+        // silently losing the line. A callback that cannot take a third
+        // argument gets the prefix without it.
         try {
-          forward(
-            OP_ID,
-            level,
-            args.map((a) => {
-              try {
-                return String(a);
-              } catch (_) {
-                return "[unrepresentable]";
-              }
-            }),
-          );
+          let left = PREFIX_UNITS;
+          let cut = false;
+          const text = args.map((a) => {
+            let s;
+            try {
+              s = String(a);
+            } catch (_) {
+              return "[unrepresentable]";
+            }
+            if (s.length > left) {
+              cut = true;
+            }
+            s = s.slice(0, left);
+            left -= s.length;
+            return s;
+          });
+          if (cut) {
+            try {
+              forward(OP_ID, level, text, true);
+            } catch (_) {
+              forward(OP_ID, level, text);
+            }
+          } else {
+            forward(OP_ID, level, text);
+          }
         } catch (_) {}
       }
       if (prior !== null) {

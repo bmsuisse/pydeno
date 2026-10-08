@@ -130,7 +130,7 @@ disagree, the report wins and this page has a bug.
 | Worker may outlive a dead parent (`PR_SET_PDEATHSIG` not set). | Report |
 | macOS: `notify_post()` still reaches other processes; `kill(pid, 0)` distinguishes live pids; path existence is observable (also on Linux with Landlock only). | Report |
 | Hosts mounting `/proc` with `hidepid`: usage unreadable; `require` refuses to start, `auto` warns. | Report |
-| `sandbox="auto"` (the default) runs with fewer layers if some cannot apply; it warns. `require` is the hardened choice. | Report; `SECURITY.md` |
+| `sandbox="auto"` runs with fewer layers if some cannot apply; it warns, logs and sets `sandbox_degraded`. The default is `"require"` since 0.11, the hardened choice. | Report; `SECURITY.md` |
 | Sandboxed tool process: host tools run in the parent's address space. | Issue #45 |
 
 ### Open at the host/worker boundary and guest surface
@@ -173,7 +173,7 @@ unbounded. Refused on the default jitless worker. Details and probes: security r
 | Item | Source |
 |---|---|
 | V8 and `deno_core` fixes arrive only on a `deno_core` upgrade; the scanners do not see Chromium V8 CVEs. `scripts/check_engine.py` runs weekly. | [Supply-chain](supply-chain.md) |
-| `RUSTSEC-2026-0176` / `-0177` (`pyo3` 0.27.2) excepted in `deny.toml` as unreachable; removal needs `pyo3-async-runtimes` for `pyo3 >= 0.29`. | `deny.toml` |
+| No RustSec advisory is excepted in `deny.toml`: `RUSTSEC-2026-0176` / `-0177` applied to `pyo3` 0.27.2 and went away with the `pyo3` 0.29 upgrade (`Cargo.lock` has 0.29.3). | `deny.toml` |
 | `paste` unmaintained (transitive via `v8`); `yoke-derive` 0.8.3 yanked. | Supply-chain page |
 
 ### Process gaps

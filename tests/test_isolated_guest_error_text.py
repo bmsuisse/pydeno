@@ -211,11 +211,10 @@ def test_a_late_bind_over_a_guest_made_read_only_global_fails_loudly() -> None:
 
 
 def _notes(exc: BaseException) -> str:
-    if not hasattr(exc, "add_note"):  # Python 3.10 has no exception notes
-        pytest.xfail("exception notes need Python 3.11+")
     return "\n".join(getattr(exc, "__notes__", []))
 
 
+@pytest.mark.exception_notes
 def test_the_host_exception_for_a_size_limit_names_the_limit_the_guest_does_not_see() -> (
     None
 ):
@@ -233,6 +232,7 @@ def test_the_host_exception_for_a_size_limit_names_the_limit_the_guest_does_not_
     assert "arrow-ipc-dataframes.md" in notes
 
 
+@pytest.mark.exception_notes
 def test_the_host_exception_for_a_depth_limit_names_the_limit() -> None:
     config = RuntimeConfig(timeout=10, max_serialization_depth=8)
     with IsolatedRuntime(config) as runtime:
@@ -242,6 +242,7 @@ def test_the_host_exception_for_a_depth_limit_names_the_limit() -> None:
     assert "max_serialization_depth=8" in _notes(excinfo.value)
 
 
+@pytest.mark.exception_notes
 def test_the_host_exception_for_a_denied_module_carries_the_hint() -> None:
     with IsolatedRuntime(RuntimeConfig(timeout=10)) as runtime:
         with pytest.raises(JavaScriptError) as excinfo:
@@ -250,6 +251,7 @@ def test_the_host_exception_for_a_denied_module_carries_the_hint() -> None:
     assert "add_static_module" in _notes(excinfo.value)
 
 
+@pytest.mark.exception_notes
 def test_the_host_exception_for_a_bigint_result_names_the_interpreter_setting(
     rt,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -265,6 +267,7 @@ def test_an_unrelated_error_gets_no_note(rt) -> None:  # type: ignore[no-untyped
         assert not getattr(excinfo.value, "__notes__", [])
 
 
+@pytest.mark.exception_notes
 def test_the_async_runtime_attaches_the_same_notes() -> None:
     from pydeno import AsyncIsolatedRuntime
 

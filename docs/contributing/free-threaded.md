@@ -1,8 +1,13 @@
 # Free-threaded CPython (3.14t)
 
 **Status: not supported.** pydeno does not declare free-threaded compatibility, publishes no
-free-threaded wheels, and runs no free-threaded job in CI. On a free-threaded interpreter the
-extension still loads, but CPython turns the GIL back on for the whole process when it does.
+free-threaded wheels (0.11.0 and 0.12.0 published `cp314t` and `cp315t` ones by mistake; they were an accident of
+`--find-interpreter` and the release job now drops them), and runs no free-threaded job in CI.
+`IsolatedRuntime`, `AsyncIsolatedRuntime` (and so `AgentSandbox` and `Pydeno`) refuse to start on a
+free-threaded build with a `RuntimeError` (error kind `sandbox_unavailable`) unless you set
+`PYDENO_ALLOW_FREE_THREADED=1`, at your own risk. The plain `Runtime` is not affected. On a
+free-threaded interpreter the extension still loads, but CPython turns the GIL back on for the whole
+process when it does.
 This page records what was checked for the 0.10 roadmap item and why we stop there.
 
 ## What was checked (2026-10, on 0.10 development)
