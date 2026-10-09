@@ -1594,3 +1594,44 @@ class TestSupervisionWhileAHostHandlerRuns:
         assert killed_after < 5, killed_after
         t.join(30)
         assert isinstance(outcome[0], WorkerCrashed), outcome
+
+
+class TestHostValueMisbehavesDuringEncoding:
+    """A bound host function can return a value whose own `__iter__`/`__len__`/getter raises
+    while the reply is being serialised, after the handler itself already returned successfully.
+    That failure is the host's own value misbehaving, not the worker sending something bad; it
+    must surface as an ordinary catchable guest-side error, and the runtime must stay usable."""
+
+    def test_a_raising_iterator_in_the_return_value_is_a_catchable_error(self) -> None:
+        class BadList(list):
+            def __iter__(self):
+                raise RuntimeError("iter boom")
+
+        rt = IsolatedRuntime(sandbox="auto")
+        try:
+            rt.bind_function("give", lambda: BadList([1, 2, 3]))
+            with pytest.raises(JavaScriptError):
+                rt.eval("give()")
+            # the runtime must still be alive and usable afterwards
+            assert rt.eval("1 + 1") == 2
+        finally:
+            rt.close()
+
+    def test_wire_dumps_wraps_a_value_s_own_exception_as_wire_error(self) -> None:
+        """Unit-level: `_wire.dumps` itself, independent of the runtime, must turn a value's
+        own exception into `WireError`, not let it escape as whatever type the value raised."""
+
+        class Hostile(list):
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(_wire.WireError):
+            _wire.dumps({"t": "reply", "cid": 1, "v": _wire.Enc(Hostile([1]))})
+
+    def test_wire_dumps_still_lets_a_bare_value_error_through_unwrapped(self) -> None:
+        """A plain `ValueError` is CPython's own int-to-str digit limit on an oversized BigInt
+        (see `_worker._encode_error_text`), the one case every caller already gives the guest a
+        fixed, sanitized message for without checking `redact_host_errors`. It must keep
+        reaching callers as a bare `ValueError`, not get folded into `WireError` with it."""
+        with pytest.raises(ValueError, match="digits"):
+            _wire.dumps({"t": "reply", "cid": 1, "v": _wire.Enc(10**4301)})

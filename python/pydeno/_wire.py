@@ -121,6 +121,26 @@ def dumps(message: dict[str, Any]) -> bytes:
         return _native_dumps(message, Enc, MAX_DEPTH, MAX_FRAME_BYTES)
     except _NativeError as exc:
         raise WireError(str(exc)) from None
+    except ValueError:
+        # CPython's own int-to-str digit limit, raised while converting an oversized BigInt
+        # (there is no other way a plain value reaching this point raises ValueError: a guest
+        # result is always built from plain containers by the Rust conversion, never a
+        # user-defined class). Every caller already knows this one specific case and gives the
+        # guest a fixed, sanitized message for it (see `_worker._encode_error_text`); wrapping
+        # it as `WireError` here would skip that and let CPython's own wording (it names
+        # `sys.set_int_max_str_digits`) reach the guest instead. Let it propagate as-is.
+        raise
+    except Exception as exc:  # noqa: BLE001 - the value being walked raised its own exception
+        # The native encoder calls back into Python to walk a value (iterating a list, reading
+        # an attribute, ...). If that value's own `__iter__`/`__len__`/getter raises, the native
+        # call lets it propagate as whatever Python exception it was, not as `_NativeError`, so
+        # the branch above misses it. Without this, a host function that returns a value whose
+        # own code misbehaves while being encoded looks identical to a genuine protocol fault to
+        # whoever reads this frame's send, which blames and kills the wrong side (see
+        # `IsolatedRuntime._send_reply`, `WorkerState._call_host`).
+        raise WireError(
+            f"value raised {type(exc).__name__} while being encoded: {exc}"
+        ) from None
 
 
 def loads(data: bytes) -> dict[str, Any]:

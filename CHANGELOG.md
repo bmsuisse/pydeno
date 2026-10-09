@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A host function that returns a value whose own `__iter__`/`__len__` raises while being
+  encoded no longer kills the runtime.** `IsolatedRuntime` serializes a host function's return
+  value to reply to the guest; if that value's own code misbehaves during that walk (a list
+  subclass whose `__iter__` raises, for instance), the exception used to look identical to the
+  worker sending a malformed frame, which killed and permanently closed the whole runtime. It is
+  now reported as an ordinary catchable guest-side error (`JavaScriptError`, redacted like any
+  other host-function failure), and the runtime stays usable afterwards. No guest escape,
+  information disclosure or state bleed was involved — it needs a misbehaving host-bound
+  function, not guest-controlled input.
+
 ## 0.13.0 — unreleased
 
 ### Fixed

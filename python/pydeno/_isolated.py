@@ -1889,6 +1889,16 @@ class IsolatedRuntime:
                 self._writer.send(reply)
             except _wire.WireError as exc:
                 self._writer.send(self._error(reply["cid"], exc))
+            except OSError:
+                raise  # the worker is gone or the pipe stalled; let the outer handlers see it
+            except Exception as exc:  # noqa: BLE001
+                # Encoding failed on OUR side while walking the value a host handler returned
+                # (e.g. a user object whose __iter__/__len__/property getter raised mid-walk).
+                # `send` builds the whole frame before writing a byte (`FrameWriter.send_encoded`),
+                # so nothing has reached the wire yet; report it as this call's own error rather
+                # than letting it reach `_pump`, which would blame the worker for a malformed
+                # frame it never sent and kill the runtime over a host-side bug.
+                self._writer.send(self._error(reply["cid"], exc))
         except _wire.StalledWrite:
             # The worker stopped reading what we send. Waiting longer only freezes whoever is
             # sending (possibly the caller's event loop); kill it and let the pump report it.
