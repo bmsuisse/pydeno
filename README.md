@@ -351,6 +351,14 @@ test checks the answer against an independent computation (and Monty's against C
 | [SQL to chart](examples/monty_sql_charts.py) | answers a business question through a read-only SQL tool | [Vega-Lite](https://vega.github.io/vega-lite/): bars, stacked bars, cohort heatmap | SVG charts |
 | [Spreadsheet to deck](examples/monty_spreadsheet_deck.py) | analyses a sheet through a read-only wrapper | [pptxgenjs](https://gitbrent.github.io/PptxGenJS/): native charts, tables, narrative | `.pptx` board deck |
 
+<p align="center">
+  <img src="docs/assets/examples/monty_three_terrain.png" alt="3D island with trees, from monty_three_terrain.py" width="32%">
+  <img src="docs/assets/examples/monty_d3_network.png" alt="Force-directed dependency network, from monty_d3_network.py" width="32%">
+  <img src="docs/assets/examples/monty_echarts_dashboard.png" alt="Four-panel dashboard, from monty_echarts_dashboard.py" width="32%">
+</p>
+
+Left to right: the terrain, dependency-network and dashboard outputs. Every example's rendered output is in the [gallery](docs/guides/monty-examples.md).
+
 How fast are they together? One warm worker, median of three, on an Apple-silicon Mac, with V8 in
 its secure default (`jitless`) and with the JIT turned on:
 

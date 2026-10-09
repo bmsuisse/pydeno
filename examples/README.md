@@ -49,6 +49,21 @@ This directory contains practical examples demonstrating pydeno's features and u
 - [**vendored_npm_libraries.py**](vendored_npm_libraries.py) - Run real npm document-generation libraries (`pptxgenjs`, `pdf-lib`) from their browser bundles, host-supplied polyfills only, no `require()`/npm access for guest code — see [`docs/guides/advanced/vendored-npm-libraries.md`](../docs/guides/advanced/vendored-npm-libraries.md) for the full pattern and what did/didn't work
 - [**pptxgenjs_presentation.py**](pptxgenjs_presentation.py) - The same pattern taken all the way: the pinned, unmodified 460,889-byte `pptxgenjs` 4.0.1 bundle from [`vendor/pptxgenjs/`](../vendor/pptxgenjs/) builds a six-slide deck (table, three native OOXML charts including a combo chart on a secondary axis, an embedded PNG), then validates it with `zipfile`, reads it back with `python-pptx`, and renders every slide to PNG via LibreOffice so you can actually look at it. No network needed. Hermetic regression guard: [`tests/test_vendored_bundle_execution.py`](../tests/test_vendored_bundle_execution.py)
 
+### Monty + pydeno (rendered outputs)
+
+Python runs in [Monty](https://github.com/pydantic/monty), JavaScript in pydeno. Full gallery: [`docs/guides/monty-examples.md`](../docs/guides/monty-examples.md).
+
+| Example | Output |
+|---|---|
+| [`monty_three_terrain.py`](monty_three_terrain.py): procedural island with instanced trees | <img src="../docs/assets/examples/monty_three_terrain.png" width="360" alt="3D island with trees"> |
+| [`monty_three_orbits.py`](monty_three_orbits.py): N-body orbit trails as tubes | <img src="../docs/assets/examples/monty_three_orbits.png" width="360" alt="3D orbit trails"> |
+| [`monty_three_julia.py`](monty_three_julia.py): Julia-set relief | <img src="../docs/assets/examples/monty_three_julia.png" width="360" alt="3D Julia relief"> |
+| [`monty_three_city.py`](monty_three_city.py): city with per-building sun analysis | <img src="../docs/assets/examples/monty_three_city.png" width="360" alt="3D city"> |
+| [`monty_d3_network.py`](monty_d3_network.py): force-directed dependency network | <img src="../docs/assets/examples/monty_d3_network.png" width="360" alt="Network graph"> |
+| [`monty_echarts_dashboard.py`](monty_echarts_dashboard.py): four-panel ECharts dashboard | <img src="../docs/assets/examples/monty_echarts_dashboard.png" width="360" alt="Dashboard"> |
+| [`monty_turf_geo.py`](monty_turf_geo.py): fleet tracks, corridors and service zones | <img src="../docs/assets/examples/monty_turf_geo.png" width="360" alt="Geospatial map"> |
+| [`monty_sql_charts.py`](monty_sql_charts.py): SQL answers drawn with Vega-Lite | <img src="../docs/assets/examples/revenue_by_month.svg" width="360" alt="Revenue by month chart"> |
+
 ### Concurrency
 
 - [**threading_gil.py**](threading_gil.py) - Per-thread runtime isolation and GIL release demonstration
