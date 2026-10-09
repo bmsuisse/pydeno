@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.1 — 2026-10-09
 
 ### Fixed
 
@@ -14,7 +14,7 @@
   information disclosure or state bleed was involved — it needs a misbehaving host-bound
   function, not guest-controlled input.
 
-## 0.13.0 — unreleased
+## 0.13.0 — 2026-10-08
 
 ### Fixed
 
