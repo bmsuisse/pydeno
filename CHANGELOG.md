@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`IsolatedRuntime`'s pump loop now kills the worker on any `BaseException`, not just
+  `Exception`.** A `KeyboardInterrupt` (or similar) escaping mid-command left the worker process
+  alive and the runtime looking usable; a later, unrelated call would then see its stale reply
+  and fail with a confusing "worker broke protocol" instead of the interruption failing cleanly
+  where it happened. `AsyncIsolatedRuntime` already had this guard; the sync side did not.
+
 ## 0.13.1 — 2026-10-09
 
 ### Fixed

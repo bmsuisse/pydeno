@@ -1595,6 +1595,37 @@ class TestSupervisionWhileAHostHandlerRuns:
         t.join(30)
         assert isinstance(outcome[0], WorkerCrashed), outcome
 
+    def test_a_basexception_escaping_the_pump_kills_the_worker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `BaseException` that isn't `Exception` (KeyboardInterrupt and friends) can escape
+        the pump loop mid-command. It must kill the worker on its way out, the same as
+        `AsyncIsolatedRuntime._pump` already does -- otherwise the worker is left alive,
+        mid-command, and a later unrelated call sees its stale reply and fails with a confusing
+        "worker broke protocol" instead of this interruption failing cleanly where it happened."""
+        rt = IsolatedRuntime(sandbox="auto")
+        try:
+            real_loads_decoded = _wire.loads_decoded
+            hit = []
+
+            def boom(payload: bytes) -> dict[str, object]:
+                if not hit:
+                    hit.append(True)
+                    raise KeyboardInterrupt
+                return real_loads_decoded(payload)
+
+            monkeypatch.setattr(_wire, "loads_decoded", boom)
+            with pytest.raises(KeyboardInterrupt):
+                rt.eval("1")
+            proc = rt._proc  # noqa: SLF001
+            proc.wait(5)
+            assert proc.poll() is not None, (
+                "the worker was left running after the interrupt"
+            )
+        finally:
+            monkeypatch.undo()
+            rt.close()
+
 
 class TestHostValueMisbehavesDuringEncoding:
     """A bound host function can return a value whose own `__iter__`/`__len__`/getter raises

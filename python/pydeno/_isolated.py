@@ -1527,6 +1527,14 @@ class IsolatedRuntime:
             raise WorkerCrashed(
                 f"worker sent a malformed frame ({type(exc).__name__})"
             ) from None
+        except BaseException:
+            # KeyboardInterrupt and friends: AsyncIsolatedRuntime._pump already kills on any of
+            # these; this loop read mid-command, so leaving the worker alive without killing it
+            # here means a later, unrelated call sees its stale reply and fails with a confusing
+            # "worker broke protocol" instead of this interruption failing cleanly where it
+            # happened.
+            self._kill()
+            raise
         assert remote is not None
         raise remote
 
