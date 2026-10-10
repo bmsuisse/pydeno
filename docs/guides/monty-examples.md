@@ -27,6 +27,10 @@ same code split into cells, already run, with its output saved inline.
 
 [`examples/monty_three_city.py`](https://github.com/bmsuisse/pydeno/blob/main/examples/monty_three_city.py) ([notebook](https://github.com/bmsuisse/pydeno/blob/main/examples/notebooks/monty_three_city.ipynb)): a procedural city. Monty lays it out; three.js casts a ray from every roof to the sun and darkens the buildings that are shaded.
 
+![Glowing amber, cyan and magenta flow arcs rising above a dark grid of taxi-zone density columns](../assets/examples/monty_taxi_flows.png)
+
+[`examples/monty_taxi_flows.py`](https://github.com/bmsuisse/pydeno/blob/main/examples/monty_taxi_flows.py) ([notebook](https://github.com/bmsuisse/pydeno/blob/main/examples/notebooks/monty_taxi_flows.ipynb)): 60,000 real NYC taxi trips. Monty joins them to zones and bins them by time of day; three.js extrudes a density column per zone and arcs the busiest flows between pickup and dropoff as glowing tube trails, handed over as Arrow IPC bytes.
+
 ## Charts and maps (SVG and HTML)
 
 ![A force-directed dependency network with Voronoi cells and a treemap inset](../assets/examples/monty_d3_network.png)
