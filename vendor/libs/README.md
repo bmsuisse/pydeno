@@ -15,6 +15,7 @@ seccomp + Landlock/Seatbelt). Hermetic by design: no network, nothing is fetched
 | `dagre.bundle.js` | `@dagrejs/dagre` | 3.1.1 | MIT | esbuild IIFE (see below) |
 | `turf-7.4.0.bundle.js` | `@turf/turf` (whole package, 527 KB minified) | 7.4.0 | MIT (+ bundled third-party notices) | esbuild IIFE, `--platform=browser` (see below) |
 | `d3-force-3.0.0-delaunay-6.0.4.bundle.js` | `d3-force` 3.0.0, `d3-delaunay` 6.0.4 (+ `delaunator` 5.1.0, `robust-predicates` 3.0.3), `d3-hierarchy` 3.1.2, `d3-scale` 4.0.2, `d3-shape` 3.2.0, `d3-array` 3.2.4, `d3-scale-chromatic` 3.1.0 | see left | ISC (robust-predicates: public domain) | esbuild IIFE (see below); `--platform=browser`, no DOM needed |
+| `apache-arrow-21.2.0.es2015.min.js` | `apache-arrow` | 21.2.0 | Apache-2.0 | `Arrow.es2015.min.js` from the npm tarball, **unmodified**; reconstructs an Arrow IPC stream (schema + columns) from the `Uint8Array` a host passes in. Needs `TextDecoder`/`TextEncoder` for field names (`examples/arrow_ipc_dataframes.py` has a minimal polyfill) |
 
 The pptxgenjs bundle lives in `../pptxgenjs/` (see its README).
 
@@ -83,3 +84,4 @@ release (a change is a changelog entry), and the tests pin the same hashes.
 | `vega-6.4.0.min.js` | 521123 | `8f6a3587cf8d4f42c7e08120e3eb05d067e746d554e39d2dcf52acc0bd5ba28f` |
 | `vega-interpreter-2.3.2.bundle.js` | 5098 | `54d2c534de8f0b35e29db6170a4776e666847c9b88c5fd15d56489575c89abdb` |
 | `vega-lite-6.4.3.min.js` | 250845 | `35a9821df838825b05a6a73e9414b58747a1b18321583858ed903c66393a5c7e` |
+| `apache-arrow-21.2.0.es2015.min.js` | 192563 | `4bb22da0967f403eea39bc51820552e729ed1ad3e50c2568fb43d818bc1ca4d0` |
