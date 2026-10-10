@@ -330,7 +330,8 @@ with IsolatedRuntime(RuntimeConfig(bootstrap=WEB_POLYFILLS), sandbox="require") 
 
 Python crunched the numbers; JavaScript drew the chart with [Vega-Lite](https://vega.github.io/vega-lite/);
 each sandbox refused its own attempt to reach outside, and both drew on the same five-call tool
-budget. Full runnable example: [`examples/monty_and_pydeno.py`](examples/monty_and_pydeno.py).
+budget. Full runnable example: [`examples/monty_and_pydeno.py`](examples/monty_and_pydeno.py)
+([notebook](examples/notebooks/monty_and_pydeno.ipynb)).
 
 ### More of the same: Python prepares, JavaScript builds
 

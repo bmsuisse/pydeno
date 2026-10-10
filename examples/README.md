@@ -51,18 +51,18 @@ This directory contains practical examples demonstrating pydeno's features and u
 
 ### Monty + pydeno (rendered outputs)
 
-Python runs in [Monty](https://github.com/pydantic/monty), JavaScript in pydeno. Full gallery: [`docs/guides/monty-examples.md`](../docs/guides/monty-examples.md).
+Python runs in [Monty](https://github.com/pydantic/monty), JavaScript in pydeno. Full gallery: [`docs/guides/monty-examples.md`](../docs/guides/monty-examples.md). Each script has a matching, already-run notebook under [`notebooks/`](notebooks/).
 
-| Example | Output |
-|---|---|
-| [`monty_three_terrain.py`](monty_three_terrain.py): procedural island with instanced trees | <img src="../docs/assets/examples/monty_three_terrain.png" width="360" alt="3D island with trees"> |
-| [`monty_three_orbits.py`](monty_three_orbits.py): N-body orbit trails as tubes | <img src="../docs/assets/examples/monty_three_orbits.png" width="360" alt="3D orbit trails"> |
-| [`monty_three_julia.py`](monty_three_julia.py): Julia-set relief | <img src="../docs/assets/examples/monty_three_julia.png" width="360" alt="3D Julia relief"> |
-| [`monty_three_city.py`](monty_three_city.py): city with per-building sun analysis | <img src="../docs/assets/examples/monty_three_city.png" width="360" alt="3D city"> |
-| [`monty_d3_network.py`](monty_d3_network.py): force-directed dependency network | <img src="../docs/assets/examples/monty_d3_network.png" width="360" alt="Network graph"> |
-| [`monty_echarts_dashboard.py`](monty_echarts_dashboard.py): four-panel ECharts dashboard | <img src="../docs/assets/examples/monty_echarts_dashboard.png" width="360" alt="Dashboard"> |
-| [`monty_turf_geo.py`](monty_turf_geo.py): fleet tracks, corridors and service zones | <img src="../docs/assets/examples/monty_turf_geo.png" width="360" alt="Geospatial map"> |
-| [`monty_sql_charts.py`](monty_sql_charts.py): SQL answers drawn with Vega-Lite | <img src="../docs/assets/examples/revenue_by_month.svg" width="360" alt="Revenue by month chart"> |
+| Example | Notebook | Output |
+|---|---|---|
+| [`monty_three_terrain.py`](monty_three_terrain.py): procedural island with instanced trees | [notebook](notebooks/monty_three_terrain.ipynb) | <img src="../docs/assets/examples/monty_three_terrain.png" width="360" alt="3D island with trees"> |
+| [`monty_three_orbits.py`](monty_three_orbits.py): N-body orbit trails as tubes | [notebook](notebooks/monty_three_orbits.ipynb) | <img src="../docs/assets/examples/monty_three_orbits.png" width="360" alt="3D orbit trails"> |
+| [`monty_three_julia.py`](monty_three_julia.py): Julia-set relief | [notebook](notebooks/monty_three_julia.ipynb) | <img src="../docs/assets/examples/monty_three_julia.png" width="360" alt="3D Julia relief"> |
+| [`monty_three_city.py`](monty_three_city.py): city with per-building sun analysis | [notebook](notebooks/monty_three_city.ipynb) | <img src="../docs/assets/examples/monty_three_city.png" width="360" alt="3D city"> |
+| [`monty_d3_network.py`](monty_d3_network.py): force-directed dependency network | [notebook](notebooks/monty_d3_network.ipynb) | <img src="../docs/assets/examples/monty_d3_network.png" width="360" alt="Network graph"> |
+| [`monty_echarts_dashboard.py`](monty_echarts_dashboard.py): four-panel ECharts dashboard | [notebook](notebooks/monty_echarts_dashboard.ipynb) | <img src="../docs/assets/examples/monty_echarts_dashboard.png" width="360" alt="Dashboard"> |
+| [`monty_turf_geo.py`](monty_turf_geo.py): fleet tracks, corridors and service zones | [notebook](notebooks/monty_turf_geo.ipynb) | <img src="../docs/assets/examples/monty_turf_geo.png" width="360" alt="Geospatial map"> |
+| [`monty_sql_charts.py`](monty_sql_charts.py): SQL answers drawn with Vega-Lite | [notebook](notebooks/monty_sql_charts.ipynb) | <img src="../docs/assets/examples/revenue_by_month.svg" width="360" alt="Revenue by month chart"> |
 
 ### Concurrency
 
